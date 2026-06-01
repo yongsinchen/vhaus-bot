@@ -39,8 +39,8 @@ const downloadImageAsBase64 = async (url) => {
 
 // ── OpenAI Vision ─────────────────────────────────────────────────
 const extractOrderFromImage = async (base64Image) => {
-  const prompt = `You are a sales order OCR assistant.
-Extract all information from this handwritten or printed sales order image.
+  const prompt = `You are a sales order OCR assistant for V Haus Living (PG) Sdn Bhd, a furniture company in Penang, Malaysia.
+Extract all information from this handwritten sales order image.
 Return ONLY valid JSON with no extra text, no markdown, no explanation.
 Use this exact structure:
 {
@@ -71,13 +71,25 @@ Use this exact structure:
     }
   ]
 }
+
 Rules:
-- soNumber: look for SO number, invoice number, order number
-- orderDate and deliveryDate must be in YYYY-MM-DD format, or leave empty string
-- orderAmount and balance must be numeric string only, no currency symbol
-- items array must have at least one entry even if details are partial
-- type must be either "Delivery" or "Service"
-- status must always be "Pending"
+- soNumber: look for "SALES ORDER:" or "SO:" number, usually a 5-digit number like 31073
+- customerName: look for "NAME:" field
+- address: look for "ADDRESS:" field. If it says "SAME WITH XXXXX" keep that text as-is
+- contact: look for "H/P NO:" or "TEL:" or "CONTACT:" field. Leave empty if not found
+- orderDate: look for "ORDER DATE:". Convert to YYYY-MM-DD. Example: 1/6/2026 = 2026-06-01. Leave empty if not found
+- deliveryDate: look for "DELIVERY DATE:". Convert to YYYY-MM-DD format. If it says "ASAP" or is unclear, return the string "ASAP". Leave empty string only if delivery date field is completely blank.
+- salesman: look for "SALES ASSISTANT:" or "ORDER BY:" field
+- orderAmount: look for "TOTAL" amount, numeric only, no RM symbol. Example: 5590
+- balance: look for "BALANCE" amount, numeric only, no RM symbol. Example: 3891
+- items: extract ALL item rows from the DESCRIPTION column. Each numbered row (1., 2., 3.) is a separate item. Sub-items with "-" under a main item should be combined into one item description
+- For FOC items (free of charge), include them as separate items with unit price 0
+- itemCode: the product code if shown (e.g. 5023). Leave empty if not shown
+- itemName: full description of the item including sub-components
+- unit: quantity from QTY column, default "1" if not shown
+- remark: extract from "REMARKS:" section at the bottom
+- type: always "Delivery" unless the order says "SERVICE"
+- status: always "Pending"
 - If a field cannot be found, use empty string`;
 
   const response = await openai.responses.create({
@@ -134,6 +146,14 @@ app.post("/telegram/webhook", async (req, res) => {
     } catch (err) {
       await sendMessage(chatId, `❌ Failed to extract order data.\nError: ${err.message}`);
       return;
+    }
+
+    // Handle ASAP delivery date — schedule 3 weeks from today
+    if (!data.deliveryDate || data.deliveryDate.toUpperCase() === "ASAP") {
+      const asapDate = new Date();
+      asapDate.setDate(asapDate.getDate() + 21);
+      data.deliveryDate = asapDate.toISOString().split("T")[0];
+      data._asapScheduled = true;
     }
 
     // Validate required fields
@@ -196,11 +216,12 @@ app.post("/telegram/webhook", async (req, res) => {
       .join("\n");
 
     // Success reply
+    const asapNote = data._asapScheduled ? `\n⚠️ _Delivery date was ASAP — auto scheduled 3 weeks from today_` : "";
     const reply = `✅ *Order Added Successfully*
 
 📋 *SO:* ${data.soNumber}
 👤 *Customer:* ${data.customerName || "-"}
-📅 *Delivery Date:* ${data.deliveryDate || "-"}
+📅 *Delivery Date:* ${data.deliveryDate || "-"}${asapNote}
 ⏰ *Time Slot:* ${data.timeSlot || "-"}
 👨‍💼 *Salesman:* ${data.salesman || "-"}
 💰 *Amount:* RM ${data.orderAmount || "0"}
