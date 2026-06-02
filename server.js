@@ -117,7 +117,61 @@ Rules:
   return JSON.parse(clean);
 };
 
-// ── Webhook Handler ───────────────────────────────────────────────
+// ── Parse Delivery Date from natural text ────────────────────────
+const parseDeliveryDate = (text) => {
+  const today = new Date();
+
+  // Check for explicit date pattern like 2/6, 2/6/2026, 02-06-2026
+  const explicitDate = text.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
+  if (explicitDate) {
+    const day = parseInt(explicitDate[1]);
+    const month = parseInt(explicitDate[2]) - 1;
+    const year = explicitDate[3]
+      ? (explicitDate[3].length === 2 ? 2000 + parseInt(explicitDate[3]) : parseInt(explicitDate[3]))
+      : today.getFullYear();
+    const date = new Date(year, month, day);
+    if (!isNaN(date.getTime())) return date.toISOString().split("T")[0];
+  }
+
+  // Check for relative keywords
+  const lower = text.toLowerCase();
+  if (lower.includes("tmr") || lower.includes("tomorrow") || lower.includes("esok")) {
+    const tmr = new Date(today);
+    tmr.setDate(today.getDate() + 1);
+    return tmr.toISOString().split("T")[0];
+  }
+  if (lower.includes("today") || lower.includes("hari ini")) {
+    return today.toISOString().split("T")[0];
+  }
+  if (lower.includes("next week") || lower.includes("minggu depan")) {
+    const nw = new Date(today);
+    nw.setDate(today.getDate() + 7);
+    return nw.toISOString().split("T")[0];
+  }
+
+  return null;
+};
+
+// ── Parse SO Update Message ───────────────────────────────────────
+const parseUpdateMessage = (text) => {
+  // Match SO number
+  const soMatch = text.match(/SO\s*[:\-]?\s*(\S+)/i);
+  // Match delivery date line
+  const dateMatch = text.match(/DELIVERY\s*DATE\s*[:\-]?\s*(.+)/i);
+
+  if (!soMatch || !dateMatch) return null;
+
+  const soNumber = soMatch[1].trim();
+  const dateText = dateMatch[1].trim();
+  const deliveryDate = parseDeliveryDate(dateText);
+
+  // Extract remark — everything after the delivery date line
+  const lines = text.split("\n");
+  const dateLineIdx = lines.findIndex(l => /DELIVERY\s*DATE/i.test(l));
+  const remark = lines.slice(dateLineIdx + 1).join(" ").trim();
+
+  return { soNumber, deliveryDate, dateText, remark };
+};
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200); // Always acknowledge Telegram immediately
 
@@ -127,6 +181,71 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const chatId = message.chat.id;
 
+    // ── Handle text messages for delivery date update ──────────────
+    if (message.text) {
+      const parsed = parseUpdateMessage(message.text);
+      if (!parsed) return; // Not a delivery update message, ignore
+
+      const { soNumber, deliveryDate, dateText, remark } = parsed;
+
+      // Find the SO in Supabase
+      const { data: existing, error: findErr } = await supabase
+        .from("orders")
+        .select("id, so_number, customer_name, delivery_date, remark")
+        .eq("so_number", soNumber)
+        .maybeSingle();
+
+      if (findErr) {
+        await sendMessage(chatId, `❌ Database error: ${findErr.message}`);
+        return;
+      }
+
+      if (!existing) {
+        await sendMessage(chatId, `❌ SO *${soNumber}* not found in the system.`);
+        return;
+      }
+
+      if (!deliveryDate) {
+        await sendMessage(chatId, `⚠️ Could not understand delivery date: *"${dateText}"*\nPlease use format like: \`2/6\` or \`tmr\` or \`3/6/2026\``);
+        return;
+      }
+
+      // Build updated remark — append new remark if any
+      const updatedRemark = remark
+        ? `${existing.remark ? existing.remark + " | " : ""}${remark}`
+        : existing.remark;
+
+      // Update delivery date in Supabase
+      const { error: updateErr } = await supabase
+        .from("orders")
+        .update({
+          delivery_date: deliveryDate,
+          ...(updatedRemark && { remark: updatedRemark })
+        })
+        .eq("so_number", soNumber);
+
+      if (updateErr) {
+        await sendMessage(chatId, `❌ Failed to update SO *${soNumber}*\nError: ${updateErr.message}`);
+        return;
+      }
+
+      const formattedDate = new Date(deliveryDate).toLocaleDateString("en-MY", {
+        weekday: "long", year: "numeric", month: "long", day: "numeric"
+      });
+
+      await sendMessage(chatId,
+        `✅ *Delivery Date Updated*\n\n` +
+        `📋 *SO:* ${soNumber}\n` +
+        `👤 *Customer:* ${existing.customer_name || "-"}\n` +
+        `📅 *New Delivery Date:* ${formattedDate}\n` +
+        `📝 *Date Input:* "${dateText}"\n` +
+        `${remark ? `💬 *Remark:* ${remark}\n` : ""}` +
+        `\n_Delivery sheet has been updated._`
+      );
+      return;
+    }
+
+    // ── Handle photo messages for new sales order ──────────────────
     // Ignore non-photo messages
     if (!message.photo || message.photo.length === 0) return;
 
