@@ -160,6 +160,111 @@ const parseUpdateMessage = (text) => {
   return { soNumber, deliveryDate, dateText, remark };
 };
 
+// ── Normalize Delivery Date ───────────────────────────────────────
+// Converts any raw delivery date text to a valid YYYY-MM-DD date (or null).
+// Preserves original text in remark.
+const normalizeDeliveryDate = (rawText) => {
+  if (!rawText || rawText.toString().trim() === "") {
+    return { deliveryDate: null, originalDeliveryText: "", remarkNote: "" };
+  }
+
+  const raw = rawText.toString().trim();
+
+  // Already ISO YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return { deliveryDate: raw, originalDeliveryText: raw, remarkNote: "" };
+  }
+
+  // ASAP → +21 days
+  if (/^asap$/i.test(raw)) {
+    const d = new Date();
+    d.setDate(d.getDate() + 21);
+    return {
+      deliveryDate: d.toISOString().split("T")[0],
+      originalDeliveryText: raw,
+      remarkNote: "Original delivery date: ASAP",
+    };
+  }
+
+  // Exact date: d/m, d/m/yy, d/m/yyyy, d-m-yyyy etc.
+  const exactMatch = raw.match(/^(\d{1,2})[\/-](\d{1,2})(?:[\/-](\d{2,4}))?$/);
+  if (exactMatch) {
+    const day = parseInt(exactMatch[1]);
+    const month = parseInt(exactMatch[2]) - 1;
+    const rawYear = exactMatch[3];
+    const year = rawYear
+      ? (rawYear.length === 2 ? 2000 + parseInt(rawYear) : parseInt(rawYear))
+      : new Date().getFullYear();
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) {
+      return { deliveryDate: d.toISOString().split("T")[0], originalDeliveryText: raw, remarkNote: "" };
+    }
+  }
+
+  // Month name / range / vague text → resolve to earliest guideline date
+  const MONTHS = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
+    apr: 3, april: 3, may: 4, jun: 5, june: 5,
+    jul: 6, july: 6, aug: 7, august: 7, sep: 8, sept: 8, september: 8,
+    oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11,
+    // Chinese month abbreviations (8月 = aug, 9月 = sep etc.)
+  };
+
+  // Chinese month pattern e.g. "8月" or "9月"
+  const chineseMonth = raw.match(/(\d{1,2})月/);
+  if (chineseMonth) {
+    const monthIdx = parseInt(chineseMonth[1]) - 1;
+    return buildMonthResult(raw, monthIdx, "early");
+  }
+
+  const lower = raw.toLowerCase().replace(/[^a-z0-9\s\/-]/g, " ");
+
+  // Determine qualifier: early / mid / end / late
+  let qualifier = "early";
+  if (/\b(end|late|akhir)\b/.test(lower)) qualifier = "end";
+  else if (/\b(mid|middle|pertengahan)\b/.test(lower)) qualifier = "mid";
+  else if (/\b(early|awal)\b/.test(lower)) qualifier = "early";
+
+  // Extract first month name found (earliest in range)
+  let foundMonth = null;
+  for (const [name, idx] of Object.entries(MONTHS)) {
+    const re = new RegExp("\\b" + name + "\\b");
+    if (re.test(lower)) {
+      if (foundMonth === null || idx < foundMonth) foundMonth = idx;
+    }
+  }
+
+  if (foundMonth !== null) {
+    return buildMonthResult(raw, foundMonth, qualifier);
+  }
+
+  // Cannot parse — return null, preserve raw in remark
+  return {
+    deliveryDate: null,
+    originalDeliveryText: raw,
+    remarkNote: `Original delivery date: ${raw}`,
+  };
+};
+
+// Helper: build result for a resolved month + qualifier
+const buildMonthResult = (raw, monthIdx, qualifier) => {
+  const today = new Date();
+  let year = today.getFullYear();
+  // If this month has already passed this year, use next year
+  if (monthIdx < today.getMonth()) year += 1;
+
+  let day = 1;
+  if (qualifier === "mid") day = 15;
+  else if (qualifier === "end") day = 25;
+
+  const d = new Date(year, monthIdx, day);
+  return {
+    deliveryDate: d.toISOString().split("T")[0],
+    originalDeliveryText: raw,
+    remarkNote: `Original delivery date: ${raw}`,
+  };
+};
+
 // ── Build Order Preview ───────────────────────────────────────────
 const buildOrderPreview = (data) => {
   const fmt = (v) => (v !== null && v !== undefined && v !== "" ? v : "-");
@@ -177,7 +282,10 @@ const buildOrderPreview = (data) => {
     `Contact: ${fmt(data.contact)}\n` +
     `Address: ${fmt(data.address)}\n` +
     `Order Date: ${fmt(data.orderDate)}\n` +
-    `Delivery Date: ${fmt(data.deliveryDate)}\n` +
+    `Delivery Date Guideline: ${fmt(data.deliveryDate)}\n` +
+    (data.originalDeliveryText && data.originalDeliveryText !== data.deliveryDate
+      ? `Original Delivery Text: ${data.originalDeliveryText}\n`
+      : "") +
     `Time Slot: ${fmt(data.timeSlot)}\n` +
     `Salesman: ${fmt(data.salesman)}\n` +
     `Amount: RM${fmt(data.orderAmount)}\n` +
@@ -221,7 +329,7 @@ Apply the user's correction to the draft. Return ONLY the updated JSON object wi
 Rules:
 - Preserve ALL existing fields unless the user specifically changes them.
 - For items: if user says "item 2 is X", update items[1]. If user says "remove item 3", remove items[2]. If user says "add item X", append to items array.
-- For delivery date: keep the user's natural language value as-is (e.g. "Aug - Sept", "October", "ASAP") — do NOT convert to ISO format unless user gives a specific date like "20/6/2026".
+- For delivery date: store the user's natural language value as-is into deliveryDate (e.g. "October", "Aug - Sept", "ASAP", "3/6/2026"). Also update originalDeliveryText to match. The normalizeDeliveryDate function will handle ISO conversion before saving.
 - For balance/amount: extract numeric value only, no RM symbol.
 - For items added by user: use structure { itemName, unit, supplier, itemCode } — leave supplier and itemCode empty string if not mentioned.
 - Return valid JSON only.`;
@@ -243,15 +351,15 @@ const saveOrderToSupabase = async (draft) => {
     return { ok: false, msg: "❌ SO Number is required before saving." };
   }
 
-  // Resolve ASAP / natural language delivery date → use as-is in DB, just handle ASAP
-  let deliveryDate = draft.deliveryDate;
-  let asapScheduled = false;
-  if (!deliveryDate || deliveryDate.toString().toUpperCase() === "ASAP") {
-    const asapDate = new Date();
-    asapDate.setDate(asapDate.getDate() + 21);
-    deliveryDate = asapDate.toISOString().split("T")[0];
-    asapScheduled = true;
-  }
+  // Normalize delivery date — always store as YYYY-MM-DD or null
+  const normalized = normalizeDeliveryDate(draft.deliveryDate);
+  const deliveryDate = normalized.deliveryDate;
+
+  // Build final remark — append original delivery text note if present
+  const baseRemark = draft.remark || "";
+  const finalRemark = normalized.remarkNote
+    ? (baseRemark ? `${baseRemark} | ${normalized.remarkNote}` : normalized.remarkNote)
+    : baseRemark || null;
 
   // Duplicate SO check
   const { data: existing } = await supabase
@@ -272,7 +380,7 @@ const saveOrderToSupabase = async (draft) => {
     plate_no: draft.plateNo || null,
     type: draft.type || "Delivery",
     service_note: draft.serviceNote || null,
-    remark: draft.remark || null,
+    remark: finalRemark,
     status: "Pending",
     items: JSON.stringify(draft.items || []),
   };
@@ -280,10 +388,11 @@ const saveOrderToSupabase = async (draft) => {
   const { error } = await supabase.from("orders").insert(payload);
   if (error) return { ok: false, msg: `❌ Insert failed: ${error.message}` };
 
-  const asapNote = asapScheduled ? `\n⚠️ _Delivery date was ASAP — auto scheduled 3 weeks from today_` : "";
+  const dateDisplay = deliveryDate || "Not set";
+  const origNote = normalized.remarkNote ? `\n📝 _${normalized.remarkNote}_` : "";
   return {
     ok: true,
-    msg: `✅ *Order Saved Successfully*\n\n📋 *SO:* ${draft.soNumber}\n👤 *Customer:* ${draft.customerName || "-"}\n📅 *Delivery Date:* ${deliveryDate}${asapNote}\n\n_Order has been saved to the delivery sheet._`,
+    msg: `✅ *Order Saved Successfully*\n\n📋 *SO:* ${draft.soNumber}\n👤 *Customer:* ${draft.customerName || "-"}\n📅 *Delivery Date:* ${dateDisplay}${origNote}\n\n_Order has been saved to the delivery sheet._`,
   };
 };
 
@@ -674,6 +783,17 @@ app.post("/telegram/webhook", async (req, res) => {
     if (!data.soNumber) {
       await sendMessage(chatId, "❌ Could not find SO Number in the image. Please try again with a clearer image.");
       return;
+    }
+
+    // Normalize delivery date immediately after extraction
+    const normalized = normalizeDeliveryDate(data.deliveryDate);
+    data.deliveryDate = normalized.deliveryDate;
+    data.originalDeliveryText = normalized.originalDeliveryText;
+    // Pre-populate remark note into draft so salesman can see it
+    if (normalized.remarkNote) {
+      data.remark = data.remark
+        ? `${data.remark} | ${normalized.remarkNote}`
+        : normalized.remarkNote;
     }
 
     // Store as pending draft — NO Supabase insert yet
