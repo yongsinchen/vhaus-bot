@@ -907,11 +907,12 @@ const handleDeliveryTemplate = async (chatId, text) => {
 
   const { driver, helper, soNumber, date, note, isSettle, statusRaw } = parsed;
 
-  // Find the order in DB
+  // Find the order in DB — filter by Delivery type to avoid matching converted Service orders
   const { data: order, error: findErr } = await supabase
     .from("orders")
     .select("id, so_number, customer_name, remark, status, delivery_date")
     .eq("so_number", soNumber)
+    .eq("type", "Delivery")
     .maybeSingle();
 
   if (findErr) {
@@ -1268,9 +1269,10 @@ app.post("/service-pending/:id/convert", async (req, res) => {
     .from("service_pending").select("*").eq("id", id).single();
   if (spErr || !sp) return res.status(404).json({ error: "Service pending not found" });
 
-  // Get original order for customer details
-  const { data: order } = await supabase
-    .from("orders").select("*").eq("so_number", sp.so_number).maybeSingle();
+  // Get original order — filter by type=Delivery to avoid duplicates
+  const { data: order, error: orderErr } = await supabase
+    .from("orders").select("*").eq("so_number", sp.so_number).eq("type", "Delivery").maybeSingle();
+  if (orderErr || !order) return res.status(404).json({ error: `Original delivery order for SO ${sp.so_number} not found` });
 
   // Get next SV number
   const svNumber = await getNextSvNumber();
@@ -1278,40 +1280,33 @@ app.post("/service-pending/:id/convert", async (req, res) => {
   // Build service note
   const serviceNote = `${sp.so_number}${sp.note ? ` — ${sp.note}` : ""}`;
 
-  // Build remark combining driver info + admin remark
+  // Build remark combining existing remark + driver info + admin remark
   const remarkParts = [
+    order.remark || null,
     `Converted from Service Pending`,
     `Driver: ${sp.driver}${sp.helper ? ` | Helper: ${sp.helper}` : ""}`,
     sp.note ? `Issue: ${sp.note}` : null,
     adminRemark ? `Admin note: ${adminRemark}` : null,
   ].filter(Boolean);
 
-  // Create new Service order
-  const payload = {
-    so_number: sp.so_number,
-    sv_number: svNumber,
-    customer_name: order?.customer_name || null,
-    address: order?.address || null,
-    contact: order?.contact || null,
-    salesman: order?.salesman || null,
-    order_amount: order?.order_amount || null,
-    balance: order?.balance || null,
-    type: "Service",
-    service_note: serviceNote,
-    remark: remarkParts.join(" | "),
-    status: "Pending",
-    items: order?.items || "[]",
-    delivery_date: null,
-  };
-
-  const { data: newOrder, error: insertErr } = await supabase
-    .from("orders").insert(payload).select().single();
-  if (insertErr) return res.status(500).json({ error: insertErr.message });
+  // UPDATE the existing order — change type to Service, set sv_number
+  const { data: updatedOrder, error: updateErr } = await supabase
+    .from("orders")
+    .update({
+      type: "Service",
+      sv_number: svNumber,
+      service_note: serviceNote,
+      remark: remarkParts.join(" | "),
+      status: "Pending",
+    })
+    .eq("id", order.id)
+    .select().single();
+  if (updateErr) return res.status(500).json({ error: updateErr.message });
 
   // Mark service_pending as Converted
   await supabase.from("service_pending").update({ status: "Converted" }).eq("id", id);
 
-  res.json({ success: true, svNumber, order: newOrder });
+  res.json({ success: true, svNumber, order: updatedOrder });
 });
 
 // DELETE /service-pending/:id — remove (not applicable)
