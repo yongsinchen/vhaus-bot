@@ -104,20 +104,21 @@ Rules:
 - status: always "Pending"
 - If a field cannot be found, use empty string`;
 
-  const response = await openai.responses.create({
+  const response = await openai.chat.completions.create({
     model: "gpt-4o",
-    input: [
+    max_tokens: 2000,
+    messages: [
       {
         role: "user",
         content: [
-          { type: "input_text", text: prompt },
-          { type: "input_image", image_url: `data:image/jpeg;base64,${base64Image}` },
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}`, detail: "high" } },
         ],
       },
     ],
   });
 
-  const raw = response.output_text.trim();
+  const raw = response.choices[0].message.content.trim();
   const clean = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
   return JSON.parse(clean);
 };
