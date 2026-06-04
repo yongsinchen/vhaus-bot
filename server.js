@@ -24,6 +24,7 @@ const supabase = createClient(
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // set this in your .env
 
 // ── In-memory pending drafts ──────────────────────────────────────
 // Key: `${chatId}:${userId}` — each salesman has their own draft
@@ -681,6 +682,92 @@ const handleScheduleCommand = async (chatId, text) => {
   await sendMessage(chatId, reply);
 };
 
+// ── Bot: /flag command ────────────────────────────────────────────
+const handleFlagCommand = async (chatId, text, from) => {
+  // Usage: /flag 31074 balance should be 3840 not 1650
+  const match = text.match(/\/flag\s+(\S+)\s+([\s\S]+)/i);
+  if (!match) {
+    await sendMessage(chatId,
+      "⚠️ *How to flag an order:*\n\n" +
+      "`/flag <SO Number> <what is wrong>`\n\n" +
+      "*Examples:*\n" +
+      "`/flag 31074 balance should be 3840 not 1650`\n" +
+      "`/flag 31074 wrong customer name, should be Rebecca Tan`\n" +
+      "`/flag 31074 delivery date should be 15/6 not 10/6`"
+    );
+    return;
+  }
+
+  const soNumber = match[1].trim();
+  const flagNote = match[2].trim();
+  const salesmanName = from?.first_name
+    ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
+    : (from?.username || "Unknown");
+
+  // Find the order
+  const { data: order, error: findErr } = await supabase
+    .from("orders")
+    .select("id, so_number, customer_name, status, remark, delivery_date")
+    .eq("so_number", soNumber)
+    .maybeSingle();
+
+  if (findErr) {
+    await sendMessage(chatId, `❌ Database error: ${findErr.message}`);
+    return;
+  }
+  if (!order) {
+    await sendMessage(chatId,
+      `❌ SO *${soNumber}* not found in the system.\n` +
+      `Please check the SO number and try again.`
+    );
+    return;
+  }
+
+  // Build updated remark — append flag note with timestamp
+  const now = new Date().toLocaleString("en-MY", {
+    timeZone: "Asia/Kuala_Lumpur",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit"
+  });
+  const flagEntry = `⚠️ FLAGGED by ${salesmanName} (${now}): ${flagNote}`;
+  const updatedRemark = order.remark
+    ? `${order.remark} | ${flagEntry}`
+    : flagEntry;
+
+  // Update order: status → Flagged, remark → append flag note
+  const { error: updateErr } = await supabase
+    .from("orders")
+    .update({ status: "Flagged", remark: updatedRemark })
+    .eq("so_number", soNumber);
+
+  if (updateErr) {
+    await sendMessage(chatId, `❌ Failed to flag SO *${soNumber}*: ${updateErr.message}`);
+    return;
+  }
+
+  // Confirm to salesman
+  await sendMessage(chatId,
+    `✅ *SO ${soNumber} has been flagged*\n\n` +
+    `👤 Customer: ${order.customer_name || "-"}\n` +
+    `📝 Issue: ${flagNote}\n\n` +
+    `_Admin has been notified and will correct it in the delivery sheet._`
+  );
+
+  // Notify admin group
+  if (ADMIN_CHAT_ID) {
+    await sendMessage(ADMIN_CHAT_ID,
+      `🚨 *Order Flagged — Action Required*\n\n` +
+      `📋 *SO:* ${soNumber}\n` +
+      `👤 *Customer:* ${order.customer_name || "-"}\n` +
+      `📅 *Delivery Date:* ${order.delivery_date || "-"}\n\n` +
+      `⚠️ *Issue reported by ${salesmanName}:*\n` +
+      `_${flagNote}_\n\n` +
+      `Please correct this order in the delivery sheet.\n` +
+      `🔗 https://vhaus-delivery.vercel.app`
+    );
+  }
+};
+
 // ── Delivery Vehicle API ──────────────────────────────────────────
 
 // GET /delivery/vehicles
@@ -936,6 +1023,11 @@ app.post("/telegram/webhook", async (req, res) => {
       // No pending draft — existing flows unchanged
       if (message.text.startsWith("/schedule")) {
         await handleScheduleCommand(chatId, message.text);
+        return;
+      }
+
+      if (message.text.startsWith("/flag")) {
+        await handleFlagCommand(chatId, message.text, message.from);
         return;
       }
 
