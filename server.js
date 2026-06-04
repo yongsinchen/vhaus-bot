@@ -1262,6 +1262,7 @@ app.get("/service-pending", async (req, res) => {
 // POST /service-pending/:id/convert — convert to Service order
 app.post("/service-pending/:id/convert", async (req, res) => {
   const { id } = req.params;
+  const { remark: adminRemark } = req.body || {};
 
   const { data: sp, error: spErr } = await supabase
     .from("service_pending").select("*").eq("id", id).single();
@@ -1277,6 +1278,14 @@ app.post("/service-pending/:id/convert", async (req, res) => {
   // Build service note
   const serviceNote = `${sp.so_number}${sp.note ? ` — ${sp.note}` : ""}`;
 
+  // Build remark combining driver info + admin remark
+  const remarkParts = [
+    `Converted from Service Pending`,
+    `Driver: ${sp.driver}${sp.helper ? ` | Helper: ${sp.helper}` : ""}`,
+    sp.note ? `Issue: ${sp.note}` : null,
+    adminRemark ? `Admin note: ${adminRemark}` : null,
+  ].filter(Boolean);
+
   // Create new Service order
   const payload = {
     so_number: sp.so_number,
@@ -1289,7 +1298,7 @@ app.post("/service-pending/:id/convert", async (req, res) => {
     balance: order?.balance || null,
     type: "Service",
     service_note: serviceNote,
-    remark: `Converted from Service Pending | Driver: ${sp.driver}${sp.helper ? ` | Helper: ${sp.helper}` : ""}${sp.note ? ` | Issue: ${sp.note}` : ""}`,
+    remark: remarkParts.join(" | "),
     status: "Pending",
     items: order?.items || "[]",
     delivery_date: null,
