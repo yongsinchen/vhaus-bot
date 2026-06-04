@@ -184,6 +184,10 @@ app.post("/telegram/webhook", async (req, res) => {
     // ── Handle text messages for delivery date update ──────────────
     if (message.text) {
       const parsed = parseUpdateMessage(message.text);
+      if (message.text && message.text.startsWith("/schedule")) {
+  await handleScheduleCommand(chatId, message.text);
+  return;
+}
       if (!parsed) return; // Not a delivery update message, ignore
 
       const { soNumber, deliveryDate, dateText, remark } = parsed;
@@ -360,6 +364,446 @@ _Order has been saved to the delivery sheet._`;
 
 // ── Health Check ──────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "ok", message: "V Haus Telegram Bot Server" }));
+
+
+// ── Delivery Schedule API ─────────────────────────────────────────
+// Add CORS so React frontend can call this backend
+const cors = require("cors");
+app.use(cors());
+
+// GET /delivery/routes?date=2026-07-15
+// Returns all routes + their assigned orders for a date
+app.get("/delivery/routes", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+
+  const { data: routes, error: routeErr } = await supabase
+    .from("delivery_routes")
+    .select("*")
+    .eq("delivery_date", date)
+    .order("created_at");
+
+  if (routeErr) return res.status(500).json({ error: routeErr.message });
+
+  // For each route, get assigned orders
+  const routesWithOrders = await Promise.all(routes.map(async (route) => {
+    const { data: routeOrders } = await supabase
+      .from("delivery_route_orders")
+      .select("*, orders(*)")
+      .eq("route_id", route.id)
+      .order("sequence_no");
+    return { ...route, orders: routeOrders || [] };
+  }));
+
+  res.json(routesWithOrders);
+});
+
+// GET /delivery/unassigned?date=2026-07-15
+// Returns orders for a date that are not yet assigned to any route
+app.get("/delivery/unassigned", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+
+  // Get all orders for that date
+  const { data: orders, error: ordErr } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("delivery_date", date);
+
+  if (ordErr) return res.status(500).json({ error: ordErr.message });
+
+  // Get assigned order IDs for that date
+  const { data: assigned } = await supabase
+    .from("delivery_route_orders")
+    .select("order_id, delivery_routes!inner(delivery_date)")
+    .eq("delivery_routes.delivery_date", date);
+
+  const assignedIds = new Set((assigned || []).map(a => a.order_id));
+  const unassigned = (orders || []).filter(o => !assignedIds.has(o.id));
+
+  res.json(unassigned);
+});
+
+// POST /delivery/routes
+// Create a new route
+app.post("/delivery/routes", async (req, res) => {
+  const { delivery_date, lorry_plate, driver_name, area, notes } = req.body;
+  if (!delivery_date) return res.status(400).json({ error: "delivery_date is required" });
+
+  const { data, error } = await supabase
+    .from("delivery_routes")
+    .insert({ delivery_date, lorry_plate, driver_name, area, notes, status: "Pending" })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// PATCH /delivery/routes/:id
+// Update route details (lorry, driver, area, status)
+app.patch("/delivery/routes/:id", async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+
+  const { data, error } = await supabase
+    .from("delivery_routes")
+    .update(updates)
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// DELETE /delivery/routes/:id
+// Delete a route (cascade deletes route_orders)
+app.delete("/delivery/routes/:id", async (req, res) => {
+  const { id } = req.params;
+  const { error } = await supabase.from("delivery_routes").delete().eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// POST /delivery/routes/:routeId/orders
+// Assign an order to a route
+app.post("/delivery/routes/:routeId/orders", async (req, res) => {
+  const { routeId } = req.params;
+  const { order_id, sequence_no } = req.body;
+
+  const { data, error } = await supabase
+    .from("delivery_route_orders")
+    .insert({ route_id: routeId, order_id, sequence_no: sequence_no || 1 })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// PATCH /delivery/routes/:routeId/orders/:orderId
+// Update sequence number
+app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+  const { routeId, orderId } = req.params;
+  const { sequence_no } = req.body;
+
+  const { data, error } = await supabase
+    .from("delivery_route_orders")
+    .update({ sequence_no })
+    .eq("route_id", routeId)
+    .eq("order_id", orderId)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// DELETE /delivery/routes/:routeId/orders/:orderId
+// Unassign order from route
+app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+  const { routeId, orderId } = req.params;
+  const { error } = await supabase
+    .from("delivery_route_orders")
+    .delete()
+    .eq("route_id", routeId)
+    .eq("order_id", orderId);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// ── Bot: /schedule command ────────────────────────────────────────
+const handleScheduleCommand = async (chatId, text) => {
+  // Parse date from /schedule 15/7 or /schedule 2026-07-15
+  const dateMatch = text.match(/\/schedule\s+(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/i);
+  if (!dateMatch) {
+    await sendMessage(chatId, "Usage: `/schedule 15/7` or `/schedule 2026-07-15`");
+    return;
+  }
+
+  const day = parseInt(dateMatch[1]);
+  const month = parseInt(dateMatch[2]) - 1;
+  const year = dateMatch[3]
+    ? (dateMatch[3].length === 2 ? 2000 + parseInt(dateMatch[3]) : parseInt(dateMatch[3]))
+    : new Date().getFullYear();
+  const dateObj = new Date(year, month, day);
+  const dateStr = dateObj.toISOString().split("T")[0];
+  const dateLabel = dateObj.toLocaleDateString("en-MY", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+
+  // Get orders for that date
+  const { data: orders, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("delivery_date", dateStr);
+
+  if (error) { await sendMessage(chatId, `❌ Error: ${error.message}`); return; }
+  if (!orders || orders.length === 0) {
+    await sendMessage(chatId, `📅 No orders found for *${dateLabel}*`);
+    return;
+  }
+
+  // Group by area (from address)
+  const grouped = {};
+  orders.forEach(o => {
+    const addr = (o.address || "").toUpperCase();
+    let area = "OTHER";
+    if (addr.includes("GEORGETOWN") || addr.includes("G.TOWN")) area = "GEORGETOWN";
+    else if (addr.includes("BUKIT MERTAJAM") || addr.includes("BM")) area = "BUKIT MERTAJAM";
+    else if (addr.includes("BUTTERWORTH")) area = "BUTTERWORTH";
+    else if (addr.includes("KEPALA BATAS")) area = "KEPALA BATAS";
+    else if (addr.includes("SIMPANG AMPAT")) area = "SIMPANG AMPAT";
+    else if (addr.includes("NIBONG TEBAL")) area = "NIBONG TEBAL";
+    else if (addr.includes("PERMATANG PAUH")) area = "PERMATANG PAUH";
+    else if (addr.includes("SEBERANG JAYA")) area = "SEBERANG JAYA";
+    if (!grouped[area]) grouped[area] = [];
+    grouped[area].push(o);
+  });
+
+  // Build reply
+  let reply = `📦 *Delivery Schedule — ${dateLabel}*\n`;
+  reply += `Total: *${orders.length} orders*\n\n`;
+  reply += `*Suggested grouping by area:*\n`;
+  reply += `━━━━━━━━━━━━━━━━━━━━\n`;
+
+  Object.entries(grouped).forEach(([area, areaOrders]) => {
+    reply += `\n📍 *${area}* (${areaOrders.length} orders)\n`;
+    areaOrders.forEach((o, i) => {
+      const items = typeof o.items === "string" ? JSON.parse(o.items || "[]") : (o.items || []);
+      const itemNames = items.map(it => it.itemName).filter(Boolean).join(", ");
+      reply += `  ${i + 1}. SO *${o.so_number}* — ${o.customer_name || "-"}\n`;
+      reply += `     📦 ${itemNames || "No items"}\n`;
+      if (o.time_slot) reply += `     ⏰ ${o.time_slot}\n`;
+      if (parseFloat(o.balance) > 0) reply += `     🔴 Balance: RM ${o.balance}\n`;
+    });
+  });
+
+  reply += `\n━━━━━━━━━━━━━━━━━━━━\n`;
+  reply += `_Open delivery sheet to assign lorries._`;
+
+  await sendMessage(chatId, reply);
+};
+
+// ── Delivery Schedule API ─────────────────────────────────────────
+// Add CORS so React frontend can call this backend
+const cors = require("cors");
+app.use(cors());
+
+// GET /delivery/routes?date=2026-07-15
+// Returns all routes + their assigned orders for a date
+app.get("/delivery/routes", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+
+  const { data: routes, error: routeErr } = await supabase
+    .from("delivery_routes")
+    .select("*")
+    .eq("delivery_date", date)
+    .order("created_at");
+
+  if (routeErr) return res.status(500).json({ error: routeErr.message });
+
+  // For each route, get assigned orders
+  const routesWithOrders = await Promise.all(routes.map(async (route) => {
+    const { data: routeOrders } = await supabase
+      .from("delivery_route_orders")
+      .select("*, orders(*)")
+      .eq("route_id", route.id)
+      .order("sequence_no");
+    return { ...route, orders: routeOrders || [] };
+  }));
+
+  res.json(routesWithOrders);
+});
+
+// GET /delivery/unassigned?date=2026-07-15
+// Returns orders for a date that are not yet assigned to any route
+app.get("/delivery/unassigned", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+
+  // Get all orders for that date
+  const { data: orders, error: ordErr } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("delivery_date", date);
+
+  if (ordErr) return res.status(500).json({ error: ordErr.message });
+
+  // Get assigned order IDs for that date
+  const { data: assigned } = await supabase
+    .from("delivery_route_orders")
+    .select("order_id, delivery_routes!inner(delivery_date)")
+    .eq("delivery_routes.delivery_date", date);
+
+  const assignedIds = new Set((assigned || []).map(a => a.order_id));
+  const unassigned = (orders || []).filter(o => !assignedIds.has(o.id));
+
+  res.json(unassigned);
+});
+
+// POST /delivery/routes
+// Create a new route
+app.post("/delivery/routes", async (req, res) => {
+  const { delivery_date, lorry_plate, driver_name, area, notes } = req.body;
+  if (!delivery_date) return res.status(400).json({ error: "delivery_date is required" });
+
+  const { data, error } = await supabase
+    .from("delivery_routes")
+    .insert({ delivery_date, lorry_plate, driver_name, area, notes, status: "Pending" })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// PATCH /delivery/routes/:id
+// Update route details (lorry, driver, area, status)
+app.patch("/delivery/routes/:id", async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+
+  const { data, error } = await supabase
+    .from("delivery_routes")
+    .update(updates)
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// DELETE /delivery/routes/:id
+// Delete a route (cascade deletes route_orders)
+app.delete("/delivery/routes/:id", async (req, res) => {
+  const { id } = req.params;
+  const { error } = await supabase.from("delivery_routes").delete().eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// POST /delivery/routes/:routeId/orders
+// Assign an order to a route
+app.post("/delivery/routes/:routeId/orders", async (req, res) => {
+  const { routeId } = req.params;
+  const { order_id, sequence_no } = req.body;
+
+  const { data, error } = await supabase
+    .from("delivery_route_orders")
+    .insert({ route_id: routeId, order_id, sequence_no: sequence_no || 1 })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// PATCH /delivery/routes/:routeId/orders/:orderId
+// Update sequence number
+app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+  const { routeId, orderId } = req.params;
+  const { sequence_no } = req.body;
+
+  const { data, error } = await supabase
+    .from("delivery_route_orders")
+    .update({ sequence_no })
+    .eq("route_id", routeId)
+    .eq("order_id", orderId)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// DELETE /delivery/routes/:routeId/orders/:orderId
+// Unassign order from route
+app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+  const { routeId, orderId } = req.params;
+  const { error } = await supabase
+    .from("delivery_route_orders")
+    .delete()
+    .eq("route_id", routeId)
+    .eq("order_id", orderId);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// ── Bot: /schedule command ────────────────────────────────────────
+const handleScheduleCommand = async (chatId, text) => {
+  // Parse date from /schedule 15/7 or /schedule 2026-07-15
+  const dateMatch = text.match(/\/schedule\s+(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/i);
+  if (!dateMatch) {
+    await sendMessage(chatId, "Usage: `/schedule 15/7` or `/schedule 2026-07-15`");
+    return;
+  }
+
+  const day = parseInt(dateMatch[1]);
+  const month = parseInt(dateMatch[2]) - 1;
+  const year = dateMatch[3]
+    ? (dateMatch[3].length === 2 ? 2000 + parseInt(dateMatch[3]) : parseInt(dateMatch[3]))
+    : new Date().getFullYear();
+  const dateObj = new Date(year, month, day);
+  const dateStr = dateObj.toISOString().split("T")[0];
+  const dateLabel = dateObj.toLocaleDateString("en-MY", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+
+  // Get orders for that date
+  const { data: orders, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("delivery_date", dateStr);
+
+  if (error) { await sendMessage(chatId, `❌ Error: ${error.message}`); return; }
+  if (!orders || orders.length === 0) {
+    await sendMessage(chatId, `📅 No orders found for *${dateLabel}*`);
+    return;
+  }
+
+  // Group by area (from address)
+  const grouped = {};
+  orders.forEach(o => {
+    const addr = (o.address || "").toUpperCase();
+    let area = "OTHER";
+    if (addr.includes("GEORGETOWN") || addr.includes("G.TOWN")) area = "GEORGETOWN";
+    else if (addr.includes("BUKIT MERTAJAM") || addr.includes("BM")) area = "BUKIT MERTAJAM";
+    else if (addr.includes("BUTTERWORTH")) area = "BUTTERWORTH";
+    else if (addr.includes("KEPALA BATAS")) area = "KEPALA BATAS";
+    else if (addr.includes("SIMPANG AMPAT")) area = "SIMPANG AMPAT";
+    else if (addr.includes("NIBONG TEBAL")) area = "NIBONG TEBAL";
+    else if (addr.includes("PERMATANG PAUH")) area = "PERMATANG PAUH";
+    else if (addr.includes("SEBERANG JAYA")) area = "SEBERANG JAYA";
+    if (!grouped[area]) grouped[area] = [];
+    grouped[area].push(o);
+  });
+
+  // Build reply
+  let reply = `📦 *Delivery Schedule — ${dateLabel}*\n`;
+  reply += `Total: *${orders.length} orders*\n\n`;
+  reply += `*Suggested grouping by area:*\n`;
+  reply += `━━━━━━━━━━━━━━━━━━━━\n`;
+
+  Object.entries(grouped).forEach(([area, areaOrders]) => {
+    reply += `\n📍 *${area}* (${areaOrders.length} orders)\n`;
+    areaOrders.forEach((o, i) => {
+      const items = typeof o.items === "string" ? JSON.parse(o.items || "[]") : (o.items || []);
+      const itemNames = items.map(it => it.itemName).filter(Boolean).join(", ");
+      reply += `  ${i + 1}. SO *${o.so_number}* — ${o.customer_name || "-"}\n`;
+      reply += `     📦 ${itemNames || "No items"}\n`;
+      if (o.time_slot) reply += `     ⏰ ${o.time_slot}\n`;
+      if (parseFloat(o.balance) > 0) reply += `     🔴 Balance: RM ${o.balance}\n`;
+    });
+  });
+
+  reply += `\n━━━━━━━━━━━━━━━━━━━━\n`;
+  reply += `_Open delivery sheet to assign lorries._`;
+
+  await sendMessage(chatId, reply);
+};
+
 
 // ── Start Server ──────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
