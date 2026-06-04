@@ -32,11 +32,20 @@ const pendingOrders = new Map();
 
 // ── Telegram Helpers ──────────────────────────────────────────────
 const sendMessage = async (chatId, text) => {
-  await axios.post(`${TELEGRAM_API}/sendMessage`, {
-    chat_id: chatId,
-    text,
-    parse_mode: "Markdown",
-  });
+  try {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text,
+      parse_mode: "Markdown",
+    });
+  } catch (err) {
+    // Retry without Markdown if formatting caused the error
+    console.error("sendMessage Markdown failed, retrying as plain text:", err.message);
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text: text.replace(/[*_`]/g, ""),
+    });
+  }
 };
 
 const getFileUrl = async (fileId) => {
