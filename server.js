@@ -163,7 +163,7 @@ const parseUpdateMessage = (text) => {
 // ── Normalize Delivery Date ───────────────────────────────────────
 // Converts any raw delivery date text to a valid YYYY-MM-DD date (or null).
 // Preserves original text in remark.
-const normalizeDeliveryDate = (rawText) => {
+const normalizeDeliveryDate = (rawText, orderDate = null) => {
   if (!rawText || rawText.toString().trim() === "") {
     return { deliveryDate: null, originalDeliveryText: "", remarkNote: "" };
   }
@@ -184,6 +184,24 @@ const normalizeDeliveryDate = (rawText) => {
       originalDeliveryText: raw,
       remarkNote: "Original delivery date: ASAP",
     };
+  }
+
+  // Relative keywords: today, tomorrow, tmr, next week, esok etc.
+  // Base date: use orderDate if available, otherwise today
+  const lower0 = raw.toLowerCase();
+  const relOffset = (
+    /\b(today|hari ini)\b/.test(lower0) ? 0 :
+    /\b(tomorrow|tmr|esok)\b/.test(lower0) ? 1 :
+    /\b(next week|minggu depan)\b/.test(lower0) ? 7 :
+    null
+  );
+  if (relOffset !== null) {
+    const base = (orderDate && /^\d{4}-\d{2}-\d{2}$/.test(orderDate))
+      ? new Date(orderDate + "T00:00:00")
+      : new Date();
+    base.setDate(base.getDate() + relOffset);
+    const iso = base.toISOString().split("T")[0];
+    return { deliveryDate: iso, originalDeliveryText: raw, remarkNote: "" };
   }
 
   // Exact date: d/m, d/m/yy, d/m/yyyy, d-m-yyyy etc.
@@ -352,7 +370,7 @@ const saveOrderToSupabase = async (draft) => {
   }
 
   // Normalize delivery date — always store as YYYY-MM-DD or null
-  const normalized = normalizeDeliveryDate(draft.deliveryDate);
+  const normalized = normalizeDeliveryDate(draft.deliveryDate, draft.orderDate);
   const deliveryDate = normalized.deliveryDate;
 
   // Build final remark — append original delivery text note if present
@@ -786,7 +804,7 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     // Normalize delivery date immediately after extraction
-    const normalized = normalizeDeliveryDate(data.deliveryDate);
+    const normalized = normalizeDeliveryDate(data.deliveryDate, data.orderDate);
     data.deliveryDate = normalized.deliveryDate;
     data.originalDeliveryText = normalized.originalDeliveryText;
     // Pre-populate remark note into draft so salesman can see it
