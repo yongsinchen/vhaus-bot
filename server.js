@@ -25,38 +25,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // set this in your .env
-
-// ── Bot: /start command ───────────────────────────────────────────
-const handleStartCommand = async (chatId, from) => {
-  const name = from?.first_name || "there";
-  await sendMessage(chatId,
-    `👋 Hello ${name}! Welcome to *V Haus Living (PG) Bot*\n\n` +
-    `Here's what I can do:\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `📷 *Submit a Sales Order*\n` +
-    `Send me a photo of the handwritten sales order.\n` +
-    `I'll extract all details and show you a preview.\n` +
-    `Reply *YES* to save, *CANCEL* to discard,\n` +
-    `or tell me what to correct naturally.\n\n` +
-    `_e.g. "balance is 3840", "delivery date is 10/6"_\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `📅 *Update Delivery Date*\n` +
-    `Send a message in this format:\n` +
-    `SO: 31074\n` +
-    `DELIVERY DATE: 10/6\n` +
-    `optional note here\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `🚨 *Flag a Wrong Order*\n` +
-    `If you saved an order with wrong info:\n` +
-    "`/flag <SO Number> <what is wrong>`\n\n" +
-    `_e.g. /flag 31074 balance should be 3840_\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `🗓 *Check Delivery Schedule*\n` +
-    "`/schedule 15/6`\n\n" +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `Type /help anytime to see this menu again.`
-  );
-};
+const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID; // Group B — drivers send delivery templates here
 
 // ── In-memory pending drafts ──────────────────────────────────────
 // Key: `${chatId}:${userId}` — each salesman has their own draft
@@ -723,6 +692,67 @@ const handleScheduleCommand = async (chatId, text) => {
   await sendMessage(chatId, reply);
 };
 
+// ── Bot: /start and /help command ───────────────────────────────
+const handleStartCommand = async (chatId, from) => {
+  const name = from?.first_name || "there";
+  await sendMessage(chatId,
+    `👋 Hello ${name}! Welcome to *V Haus Living (PG) Bot*
+
+` +
+    `Here is what I can do:
+
+` +
+    `━━━━━━━━━━━━━━━━━━━━
+` +
+    `📷 *Submit a Sales Order*
+` +
+    `Send me a photo of the handwritten sales order.
+` +
+    `I will extract all details and show you a preview.
+` +
+    `Reply *YES* to save, *CANCEL* to discard,
+` +
+    `or tell me what to correct naturally.
+
+` +
+    `_e.g. "balance is 3840", "delivery date is 10/6"_
+
+` +
+    `━━━━━━━━━━━━━━━━━━━━
+` +
+    `📅 *Update Delivery Date*
+` +
+    `Send a message in this format:
+` +
+    `SO: 31074
+` +
+    `DELIVERY DATE: 10/6
+` +
+    `optional remark here
+
+` +
+    `━━━━━━━━━━━━━━━━━━━━
+` +
+    `🚨 *Flag a Wrong Order*
+` +
+    `If you saved an order with wrong info:
+` +
+    `/flag 31074 balance should be 3840
+
+` +
+    `━━━━━━━━━━━━━━━━━━━━
+` +
+    `🗓 *Check Delivery Schedule*
+` +
+    `/schedule 15/6
+
+` +
+    `━━━━━━━━━━━━━━━━━━━━
+` +
+    `Type /help anytime to see this menu again.`
+  );
+};
+
 // ── Bot: /flag command ────────────────────────────────────────────
 const handleFlagCommand = async (chatId, text, from) => {
   // Usage: /flag 31074 balance should be 3840 not 1650
@@ -807,6 +837,179 @@ const handleFlagCommand = async (chatId, text, from) => {
       `🔗 https://vhaus-delivery.vercel.app`
     );
   }
+};
+
+
+// ── Get Next SV Number ────────────────────────────────────────────
+const getNextSvNumber = async () => {
+  const { data, error } = await supabase
+    .from("orders")
+    .select("sv_number")
+    .not("sv_number", "is", null)
+    .order("sv_number", { ascending: false })
+    .limit(1);
+  if (error || !data || data.length === 0) return "SV-001";
+  const last = data[0].sv_number; // e.g. "SV-007"
+  const num = parseInt(last.replace("SV-", "")) + 1;
+  return `SV-${String(num).padStart(3, "0")}`;
+};
+
+// ── Parse Delivery Template from Group B ─────────────────────────
+const parseDeliveryTemplate = (text) => {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const get = (key) => {
+    const line = lines.find(l => l.toLowerCase().startsWith(key.toLowerCase() + ":"));
+    return line ? line.substring(line.indexOf(":") + 1).trim() : null;
+  };
+
+  const driver = get("Driver");
+  const helper = get("Kelindan");
+  const soRaw  = get("SO");
+  const statusRaw = get("Status");
+
+  if (!driver || !soRaw || !statusRaw) return null;
+
+  // Parse date — look for a line matching d/m/yyyy or d/m/yy or d/m
+  let date = null;
+  for (const line of lines) {
+    const m = line.match(/^(\d{1,2})[\/-](\d{1,2})(?:[\/-](\d{2,4}))?$/);
+    if (m) {
+      const day = parseInt(m[1]);
+      const month = parseInt(m[2]) - 1;
+      const year = m[3]
+        ? (m[3].length === 2 ? 2000 + parseInt(m[3]) : parseInt(m[3]))
+        : new Date().getFullYear();
+      date = new Date(year, month, day).toISOString().split("T")[0];
+      break;
+    }
+  }
+
+  // Note — any line that is not a known key and not the date line
+  const knownPrefixes = ["driver", "kelindan", "so", "status"];
+  const noteLines = lines.filter(l => {
+    const lower = l.toLowerCase();
+    if (knownPrefixes.some(k => lower.startsWith(k + ":"))) return false;
+    if (/^\d{1,2}[\/-]\d{1,2}/.test(l)) return false;
+    return true;
+  });
+  const note = noteLines.join(" ").trim() || null;
+
+  const soNumber = soRaw.toString().trim();
+  const isSettle = /settle/i.test(statusRaw) && !/no|not/i.test(statusRaw);
+
+  return { driver, helper, soNumber, date, note, isSettle, statusRaw };
+};
+
+// ── Handle Delivery Group Template ────────────────────────────────
+const handleDeliveryTemplate = async (chatId, text) => {
+  const parsed = parseDeliveryTemplate(text);
+  if (!parsed) return false; // not a template — ignore
+
+  const { driver, helper, soNumber, date, note, isSettle, statusRaw } = parsed;
+
+  // Find the order in DB
+  const { data: order, error: findErr } = await supabase
+    .from("orders")
+    .select("id, so_number, customer_name, remark, status, delivery_date")
+    .eq("so_number", soNumber)
+    .maybeSingle();
+
+  if (findErr) {
+    await sendMessage(chatId, `❌ Database error: ${findErr.message}`);
+    return true;
+  }
+  if (!order) {
+    await sendMessage(chatId, `❌ SO *${soNumber}* not found in system.\nPlease check the SO number.`);
+    return true;
+  }
+
+  // Build remark note with driver/helper info
+  const now = new Date().toLocaleString("en-MY", {
+    timeZone: "Asia/Kuala_Lumpur",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit"
+  });
+  const driverNote = `Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""} (${now})`;
+  const updatedRemark = order.remark
+    ? `${order.remark} | ${driverNote}`
+    : driverNote;
+
+  if (isSettle) {
+    // ── SETTLE: mark order as Delivered ──────────────────────────
+    const { error: updateErr } = await supabase
+      .from("orders")
+      .update({ status: "Delivered", remark: updatedRemark })
+      .eq("so_number", soNumber);
+
+    if (updateErr) {
+      await sendMessage(chatId, `❌ Failed to update SO *${soNumber}*: ${updateErr.message}`);
+      return true;
+    }
+
+    await sendMessage(chatId,
+      `✅ *SO ${soNumber} — Settled*\n\n` +
+      `👤 Customer: ${order.customer_name || "-"}\n` +
+      `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+      `📅 Date: ${date || "-"}\n\n` +
+      `_Order marked as Delivered._`
+    );
+
+    if (ADMIN_CHAT_ID) {
+      await sendMessage(ADMIN_CHAT_ID,
+        `✅ *Delivery Settled*\n\n` +
+        `📋 SO: ${soNumber} | 👤 ${order.customer_name || "-"}\n` +
+        `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+        `📅 Date: ${date || "-"}`
+      );
+    }
+
+  } else {
+    // ── NO SETTLE: create service_pending record ──────────────────
+    const { error: spErr } = await supabase
+      .from("service_pending")
+      .insert({
+        so_number: soNumber,
+        driver,
+        helper: helper || null,
+        date: date || null,
+        note: note || null,
+        status: "Pending"
+      });
+
+    if (spErr) {
+      await sendMessage(chatId, `❌ Failed to create service pending for SO *${soNumber}*: ${spErr.message}`);
+      return true;
+    }
+
+    // Also append driver/helper + note to order remark
+    const fullRemark = note
+      ? `${updatedRemark} | Issue: ${note}`
+      : updatedRemark;
+    await supabase.from("orders").update({ remark: fullRemark }).eq("so_number", soNumber);
+
+    await sendMessage(chatId,
+      `⚠️ *SO ${soNumber} — Not Settled*\n\n` +
+      `👤 Customer: ${order.customer_name || "-"}\n` +
+      `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+      `📅 Date: ${date || "-"}\n` +
+      (note ? `📝 Note: ${note}\n` : "") +
+      `\n_Service Pending created. Admin has been notified._`
+    );
+
+    if (ADMIN_CHAT_ID) {
+      await sendMessage(ADMIN_CHAT_ID,
+        `🔧 *Service Pending — Action Required*\n\n` +
+        `📋 SO: *${soNumber}* | 👤 ${order.customer_name || "-"}\n` +
+        `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+        `📅 Date: ${date || "-"}\n` +
+        (note ? `📝 Issue: ${note}\n` : "") +
+        `\nCheck Service Pending tab to convert or remove.\n` +
+        `🔗 https://vhaus-delivery.vercel.app`
+      );
+    }
+  }
+
+  return true;
 };
 
 // ── Delivery Vehicle API ──────────────────────────────────────────
@@ -1043,6 +1246,73 @@ app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
   res.json({ success: true });
 });
 
+// ── Service Pending API ──────────────────────────────────────────
+
+// GET /service-pending
+app.get("/service-pending", async (req, res) => {
+  const { data, error } = await supabase
+    .from("service_pending")
+    .select("*")
+    .eq("status", "Pending")
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// POST /service-pending/:id/convert — convert to Service order
+app.post("/service-pending/:id/convert", async (req, res) => {
+  const { id } = req.params;
+
+  const { data: sp, error: spErr } = await supabase
+    .from("service_pending").select("*").eq("id", id).single();
+  if (spErr || !sp) return res.status(404).json({ error: "Service pending not found" });
+
+  // Get original order for customer details
+  const { data: order } = await supabase
+    .from("orders").select("*").eq("so_number", sp.so_number).maybeSingle();
+
+  // Get next SV number
+  const svNumber = await getNextSvNumber();
+
+  // Build service note
+  const serviceNote = `${sp.so_number}${sp.note ? ` — ${sp.note}` : ""}`;
+
+  // Create new Service order
+  const payload = {
+    so_number: sp.so_number,
+    sv_number: svNumber,
+    customer_name: order?.customer_name || null,
+    address: order?.address || null,
+    contact: order?.contact || null,
+    salesman: order?.salesman || null,
+    order_amount: order?.order_amount || null,
+    balance: order?.balance || null,
+    type: "Service",
+    service_note: serviceNote,
+    remark: `Converted from Service Pending | Driver: ${sp.driver}${sp.helper ? ` | Helper: ${sp.helper}` : ""}${sp.note ? ` | Issue: ${sp.note}` : ""}`,
+    status: "Pending",
+    items: order?.items || "[]",
+    delivery_date: null,
+  };
+
+  const { data: newOrder, error: insertErr } = await supabase
+    .from("orders").insert(payload).select().single();
+  if (insertErr) return res.status(500).json({ error: insertErr.message });
+
+  // Mark service_pending as Converted
+  await supabase.from("service_pending").update({ status: "Converted" }).eq("id", id);
+
+  res.json({ success: true, svNumber, order: newOrder });
+});
+
+// DELETE /service-pending/:id — remove (not applicable)
+app.delete("/service-pending/:id", async (req, res) => {
+  const { id } = req.params;
+  const { error } = await supabase.from("service_pending").update({ status: "Removed" }).eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── Telegram Webhook ──────────────────────────────────────────────
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200);
@@ -1053,10 +1323,14 @@ app.post("/telegram/webhook", async (req, res) => {
     const userId = message.from?.id;
     const draftKey = `${chatId}:${userId}`;
 
-    if (message.text === "/start" || message.text === "/help") {
-  await handleStartCommand(chatId, message.from);
-  return;
-}
+    // ── Group B: Delivery template messages ───────────────────────
+    if (String(chatId) === String(DELIVERY_GROUP_CHAT_ID)) {
+      if (message.text) {
+        await handleDeliveryTemplate(chatId, message.text);
+      }
+      return;
+    }
+
     // ── Text messages ─────────────────────────────────────────────
     if (message.text) {
       // Pending draft exists — route ALL text to confirmation handler first
@@ -1066,6 +1340,11 @@ app.post("/telegram/webhook", async (req, res) => {
       }
 
       // No pending draft — existing flows unchanged
+      if (message.text.startsWith("/start") || message.text.startsWith("/help")) {
+        await handleStartCommand(chatId, message.from);
+        return;
+      }
+
       if (message.text.startsWith("/schedule")) {
         await handleScheduleCommand(chatId, message.text);
         return;
