@@ -533,31 +533,29 @@ Rules:
 
 // ── Save Order to Supabase ────────────────────────────────────────
 const saveOrderToSupabase = async (draft) => {
-  if (existing) {
-  return {
-    ok: false,
-    duplicate: true,
-    msg:
-      `❌ SO *${draft.soNumber}* already exists in the system.\n\n` +
-      `This draft has been discarded automatically.\n` +
-      `If this is a new order, please check the SO number and resend the photo.`
-  };
-}
-
-  // Normalize delivery date — always store as YYYY-MM-DD or null
+  // Normalize delivery date first
   const normalized = normalizeDeliveryDate(draft.deliveryDate, draft.orderDate);
   const deliveryDate = normalized.deliveryDate;
 
-  // Build final remark — append original delivery text note if present
   const baseRemark = draft.remark || "";
   const finalRemark = normalized.remarkNote
     ? (baseRemark ? `${baseRemark} | ${normalized.remarkNote}` : normalized.remarkNote)
     : baseRemark || null;
 
-  // Duplicate SO check
+  // ✅ Duplicate SO check AFTER declaring 'existing'
   const { data: existing } = await supabase
     .from("orders").select("id").eq("so_number", draft.soNumber).maybeSingle();
-  if (existing) return { ok: false, msg: `❌ SO *${draft.soNumber}* already exists in the system.` };
+
+  if (existing) {
+    return {
+      ok: false,
+      duplicate: true,
+      msg:
+        `❌ SO *${draft.soNumber}* already exists in the system.\n\n` +
+        `This draft has been discarded automatically.\n` +
+        `If this is a new order, please check the SO number and resend the photo.`
+    };
+  }
 
   const payload = {
     so_number: draft.soNumber || null,
