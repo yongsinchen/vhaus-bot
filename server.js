@@ -43,7 +43,8 @@ const handleStartCommand = async (chatId, from) => {
     `📅 *Update Delivery Date*\n` +
     `Send a message in this format:\n` +
     `SO: 31074\n` +
-    `DELIVERY DATE: 10/6\n\n` +
+    `DELIVERY DATE: 10/6\n` +
+    `optional note here\n\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `🚨 *Flag a Wrong Order*\n` +
     `If you saved an order with wrong info:\n` +
