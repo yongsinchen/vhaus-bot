@@ -627,6 +627,8 @@ const saveOrderToSupabase = async (draft) => {
     remark: finalRemark,
     status: "Pending",
     items: JSON.stringify(draft.items || []),
+    is_multi_trip: draft.isMultiTrip || false,
+    planned_trips: draft.plannedTrips || 1,
   };
 
   const { error } = await supabase.from("orders").insert(payload);
@@ -1264,7 +1266,6 @@ const parseDeliveryTemplate = (text) => {
 
 // ── Handle Delivery Group Template ────────────────────────────────
 const handleDeliveryTemplate = async (chatId, text) => {
-  // Only process messages that start with DELIVERY keyword
   if (!text.trim().toUpperCase().startsWith("DELIVERY")) return false;
   const parsed = parseDeliveryTemplate(text);
   if (!parsed) {
@@ -1281,47 +1282,130 @@ const handleDeliveryTemplate = async (chatId, text) => {
     return true;
   }
 
-  const { driver, helper, soNumber, date, note, isSettle, statusRaw } = parsed;
-
-  // Find the order in DB — filter by Delivery type to avoid matching converted Service orders
-  const { data: order, error: findErr } = await supabase
-    .from("orders")
-    .select("id, so_number, customer_name, remark, status, delivery_date")
-    .eq("so_number", soNumber)
-    .eq("type", "Delivery")
-    .maybeSingle();
-
-  if (findErr) {
-    await sendMessage(chatId, `❌ Database error: ${findErr.message}`);
-    return true;
-  }
-  if (!order) {
-    await sendMessage(chatId, `❌ SO *${soNumber}* not found in system.\nPlease check the SO number.`);
-    return true;
-  }
-
-  // Build remark note with driver/helper info
+  const { driver, helper, soNumber, date, note, isSettle } = parsed;
   const now = new Date().toLocaleString("en-MY", {
-    timeZone: "Asia/Kuala_Lumpur",
-    day: "2-digit", month: "2-digit", year: "numeric",
-    hour: "2-digit", minute: "2-digit"
+    timeZone: "Asia/Kuala_Lumpur", day: "2-digit", month: "2-digit",
+    year: "numeric", hour: "2-digit", minute: "2-digit"
   });
   const driverNote = `Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""} (${now})`;
-  const updatedRemark = order.remark
-    ? `${order.remark} | ${driverNote}`
-    : driverNote;
 
-  if (isSettle) {
-    // ── SETTLE: mark order as Delivered ──────────────────────────
-    const { error: updateErr } = await supabase
-      .from("orders")
-      .update({ status: "Delivered", remark: updatedRemark })
-      .eq("so_number", soNumber);
+  // Find the order
+  const { data: order, error: findErr } = await supabase
+    .from("orders")
+    .select("id, so_number, customer_name, remark, status, is_multi_trip, planned_trips, first_delivery_date")
+    .eq("so_number", soNumber).eq("type", "Delivery").maybeSingle();
 
-    if (updateErr) {
-      await sendMessage(chatId, `❌ Failed to update SO *${soNumber}*: ${updateErr.message}`);
+  if (findErr) { await sendMessage(chatId, `❌ Database error: ${findErr.message}`); return true; }
+  if (!order) { await sendMessage(chatId, `❌ SO *${soNumber}* not found.\nPlease check the SO number.`); return true; }
+
+  const updatedRemark = order.remark ? `${order.remark} | ${driverNote}` : driverNote;
+
+  // Record first delivery date if not set
+  const firstDeliveryDate = order.first_delivery_date || date || null;
+
+  // ── MULTI-TRIP ORDER ──────────────────────────────────────────
+  if (order.is_multi_trip) {
+    // Find the current Out for Delivery / Assigned trip
+    const { data: trips } = await supabase
+      .from("order_trips").select("*").eq("so_number", soNumber)
+      .in("status", ["Out for Delivery", "Assigned", "Scheduled"])
+      .order("trip_no");
+
+    const currentTrip = trips?.find(t => t.status === "Out for Delivery" || t.status === "Assigned") || trips?.[0];
+
+    if (!currentTrip) {
+      await sendMessage(chatId, `⚠️ No active trip found for SO *${soNumber}*.`);
       return true;
     }
+
+    // Mark current trip as Completed
+    await supabase.from("order_trips")
+      .update({ status: "Completed", driver, helper: helper || null, note: note || null })
+      .eq("id", currentTrip.id);
+
+    // Update order remark + first delivery date
+    await supabase.from("orders")
+      .update({ remark: updatedRemark, first_delivery_date: firstDeliveryDate, status: "In Progress" })
+      .eq("so_number", soNumber);
+
+    if (isSettle) {
+      // Settled — mark order Delivered, cancel remaining trips
+      await supabase.from("orders").update({ status: "Delivered" }).eq("so_number", soNumber);
+      await supabase.from("order_trips")
+        .update({ status: "Cancelled" })
+        .eq("so_number", soNumber)
+        .in("status", ["Scheduled", "Assigned"])
+        .gt("trip_no", currentTrip.trip_no);
+
+      await sendMessage(chatId,
+        `✅ *SO ${soNumber} — Fully Settled (Trip ${currentTrip.trip_no}/${currentTrip.total_trips})*\n\n` +
+        `👤 Customer: ${order.customer_name || "-"}\n` +
+        `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+        `📅 Date: ${date || "-"}\n\n` +
+        `_Remaining trips cancelled. Order marked Delivered._`
+      );
+      if (ADMIN_CHAT_ID) await sendMessage(ADMIN_CHAT_ID,
+        `✅ *Multi-Trip Settled*\n📋 SO: ${soNumber} | 👤 ${order.customer_name || "-"}\n` +
+        `🔄 Trip ${currentTrip.trip_no}/${currentTrip.total_trips} — fully settled.`
+      );
+
+    } else {
+      // Not settled — check if this was the last trip
+      const remainingTrips = trips?.filter(t => t.trip_no > currentTrip.trip_no && t.status !== "Cancelled") || [];
+
+      if (remainingTrips.length === 0) {
+        // Last trip, not settled — auto-create next trip
+        const newTripNo = currentTrip.total_trips + 1;
+        const newTotal = newTripNo;
+        const svNumber = currentTrip.sv_number || await getNextSvNumber();
+
+        await supabase.from("order_trips").insert({
+          so_number: soNumber, sv_number: svNumber,
+          trip_no: newTripNo, total_trips: newTotal, status: "Scheduled",
+        });
+        // Update total_trips on all existing trips
+        await supabase.from("order_trips").update({ total_trips: newTotal }).eq("so_number", soNumber);
+
+        await sendMessage(chatId,
+          `⚠️ *SO ${soNumber} — Trip ${currentTrip.trip_no} Not Settled*\n\n` +
+          `👤 Customer: ${order.customer_name || "-"}\n` +
+          `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+          (note ? `📝 Note: ${note}\n` : "") +
+          `\n🔄 *Trip ${newTripNo} auto-created.* Admin to schedule next visit.`
+        );
+        if (ADMIN_CHAT_ID) await sendMessage(ADMIN_CHAT_ID,
+          `⚠️ *Multi-Trip Not Settled — Auto Extended*\n\n` +
+          `📋 SO: *${soNumber}* | 👤 ${order.customer_name || "-"}\n` +
+          `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+          (note ? `📝 Issue: ${note}\n` : "") +
+          `\n🔄 Trip ${currentTrip.trip_no} was last trip — Trip ${newTripNo} auto-created.\n` +
+          `Please schedule in delivery sheet.\n🔗 https://vhaus-delivery.vercel.app`
+        );
+      } else {
+        // Still have remaining trips — just confirm
+        const nextTrip = remainingTrips[0];
+        await sendMessage(chatId,
+          `⚠️ *SO ${soNumber} — Trip ${currentTrip.trip_no}/${currentTrip.total_trips} Not Settled*\n\n` +
+          `👤 Customer: ${order.customer_name || "-"}\n` +
+          `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+          (note ? `📝 Note: ${note}\n` : "") +
+          `\n📅 Next: Trip ${nextTrip.trip_no} — ${nextTrip.scheduled_date ? nextTrip.scheduled_date : "date TBD"}`
+        );
+        if (ADMIN_CHAT_ID) await sendMessage(ADMIN_CHAT_ID,
+          `⚠️ *Multi-Trip Not Settled*\n\n` +
+          `📋 SO: *${soNumber}* | 👤 ${order.customer_name || "-"}\n` +
+          `🚛 Trip ${currentTrip.trip_no}/${currentTrip.total_trips} done. Next: Trip ${nextTrip.trip_no}.`
+        );
+      }
+    }
+    return true;
+  }
+
+  // ── SINGLE TRIP ORDER ─────────────────────────────────────────
+  if (isSettle) {
+    await supabase.from("orders")
+      .update({ status: "Delivered", remark: updatedRemark, first_delivery_date: firstDeliveryDate })
+      .eq("so_number", soNumber);
 
     await sendMessage(chatId,
       `✅ *SO ${soNumber} — Settled*\n\n` +
@@ -1330,39 +1414,22 @@ const handleDeliveryTemplate = async (chatId, text) => {
       `📅 Date: ${date || "-"}\n\n` +
       `_Order marked as Delivered._`
     );
-
-    if (ADMIN_CHAT_ID) {
-      await sendMessage(ADMIN_CHAT_ID,
-        `✅ *Delivery Settled*\n\n` +
-        `📋 SO: ${soNumber} | 👤 ${order.customer_name || "-"}\n` +
-        `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
-        `📅 Date: ${date || "-"}`
-      );
-    }
+    if (ADMIN_CHAT_ID) await sendMessage(ADMIN_CHAT_ID,
+      `✅ *Delivery Settled*\n📋 SO: ${soNumber} | 👤 ${order.customer_name || "-"}\n` +
+      `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n📅 ${date || "-"}`
+    );
 
   } else {
-    // ── NO SETTLE: create service_pending record ──────────────────
-    const { error: spErr } = await supabase
-      .from("service_pending")
-      .insert({
-        so_number: soNumber,
-        driver,
-        helper: helper || null,
-        date: date || null,
-        note: note || null,
-        status: "Pending"
-      });
+    // Single trip not settled — create service pending
+    const fullRemark = note ? `${updatedRemark} | Issue: ${note}` : updatedRemark;
+    await supabase.from("orders")
+      .update({ remark: fullRemark, first_delivery_date: firstDeliveryDate })
+      .eq("so_number", soNumber);
 
-    if (spErr) {
-      await sendMessage(chatId, `❌ Failed to create service pending for SO *${soNumber}*: ${spErr.message}`);
-      return true;
-    }
-
-    // Also append driver/helper + note to order remark
-    const fullRemark = note
-      ? `${updatedRemark} | Issue: ${note}`
-      : updatedRemark;
-    await supabase.from("orders").update({ remark: fullRemark }).eq("so_number", soNumber);
+    await supabase.from("service_pending").insert({
+      so_number: soNumber, driver, helper: helper || null,
+      date: date || null, note: note || null, status: "Pending"
+    });
 
     await sendMessage(chatId,
       `⚠️ *SO ${soNumber} — Not Settled*\n\n` +
@@ -1372,22 +1439,72 @@ const handleDeliveryTemplate = async (chatId, text) => {
       (note ? `📝 Note: ${note}\n` : "") +
       `\n_Service Pending created. Admin has been notified._`
     );
-
-    if (ADMIN_CHAT_ID) {
-      await sendMessage(ADMIN_CHAT_ID,
-        `🔧 *Service Pending — Action Required*\n\n` +
-        `📋 SO: *${soNumber}* | 👤 ${order.customer_name || "-"}\n` +
-        `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
-        `📅 Date: ${date || "-"}\n` +
-        (note ? `📝 Issue: ${note}\n` : "") +
-        `\nCheck Service Pending tab to convert or remove.\n` +
-        `🔗 https://vhaus-delivery.vercel.app`
-      );
-    }
+    if (ADMIN_CHAT_ID) await sendMessage(ADMIN_CHAT_ID,
+      `🔧 *Service Pending — Action Required*\n\n` +
+      `📋 SO: *${soNumber}* | 👤 ${order.customer_name || "-"}\n` +
+      `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
+      (note ? `📝 Issue: ${note}\n` : "") +
+      `\n🔗 https://vhaus-delivery.vercel.app`
+    );
   }
 
   return true;
 };
+
+// ── Order Trips API ──────────────────────────────────────────────
+
+// GET /order-trips?date=2026-06-15  — trips scheduled for a date (for delivery schedule UI)
+app.get("/order-trips", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+  const { data, error } = await supabase
+    .from("order_trips")
+    .select("*, orders!order_trips_so_number_fkey(customer_name, address, contact, items, time_slot, balance, salesman, remark)")
+    .eq("scheduled_date", date)
+    .in("status", ["Scheduled", "Assigned"])
+    .order("trip_no");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// GET /order-trips/so/:soNumber — all trips for a specific SO
+app.get("/order-trips/so/:soNumber", async (req, res) => {
+  const { soNumber } = req.params;
+  const { data, error } = await supabase
+    .from("order_trips")
+    .select("*")
+    .eq("so_number", soNumber)
+    .order("trip_no");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// PATCH /order-trips/:id — update trip (date, status, driver, helper)
+app.patch("/order-trips/:id", async (req, res) => {
+  const { id } = req.params;
+  const { data, error } = await supabase
+    .from("order_trips")
+    .update(req.body)
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// POST /order-trips/so/:soNumber/cancel-remaining — cancel all scheduled trips after a given trip_no
+app.post("/order-trips/so/:soNumber/cancel-remaining", async (req, res) => {
+  const { soNumber } = req.params;
+  const { after_trip_no } = req.body;
+  const { error } = await supabase
+    .from("order_trips")
+    .update({ status: "Cancelled" })
+    .eq("so_number", soNumber)
+    .in("status", ["Scheduled", "Assigned"])
+    .gt("trip_no", after_trip_no || 0);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
 
 // ── Delivery Vehicle API ──────────────────────────────────────────
 
@@ -1534,7 +1651,34 @@ app.patch("/delivery/routes/:id", async (req, res) => {
     if (routeOrders && routeOrders.length > 0) {
       const orderIds = routeOrders.map(ro => ro.order_id);
       const orderStatus = req.body.status === "Delivered" ? "Delivered" : "Out for Delivery";
-      await supabase.from("orders").update({ status: orderStatus }).in("id", orderIds);
+
+      // Update regular orders — skip multi-trip orders (they are managed by driver template)
+      const { data: regularOrders } = await supabase
+        .from("orders").select("id, is_multi_trip").in("id", orderIds);
+      const regularOrderIds = (regularOrders || []).filter(o => !o.is_multi_trip).map(o => o.id);
+      if (regularOrderIds.length > 0) {
+        await supabase.from("orders").update({ status: orderStatus }).in("id", regularOrderIds);
+      }
+
+      // For multi-trip orders — update the trip status instead
+      const multiOrderIds = (regularOrders || []).filter(o => o.is_multi_trip).map(o => o.id);
+      if (multiOrderIds.length > 0 && req.body.status === "Out for Delivery") {
+        // Get SO numbers for multi-trip orders in this route
+        const { data: multiOrders } = await supabase
+          .from("orders").select("so_number").in("id", multiOrderIds);
+        const soNumbers = (multiOrders || []).map(o => o.so_number);
+        // Mark their current Assigned/Scheduled trip as Out for Delivery
+        for (const soNumber of soNumbers) {
+          const { data: trips } = await supabase
+            .from("order_trips").select("id").eq("so_number", soNumber)
+            .in("status", ["Assigned", "Scheduled"]).order("trip_no").limit(1);
+          if (trips && trips.length > 0) {
+            await supabase.from("order_trips").update({ status: "Out for Delivery" }).eq("id", trips[0].id);
+          }
+        }
+        // Also mark multi-trip orders as In Progress
+        await supabase.from("orders").update({ status: "In Progress" }).in("id", multiOrderIds);
+      }
     }
   }
 
