@@ -166,12 +166,12 @@ const buildOrderPreview = (data) => {
   const itemLines = (data.items || [])
     .map((item, i) => {
       const code = item.itemCode ? `[${item.itemCode}] ` : "";
-      return `  ${i + 1}. ${code}${fmt(item.itemName)} x${fmt(item.unit)}\n     Supplier: ${fmt(item.supplier)}`;
+      return `  ${i + 1}. ${code}${fmt(item.itemName)} x${fmt(item.unit)}`;
     })
     .join("\n");
 
   return (
-    `📋 *Please confirm sales order*\n\n` +
+    `📋 *Please confirm Sales Order*\n\n` +
     `SO: *${fmt(data.soNumber)}*\n` +
     `Customer: ${fmt(data.customerName)}\n` +
     `Contact: ${fmt(data.contact)}\n` +
@@ -180,23 +180,18 @@ const buildOrderPreview = (data) => {
     `Delivery Date: ${fmt(data.deliveryDate)}\n` +
     `Time Slot: ${fmt(data.timeSlot)}\n` +
     `Salesman: ${fmt(data.salesman)}\n` +
-    `Amount: RM ${fmt(data.orderAmount)}\n` +
-    `Balance: RM ${fmt(data.balance)}\n` +
+    `Amount: RM${fmt(data.orderAmount)}\n` +
+    `Balance: RM${fmt(data.balance)}\n` +
     `Type: ${fmt(data.type)}\n` +
     `Remark: ${fmt(data.remark)}\n` +
     (data.serviceNote ? `Service Note: ${fmt(data.serviceNote)}\n` : "") +
     (data.plateNo ? `Plate No: ${fmt(data.plateNo)}\n` : "") +
     `\n*Items:*\n` +
     (itemLines || "  (none)") +
-    `\n\nReply:\n` +
-    `YES = save\n` +
-    `CANCEL = discard\n` +
-    `EDIT customerName=New Name\n` +
-    `EDIT deliveryDate=20/6/2026\n` +
-    `EDIT balance=500\n` +
-    `EDIT ITEM 1 unit=2\n` +
-    `ADD ITEM itemName=Mirror 60 unit=1 supplier=ABC\n` +
-    `REMOVE ITEM 2`
+    `\n\n_Reply:_\n` +
+    `*YES* = save  |  *CANCEL* = discard\n` +
+    `Or tell me what to change naturally.\n` +
+    `_e.g. "delivery date is October", "balance is 3840", "item 2 is queen size", "remove item 3"_`
   );
 };
 
@@ -211,100 +206,57 @@ const parseKVPairs = (str) => {
   return result;
 };
 
-// ── Apply Draft Edit ──────────────────────────────────────────────
-const applyDraftEdit = (draft, text) => {
-  // REMOVE ITEM N
-  const removeMatch = text.match(/^REMOVE\s+ITEM\s+(\d+)$/i);
-  if (removeMatch) {
-    const idx = parseInt(removeMatch[1], 10) - 1;
-    if (draft.items && idx >= 0 && idx < draft.items.length) {
-      draft.items.splice(idx, 1);
-      return { ok: true, msg: `Item ${idx + 1} removed.` };
-    }
-    return { ok: false, msg: `Item ${idx + 1} not found.` };
-  }
+// ── Update Draft with Natural Language (GPT) ─────────────────────
+const updateDraftWithNaturalLanguage = async (draft, correctionText) => {
+  const prompt = `You are a sales order assistant. The user has reviewed an extracted sales order and wants to correct some fields.
 
-  // ADD ITEM key=value ...
-  const addMatch = text.match(/^ADD\s+ITEM\s+(.+)$/i);
-  if (addMatch) {
-    const pairs = parseKVPairs(addMatch[1]);
-    const newItem = {
-      itemName: pairs.itemName || pairs.itemname || "",
-      unit: pairs.unit ? Number(pairs.unit) : 1,
-      supplier: pairs.supplier || "-",
-    };
-    if (pairs.itemCode || pairs.itemcode) newItem.itemCode = pairs.itemCode || pairs.itemcode;
-    draft.items = draft.items || [];
-    draft.items.push(newItem);
-    return { ok: true, msg: `Item added: ${newItem.itemName} x${newItem.unit}` };
-  }
+Current order draft (JSON):
+${JSON.stringify(draft, null, 2)}
 
-  // EDIT ITEM N field=value
-  const editItemMatch = text.match(/^EDIT\s+ITEM\s+(\d+)\s+(.+)$/i);
-  if (editItemMatch) {
-    const idx = parseInt(editItemMatch[1], 10) - 1;
-    if (!draft.items || idx < 0 || idx >= draft.items.length) {
-      return { ok: false, msg: `Item ${idx + 1} not found.` };
-    }
-    const pairs = parseKVPairs(editItemMatch[2]);
-    const item = draft.items[idx];
-    if (pairs.itemName || pairs.itemname) item.itemName = pairs.itemName || pairs.itemname;
-    if (pairs.unit !== undefined) item.unit = Number(pairs.unit);
-    if (pairs.supplier !== undefined) item.supplier = pairs.supplier;
-    if (pairs.itemCode || pairs.itemcode) item.itemCode = pairs.itemCode || pairs.itemcode;
-    return { ok: true, msg: `Item ${idx + 1} updated.` };
-  }
+User correction message:
+"${correctionText}"
 
-  // EDIT field=value
-  const editMatch = text.match(/^EDIT\s+(.+)$/i);
-  if (editMatch) {
-    const pairs = parseKVPairs(editMatch[1]);
-    const dateFields = ["orderDate", "deliveryDate"];
-    const numFields = ["orderAmount", "balance"];
-    const fieldMap = {
-      sonumber: "soNumber", customername: "customerName", address: "address",
-      contact: "contact", orderdate: "orderDate", salesman: "salesman",
-      orderamount: "orderAmount", balance: "balance", deliverydate: "deliveryDate",
-      timeslot: "timeSlot", plateno: "plateNo", type: "type",
-      servicenote: "serviceNote", remark: "remark",
-    };
-    const updated = [];
-    for (const [rawKey, val] of Object.entries(pairs)) {
-      const key = fieldMap[rawKey.toLowerCase()];
-      if (!key) continue;
-      if (dateFields.includes(key)) {
-        draft[key] = parseDeliveryDate(val) || val;
-      } else if (numFields.includes(key)) {
-        draft[key] = parseFloat(val.replace(/[^0-9.]/g, "")) || 0;
-      } else {
-        draft[key] = val;
-      }
-      updated.push(key);
-    }
-    if (updated.length === 0) return { ok: false, msg: "No recognised fields to edit." };
-    return { ok: true, msg: `Updated: ${updated.join(", ")}` };
-  }
+Apply the user's correction to the draft. Return ONLY the updated JSON object with no explanation, no markdown, no extra text.
 
-  return { ok: false, msg: "Command not recognised." };
+Rules:
+- Preserve ALL existing fields unless the user specifically changes them.
+- For items: if user says "item 2 is X", update items[1]. If user says "remove item 3", remove items[2]. If user says "add item X", append to items array.
+- For delivery date: keep the user's natural language value as-is (e.g. "Aug - Sept", "October", "ASAP") — do NOT convert to ISO format unless user gives a specific date like "20/6/2026".
+- For balance/amount: extract numeric value only, no RM symbol.
+- For items added by user: use structure { itemName, unit, supplier, itemCode } — leave supplier and itemCode empty string if not mentioned.
+- Return valid JSON only.`;
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: prompt }],
+    max_tokens: 1000,
+  });
+
+  const raw = response.choices[0].message.content.trim();
+  const clean = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
+  return JSON.parse(clean);
 };
 
 // ── Save Order to Supabase ────────────────────────────────────────
 const saveOrderToSupabase = async (draft) => {
-  // Resolve ASAP delivery date
+  if (!draft.soNumber) {
+    return { ok: false, msg: "❌ SO Number is required before saving." };
+  }
+
+  // Resolve ASAP / natural language delivery date → use as-is in DB, just handle ASAP
   let deliveryDate = draft.deliveryDate;
-  if (!deliveryDate || deliveryDate.toUpperCase() === "ASAP") {
+  let asapScheduled = false;
+  if (!deliveryDate || deliveryDate.toString().toUpperCase() === "ASAP") {
     const asapDate = new Date();
     asapDate.setDate(asapDate.getDate() + 21);
     deliveryDate = asapDate.toISOString().split("T")[0];
-    draft._asapScheduled = true;
+    asapScheduled = true;
   }
 
   // Duplicate SO check
-  if (draft.soNumber) {
-    const { data: existing } = await supabase
-      .from("orders").select("id").eq("so_number", draft.soNumber).maybeSingle();
-    if (existing) return { ok: false, msg: `❌ SO *${draft.soNumber}* already exists in the system.` };
-  }
+  const { data: existing } = await supabase
+    .from("orders").select("id").eq("so_number", draft.soNumber).maybeSingle();
+  if (existing) return { ok: false, msg: `❌ SO *${draft.soNumber}* already exists in the system.` };
 
   const payload = {
     so_number: draft.soNumber || null,
@@ -328,15 +280,15 @@ const saveOrderToSupabase = async (draft) => {
   const { error } = await supabase.from("orders").insert(payload);
   if (error) return { ok: false, msg: `❌ Insert failed: ${error.message}` };
 
-  const asapNote = draft._asapScheduled ? `\n⚠️ _Delivery date was ASAP — auto scheduled 3 weeks from today_` : "";
+  const asapNote = asapScheduled ? `\n⚠️ _Delivery date was ASAP — auto scheduled 3 weeks from today_` : "";
   return {
     ok: true,
-    msg: `✅ *Order Saved Successfully*\n\n📋 *SO:* ${draft.soNumber || "(no SO)"}\n👤 *Customer:* ${draft.customerName || "-"}\n📅 *Delivery Date:* ${deliveryDate}${asapNote}\n\n_Order has been saved to the delivery sheet._`,
+    msg: `✅ *Order Saved Successfully*\n\n📋 *SO:* ${draft.soNumber}\n👤 *Customer:* ${draft.customerName || "-"}\n📅 *Delivery Date:* ${deliveryDate}${asapNote}\n\n_Order has been saved to the delivery sheet._`,
   };
 };
 
-// ── Handle Order Confirmation ─────────────────────────────────────
-const handleOrderConfirmation = async (chatId, userId, text) => {
+// ── Handle Pending Draft Message ──────────────────────────────────
+const handlePendingDraftMessage = async (chatId, userId, text) => {
   const draftKey = `${chatId}:${userId}`;
   const draft = pendingOrders.get(draftKey);
   if (!draft) return false; // no pending draft — caller handles normally
@@ -350,7 +302,7 @@ const handleOrderConfirmation = async (chatId, userId, text) => {
       pendingOrders.delete(draftKey);
       await sendMessage(chatId, result.msg);
     } else {
-      await sendMessage(chatId, result.msg + "\n\nDraft is still active. Fix and reply YES again.");
+      await sendMessage(chatId, result.msg + "\n\nDraft is still active. Make corrections and reply YES again.");
     }
     return true;
   }
@@ -362,20 +314,15 @@ const handleOrderConfirmation = async (chatId, userId, text) => {
     return true;
   }
 
-  // EDIT / ADD ITEM / REMOVE ITEM
-  if (/^(EDIT|ADD\s+ITEM|REMOVE\s+ITEM)/i.test(text.trim())) {
-    const result = applyDraftEdit(draft, text.trim());
-    if (result.ok) {
-      pendingOrders.set(draftKey, draft);
-      await sendMessage(chatId, `✏️ ${result.msg}\n\n${buildOrderPreview(draft)}`);
-    } else {
-      await sendMessage(chatId, `⚠️ ${result.msg}`);
-    }
-    return true;
+  // Natural language correction → send to GPT
+  await sendMessage(chatId, "✏️ Updating draft...");
+  try {
+    const updatedDraft = await updateDraftWithNaturalLanguage(draft, text);
+    pendingOrders.set(draftKey, updatedDraft);
+    await sendMessage(chatId, buildOrderPreview(updatedDraft));
+  } catch (err) {
+    await sendMessage(chatId, `⚠️ Could not update draft: ${err.message}\nPlease try again or reply YES / CANCEL.`);
   }
-
-  // Unknown reply while draft is pending
-  await sendMessage(chatId, `⚠️ Pending order awaiting confirmation.\nReply YES, CANCEL, or EDIT field=value.`);
   return true;
 };
 
@@ -676,7 +623,7 @@ app.post("/telegram/webhook", async (req, res) => {
     if (message.text) {
       // Pending draft exists — route ALL text to confirmation handler first
       if (pendingOrders.has(draftKey)) {
-        await handleOrderConfirmation(chatId, userId, message.text);
+        await handlePendingDraftMessage(chatId, userId, message.text);
         return;
       }
 
