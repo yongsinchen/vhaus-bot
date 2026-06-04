@@ -253,6 +253,7 @@ app.delete("/delivery/vehicles/:id", async (req, res) => {
 
 // ── Delivery Routes API ───────────────────────────────────────────
 
+
 // GET /delivery/routes?date=2026-07-15
 app.get("/delivery/routes", async (req, res) => {
   const { date } = req.query;
@@ -271,6 +272,7 @@ app.get("/delivery/routes", async (req, res) => {
   res.json(routesWithOrders);
 });
 
+
 // GET /delivery/unassigned?date=2026-07-15
 app.get("/delivery/unassigned", async (req, res) => {
   const { date } = req.query;
@@ -283,29 +285,22 @@ app.get("/delivery/unassigned", async (req, res) => {
     .eq("delivery_routes.delivery_date", date);
   const assignedIds = new Set((assigned || []).map(a => a.order_id));
   res.json((orders || []).filter(o => !assignedIds.has(o.id)));
-});
+}); 
 
 // POST /delivery/routes — with duplicate vehicle validation
 app.post("/delivery/routes", async (req, res) => {
   const { delivery_date, lorry_plate, driver_name, area, notes, vehicle_id } = req.body;
   if (!delivery_date) return res.status(400).json({ error: "delivery_date is required" });
 
-  // Duplicate vehicle check
   if (vehicle_id) {
     const { data: existing } = await supabase
-      .from("delivery_routes")
-      .select("id")
-      .eq("delivery_date", delivery_date)
-      .eq("vehicle_id", vehicle_id)
-      .maybeSingle();
+      .from("delivery_routes").select("id")
+      .eq("delivery_date", delivery_date).eq("vehicle_id", vehicle_id).maybeSingle();
     if (existing) return res.status(409).json({ error: "This vehicle already has a route for this date." });
   } else if (lorry_plate) {
     const { data: existing } = await supabase
-      .from("delivery_routes")
-      .select("id")
-      .eq("delivery_date", delivery_date)
-      .eq("lorry_plate", lorry_plate)
-      .maybeSingle();
+      .from("delivery_routes").select("id")
+      .eq("delivery_date", delivery_date).eq("lorry_plate", lorry_plate).maybeSingle();
     if (existing) return res.status(409).json({ error: "This vehicle already has a route for this date." });
   }
 
@@ -317,9 +312,26 @@ app.post("/delivery/routes", async (req, res) => {
   res.json(data);
 });
 
+
 // PATCH /delivery/routes/:id
 app.patch("/delivery/routes/:id", async (req, res) => {
   const { id } = req.params;
+
+  // Fetch current route to check lock status
+  const { data: current } = await supabase.from("delivery_routes").select("status").eq("id", id).single();
+  const isLocked = current?.status === "Out for Delivery" || current?.status === "Delivered";
+
+  if (isLocked) {
+    // Only allow status change from "Out for Delivery" → "Delivered"
+    const allowedKeys = ["status"];
+    const keys = Object.keys(req.body);
+    const onlyStatus = keys.length === 1 && keys[0] === "status";
+    const validTransition = req.body.status === "Delivered" || req.body.status === "Out for Delivery";
+    if (!onlyStatus || !validTransition) {
+      return res.status(403).json({ error: "Route is locked. Only status update is allowed." });
+    }
+  }
+
   const { data, error } = await supabase
     .from("delivery_routes").update(req.body).eq("id", id).select().single();
   if (error) return res.status(500).json({ error: error.message });
@@ -334,12 +346,17 @@ app.patch("/delivery/routes/:id", async (req, res) => {
       await supabase.from("orders").update({ status: orderStatus }).in("id", orderIds);
     }
   }
+
   res.json(data);
 });
 
 // DELETE /delivery/routes/:id
 app.delete("/delivery/routes/:id", async (req, res) => {
   const { id } = req.params;
+  const { data: current } = await supabase.from("delivery_routes").select("status").eq("id", id).single();
+  if (current?.status === "Out for Delivery" || current?.status === "Delivered") {
+    return res.status(403).json({ error: "Route is locked and cannot be deleted." });
+  }
   const { error } = await supabase.from("delivery_routes").delete().eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
@@ -351,24 +368,35 @@ app.delete("/delivery/routes/:id", async (req, res) => {
 app.post("/delivery/routes/:routeId/orders", async (req, res) => {
   const { routeId } = req.params;
   const { order_id, sequence_no, scheduled_time_range, route_note } = req.body;
+
+  // Lock check
+  const { data: route } = await supabase.from("delivery_routes").select("status").eq("id", routeId).single();
+  if (route?.status === "Out for Delivery" || route?.status === "Delivered") {
+    return res.status(403).json({ error: "Route is locked. Cannot add orders." });
+  }
+
   const { data, error } = await supabase
     .from("delivery_route_orders")
-    .insert({
-      route_id: routeId,
-      order_id,
-      sequence_no: sequence_no || 1,
+    .insert({ route_id: routeId, order_id, sequence_no: sequence_no || 1,
       ...(scheduled_time_range && { scheduled_time_range }),
-      ...(route_note && { route_note })
-    })
+      ...(route_note && { route_note }) })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
+
 // PATCH /delivery/routes/:routeId/orders/:orderId
 app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
   const { routeId, orderId } = req.params;
   const { sequence_no, scheduled_time_range, route_note } = req.body;
+
+  // Lock check
+  const { data: route } = await supabase.from("delivery_routes").select("status").eq("id", routeId).single();
+  if (route?.status === "Out for Delivery" || route?.status === "Delivered") {
+    return res.status(403).json({ error: "Route is locked. Cannot update orders." });
+  }
+
   const updates = {};
   if (sequence_no !== undefined) updates.sequence_no = sequence_no;
   if (scheduled_time_range !== undefined) updates.scheduled_time_range = scheduled_time_range;
@@ -376,18 +404,13 @@ app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
 
   const { data, error } = await supabase
     .from("delivery_route_orders")
-    .update(updates)
-    .eq("route_id", routeId)
-    .eq("order_id", orderId)
+    .update(updates).eq("route_id", routeId).eq("order_id", orderId)
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  // If scheduled_time_range provided, also update orders.time_slot
+  // Sync orders.time_slot when scheduled_time_range is saved
   if (scheduled_time_range !== undefined) {
-    await supabase
-      .from("orders")
-      .update({ time_slot: scheduled_time_range })
-      .eq("id", orderId);
+    await supabase.from("orders").update({ time_slot: scheduled_time_range }).eq("id", orderId);
   }
 
   res.json(data);
@@ -396,11 +419,15 @@ app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
 // DELETE /delivery/routes/:routeId/orders/:orderId
 app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
   const { routeId, orderId } = req.params;
+
+  // Lock check
+  const { data: route } = await supabase.from("delivery_routes").select("status").eq("id", routeId).single();
+  if (route?.status === "Out for Delivery" || route?.status === "Delivered") {
+    return res.status(403).json({ error: "Route is locked. Cannot remove orders." });
+  }
+
   const { error } = await supabase
-    .from("delivery_route_orders")
-    .delete()
-    .eq("route_id", routeId)
-    .eq("order_id", orderId);
+    .from("delivery_route_orders").delete().eq("route_id", routeId).eq("order_id", orderId);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
