@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V Haus Bot — Command Guide</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
+
+  :root {
+    --bg: #0f0f0f;
+    --surface: #181818;
+    --surface2: #222222;
+    --border: #2a2a2a;
+    --accent: #f5a623;
+    --accent2: #e8f5a6;
+    --red: #ff5f5f;
+    --green: #6fffc4;
+    --blue: #6fbbff;
+    --muted: #666;
+    --text: #f0ede8;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    min-height: 100vh;
+    padding: 48px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .page {
+    width: 100%;
+    max-width: 680px;
+  }
+
+  /* Header */
+  .header {
+    margin-bottom: 48px;
+    position: relative;
+  }
+
+  .header-tag {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .header-tag::before {
+    content: '';
+    width: 24px;
+    height: 1px;
+    background: var(--accent);
+  }
+
+  .header h1 {
+    font-size: clamp(36px, 8vw, 56px);
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: -2px;
+    color: var(--text);
+  }
+
+  .header h1 span {
+    color: var(--accent);
+  }
+
+  .header-sub {
+    margin-top: 14px;
+    font-size: 14px;
+    color: var(--muted);
+    font-family: 'Space Mono', monospace;
+    line-height: 1.6;
+  }
+
+  .bot-name {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 4px 12px;
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    color: var(--accent);
+    margin-top: 16px;
+  }
+
+  .bot-name::before {
+    content: '🤖';
+    font-size: 14px;
+  }
+
+  /* Section label */
+  .section-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 16px;
+    padding-left: 2px;
+  }
+
+  /* Flow cards */
+  .flow-grid {
+    display: grid;
+    gap: 12px;
+    margin-bottom: 40px;
+  }
+
+  .flow-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+
+  .flow-card:hover {
+    border-color: #444;
+  }
+
+  .flow-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+  }
+
+  .flow-card.photo::before { background: var(--accent); }
+  .flow-card.update::before { background: var(--blue); }
+  .flow-card.schedule::before { background: var(--green); }
+
+  .flow-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  .flow-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+  }
+
+  .photo .flow-icon { background: rgba(245,166,35,0.12); }
+  .update .flow-icon { background: rgba(111,187,255,0.12); }
+  .schedule .flow-icon { background: rgba(111,255,196,0.12); }
+
+  .flow-title {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+
+  .flow-desc {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 3px;
+    font-family: 'Space Mono', monospace;
+    line-height: 1.4;
+  }
+
+  /* Steps */
+  .steps {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .step {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .step-num {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: 'Space Mono', monospace;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .photo .step-num { background: rgba(245,166,35,0.2); color: var(--accent); }
+  .update .step-num { background: rgba(111,187,255,0.2); color: var(--blue); }
+  .schedule .step-num { background: rgba(111,255,196,0.2); color: var(--green); }
+
+  .step-text { color: #ccc; }
+
+  code {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 1px 6px;
+    color: var(--accent);
+  }
+
+  .step-text code.blue { color: var(--blue); }
+  .step-text code.green { color: var(--green); }
+
+  /* Reply options */
+  .reply-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+
+  .reply-chip {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    border: 1px solid;
+  }
+
+  .chip-yes { color: var(--green); border-color: rgba(111,255,196,0.3); background: rgba(111,255,196,0.07); }
+  .chip-cancel { color: var(--red); border-color: rgba(255,95,95,0.3); background: rgba(255,95,95,0.07); }
+  .chip-edit { color: var(--accent); border-color: rgba(245,166,35,0.3); background: rgba(245,166,35,0.07); }
+
+  /* Example box */
+  .example-box {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-top: 10px;
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: #aaa;
+    line-height: 1.8;
+  }
+
+  .example-box strong {
+    color: var(--text);
+    font-weight: 700;
+  }
+
+  .example-label {
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+
+  /* Tips */
+  .tips-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 40px;
+  }
+
+  @media (max-width: 480px) {
+    .tips-grid { grid-template-columns: 1fr; }
+  }
+
+  .tip-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+  }
+
+  .tip-emoji { font-size: 20px; margin-bottom: 8px; }
+
+  .tip-title {
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 6px;
+  }
+
+  .tip-body {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: 'Space Mono', monospace;
+    line-height: 1.6;
+  }
+
+  /* Date examples table */
+  .date-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    margin-top: 10px;
+  }
+
+  .date-table th {
+    text-align: left;
+    padding: 8px 12px;
+    background: var(--surface2);
+    color: var(--muted);
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .date-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    color: #ccc;
+    vertical-align: top;
+  }
+
+  .date-table td:first-child { color: var(--accent); }
+  .date-table tr:last-child td { border-bottom: none; }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    line-height: 1.8;
+  }
+
+  /* Animate in */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .flow-card, .tip-card {
+    animation: fadeUp 0.4s ease both;
+  }
+  .flow-card:nth-child(1) { animation-delay: 0.05s; }
+  .flow-card:nth-child(2) { animation-delay: 0.1s; }
+  .flow-card:nth-child(3) { animation-delay: 0.15s; }
+  .tip-card:nth-child(1) { animation-delay: 0.2s; }
+  .tip-card:nth-child(2) { animation-delay: 0.25s; }
+  .tip-card:nth-child(3) { animation-delay: 0.3s; }
+  .tip-card:nth-child(4) { animation-delay: 0.35s; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-tag">V Haus Living (PG)</div>
+    <h1>Bot <span>Guide</span></h1>
+    <div class="header-sub">
+      Telegram delivery assistant — what it can do<br>and how to use it.
+    </div>
+    <div class="bot-name">@vhausdelivery_bot</div>
+  </div>
+
+  <!-- Section 1: Flows -->
+  <div class="section-label">What the bot does</div>
+  <div class="flow-grid">
+
+    <!-- Flow 1: Photo -->
+    <div class="flow-card photo">
+      <div class="flow-header">
+        <div class="flow-icon">📷</div>
+        <div>
+          <div class="flow-title">Submit a Sales Order</div>
+          <div class="flow-desc">Send photo → AI reads → confirm → saved</div>
+        </div>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-text">Take a clear photo of the handwritten sales order and <strong>send it to the bot</strong></div>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-text">Bot extracts all fields with AI — SO number, customer, items, delivery date, balance</div>
+        </div>
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-text"><strong>Review the preview</strong> — check all details are correct</div>
+        </div>
+        <div class="step">
+          <div class="step-num">4</div>
+          <div class="step-text">Reply to confirm or make corrections</div>
+        </div>
+      </div>
+      <div class="reply-row">
+        <div class="reply-chip chip-yes">YES — save order</div>
+        <div class="reply-chip chip-cancel">CANCEL — discard</div>
+        <div class="reply-chip chip-edit">or type a correction</div>
+      </div>
+
+      <div style="margin-top:14px">
+        <div class="example-label">Correction examples</div>
+        <div class="example-box">
+          <strong>"delivery date is October"</strong><br>
+          <strong>"balance is 3840"</strong><br>
+          <strong>"item 2 is king size"</strong><br>
+          <strong>"remove item 3"</strong><br>
+          <strong>"add sofa 3 seater"</strong>
+        </div>
+      </div>
+    </div>
+
+    <!-- Flow 2: Update delivery date -->
+    <div class="flow-card update">
+      <div class="flow-header">
+        <div class="flow-icon">📅</div>
+        <div>
+          <div class="flow-title">Update Delivery Date</div>
+          <div class="flow-desc">Text the bot to reschedule an existing order</div>
+        </div>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-text">Type a message in this format:</div>
+        </div>
+      </div>
+      <div class="example-box" style="margin-top:10px">
+        <strong>SO: 31074</strong><br>
+        <strong>DELIVERY DATE: 10/6</strong><br>
+        <span style="color:#666">optional note on next line</span>
+      </div>
+      <div style="margin-top:12px">
+        <div class="example-label">Date formats accepted</div>
+        <table class="date-table">
+          <tr><th>You type</th><th>Bot reads as</th></tr>
+          <tr><td>3/6</td><td>3 June (current year)</td></tr>
+          <tr><td>3/6/2026</td><td>3 June 2026</td></tr>
+          <tr><td>TMR</td><td>Tomorrow</td></tr>
+          <tr><td>today</td><td>Today</td></tr>
+          <tr><td>next week</td><td>+7 days</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <!-- Flow 3: Schedule check -->
+    <div class="flow-card schedule">
+      <div class="flow-header">
+        <div class="flow-icon">🗓</div>
+        <div>
+          <div class="flow-title">Check Delivery Schedule</div>
+          <div class="flow-desc">See all orders grouped by area for a date</div>
+        </div>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-text">Type the <code class="green">/schedule</code> command followed by a date</div>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-text">Bot replies with all orders for that day, grouped by area, with balances highlighted</div>
+        </div>
+      </div>
+      <div class="example-box" style="margin-top:14px">
+        <strong>/schedule 15/7</strong><br>
+        <strong>/schedule 2026-07-15</strong>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Section 2: Tips -->
+  <div class="section-label">Tips for best results</div>
+  <div class="tips-grid">
+    <div class="tip-card">
+      <div class="tip-emoji">💡</div>
+      <div class="tip-title">Good photo = fast extract</div>
+      <div class="tip-body">Lay the order flat, good lighting, no shadows covering the SO number or delivery date</div>
+    </div>
+    <div class="tip-card">
+      <div class="tip-emoji">⚠️</div>
+      <div class="tip-title">One draft at a time</div>
+      <div class="tip-body">Confirm or cancel current order before sending another photo — otherwise replies go to the active draft</div>
+    </div>
+    <div class="tip-card">
+      <div class="tip-emoji">🔴</div>
+      <div class="tip-title">Balance in red</div>
+      <div class="tip-body">If balance shows red in the delivery sheet, it means payment is outstanding — double check before dispatch</div>
+    </div>
+    <div class="tip-card">
+      <div class="tip-emoji">🔁</div>
+      <div class="tip-title">Duplicate SO blocked</div>
+      <div class="tip-body">Bot won't allow the same SO number to be saved twice — draft is auto-discarded if SO already exists</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    V Haus Living (PG) Sdn. Bhd. — Internal Use Only<br>
+    Delivery Management System
+  </div>
+
+</div>
+</body>
+</html>
