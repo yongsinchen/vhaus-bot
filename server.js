@@ -27,9 +27,51 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // set this in your .env
 const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID; // Group B — drivers send delivery templates here
 
-// ── In-memory pending drafts ──────────────────────────────────────
-// Key: `${chatId}:${userId}` — each salesman has their own draft
-const pendingOrders = new Map();
+// ── Session State Manager ────────────────────────────────────────
+// Replaces simple pendingOrders map with full guided session system
+// Session shape: { mode, step, data, expiresAt }
+// Modes: "new_order", "reschedule", "flag"
+// Steps vary per mode
+
+const sessions = new Map();
+
+const TIMEOUTS = {
+  new_order: 10 * 60 * 1000,  // 10 minutes
+  reschedule: 5 * 60 * 1000,  // 5 minutes
+  flag: 5 * 60 * 1000,        // 5 minutes
+};
+
+const WARDROBE_KEYWORDS = [
+  "wardrobe", "wardrob", "almari", "almeria",
+  "衣橱", "衣柜", "衣櫃",
+  "full fitting", "full set fitting", "full-fitting",
+  "customize", "custom", "customized",
+  "fitting", "install", "installation",
+];
+
+const hasWardrobeItem = (items = []) => {
+  return items.some(item => {
+    const name = (item.itemName || "").toLowerCase();
+    return WARDROBE_KEYWORDS.some(kw => name.includes(kw.toLowerCase()));
+  });
+};
+
+const setSession = (key, mode, step, data = {}) => {
+  const timeout = TIMEOUTS[mode] || 5 * 60 * 1000;
+  sessions.set(key, { mode, step, data, expiresAt: Date.now() + timeout });
+};
+
+const getSession = (key) => {
+  const s = sessions.get(key);
+  if (!s) return null;
+  if (Date.now() > s.expiresAt) { sessions.delete(key); return null; }
+  return s;
+};
+
+const clearSession = (key) => sessions.delete(key);
+
+// Backwards compatibility — pendingOrders is now sessions in new_order mode
+const pendingOrders = { has: (k) => { const s = getSession(k); return s?.mode === "new_order" && s?.step === "confirm"; }, get: (k) => getSession(k)?.data?.draft, set: () => {} };
 
 // ── Telegram Helpers ──────────────────────────────────────────────
 const sendMessage = async (chatId, text) => {
@@ -692,6 +734,326 @@ const handleScheduleCommand = async (chatId, text) => {
   await sendMessage(chatId, reply);
 };
 
+// ── Show Main Menu ───────────────────────────────────────────────
+const showMenu = async (chatId, intro = "") => {
+  const lines = [
+    intro || null,
+    "🏠 *V Haus Living Bot*",
+    "",
+    "What would you like to do?",
+    "",
+    "1\u{31}\u{FE0F}\u{20E3} New Order",
+    "2\u{32}\u{FE0F}\u{20E3} Reschedule",
+    "3\u{33}\u{FE0F}\u{20E3} Flag Wrong Order",
+    "4\u{34}\u{FE0F}\u{20E3} Help",
+    "",
+    "_Reply with a number or keyword_",
+  ].filter(l => l !== null);
+  await sendMessage(chatId, lines.join("\n"));
+};
+
+// ── Parse date helper ─────────────────────────────────────────────
+const parseDateInput = (text) => {
+  const t = text.trim();
+  const m = t.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
+  if (m) {
+    const day = parseInt(m[1]);
+    const month = parseInt(m[2]) - 1;
+    const year = m[3] ? (m[3].length === 2 ? 2000 + parseInt(m[3]) : parseInt(m[3])) : new Date().getFullYear();
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return d.toISOString().split("T")[0];
+  }
+  const lower = t.toLowerCase();
+  const today = new Date();
+  if (/^(today|hari ini)$/.test(lower)) return today.toISOString().split("T")[0];
+  if (/^(tmr|tomorrow|esok)$/.test(lower)) { today.setDate(today.getDate()+1); return today.toISOString().split("T")[0]; }
+  return null;
+};
+
+const fmtDate = (d) => d ? new Date(d + "T00:00:00").toLocaleDateString("en-MY", { weekday: "short", day: "numeric", month: "short", year: "numeric" }) : "-";
+
+// ── Create order trips ────────────────────────────────────────────
+const createTrips = async (soNumber, svNumber, totalTrips) => {
+  const trips = Array.from({ length: totalTrips }, (_, i) => ({
+    so_number: soNumber,
+    sv_number: svNumber,
+    trip_no: i + 1,
+    total_trips: totalTrips,
+    status: "Scheduled",
+  }));
+  const { error } = await supabase.from("order_trips").insert(trips);
+  return error;
+};
+
+// ── Handle session input (guided menu router) ─────────────────────
+const handleSession = async (chatId, userId, text, from) => {
+  const key = `${chatId}:${userId}`;
+  const session = getSession(key);
+
+  // ── NEW ORDER flow ────────────────────────────────────────────
+  if (session?.mode === "new_order") {
+
+    // step: waiting_photo — only accept photo (handled in photo section)
+    if (session.step === "waiting_photo") {
+      await sendMessage(chatId, "📷 Please send me the sales order photo, or type *cancel* to go back to the menu.");
+      return true;
+    }
+
+    // step: waiting_trips — salesman answered how many trips
+    if (session.step === "waiting_trips") {
+      if (text.toLowerCase() === "cancel") { clearSession(key); await showMenu(chatId, "Cancelled."); return true; }
+      const trips = parseInt(text.trim());
+      if (isNaN(trips) || trips < 1 || trips > 10) {
+        await sendMessage(chatId, "⚠️ Please enter a number between 1 and 10.");
+        return true;
+      }
+      const draft = session.data.draft;
+      draft.plannedTrips = trips;
+      draft.isMultiTrip = trips > 1;
+      setSession(key, "new_order", "confirm", { draft });
+      await sendMessage(chatId, buildOrderPreview(draft));
+      return true;
+    }
+
+    // step: confirm — YES/CANCEL/correction
+    if (session.step === "confirm") {
+      const draft = session.data.draft;
+      const upper = text.trim().toUpperCase();
+
+      if (upper === "CANCEL") {
+        clearSession(key);
+        await showMenu(chatId, "🗑 Order draft discarded.");
+        return true;
+      }
+
+      if (["YES", "CONFIRM", "OK"].includes(upper)) {
+        const result = await saveOrderToSupabase(draft);
+        if (result.ok) {
+          // Create trips if multi-trip
+          if (draft.isMultiTrip && draft.plannedTrips > 1) {
+            const svNumber = await getNextSvNumber();
+            const tripErr = await createTrips(draft.soNumber, svNumber, draft.plannedTrips);
+            if (!tripErr) {
+              await sendMessage(chatId,
+                `${result.msg}
+
+🔄 *${draft.plannedTrips} trips pre-scheduled* (SV: ${svNumber})
+_Admin can assign dates in the delivery schedule._`
+              );
+            } else {
+              await sendMessage(chatId, result.msg + "\n⚠️ Could not create trips: " + tripErr.message);
+            }
+          } else {
+            await sendMessage(chatId, result.msg);
+          }
+          clearSession(key);
+        } else if (result.duplicate) {
+          clearSession(key);
+          await sendMessage(chatId, result.msg);
+        } else {
+          await sendMessage(chatId, result.msg + "\n\nDraft still active. Correct and reply YES again.");
+        }
+        return true;
+      }
+
+      // Natural language correction
+      await sendMessage(chatId, "✏️ Updating draft...");
+      try {
+        const updated = await updateDraftWithNaturalLanguage(draft, text);
+        setSession(key, "new_order", "confirm", { draft: updated });
+        await sendMessage(chatId, buildOrderPreview(updated));
+      } catch (err) {
+        await sendMessage(chatId, `⚠️ Could not update: ${err.message}
+Reply YES / CANCEL or correct again.`);
+      }
+      return true;
+    }
+  }
+
+  // ── RESCHEDULE flow ───────────────────────────────────────────
+  if (session?.mode === "reschedule") {
+
+    if (text.toLowerCase() === "cancel") { clearSession(key); await showMenu(chatId, "Cancelled."); return true; }
+
+    // step: waiting_so — waiting for SO + optional trip number
+    if (session.step === "waiting_so") {
+      // Parse: "11576 trip 2" or "11576 2" or just "11576"
+      const tripMatch = text.match(/(\d+)\s+(?:trip\s*)?(\d+)/i);
+      const soOnly = text.match(/^(\d+)$/);
+      const soNumber = tripMatch ? tripMatch[1] : (soOnly ? soOnly[1] : text.trim());
+      const tripNo = tripMatch ? parseInt(tripMatch[2]) : null;
+
+      // Look up in order_trips or orders
+      if (tripNo) {
+        const { data: trip } = await supabase
+          .from("order_trips")
+          .select("*")
+          .eq("so_number", soNumber)
+          .eq("trip_no", tripNo)
+          .maybeSingle();
+
+        if (!trip) {
+          await sendMessage(chatId, `❌ Trip ${tripNo} for SO *${soNumber}* not found.
+Please check and try again.`);
+          return true;
+        }
+        if (trip.status === "Completed" || trip.status === "Cancelled") {
+          await sendMessage(chatId, `❌ Trip ${tripNo} is already *${trip.status}* and cannot be rescheduled.`);
+          return true;
+        }
+
+        setSession(key, "reschedule", "waiting_date", { soNumber, tripNo, tripId: trip.id, currentDate: trip.scheduled_date, isTrip: true });
+        await sendMessage(chatId,
+          `📋 *SO ${soNumber} — Trip ${tripNo} of ${trip.total_trips}*
+` +
+          `📅 Currently scheduled: *${fmtDate(trip.scheduled_date)}*
+
+` +
+          `What is the new date?
+_e.g. 5/3, 5/3/2026, tmr_`
+        );
+      } else {
+        // Single trip order — update delivery_date on orders
+        const { data: order } = await supabase
+          .from("orders").select("id, so_number, customer_name, delivery_date")
+          .eq("so_number", soNumber).eq("type", "Delivery").maybeSingle();
+
+        if (!order) {
+          await sendMessage(chatId, `❌ SO *${soNumber}* not found.
+Please check and try again.`);
+          return true;
+        }
+
+        setSession(key, "reschedule", "waiting_date", { soNumber, orderId: order.id, currentDate: order.delivery_date, customerName: order.customer_name, isTrip: false });
+        await sendMessage(chatId,
+          `📋 *SO ${soNumber}* — ${order.customer_name || ""}
+` +
+          `📅 Currently scheduled: *${fmtDate(order.delivery_date)}*
+
+` +
+          `What is the new date?
+_e.g. 5/3, 5/3/2026, tmr_`
+        );
+      }
+      return true;
+    }
+
+    // step: waiting_date
+    if (session.step === "waiting_date") {
+      const newDate = parseDateInput(text);
+      if (!newDate) {
+        await sendMessage(chatId, `⚠️ Could not understand date: "${text}"
+Please use format like: 5/3, 5/3/2026, tmr`);
+        return true;
+      }
+
+      const { soNumber, tripNo, tripId, orderId, currentDate, customerName, isTrip } = session.data;
+
+      if (isTrip) {
+        const { error } = await supabase.from("order_trips").update({ scheduled_date: newDate }).eq("id", tripId);
+        if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
+        clearSession(key);
+        await sendMessage(chatId,
+          `✅ *Trip Rescheduled*
+
+` +
+          `📋 SO: ${soNumber} — Trip ${tripNo}
+` +
+          `📅 Old date: ${fmtDate(currentDate)}
+` +
+          `📅 New date: *${fmtDate(newDate)}*
+
+` +
+          `_Delivery schedule has been updated._`
+        );
+      } else {
+        const { error } = await supabase.from("orders").update({ delivery_date: newDate }).eq("id", orderId);
+        if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
+        clearSession(key);
+        await sendMessage(chatId,
+          `✅ *Delivery Date Updated*
+
+` +
+          `📋 SO: ${soNumber}${customerName ? ` — ${customerName}` : ""}
+` +
+          `📅 Old date: ${fmtDate(currentDate)}
+` +
+          `📅 New date: *${fmtDate(newDate)}*
+
+` +
+          `_Delivery schedule has been updated._`
+        );
+      }
+      return true;
+    }
+  }
+
+  // ── FLAG flow ─────────────────────────────────────────────────
+  if (session?.mode === "flag") {
+
+    if (text.toLowerCase() === "cancel") { clearSession(key); await showMenu(chatId, "Cancelled."); return true; }
+
+    // step: waiting_so
+    if (session.step === "waiting_so") {
+      const soNumber = text.trim();
+      const { data: order } = await supabase
+        .from("orders").select("id, so_number, customer_name, status")
+        .eq("so_number", soNumber).eq("type", "Delivery").maybeSingle();
+      if (!order) {
+        await sendMessage(chatId, `❌ SO *${soNumber}* not found.
+Please check and try again, or type *cancel*.`);
+        return true;
+      }
+      setSession(key, "flag", "waiting_issue", { soNumber, orderId: order.id, customerName: order.customer_name });
+      await sendMessage(chatId,
+        `📋 *SO ${soNumber}* — ${order.customer_name || ""}
+
+What is wrong with this order?`
+      );
+      return true;
+    }
+
+    // step: waiting_issue
+    if (session.step === "waiting_issue") {
+      const { soNumber, orderId, customerName } = session.data;
+      const issue = text.trim();
+      const salesmanName = from?.first_name ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name) : (from?.username || "Unknown");
+      const now = new Date().toLocaleString("en-MY", { timeZone: "Asia/Kuala_Lumpur", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+      const flagEntry = `⚠️ FLAGGED by ${salesmanName} (${now}): ${issue}`;
+
+      const { data: order } = await supabase.from("orders").select("remark").eq("id", orderId).single();
+      const updatedRemark = order?.remark ? `${order.remark} | ${flagEntry}` : flagEntry;
+
+      const { error } = await supabase.from("orders").update({ status: "Flagged", remark: updatedRemark }).eq("id", orderId);
+      if (error) { await sendMessage(chatId, `❌ Failed to flag: ${error.message}`); return true; }
+
+      clearSession(key);
+      await sendMessage(chatId, `✅ *SO ${soNumber} has been flagged*
+
+📝 Issue: ${issue}
+
+_Admin has been notified._`);
+
+      if (ADMIN_CHAT_ID) {
+        await sendMessage(ADMIN_CHAT_ID,
+          `🚨 *Order Flagged — Action Required*
+
+` +
+          `📋 SO: *${soNumber}* | 👤 ${customerName || "-"}
+` +
+          `⚠️ Issue by ${salesmanName}: ${issue}
+
+` +
+          `🔗 https://vhaus-delivery.vercel.app`
+        );
+      }
+      return true;
+    }
+  }
+
+  return false; // no active session matched
+};
+
 // ── Bot: /start and /help command ───────────────────────────────
 const handleStartCommand = async (chatId, from) => {
   const name = from?.first_name || "there";
@@ -902,8 +1264,22 @@ const parseDeliveryTemplate = (text) => {
 
 // ── Handle Delivery Group Template ────────────────────────────────
 const handleDeliveryTemplate = async (chatId, text) => {
+  // Only process messages that start with DELIVERY keyword
+  if (!text.trim().toUpperCase().startsWith("DELIVERY")) return false;
   const parsed = parseDeliveryTemplate(text);
-  if (!parsed) return false; // not a template — ignore
+  if (!parsed) {
+    await sendMessage(chatId,
+      "⚠️ Could not read the template. Please use this format:\n\n" +
+      "DELIVERY\n" +
+      "SO: 11576\n" +
+      "Driver: Seng\n" +
+      "Kelindan: San\n" +
+      "Status: settle / no settle\n" +
+      "4/6/2026\n" +
+      "optional note"
+    );
+    return true;
+  }
 
   const { driver, helper, soNumber, date, note, isSettle, statusRaw } = parsed;
 
@@ -1337,56 +1713,62 @@ app.post("/telegram/webhook", async (req, res) => {
 
     // ── Text messages ─────────────────────────────────────────────
     if (message.text) {
-      // Pending draft exists — route ALL text to confirmation handler first
-      if (pendingOrders.has(draftKey)) {
-        await handlePendingDraftMessage(chatId, userId, message.text);
+      const text = message.text.trim();
+      const lower = text.toLowerCase();
+      const session = getSession(draftKey);
+
+      // /schedule (admin command — always works)
+      if (text.startsWith("/schedule")) {
+        await handleScheduleCommand(chatId, text);
         return;
       }
 
-      // No pending draft — existing flows unchanged
-      if (message.text.startsWith("/start") || message.text.startsWith("/help")) {
-        await handleStartCommand(chatId, message.from);
+      // Active session — route to session handler
+      if (session) {
+        const handled = await handleSession(chatId, userId, text, message.from);
+        if (handled) return;
+      }
+
+      // Menu selection or keyword
+      if (["1", "new order", "new"].includes(lower)) {
+        clearSession(draftKey);
+        setSession(draftKey, "new_order", "waiting_photo", {});
+        await sendMessage(chatId, "📷 *New Order*\n\nSend me the sales order photo.\n\n_Type *cancel* to go back to the menu._");
+        return;
+      }
+      if (["2", "reschedule"].includes(lower)) {
+        clearSession(draftKey);
+        setSession(draftKey, "reschedule", "waiting_so", {});
+        await sendMessage(chatId, "📅 *Reschedule*\n\nWhich SO do you want to reschedule?\n\nFor multi-trip orders include the trip number:\n_e.g. 11576 Trip 2_\n\nFor single orders just type the SO number:\n_e.g. 11576_\n\nType *cancel* to go back.");
+        return;
+      }
+      if (["3", "flag", "flag order", "flag wrong order"].includes(lower)) {
+        clearSession(draftKey);
+        setSession(draftKey, "flag", "waiting_so", {});
+        await sendMessage(chatId, "🚨 *Flag Wrong Order*\n\nWhich SO number has wrong info?\n\n_Type *cancel* to go back._");
+        return;
+      }
+      if (["4", "help", "/help", "/start", "menu", "hi", "hello"].includes(lower)) {
+        clearSession(draftKey);
+        await showMenu(chatId);
         return;
       }
 
-      if (message.text.startsWith("/schedule")) {
-        await handleScheduleCommand(chatId, message.text);
-        return;
-      }
-
-      if (message.text.startsWith("/flag")) {
-        await handleFlagCommand(chatId, message.text, message.from);
-        return;
-      }
-
-      // Existing delivery date update logic
-      const parsed = parseUpdateMessage(message.text);
-      if (!parsed) return;
-      const { soNumber, deliveryDate, dateText, remark } = parsed;
-      const { data: existing, error: findErr } = await supabase
-        .from("orders").select("id, so_number, customer_name, delivery_date, remark")
-        .eq("so_number", soNumber).maybeSingle();
-      if (findErr) { await sendMessage(chatId, `❌ Database error: ${findErr.message}`); return; }
-      if (!existing) { await sendMessage(chatId, `❌ SO *${soNumber}* not found in the system.`); return; }
-      if (!deliveryDate) {
-        await sendMessage(chatId, `⚠️ Could not understand delivery date: *"${dateText}"*\nPlease use format like: \`2/6\` or \`tmr\` or \`3/6/2026\``);
-        return;
-      }
-      const updatedRemark = remark ? `${existing.remark ? existing.remark + " | " : ""}${remark}` : existing.remark;
-      const { error: updateErr } = await supabase
-        .from("orders")
-        .update({ delivery_date: deliveryDate, ...(updatedRemark && { remark: updatedRemark }) })
-        .eq("so_number", soNumber);
-      if (updateErr) { await sendMessage(chatId, `❌ Failed to update SO *${soNumber}*\nError: ${updateErr.message}`); return; }
-      const formattedDate = new Date(deliveryDate).toLocaleDateString("en-MY", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-      await sendMessage(chatId,
-        `✅ *Delivery Date Updated*\n\n📋 *SO:* ${soNumber}\n👤 *Customer:* ${existing.customer_name || "-"}\n📅 *New Delivery Date:* ${formattedDate}\n📝 *Date Input:* "${dateText}"\n${remark ? `💬 *Remark:* ${remark}\n` : ""}\n_Delivery sheet has been updated._`
-      );
+      // Unrecognised — show menu
+      clearSession(draftKey);
+      await showMenu(chatId, "Sorry, I didn\'t understand that. Here\'s what I can do:");
       return;
     }
 
-    // ── Photo messages — create pending draft, do NOT insert yet ──
+    // ── Photo messages ────────────────────────────────────────────
     if (!message.photo || message.photo.length === 0) return;
+
+    const photoSession = getSession(draftKey);
+    if (!photoSession || photoSession.mode !== "new_order" || photoSession.step !== "waiting_photo") {
+      await showMenu(chatId, "Please select *1\u{31}\u{FE0F}\u{20E3} New Order* first before sending a photo.");
+      return;
+    }
+
     await sendMessage(chatId, "📷 Processing sales order image...");
     const photo = message.photo[message.photo.length - 1];
     const fileUrl = await getFileUrl(photo.file_id);
@@ -1394,44 +1776,41 @@ app.post("/telegram/webhook", async (req, res) => {
     await sendMessage(chatId, "🔍 Extracting order details with AI...");
 
     let data;
-try {
-  console.log("Calling extractOrderFromImage...");
-  data = await extractOrderFromImage(base64Image);
-  console.log("Extraction success:", data);
-} catch (err) {
-  console.error("Extraction failed:", err);
-
-  await sendMessage(
-    chatId,
-    `❌ AI extraction failed.\n\n` +
-    `Reason: ${err.message}\n\n` +
-    `Please resend a clearer photo or try again later.`
-  );
-
-  return;
-}
+    try {
+      console.log("Calling extractOrderFromImage...");
+      data = await extractOrderFromImage(base64Image);
+      console.log("Extraction success:", data);
+    } catch (err) {
+      console.error("Extraction failed:", err);
+      await sendMessage(chatId, `❌ AI extraction failed.\n\nReason: ${err.message}\n\nPlease resend a clearer photo or try again later.`);
+      return;
+    }
 
     if (!data.soNumber) {
       await sendMessage(chatId, "❌ Could not find SO Number in the image. Please try again with a clearer image.");
       return;
     }
 
-    // Normalize delivery date immediately after extraction
     const normalized = normalizeDeliveryDate(data.deliveryDate, data.orderDate);
     data.deliveryDate = normalized.deliveryDate;
     data.originalDeliveryText = normalized.originalDeliveryText;
-    // Pre-populate remark note into draft so salesman can see it
     if (normalized.remarkNote) {
-      data.remark = data.remark
-        ? `${data.remark} | ${normalized.remarkNote}`
-        : normalized.remarkNote;
+      data.remark = data.remark ? `${data.remark} | ${normalized.remarkNote}` : normalized.remarkNote;
     }
 
-    // Store as pending draft — NO Supabase insert yet
-    pendingOrders.set(draftKey, data);
+    if (hasWardrobeItem(data.items)) {
+      const wardrobeItems = data.items.filter(i => WARDROBE_KEYWORDS.some(kw => (i.itemName||"").toLowerCase().includes(kw.toLowerCase()))).map(i => i.itemName).join(", ");
+      setSession(draftKey, "new_order", "waiting_trips", { draft: data });
+      await sendMessage(chatId,
+        `📋 *Wardrobe / Fitting item detected:*\n_${wardrobeItems}_\n\n` +
+        `🔄 How many trips are needed for this order?\n\n_Reply with a number (e.g. 3)_\n_Type 1 if only 1 trip needed._`
+      );
+      return;
+    }
 
-    // Send preview and ask for confirmation
+    setSession(draftKey, "new_order", "confirm", { draft: data });
     await sendMessage(chatId, buildOrderPreview(data));
+
 
   } catch (err) {
     console.error("Webhook error:", err);
