@@ -533,9 +533,16 @@ Rules:
 
 // ── Save Order to Supabase ────────────────────────────────────────
 const saveOrderToSupabase = async (draft) => {
-  if (!draft.soNumber) {
-    return { ok: false, msg: "❌ SO Number is required before saving." };
-  }
+  if (existing) {
+  return {
+    ok: false,
+    duplicate: true,
+    msg:
+      `❌ SO *${draft.soNumber}* already exists in the system.\n\n` +
+      `This draft has been discarded automatically.\n` +
+      `If this is a new order, please check the SO number and resend the photo.`
+  };
+}
 
   // Normalize delivery date — always store as YYYY-MM-DD or null
   const normalized = normalizeDeliveryDate(draft.deliveryDate, draft.orderDate);
@@ -594,11 +601,17 @@ const handlePendingDraftMessage = async (chatId, userId, text) => {
   if (["YES", "CONFIRM", "OK"].includes(upper)) {
     const result = await saveOrderToSupabase(draft);
     if (result.ok) {
-      pendingOrders.delete(draftKey);
-      await sendMessage(chatId, result.msg);
-    } else {
-      await sendMessage(chatId, result.msg + "\n\nDraft is still active. Make corrections and reply YES again.");
-    }
+  pendingOrders.delete(draftKey);
+  await sendMessage(chatId, result.msg);
+} else if (result.duplicate) {
+  pendingOrders.delete(draftKey);
+  await sendMessage(chatId, result.msg);
+} else {
+  await sendMessage(
+    chatId,
+    result.msg + "\n\nDraft is still active. Make corrections and reply YES again."
+  );
+}
     return true;
   }
 
