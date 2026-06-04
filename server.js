@@ -396,6 +396,15 @@ const normalizeDeliveryDate = (rawText, orderDate = null) => {
     return { deliveryDate: raw, originalDeliveryText: raw, remarkNote: "" };
   }
 
+  // TBC / TBD / unknown → store as null, note in remark
+  if (/^(tbc|tbd|unknown|belum tahu|belum|pending date)$/i.test(raw)) {
+    return {
+      deliveryDate: null,
+      originalDeliveryText: raw,
+      remarkNote: `Delivery date: ${raw.toUpperCase()}`,
+    };
+  }
+
   // ASAP → +21 days
   if (/^asap$/i.test(raw)) {
     const d = new Date();
@@ -757,6 +766,8 @@ const showMenu = async (chatId, intro = "") => {
 // ── Parse date helper ─────────────────────────────────────────────
 const parseDateInput = (text) => {
   const t = text.trim();
+  // TBC / TBD → return special marker
+  if (/^(tbc|tbd|unknown|belum)$/i.test(t)) return "TBC";
   const m = t.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
   if (m) {
     const day = parseInt(m[1]);
@@ -944,45 +955,44 @@ _e.g. 5/3, 5/3/2026, tmr_`
     if (session.step === "waiting_date") {
       const newDate = parseDateInput(text);
       if (!newDate) {
-        await sendMessage(chatId, `⚠️ Could not understand date: "${text}"
-Please use format like: 5/3, 5/3/2026, tmr`);
+        await sendMessage(chatId, `⚠️ Could not understand date: "${text}"\nPlease use format like: 5/3, 5/3/2026, tmr, or TBC`);
         return true;
       }
 
       const { soNumber, tripNo, tripId, orderId, currentDate, customerName, isTrip } = session.data;
+      const isTbc = newDate === "TBC";
+      const dbDate = isTbc ? null : newDate;
+      const displayDate = isTbc ? "TBC (no date set)" : fmtDate(newDate);
 
       if (isTrip) {
-        const { error } = await supabase.from("order_trips").update({ scheduled_date: newDate }).eq("id", tripId);
+        const updatePayload = { scheduled_date: dbDate };
+        if (isTbc) updatePayload.status = "Scheduled";
+        const { error } = await supabase.from("order_trips").update(updatePayload).eq("id", tripId);
         if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
         clearSession(key);
         await sendMessage(chatId,
-          `✅ *Trip Rescheduled*
-
-` +
-          `📋 SO: ${soNumber} — Trip ${tripNo}
-` +
-          `📅 Old date: ${fmtDate(currentDate)}
-` +
-          `📅 New date: *${fmtDate(newDate)}*
-
-` +
+          `✅ *Trip ${isTbc ? "Set to TBC" : "Rescheduled"}*\n\n` +
+          `📋 SO: ${soNumber} — Trip ${tripNo}\n` +
+          `📅 Old date: ${fmtDate(currentDate)}\n` +
+          `📅 New date: *${displayDate}*\n\n` +
           `_Delivery schedule has been updated._`
         );
       } else {
-        const { error } = await supabase.from("orders").update({ delivery_date: newDate }).eq("id", orderId);
+        const { data: existingOrder } = await supabase.from("orders").select("remark").eq("id", orderId).single();
+        const updatedRemark = isTbc && existingOrder
+          ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
+          : existingOrder?.remark;
+        const { error } = await supabase.from("orders").update({
+          delivery_date: dbDate,
+          ...(isTbc && { remark: updatedRemark })
+        }).eq("id", orderId);
         if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
         clearSession(key);
         await sendMessage(chatId,
-          `✅ *Delivery Date Updated*
-
-` +
-          `📋 SO: ${soNumber}${customerName ? ` — ${customerName}` : ""}
-` +
-          `📅 Old date: ${fmtDate(currentDate)}
-` +
-          `📅 New date: *${fmtDate(newDate)}*
-
-` +
+          `✅ *Delivery Date ${isTbc ? "Set to TBC" : "Updated"}*\n\n` +
+          `📋 SO: ${soNumber}${customerName ? ` — ${customerName}` : ""}\n` +
+          `📅 Old date: ${fmtDate(currentDate)}\n` +
+          `📅 New date: *${displayDate}*\n\n` +
           `_Delivery schedule has been updated._`
         );
       }
