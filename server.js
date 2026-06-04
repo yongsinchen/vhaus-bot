@@ -282,6 +282,139 @@ app.patch("/delivery/routes/:id", async (req, res) => {
     .single();
   if (error) return res.status(500).json({ error: error.message });
 
+  // Auto update assigned orders when route status changes
+  if (req.body.status === "Out for Delivery" || req.body.status === "Delivered") {
+    const { data: routeOrders } = await supabase
+      .from("delivery_route_orders")
+      .select("order_id")
+      .eq("route_id", id);
+
+    if (routeOrders && routeOrders.length > 0) {
+      const orderIds = routeOrders.map(ro => ro.order_id);
+      const orderStatus = req.body.status === "Delivered" ? "Delivered" : "Out for Delivery";
+      await supabase
+        .from("orders")
+        .update({ status: orderStatus })
+        .in("id", orderIds);
+    }
+  }
+
+  res.json(data);
+});
+
+// DELETE /delivery/routes/:id
+app.delete("/delivery/routes/:id", async (req, res) => {
+  const { id } = req.params;
+  const { error } = await supabase.from("delivery_routes").delete().eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// POST /delivery/routes/:routeId/orders
+app.post("/delivery/routes/:routeId/orders", async (req, res) => {
+  const { routeId } = req.params;
+  const { order_id, sequence_no } = req.body;
+  const { data, error } = await supabase
+    .from("delivery_route_orders")
+    .insert({ route_id: routeId, order_id, sequence_no: sequence_no || 1 })
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// PATCH /delivery/routes/:routeId/orders/:orderId
+app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+  const { routeId, orderId } = req.params;
+  const { data, error } = await supabase
+    .from("delivery_route_orders")
+    .update({ sequence_no: req.body.sequence_no })
+    .eq("route_id", routeId)
+    .eq("order_id", orderId)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// DELETE /delivery/routes/:routeId/orders/:orderId
+app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+  const { routeId, orderId } = req.params;
+  const { error } = await supabase
+    .from("delivery_route_orders")
+    .delete()
+    .eq("route_id", routeId)
+    .eq("order_id", orderId);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+// ── Delivery Schedule API ─────────────────────────────────────────
+
+// GET /delivery/routes?date=2026-07-15
+app.get("/delivery/routes", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+  const { data: routes, error: routeErr } = await supabase
+    .from("delivery_routes")
+    .select("*")
+    .eq("delivery_date", date)
+    .order("created_at");
+  if (routeErr) return res.status(500).json({ error: routeErr.message });
+  const routesWithOrders = await Promise.all(routes.map(async (route) => {
+    const { data: routeOrders } = await supabase
+      .from("delivery_route_orders")
+      .select("*, orders(*)")
+      .eq("route_id", route.id)
+      .order("sequence_no");
+    return { ...route, orders: routeOrders || [] };
+  }));
+  res.json(routesWithOrders);
+});
+
+// GET /delivery/unassigned?date=2026-07-15
+app.get("/delivery/unassigned", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+  const { data: orders, error: ordErr } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("delivery_date", date);
+  if (ordErr) return res.status(500).json({ error: ordErr.message });
+  const { data: assigned } = await supabase
+    .from("delivery_route_orders")
+    .select("order_id, delivery_routes!inner(delivery_date)")
+    .eq("delivery_routes.delivery_date", date);
+  const assignedIds = new Set((assigned || []).map(a => a.order_id));
+  const unassigned = (orders || []).filter(o => !assignedIds.has(o.id));
+  res.json(unassigned);
+});
+
+// POST /delivery/routes — now accepts vehicle_id
+app.post("/delivery/routes", async (req, res) => {
+  const { delivery_date, lorry_plate, driver_name, area, notes, vehicle_id } = req.body;
+  if (!delivery_date) return res.status(400).json({ error: "delivery_date is required" });
+  const { data, error } = await supabase
+    .from("delivery_routes")
+    .insert({ delivery_date, lorry_plate, driver_name, area, notes, status: "Pending", ...(vehicle_id && { vehicle_id }) })
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// PATCH /delivery/routes/:id — auto update orders when Out for Delivery
+app.patch("/delivery/routes/:id", async (req, res) => {
+  const { id } = req.params;
+
+  // Update the route first
+  const { data, error } = await supabase
+    .from("delivery_routes")
+    .update(req.body)
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+
   // Auto update assigned orders when route goes Out for Delivery
   if (req.body.status === "Out for Delivery") {
     const { data: routeOrders } = await supabase
