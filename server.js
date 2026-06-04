@@ -25,6 +25,10 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
+// ── In-memory pending drafts ──────────────────────────────────────
+// Key: `${chatId}:${userId}` — each salesman has their own draft
+const pendingOrders = new Map();
+
 // ── Telegram Helpers ──────────────────────────────────────────────
 const sendMessage = async (chatId, text) => {
   await axios.post(`${TELEGRAM_API}/sendMessage`, {
@@ -154,6 +158,225 @@ const parseUpdateMessage = (text) => {
   const dateLineIdx = lines.findIndex(l => /DELIVERY\s*DATE/i.test(l));
   const remark = lines.slice(dateLineIdx + 1).join(" ").trim();
   return { soNumber, deliveryDate, dateText, remark };
+};
+
+// ── Build Order Preview ───────────────────────────────────────────
+const buildOrderPreview = (data) => {
+  const fmt = (v) => (v !== null && v !== undefined && v !== "" ? v : "-");
+  const itemLines = (data.items || [])
+    .map((item, i) => {
+      const code = item.itemCode ? `[${item.itemCode}] ` : "";
+      return `  ${i + 1}. ${code}${fmt(item.itemName)} x${fmt(item.unit)}\n     Supplier: ${fmt(item.supplier)}`;
+    })
+    .join("\n");
+
+  return (
+    `📋 *Please confirm sales order*\n\n` +
+    `SO: *${fmt(data.soNumber)}*\n` +
+    `Customer: ${fmt(data.customerName)}\n` +
+    `Contact: ${fmt(data.contact)}\n` +
+    `Address: ${fmt(data.address)}\n` +
+    `Order Date: ${fmt(data.orderDate)}\n` +
+    `Delivery Date: ${fmt(data.deliveryDate)}\n` +
+    `Time Slot: ${fmt(data.timeSlot)}\n` +
+    `Salesman: ${fmt(data.salesman)}\n` +
+    `Amount: RM ${fmt(data.orderAmount)}\n` +
+    `Balance: RM ${fmt(data.balance)}\n` +
+    `Type: ${fmt(data.type)}\n` +
+    `Remark: ${fmt(data.remark)}\n` +
+    (data.serviceNote ? `Service Note: ${fmt(data.serviceNote)}\n` : "") +
+    (data.plateNo ? `Plate No: ${fmt(data.plateNo)}\n` : "") +
+    `\n*Items:*\n` +
+    (itemLines || "  (none)") +
+    `\n\nReply:\n` +
+    `YES = save\n` +
+    `CANCEL = discard\n` +
+    `EDIT customerName=New Name\n` +
+    `EDIT deliveryDate=20/6/2026\n` +
+    `EDIT balance=500\n` +
+    `EDIT ITEM 1 unit=2\n` +
+    `ADD ITEM itemName=Mirror 60 unit=1 supplier=ABC\n` +
+    `REMOVE ITEM 2`
+  );
+};
+
+// ── Parse key=value pairs from edit commands ──────────────────────
+const parseKVPairs = (str) => {
+  const result = {};
+  const regex = /(\w+)=([^=]+?)(?=\s+\w+=|$)/g;
+  let match;
+  while ((match = regex.exec(str)) !== null) {
+    result[match[1].trim()] = match[2].trim();
+  }
+  return result;
+};
+
+// ── Apply Draft Edit ──────────────────────────────────────────────
+const applyDraftEdit = (draft, text) => {
+  // REMOVE ITEM N
+  const removeMatch = text.match(/^REMOVE\s+ITEM\s+(\d+)$/i);
+  if (removeMatch) {
+    const idx = parseInt(removeMatch[1], 10) - 1;
+    if (draft.items && idx >= 0 && idx < draft.items.length) {
+      draft.items.splice(idx, 1);
+      return { ok: true, msg: `Item ${idx + 1} removed.` };
+    }
+    return { ok: false, msg: `Item ${idx + 1} not found.` };
+  }
+
+  // ADD ITEM key=value ...
+  const addMatch = text.match(/^ADD\s+ITEM\s+(.+)$/i);
+  if (addMatch) {
+    const pairs = parseKVPairs(addMatch[1]);
+    const newItem = {
+      itemName: pairs.itemName || pairs.itemname || "",
+      unit: pairs.unit ? Number(pairs.unit) : 1,
+      supplier: pairs.supplier || "-",
+    };
+    if (pairs.itemCode || pairs.itemcode) newItem.itemCode = pairs.itemCode || pairs.itemcode;
+    draft.items = draft.items || [];
+    draft.items.push(newItem);
+    return { ok: true, msg: `Item added: ${newItem.itemName} x${newItem.unit}` };
+  }
+
+  // EDIT ITEM N field=value
+  const editItemMatch = text.match(/^EDIT\s+ITEM\s+(\d+)\s+(.+)$/i);
+  if (editItemMatch) {
+    const idx = parseInt(editItemMatch[1], 10) - 1;
+    if (!draft.items || idx < 0 || idx >= draft.items.length) {
+      return { ok: false, msg: `Item ${idx + 1} not found.` };
+    }
+    const pairs = parseKVPairs(editItemMatch[2]);
+    const item = draft.items[idx];
+    if (pairs.itemName || pairs.itemname) item.itemName = pairs.itemName || pairs.itemname;
+    if (pairs.unit !== undefined) item.unit = Number(pairs.unit);
+    if (pairs.supplier !== undefined) item.supplier = pairs.supplier;
+    if (pairs.itemCode || pairs.itemcode) item.itemCode = pairs.itemCode || pairs.itemcode;
+    return { ok: true, msg: `Item ${idx + 1} updated.` };
+  }
+
+  // EDIT field=value
+  const editMatch = text.match(/^EDIT\s+(.+)$/i);
+  if (editMatch) {
+    const pairs = parseKVPairs(editMatch[1]);
+    const dateFields = ["orderDate", "deliveryDate"];
+    const numFields = ["orderAmount", "balance"];
+    const fieldMap = {
+      sonumber: "soNumber", customername: "customerName", address: "address",
+      contact: "contact", orderdate: "orderDate", salesman: "salesman",
+      orderamount: "orderAmount", balance: "balance", deliverydate: "deliveryDate",
+      timeslot: "timeSlot", plateno: "plateNo", type: "type",
+      servicenote: "serviceNote", remark: "remark",
+    };
+    const updated = [];
+    for (const [rawKey, val] of Object.entries(pairs)) {
+      const key = fieldMap[rawKey.toLowerCase()];
+      if (!key) continue;
+      if (dateFields.includes(key)) {
+        draft[key] = parseDeliveryDate(val) || val;
+      } else if (numFields.includes(key)) {
+        draft[key] = parseFloat(val.replace(/[^0-9.]/g, "")) || 0;
+      } else {
+        draft[key] = val;
+      }
+      updated.push(key);
+    }
+    if (updated.length === 0) return { ok: false, msg: "No recognised fields to edit." };
+    return { ok: true, msg: `Updated: ${updated.join(", ")}` };
+  }
+
+  return { ok: false, msg: "Command not recognised." };
+};
+
+// ── Save Order to Supabase ────────────────────────────────────────
+const saveOrderToSupabase = async (draft) => {
+  // Resolve ASAP delivery date
+  let deliveryDate = draft.deliveryDate;
+  if (!deliveryDate || deliveryDate.toUpperCase() === "ASAP") {
+    const asapDate = new Date();
+    asapDate.setDate(asapDate.getDate() + 21);
+    deliveryDate = asapDate.toISOString().split("T")[0];
+    draft._asapScheduled = true;
+  }
+
+  // Duplicate SO check
+  if (draft.soNumber) {
+    const { data: existing } = await supabase
+      .from("orders").select("id").eq("so_number", draft.soNumber).maybeSingle();
+    if (existing) return { ok: false, msg: `❌ SO *${draft.soNumber}* already exists in the system.` };
+  }
+
+  const payload = {
+    so_number: draft.soNumber || null,
+    customer_name: draft.customerName || null,
+    address: draft.address || null,
+    contact: draft.contact || null,
+    order_date: draft.orderDate || null,
+    salesman: draft.salesman || null,
+    order_amount: draft.orderAmount || null,
+    balance: draft.balance || null,
+    delivery_date: deliveryDate,
+    time_slot: draft.timeSlot || null,
+    plate_no: draft.plateNo || null,
+    type: draft.type || "Delivery",
+    service_note: draft.serviceNote || null,
+    remark: draft.remark || null,
+    status: "Pending",
+    items: JSON.stringify(draft.items || []),
+  };
+
+  const { error } = await supabase.from("orders").insert(payload);
+  if (error) return { ok: false, msg: `❌ Insert failed: ${error.message}` };
+
+  const asapNote = draft._asapScheduled ? `\n⚠️ _Delivery date was ASAP — auto scheduled 3 weeks from today_` : "";
+  return {
+    ok: true,
+    msg: `✅ *Order Saved Successfully*\n\n📋 *SO:* ${draft.soNumber || "(no SO)"}\n👤 *Customer:* ${draft.customerName || "-"}\n📅 *Delivery Date:* ${deliveryDate}${asapNote}\n\n_Order has been saved to the delivery sheet._`,
+  };
+};
+
+// ── Handle Order Confirmation ─────────────────────────────────────
+const handleOrderConfirmation = async (chatId, userId, text) => {
+  const draftKey = `${chatId}:${userId}`;
+  const draft = pendingOrders.get(draftKey);
+  if (!draft) return false; // no pending draft — caller handles normally
+
+  const upper = text.trim().toUpperCase();
+
+  // YES / CONFIRM / OK → save
+  if (["YES", "CONFIRM", "OK"].includes(upper)) {
+    const result = await saveOrderToSupabase(draft);
+    if (result.ok) {
+      pendingOrders.delete(draftKey);
+      await sendMessage(chatId, result.msg);
+    } else {
+      await sendMessage(chatId, result.msg + "\n\nDraft is still active. Fix and reply YES again.");
+    }
+    return true;
+  }
+
+  // CANCEL → discard
+  if (upper === "CANCEL") {
+    pendingOrders.delete(draftKey);
+    await sendMessage(chatId, "🗑 Order draft discarded.");
+    return true;
+  }
+
+  // EDIT / ADD ITEM / REMOVE ITEM
+  if (/^(EDIT|ADD\s+ITEM|REMOVE\s+ITEM)/i.test(text.trim())) {
+    const result = applyDraftEdit(draft, text.trim());
+    if (result.ok) {
+      pendingOrders.set(draftKey, draft);
+      await sendMessage(chatId, `✏️ ${result.msg}\n\n${buildOrderPreview(draft)}`);
+    } else {
+      await sendMessage(chatId, `⚠️ ${result.msg}`);
+    }
+    return true;
+  }
+
+  // Unknown reply while draft is pending
+  await sendMessage(chatId, `⚠️ Pending order awaiting confirmation.\nReply YES, CANCEL, or EDIT field=value.`);
+  return true;
 };
 
 // ── Bot: /schedule command ────────────────────────────────────────
@@ -446,15 +669,24 @@ app.post("/telegram/webhook", async (req, res) => {
     const message = req.body.message;
     if (!message) return;
     const chatId = message.chat.id;
+    const userId = message.from?.id;
+    const draftKey = `${chatId}:${userId}`;
 
-    // Handle /schedule command
-    if (message.text && message.text.startsWith("/schedule")) {
-      await handleScheduleCommand(chatId, message.text);
-      return;
-    }
-
-    // Handle text message — delivery date update
+    // ── Text messages ─────────────────────────────────────────────
     if (message.text) {
+      // Pending draft exists — route ALL text to confirmation handler first
+      if (pendingOrders.has(draftKey)) {
+        await handleOrderConfirmation(chatId, userId, message.text);
+        return;
+      }
+
+      // No pending draft — existing flows unchanged
+      if (message.text.startsWith("/schedule")) {
+        await handleScheduleCommand(chatId, message.text);
+        return;
+      }
+
+      // Existing delivery date update logic
       const parsed = parseUpdateMessage(message.text);
       if (!parsed) return;
       const { soNumber, deliveryDate, dateText, remark } = parsed;
@@ -480,7 +712,7 @@ app.post("/telegram/webhook", async (req, res) => {
       return;
     }
 
-    // Handle photo — new sales order
+    // ── Photo messages — create pending draft, do NOT insert yet ──
     if (!message.photo || message.photo.length === 0) return;
     await sendMessage(chatId, "📷 Processing sales order image...");
     const photo = message.photo[message.photo.length - 1];
@@ -492,42 +724,17 @@ app.post("/telegram/webhook", async (req, res) => {
     try { data = await extractOrderFromImage(base64Image); }
     catch (err) { await sendMessage(chatId, `❌ Failed to extract order data.\nError: ${err.message}`); return; }
 
-    // Handle ASAP delivery date
-    if (!data.deliveryDate || data.deliveryDate.toUpperCase() === "ASAP") {
-      const asapDate = new Date();
-      asapDate.setDate(asapDate.getDate() + 21);
-      data.deliveryDate = asapDate.toISOString().split("T")[0];
-      data._asapScheduled = true;
+    if (!data.soNumber) {
+      await sendMessage(chatId, "❌ Could not find SO Number in the image. Please try again with a clearer image.");
+      return;
     }
 
-    if (!data.soNumber) { await sendMessage(chatId, "❌ Could not find SO Number in the image. Please try again with a clearer image."); return; }
+    // Store as pending draft — NO Supabase insert yet
+    pendingOrders.set(draftKey, data);
 
-    // Check duplicate
-    const { data: existing, error: checkErr } = await supabase
-      .from("orders").select("id").eq("so_number", data.soNumber).maybeSingle();
-    if (checkErr) { await sendMessage(chatId, `❌ Database error: ${checkErr.message}`); return; }
-    if (existing) { await sendMessage(chatId, `⚠️ SO *${data.soNumber}* already exists in the system. Skipping insert.`); return; }
+    // Send preview and ask for confirmation
+    await sendMessage(chatId, buildOrderPreview(data));
 
-    // Insert into Supabase
-    const payload = {
-      so_number: data.soNumber, customer_name: data.customerName, address: data.address,
-      contact: data.contact, order_date: data.orderDate || null, salesman: data.salesman,
-      order_amount: data.orderAmount, balance: data.balance, delivery_date: data.deliveryDate || null,
-      time_slot: data.timeSlot, plate_no: data.plateNo, type: data.type || "Delivery",
-      service_note: data.serviceNote, remark: data.remark, status: "Pending",
-      items: JSON.stringify(data.items || []),
-    };
-    const { error: insertErr } = await supabase.from("orders").insert(payload);
-    if (insertErr) { await sendMessage(chatId, `❌ Failed to save order.\nError: ${insertErr.message}`); return; }
-
-    const itemsSummary = (data.items || [])
-      .map((item, i) => `  ${i + 1}. ${item.itemName || "Unknown item"} x${item.unit || 1}${item.supplier ? ` (${item.supplier})` : ""}`)
-      .join("\n");
-    const asapNote = data._asapScheduled ? `\n⚠️ _Delivery date was ASAP — auto scheduled 3 weeks from today_` : "";
-
-    await sendMessage(chatId,
-      `✅ *Order Added Successfully*\n\n📋 *SO:* ${data.soNumber}\n👤 *Customer:* ${data.customerName || "-"}\n📅 *Delivery Date:* ${data.deliveryDate || "-"}${asapNote}\n⏰ *Time Slot:* ${data.timeSlot || "-"}\n👨‍💼 *Salesman:* ${data.salesman || "-"}\n💰 *Amount:* RM ${data.orderAmount || "0"}\n🔴 *Balance:* RM ${data.balance || "0"}\n📦 *Type:* ${data.type || "Delivery"}\n\n*Items:*\n${itemsSummary || "  No items extracted"}\n\n_Order has been saved to the delivery sheet._`
-    );
   } catch (err) {
     console.error("Webhook error:", err);
   }
