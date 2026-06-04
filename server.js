@@ -786,13 +786,15 @@ const parseDateInput = (text) => {
 const fmtDate = (d) => d ? new Date(d + "T00:00:00").toLocaleDateString("en-MY", { weekday: "short", day: "numeric", month: "short", year: "numeric" }) : "-";
 
 // ── Create order trips ────────────────────────────────────────────
-const createTrips = async (soNumber, svNumber, totalTrips) => {
+const createTrips = async (soNumber, svNumber, totalTrips, deliveryDate = null) => {
   const trips = Array.from({ length: totalTrips }, (_, i) => ({
     so_number: soNumber,
     sv_number: svNumber,
     trip_no: i + 1,
     total_trips: totalTrips,
     status: "Scheduled",
+    // Trip 1 inherits the original delivery date from the sales order
+    scheduled_date: i === 0 ? (deliveryDate || null) : null,
   }));
   const { error } = await supabase.from("order_trips").insert(trips);
   return error;
@@ -845,7 +847,7 @@ const handleSession = async (chatId, userId, text, from) => {
           // Create trips if multi-trip
           if (draft.isMultiTrip && draft.plannedTrips > 1) {
             const svNumber = await getNextSvNumber();
-            const tripErr = await createTrips(draft.soNumber, svNumber, draft.plannedTrips);
+            const tripErr = await createTrips(draft.soNumber, svNumber, draft.plannedTrips, draft.deliveryDate || null);
             if (!tripErr) {
               await sendMessage(chatId,
                 `${result.msg}
@@ -969,12 +971,19 @@ _e.g. 5/3, 5/3/2026, tmr_`
         if (isTbc) updatePayload.status = "Scheduled";
         const { error } = await supabase.from("order_trips").update(updatePayload).eq("id", tripId);
         if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
+
+        // If this is Trip 1, also sync orders.delivery_date to match
+        if (tripNo === 1) {
+          await supabase.from("orders").update({ delivery_date: dbDate }).eq("so_number", soNumber);
+        }
+
         clearSession(key);
         await sendMessage(chatId,
           `✅ *Trip ${isTbc ? "Set to TBC" : "Rescheduled"}*\n\n` +
           `📋 SO: ${soNumber} — Trip ${tripNo}\n` +
           `📅 Old date: ${fmtDate(currentDate)}\n` +
           `📅 New date: *${displayDate}*\n\n` +
+          (tripNo === 1 ? `_Delivery date on order updated to match._\n` : "") +
           `_Delivery schedule has been updated._`
         );
       } else {
