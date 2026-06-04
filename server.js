@@ -26,6 +26,37 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // set this in your .env
 
+// ── Bot: /start command ───────────────────────────────────────────
+const handleStartCommand = async (chatId, from) => {
+  const name = from?.first_name || "there";
+  await sendMessage(chatId,
+    `👋 Hello ${name}! Welcome to *V Haus Living (PG) Bot*\n\n` +
+    `Here's what I can do:\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📷 *Submit a Sales Order*\n` +
+    `Send me a photo of the handwritten sales order.\n` +
+    `I'll extract all details and show you a preview.\n` +
+    `Reply *YES* to save, *CANCEL* to discard,\n` +
+    `or tell me what to correct naturally.\n\n` +
+    `_e.g. "balance is 3840", "delivery date is 10/6"_\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📅 *Update Delivery Date*\n` +
+    `Send a message in this format:\n` +
+    `SO: 31074\n` +
+    `DELIVERY DATE: 10/6\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🚨 *Flag a Wrong Order*\n` +
+    `If you saved an order with wrong info:\n` +
+    "`/flag <SO Number> <what is wrong>`\n\n" +
+    `_e.g. /flag 31074 balance should be 3840_\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🗓 *Check Delivery Schedule*\n` +
+    "`/schedule 15/6`\n\n" +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `Type /help anytime to see this menu again.`
+  );
+};
+
 // ── In-memory pending drafts ──────────────────────────────────────
 // Key: `${chatId}:${userId}` — each salesman has their own draft
 const pendingOrders = new Map();
@@ -1021,6 +1052,10 @@ app.post("/telegram/webhook", async (req, res) => {
     const userId = message.from?.id;
     const draftKey = `${chatId}:${userId}`;
 
+    if (message.text === "/start" || message.text === "/help") {
+  await handleStartCommand(chatId, message.from);
+  return;
+}
     // ── Text messages ─────────────────────────────────────────────
     if (message.text) {
       // Pending draft exists — route ALL text to confirmation handler first
