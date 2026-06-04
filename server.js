@@ -312,18 +312,19 @@ app.post("/delivery/routes", async (req, res) => {
   res.json(data);
 });
 
+// Helper — Malaysia local date
+const getMalaysiaDate = () => new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Kuala_Lumpur", year: "numeric", month: "2-digit", day: "2-digit"
+}).format(new Date());
 
 // PATCH /delivery/routes/:id
 app.patch("/delivery/routes/:id", async (req, res) => {
   const { id } = req.params;
 
-  // Fetch current route to check lock status
-  const { data: current } = await supabase.from("delivery_routes").select("status").eq("id", id).single();
+  const { data: current } = await supabase.from("delivery_routes").select("status, delivery_date").eq("id", id).single();
   const isLocked = current?.status === "Out for Delivery" || current?.status === "Delivered";
 
   if (isLocked) {
-    // Only allow status change from "Out for Delivery" → "Delivered"
-    const allowedKeys = ["status"];
     const keys = Object.keys(req.body);
     const onlyStatus = keys.length === 1 && keys[0] === "status";
     const validTransition = req.body.status === "Delivered" || req.body.status === "Out for Delivery";
@@ -332,11 +333,17 @@ app.patch("/delivery/routes/:id", async (req, res) => {
     }
   }
 
+  if (req.body.status === "Out for Delivery") {
+    const today = getMalaysiaDate();
+    if (current?.delivery_date !== today) {
+      return res.status(403).json({ error: "Route can only be marked Out for Delivery on the delivery date." });
+    }
+  }
+
   const { data, error } = await supabase
     .from("delivery_routes").update(req.body).eq("id", id).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  // Auto update assigned orders when route status changes
   if (req.body.status === "Out for Delivery" || req.body.status === "Delivered") {
     const { data: routeOrders } = await supabase
       .from("delivery_route_orders").select("order_id").eq("route_id", id);
