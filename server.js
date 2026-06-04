@@ -209,7 +209,10 @@ const handleScheduleCommand = async (chatId, text) => {
 
 // GET /delivery/vehicles
 app.get("/delivery/vehicles", async (req, res) => {
-  const { data, error } = await supabase.from("delivery_vehicles").select("*").order("created_at");
+  const { data, error } = await supabase
+    .from("delivery_vehicles")
+    .select("*")
+    .order("created_at");
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -221,7 +224,8 @@ app.post("/delivery/vehicles", async (req, res) => {
   const { data, error } = await supabase
     .from("delivery_vehicles")
     .insert({ driver_name, vehicle_plate, vehicle_type, status: status || "Active" })
-    .select().single();
+    .select()
+    .single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -229,7 +233,12 @@ app.post("/delivery/vehicles", async (req, res) => {
 // PATCH /delivery/vehicles/:id
 app.patch("/delivery/vehicles/:id", async (req, res) => {
   const { id } = req.params;
-  const { data, error } = await supabase.from("delivery_vehicles").update(req.body).eq("id", id).select().single();
+  const { data, error } = await supabase
+    .from("delivery_vehicles")
+    .update(req.body)
+    .eq("id", id)
+    .select()
+    .single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -276,10 +285,30 @@ app.get("/delivery/unassigned", async (req, res) => {
   res.json((orders || []).filter(o => !assignedIds.has(o.id)));
 });
 
-// POST /delivery/routes
+// POST /delivery/routes — with duplicate vehicle validation
 app.post("/delivery/routes", async (req, res) => {
   const { delivery_date, lorry_plate, driver_name, area, notes, vehicle_id } = req.body;
   if (!delivery_date) return res.status(400).json({ error: "delivery_date is required" });
+
+  // Duplicate vehicle check
+  if (vehicle_id) {
+    const { data: existing } = await supabase
+      .from("delivery_routes")
+      .select("id")
+      .eq("delivery_date", delivery_date)
+      .eq("vehicle_id", vehicle_id)
+      .maybeSingle();
+    if (existing) return res.status(409).json({ error: "This vehicle already has a route for this date." });
+  } else if (lorry_plate) {
+    const { data: existing } = await supabase
+      .from("delivery_routes")
+      .select("id")
+      .eq("delivery_date", delivery_date)
+      .eq("lorry_plate", lorry_plate)
+      .maybeSingle();
+    if (existing) return res.status(409).json({ error: "This vehicle already has a route for this date." });
+  }
+
   const { data, error } = await supabase
     .from("delivery_routes")
     .insert({ delivery_date, lorry_plate, driver_name, area, notes, status: "Pending", ...(vehicle_id && { vehicle_id }) })
@@ -344,6 +373,7 @@ app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
   if (sequence_no !== undefined) updates.sequence_no = sequence_no;
   if (scheduled_time_range !== undefined) updates.scheduled_time_range = scheduled_time_range;
   if (route_note !== undefined) updates.route_note = route_note;
+
   const { data, error } = await supabase
     .from("delivery_route_orders")
     .update(updates)
@@ -351,6 +381,15 @@ app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
     .eq("order_id", orderId)
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
+
+  // If scheduled_time_range provided, also update orders.time_slot
+  if (scheduled_time_range !== undefined) {
+    await supabase
+      .from("orders")
+      .update({ time_slot: scheduled_time_range })
+      .eq("id", orderId);
+  }
+
   res.json(data);
 });
 
