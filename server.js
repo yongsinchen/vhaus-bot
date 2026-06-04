@@ -48,12 +48,22 @@ const downloadImageAsBase64 = async (url) => {
   const res = await axios.get(url, { responseType: "arraybuffer" });
   return Buffer.from(res.data).toString("base64");
 };
-
+const withTimeout = (promise, ms, message = "Request timeout") => {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(message)), ms)
+    )
+  ]);
+};
 // ── OpenAI Vision — Extract Sales Order ──────────────────────────
 const extractOrderFromImage = async (base64Image) => {
-  const prompt = `You are a sales order OCR assistant for V Haus Living (PG) Sdn Bhd, a furniture company in Penang, Malaysia.
+const prompt = `You are a sales order OCR assistant for V Haus Living (PG) Sdn Bhd, a furniture company in Penang, Malaysia.
+
 Extract all information from this handwritten sales order image.
+
 Return ONLY valid JSON with no extra text, no markdown, no explanation.
+
 Use this exact structure:
 {
   "soNumber": "",
@@ -64,7 +74,9 @@ Use this exact structure:
   "salesman": "",
   "orderAmount": "",
   "balance": "",
-  "deliveryDate": "YYYY-MM-DD or empty",
+  "deliveryDate": "YYYY-MM-DD, raw text, or empty",
+  "originalDeliveryText": "",
+  "needsDeliveryDateConfirmation": false,
   "timeSlot": "",
   "plateNo": "",
   "type": "Delivery",
@@ -84,43 +96,198 @@ Use this exact structure:
   ]
 }
 
-Rules:
-- soNumber: look for "SALES ORDER:" or "SO:" number, usually a 5-digit number like 31073
-- customerName: look for "NAME:" field
-- address: look for "ADDRESS:" field. If it says "SAME WITH XXXXX" keep that text as-is
-- contact: look for "H/P NO:" or "TEL:" or "CONTACT:" field. Leave empty if not found
-- orderDate: look for "ORDER DATE:". Convert to YYYY-MM-DD. Example: 1/6/2026 = 2026-06-01. Leave empty if not found
-- deliveryDate: look for "DELIVERY DATE:". Convert to YYYY-MM-DD format. If it says "ASAP" or is unclear, return the string "ASAP". Leave empty string only if delivery date field is completely blank
-- salesman: look for "SALES ASSISTANT:" or "ORDER BY:" field
-- orderAmount: look for "TOTAL" amount, numeric only, no RM symbol. Example: 5590
-- balance: look for "BALANCE" amount, numeric only, no RM symbol. Example: 3891
-- items: extract ALL item rows from the DESCRIPTION column. Each numbered row (1., 2., 3.) is a separate item. Sub-items with "-" under a main item should be combined into one item description
-- For FOC items (free of charge), include them as separate items with unit price 0
-- itemCode: the product code if shown (e.g. 5023). Leave empty if not shown
-- itemName: full description of the item including sub-components
-- unit: quantity from QTY column, default "1" if not shown
-- remark: extract from "REMARKS:" section at the bottom
-- type: always "Delivery" unless the order says "SERVICE"
-- status: always "Pending"
-- If a field cannot be found, use empty string`;
+General Rules:
+- soNumber: look for "SALES ORDER:" or "SO:" number, usually a 5-digit number like 31073.
+- customerName: look for "NAME:" field.
+- address: look for "ADDRESS:" field. If it says "SAME WITH XXXXX", keep that text as-is.
+- contact: look for "H/P NO:" or "TEL:" or "CONTACT:" field. Leave empty if not found.
+- orderDate: look for "ORDER DATE:". Convert to YYYY-MM-DD. Example: 1/6/2026 = 2026-06-01. Leave empty if not found.
+- salesman: look for "SALES ASSISTANT:" or "ORDER BY:" field.
+- orderAmount: look for "TOTAL" amount, numeric only, no RM symbol. Example: 5590.
+- balance: look for "BALANCE" amount, numeric only, no RM symbol. Example: 3891.
+- items: extract ALL item rows from the DESCRIPTION column. Each numbered row (1., 2., 3.) is a separate item.
+- Sub-items with "-" under a main item should be combined into one item description.
+- For FOC items (free of charge), include them as separate items.
+- itemCode: the product code if shown, e.g. 5023. Leave empty if not shown.
+- itemName: full description of the item including sub-components.
+- unit: quantity from QTY column, default "1" if not shown.
+- remark: extract from "REMARKS:" section at the bottom.
+- type: always "Delivery" unless the order says "SERVICE".
+- status: always "Pending".
+- If a field cannot be found, use empty string.
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 2000,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}`, detail: "high" } },
-        ],
-      },
-    ],
-  });
+Delivery Date Rules:
+- deliveryDate is very important.
+- Look for "DELIVERY DATE:" field.
 
-  const raw = response.choices[0].message.content.trim();
-  const clean = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
-  return JSON.parse(clean);
+Rule 1: Exact Date
+If delivery date is clearly written as a date, convert it to YYYY-MM-DD.
+
+Examples:
+- 3/6/2026 => 2026-06-03
+- 03/06/2026 => 2026-06-03
+- 3/6 => use same year as orderDate if available, otherwise current year.
+
+Rule 2: Tomorrow
+If delivery date contains:
+- TMR
+- Tomorrow
+- Esok
+- 明天
+
+Then set deliveryDate = orderDate + 1 day.
+Also set originalDeliveryText to the raw delivery date text.
+
+Example:
+orderDate = 2026-06-03
+raw delivery date = TMR
+deliveryDate = 2026-06-04
+originalDeliveryText = TMR
+
+Rule 3: ASAP
+If delivery date contains:
+- ASAP
+- Urgent
+
+Then set deliveryDate = orderDate + 21 days.
+Also set originalDeliveryText to the raw delivery date text.
+
+Example:
+orderDate = 2026-06-03
+raw delivery date = ASAP
+deliveryDate = 2026-06-24
+originalDeliveryText = ASAP
+
+Rule 4: Month Only
+If delivery date is only a month:
+
+Examples:
+- Aug
+- August
+- Sep
+- Sept
+- September
+- Oct
+- October
+- Nov
+- November
+- Dec
+- December
+
+Use the middle of the month as guideline date.
+Use day 15.
+
+Examples:
+- Sep => YYYY-09-15
+- October => YYYY-10-15
+- Nov => YYYY-11-15
+
+Set originalDeliveryText to the raw delivery date text.
+
+Rule 5: Month Range
+If delivery date is a month range:
+
+Examples:
+- Aug - Sept
+- Sep - Oct
+- Oct - Nov
+- August to September
+- Aug/Sept
+
+Use the earliest month in the range.
+Use day 15.
+
+Examples:
+- Aug - Sept => YYYY-08-15
+- Sep - Oct => YYYY-09-15
+- Oct - Nov => YYYY-10-15
+
+Set originalDeliveryText to the raw delivery date text.
+
+Rule 6: Notes inside brackets
+If delivery date contains extra notes inside brackets, only use the actual delivery instruction outside or at the start.
+
+Examples:
+- TMR (Fredrick T+7) => use TMR only, deliveryDate = orderDate + 1 day
+- Tomorrow (call before go) => use Tomorrow only, deliveryDate = orderDate + 1 day
+- ASAP (customer urgent) => use ASAP only, deliveryDate = orderDate + 21 days
+
+Set originalDeliveryText to the full raw text.
+
+Rule 7: Unclear Delivery Date
+If delivery date cannot be confidently determined:
+- unreadable handwriting
+- unclear text
+- partially covered
+- invalid date
+- confidence below 90%
+
+Do NOT guess.
+
+Set:
+deliveryDate = ""
+originalDeliveryText = raw delivery date text if visible, otherwise ""
+needsDeliveryDateConfirmation = true
+
+Rule 8: Empty Delivery Date
+If the delivery date field is completely blank:
+
+Set:
+deliveryDate = ""
+originalDeliveryText = ""
+needsDeliveryDateConfirmation = true
+
+Important:
+- Do not invent a delivery date.
+- If unsure, ask for confirmation by setting needsDeliveryDateConfirmation = true.
+- Always return valid JSON only.`;
+
+ const response = await withTimeout(
+    openai.chat.completions.create({
+      model: "gpt-4o",
+      max_tokens: 2000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:image/jpeg;base64,${base64Image}`,
+                detail: "high"
+              }
+            }
+          ]
+        }
+      ]
+    }),
+    60000,
+    "AI extraction timeout after 60 seconds"
+  );
+
+  console.log("OpenAI Vision response received.");
+
+  const raw = response.choices?.[0]?.message?.content?.trim() || "";
+
+  if (!raw) {
+    throw new Error("AI returned empty response");
+  }
+
+  console.log("Raw AI response:", raw);
+
+  const clean = raw
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(clean);
+  } catch (err) {
+    console.error("JSON parse failed. Clean response:", clean);
+    throw new Error("AI returned invalid JSON");
+  }
 };
 
 // ── Parse Delivery Date from natural text ─────────────────────────
@@ -796,8 +963,22 @@ app.post("/telegram/webhook", async (req, res) => {
     await sendMessage(chatId, "🔍 Extracting order details with AI...");
 
     let data;
-    try { data = await extractOrderFromImage(base64Image); }
-    catch (err) { await sendMessage(chatId, `❌ Failed to extract order data.\nError: ${err.message}`); return; }
+try {
+  console.log("Calling extractOrderFromImage...");
+  data = await extractOrderFromImage(base64Image);
+  console.log("Extraction success:", data);
+} catch (err) {
+  console.error("Extraction failed:", err);
+
+  await sendMessage(
+    chatId,
+    `❌ AI extraction failed.\n\n` +
+    `Reason: ${err.message}\n\n` +
+    `Please resend a clearer photo or try again later.`
+  );
+
+  return;
+}
 
     if (!data.soNumber) {
       await sendMessage(chatId, "❌ Could not find SO Number in the image. Please try again with a clearer image.");
