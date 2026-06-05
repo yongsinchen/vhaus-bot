@@ -1225,16 +1225,22 @@ const handleFlagCommand = async (chatId, text, from) => {
 
 // ── Get Next SV Number ────────────────────────────────────────────
 const getNextSvNumber = async () => {
-  const { data, error } = await supabase
-    .from("orders")
-    .select("sv_number")
-    .not("sv_number", "is", null)
-    .order("sv_number", { ascending: false })
-    .limit(1);
-  if (error || !data || data.length === 0) return "SV-001";
-  const last = data[0].sv_number; // e.g. "SV-007"
-  const num = parseInt(last.replace("SV-", "")) + 1;
-  return `SV-${String(num).padStart(3, "0")}`;
+  // Check both orders and order_trips tables since SV numbers exist in both
+  const [ordersRes, tripsRes] = await Promise.all([
+    supabase.from("orders").select("sv_number").not("sv_number", "is", null).order("sv_number", { ascending: false }).limit(1),
+    supabase.from("order_trips").select("sv_number").not("sv_number", "is", null).order("sv_number", { ascending: false }).limit(1),
+  ]);
+
+  const allSvNumbers = [
+    ...(ordersRes.data || []).map(r => r.sv_number),
+    ...(tripsRes.data || []).map(r => r.sv_number),
+  ].filter(Boolean);
+
+  if (allSvNumbers.length === 0) return "SV-001";
+
+  // Find the highest SV number across both tables
+  const maxNum = Math.max(...allSvNumbers.map(sv => parseInt(sv.replace("SV-", "")) || 0));
+  return `SV-${String(maxNum + 1).padStart(3, "0")}`;
 };
 
 // ── Parse Delivery Template from Group B ─────────────────────────
