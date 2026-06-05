@@ -1478,7 +1478,7 @@ app.get("/order-trips", async (req, res) => {
   if (!date) return res.status(400).json({ error: "date is required" });
   const { data, error } = await supabase
     .from("order_trips")
-    .select("*, orders!order_trips_so_number_fkey(customer_name, address, contact, items, time_slot, balance, salesman, remark)")
+    .select("*, orders!order_trips_so_number_fkey(id, so_number, customer_name, address, contact, items, time_slot, balance, salesman, remark)")
     .eq("scheduled_date", date)
     .in("status", ["Scheduled", "Assigned"])
     .order("trip_no");
