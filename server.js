@@ -24,8 +24,31 @@ const supabase = createClient(
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // set this in your .env
-const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID; // Group B — drivers send delivery templates here
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
+const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
+
+// ── Working days helper ───────────────────────────────────────────
+const getNextWorkingDays = (n, fromDate = null) => {
+  const days = [];
+  const d = fromDate ? new Date(fromDate + "T00:00:00+08:00") : new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kuala_Lumpur" }));
+  while (days.length < n) {
+    d.setDate(d.getDate() + 1);
+    if (d.getDay() !== 0) { // skip Sunday only — Saturday is a working day
+      days.push(d.toISOString().split("T")[0]);
+    }
+  }
+  return days;
+};
+
+const isWithinWorkingDays = (dateStr, n = 2) => {
+  const blocked = getNextWorkingDays(n);
+  return blocked.includes(dateStr);
+};
+
+// ── Pending reschedule approvals ─────────────────────────────────
+// Key: soNumber — stores pending approval details
+const pendingApprovals = new Map();
 
 // ── Session State Manager ────────────────────────────────────────
 // Replaces simple pendingOrders map with full guided session system
@@ -745,6 +768,55 @@ const handleScheduleCommand = async (chatId, text) => {
   await sendMessage(chatId, reply);
 };
 
+// ── Handle /approve and /reject commands (OM only) ───────────────
+const handleApprovalCommand = async (chatId, userId, text) => {
+  if (String(userId) !== OPERATION_MANAGER_ID) {
+    await sendMessage(chatId, "❌ Only the Operation Manager can approve or reject reschedule requests.");
+    return;
+  }
+
+  const isApprove = text.startsWith("/approve");
+  const soNumber = text.split(/\s+/)[1]?.trim();
+  if (!soNumber) {
+    await sendMessage(chatId, `Usage: /${isApprove ? "approve" : "reject"} <SO Number>
+Example: /${isApprove ? "approve" : "reject"} 11576`);
+    return;
+  }
+
+  const approval = pendingApprovals.get(soNumber);
+  if (!approval) {
+    await sendMessage(chatId, `❌ No pending reschedule request found for SO *${soNumber}*.`);
+    return;
+  }
+
+  pendingApprovals.delete(soNumber);
+
+  if (isApprove) {
+    // Apply the reschedule
+    const { isTrip, tripId, tripNo, orderId, newDate, customerName, salesmanName } = approval;
+    if (isTrip) {
+      await supabase.from("order_trips").update({ scheduled_date: newDate }).eq("id", tripId);
+      if (tripNo === 1) await supabase.from("orders").update({ delivery_date: newDate }).eq("so_number", soNumber);
+    } else {
+      await supabase.from("orders").update({ delivery_date: newDate }).eq("id", orderId);
+    }
+    await sendMessage(chatId, `✅ *Approved*\n\nSO *${soNumber}*${isTrip ? ` Trip ${tripNo}` : ""} rescheduled to *${fmtDate(newDate)}*.`);
+    // Notify salesman
+    if (approval.salesmanChatId) {
+      await sendMessage(approval.salesmanChatId,
+        `✅ *Reschedule Approved*\n\nYour request to reschedule SO *${soNumber}* to *${fmtDate(newDate)}* has been approved by the Operation Manager.`
+      );
+    }
+  } else {
+    await sendMessage(chatId, `❌ *Rejected*\n\nReschedule request for SO *${soNumber}* has been rejected.`);
+    if (approval.salesmanChatId) {
+      await sendMessage(approval.salesmanChatId,
+        `❌ *Reschedule Rejected*\n\nYour request to reschedule SO *${soNumber}* to *${fmtDate(approval.newDate)}* was rejected by the Operation Manager.\n\nPlease contact admin for alternative arrangements.`
+      );
+    }
+  }
+};
+
 // ── Show Main Menu ───────────────────────────────────────────────
 const showMenu = async (chatId, intro = "") => {
   const lines = [
@@ -953,61 +1025,108 @@ _e.g. 5/3, 5/3/2026, tmr_`
       return true;
     }
 
-    // step: waiting_date
-    if (session.step === "waiting_date") {
-      const newDate = parseDateInput(text);
-      if (!newDate) {
-        await sendMessage(chatId, `⚠️ Could not understand date: "${text}"\nPlease use format like: 5/3, 5/3/2026, tmr, or TBC`);
-        return true;
-      }
+     // step: waiting_date
+     if (session.step === "waiting_date") {
+       const newDate = parseDateInput(text);
+       if (!newDate) {
+         await sendMessage(chatId, `⚠️ Could not understand date: "${text}"\nPlease use format like: 5/3, 5/3/2026, tmr, or TBC`);
+         return true;
+       }
 
-      const { soNumber, tripNo, tripId, orderId, currentDate, customerName, isTrip } = session.data;
-      const isTbc = newDate === "TBC";
-      const dbDate = isTbc ? null : newDate;
-      const displayDate = isTbc ? "TBC (no date set)" : fmtDate(newDate);
+       const { soNumber, tripNo, tripId, orderId, currentDate, customerName, isTrip } = session.data;
+       const isTbc = newDate === "TBC";
+       const dbDate = isTbc ? null : newDate;
+       const displayDate = isTbc ? "TBC (no date set)" : fmtDate(newDate);
 
-      if (isTrip) {
-        const updatePayload = { scheduled_date: dbDate };
-        if (isTbc) updatePayload.status = "Scheduled";
-        const { error } = await supabase.from("order_trips").update(updatePayload).eq("id", tripId);
-        if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
+       // ── 2-working-day rule check ──────────────────────────────
+       if (!isTbc && isWithinWorkingDays(newDate, 2)) {
+         // Check if date has a Confirmed route
+         const { data: confirmedRoutes } = await supabase
+           .from("delivery_routes")
+           .select("id, lorry_plate, driver_name")
+           .eq("delivery_date", newDate)
+           .eq("status", "Confirmed");
 
-        // If this is Trip 1, also sync orders.delivery_date to match
-        if (tripNo === 1) {
-          await supabase.from("orders").update({ delivery_date: dbDate }).eq("so_number", soNumber);
-        }
+         if (confirmedRoutes && confirmedRoutes.length > 0) {
+           const salesmanName = from?.first_name
+             ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
+             : (from?.username || "Unknown");
 
-        clearSession(key);
-        await sendMessage(chatId,
-          `✅ *Trip ${isTbc ? "Set to TBC" : "Rescheduled"}*\n\n` +
-          `📋 SO: ${soNumber} — Trip ${tripNo}\n` +
-          `📅 Old date: ${fmtDate(currentDate)}\n` +
-          `📅 New date: *${displayDate}*\n\n` +
-          (tripNo === 1 ? `_Delivery date on order updated to match._\n` : "") +
-          `_Delivery schedule has been updated._`
-        );
-      } else {
-        const { data: existingOrder } = await supabase.from("orders").select("remark").eq("id", orderId).single();
-        const updatedRemark = isTbc && existingOrder
-          ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
-          : existingOrder?.remark;
-        const { error } = await supabase.from("orders").update({
-          delivery_date: dbDate,
-          ...(isTbc && { remark: updatedRemark })
-        }).eq("id", orderId);
-        if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
-        clearSession(key);
-        await sendMessage(chatId,
-          `✅ *Delivery Date ${isTbc ? "Set to TBC" : "Updated"}*\n\n` +
-          `📋 SO: ${soNumber}${customerName ? ` — ${customerName}` : ""}\n` +
-          `📅 Old date: ${fmtDate(currentDate)}\n` +
-          `📅 New date: *${displayDate}*\n\n` +
-          `_Delivery schedule has been updated._`
-        );
-      }
-      return true;
-    }
-  }
+           // Store pending approval
+           pendingApprovals.set(soNumber, {
+             isTrip, tripId, tripNo, orderId, newDate,
+             soNumber, customerName, salesmanName,
+             salesmanChatId: chatId,
+           });
+
+           clearSession(key);
+
+           // Tell salesman request is pending
+           await sendMessage(chatId,
+             `⚠️ *Approval Required*\n\n` +
+             `${fmtDate(newDate)} is within the next 2 working days and already has a *Confirmed* route.\n\n` +
+             `Your reschedule request for SO *${soNumber}* has been sent to the Operation Manager for approval.\n\n` +
+             `_You will be notified once approved or rejected._`
+           );
+
+           // Notify Operation Manager
+           const routeInfo = confirmedRoutes.map(r => `${r.lorry_plate || ""} ${r.driver_name || ""}`.trim()).join(", ");
+           await sendMessage(OPERATION_MANAGER_ID,
+             `🔔 *Reschedule Approval Needed*\n\n` +
+             `👤 Salesman: ${salesmanName}\n` +
+             `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
+             (isTrip ? `🔄 Trip ${tripNo}\n` : "") +
+             `📅 Requested date: *${fmtDate(newDate)}*\n\n` +
+             `⚠️ This date already has a Confirmed route: ${routeInfo}\n\n` +
+             `Reply:\n` +
+             `✅ /approve ${soNumber} — to approve\n` +
+             `❌ /reject ${soNumber} — to reject`
+           );
+           return true;
+         }
+       }
+
+       // No confirmed route conflict — apply directly
+       if (isTrip) {
+         const updatePayload = { scheduled_date: dbDate };
+         if (isTbc) updatePayload.status = "Scheduled";
+         const { error } = await supabase.from("order_trips").update(updatePayload).eq("id", tripId);
+         if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
+         if (tripNo === 1) {
+           await supabase.from("orders").update({ delivery_date: dbDate }).eq("so_number", soNumber);
+         }
+         clearSession(key);
+         await sendMessage(chatId,
+           `✅ *Trip ${isTbc ? "Set to TBC" : "Rescheduled"}*\n\n` +
+           `📋 SO: ${soNumber} — Trip ${tripNo}\n` +
+           `📅 Old date: ${fmtDate(currentDate)}\n` +
+           `📅 New date: *${displayDate}*\n\n` +
+           (tripNo === 1 ? `_Delivery date on order updated to match._\n` : "") +
+           `_Delivery schedule has been updated._`
+         );
+       } else {
+         const { data: existingOrder } = await supabase.from("orders").select("remark").eq("id", orderId).single();
+         const updatedRemark = isTbc && existingOrder
+           ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
+           : existingOrder?.remark;
+         const { error } = await supabase.from("orders").update({
+           delivery_date: dbDate,
+           ...(isTbc && { remark: updatedRemark })
+         }).eq("id", orderId);
+         if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
+         clearSession(key);
+         await sendMessage(chatId,
+           `✅ *Delivery Date ${isTbc ? "Set to TBC" : "Updated"}*\n\n` +
+           `📋 SO: ${soNumber}${customerName ? ` — ${customerName}` : ""}\n` +
+           `📅 Old date: ${fmtDate(currentDate)}\n` +
+           `📅 New date: *${displayDate}*\n\n` +
+           `_Delivery schedule has been updated._`
+         );
+       }
+       return true;
+     }
+   }
+
 
   // ── FLAG flow ─────────────────────────────────────────────────
   if (session?.mode === "flag") {
@@ -1648,14 +1767,25 @@ app.patch("/delivery/routes/:id", async (req, res) => {
   const { id } = req.params;
 
   const { data: current } = await supabase.from("delivery_routes").select("status, delivery_date").eq("id", id).single();
-  const isLocked = current?.status === "Out for Delivery" || current?.status === "Delivered";
+  const isHardLocked = current?.status === "Out for Delivery" || current?.status === "Delivered";
+  const isConfirmed = current?.status === "Confirmed";
 
-  if (isLocked) {
+  // Hard locked — only allow status transitions
+  if (isHardLocked) {
     const keys = Object.keys(req.body);
     const onlyStatus = keys.length === 1 && keys[0] === "status";
     const validTransition = req.body.status === "Delivered" || req.body.status === "Out for Delivery";
     if (!onlyStatus || !validTransition) {
       return res.status(403).json({ error: "Route is locked. Only status update is allowed." });
+    }
+  }
+
+  // Confirmed — allow unlock back to Pending, or upgrade to Out for Delivery
+  // Block any other field edits
+  if (isConfirmed && req.body.status !== "Pending" && req.body.status !== "Out for Delivery" && req.body.status !== "Delivered") {
+    const keys = Object.keys(req.body);
+    if (keys.some(k => k !== "status")) {
+      return res.status(403).json({ error: "Route is Confirmed. Unlock to Pending first before editing." });
     }
   }
 
@@ -1714,8 +1844,8 @@ app.patch("/delivery/routes/:id", async (req, res) => {
 app.delete("/delivery/routes/:id", async (req, res) => {
   const { id } = req.params;
   const { data: current } = await supabase.from("delivery_routes").select("status").eq("id", id).single();
-  if (current?.status === "Out for Delivery" || current?.status === "Delivered") {
-    return res.status(403).json({ error: "Route is locked and cannot be deleted." });
+  if (current?.status === "Out for Delivery" || current?.status === "Delivered" || current?.status === "Confirmed") {
+    return res.status(403).json({ error: "Route is Confirmed or locked and cannot be deleted. Unlock first." });
   }
   const { error } = await supabase.from("delivery_routes").delete().eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
@@ -1731,8 +1861,8 @@ app.post("/delivery/routes/:routeId/orders", async (req, res) => {
 
   // Lock check
   const { data: route } = await supabase.from("delivery_routes").select("status").eq("id", routeId).single();
-  if (route?.status === "Out for Delivery" || route?.status === "Delivered") {
-    return res.status(403).json({ error: "Route is locked. Cannot add orders." });
+  if (route?.status === "Out for Delivery" || route?.status === "Delivered" || route?.status === "Confirmed") {
+    return res.status(403).json({ error: "Route is Confirmed or locked. Unlock to Pending first." });
   }
 
   const { data, error } = await supabase
@@ -1753,8 +1883,8 @@ app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
 
   // Lock check
   const { data: route } = await supabase.from("delivery_routes").select("status").eq("id", routeId).single();
-  if (route?.status === "Out for Delivery" || route?.status === "Delivered") {
-    return res.status(403).json({ error: "Route is locked. Cannot update orders." });
+  if (route?.status === "Out for Delivery" || route?.status === "Delivered" || route?.status === "Confirmed") {
+    return res.status(403).json({ error: "Route is Confirmed or locked. Unlock to Pending first." });
   }
 
   const updates = {};
@@ -1782,8 +1912,8 @@ app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
 
   // Lock check
   const { data: route } = await supabase.from("delivery_routes").select("status").eq("id", routeId).single();
-  if (route?.status === "Out for Delivery" || route?.status === "Delivered") {
-    return res.status(403).json({ error: "Route is locked. Cannot remove orders." });
+  if (route?.status === "Out for Delivery" || route?.status === "Delivered" || route?.status === "Confirmed") {
+    return res.status(403).json({ error: "Route is Confirmed or locked. Unlock to Pending first." });
   }
 
   const { error } = await supabase
@@ -1889,6 +2019,12 @@ app.post("/telegram/webhook", async (req, res) => {
       // /schedule (admin command — always works)
       if (text.startsWith("/schedule")) {
         await handleScheduleCommand(chatId, text);
+        return;
+      }
+
+      // /approve and /reject — OM only
+      if (text.startsWith("/approve") || text.startsWith("/reject")) {
+        await handleApprovalCommand(chatId, userId, text);
         return;
       }
 
