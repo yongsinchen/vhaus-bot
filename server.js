@@ -60,7 +60,7 @@ const pendingApprovals = new Map();
 const sessions = new Map();
 
 const TIMEOUTS = {
-  new_order: 10 * 60 * 1000,  // 10 minutes
+  new_order: 30 * 60 * 1000,  // 30 minutes (extended for multi-order sessions)
   reschedule: 5 * 60 * 1000,  // 5 minutes
   flag: 5 * 60 * 1000,        // 5 minutes
 };
@@ -687,24 +687,25 @@ const handlePendingDraftMessage = async (chatId, userId, text) => {
   if (["YES", "CONFIRM", "OK"].includes(upper)) {
     const result = await saveOrderToSupabase(draft);
     if (result.ok) {
-  pendingOrders.delete(draftKey);
-  await sendMessage(chatId, result.msg);
-} else if (result.duplicate) {
-  pendingOrders.delete(draftKey);
-  await sendMessage(chatId, result.msg);
-} else {
-  await sendMessage(
-    chatId,
-    result.msg + "\n\nDraft is still active. Make corrections and reply YES again."
-  );
-}
+      pendingOrders.delete(draftKey);
+      await sendMessage(chatId, result.msg);
+      // Loop back — ready for next order photo
+      setSession(draftKey, "new_order", "waiting_photo", {});
+      await sendMessage(chatId, "📷 Send the next sales order photo, or type *cancel* to stop.");
+    } else if (result.duplicate) {
+      pendingOrders.delete(draftKey);
+      await sendMessage(chatId, result.msg);
+    } else {
+      await sendMessage(chatId, result.msg + "\n\nDraft is still active. Make corrections and reply YES again.");
+    }
     return true;
   }
 
   // CANCEL → discard
   if (upper === "CANCEL") {
     pendingOrders.delete(draftKey);
-    await sendMessage(chatId, "🗑 Order draft discarded.");
+    clearSession(draftKey);
+    await showMenu(chatId, "🗑 Order draft discarded.");
     return true;
   }
 
@@ -923,10 +924,7 @@ const handleSession = async (chatId, userId, text, from) => {
             const tripErr = await createTrips(draft.soNumber, svNumber, draft.plannedTrips, draft.deliveryDate || null);
             if (!tripErr) {
               await sendMessage(chatId,
-                `${result.msg}
-
-🔄 *${draft.plannedTrips} trips pre-scheduled* (SV: ${svNumber})
-_Admin can assign dates in the delivery schedule._`
+                `${result.msg}\n\n🔄 *${draft.plannedTrips} trips pre-scheduled* (SV: ${svNumber})\n_Admin can assign dates in the delivery schedule._`
               );
             } else {
               await sendMessage(chatId, result.msg + "\n⚠️ Could not create trips: " + tripErr.message);
@@ -934,7 +932,9 @@ _Admin can assign dates in the delivery schedule._`
           } else {
             await sendMessage(chatId, result.msg);
           }
-          clearSession(key);
+          // Loop back — ready for next order without needing to type 1 again
+          setSession(key, "new_order", "waiting_photo", {});
+          await sendMessage(chatId, "📷 Send the next sales order photo, or type *cancel* to stop.");
         } else if (result.duplicate) {
           clearSession(key);
           await sendMessage(chatId, result.msg);
@@ -1912,7 +1912,7 @@ app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
 
 // ── DO OCR — Extract Delivery Order ──────────────────────────────
 const extractDOFromImage = async (base64Image) => {
-    const prompt = `You are a supplier Delivery Order (DO) OCR assistant for V Haus Living (PG) Sdn Bhd, a furniture and home furnishing company in Malaysia.
+  const prompt = `You are a supplier Delivery Order (DO) OCR assistant for V Haus Living (PG) Sdn Bhd, a furniture and home furnishing company in Malaysia.
 
 Your job is to extract supplier DO information and match it back to the correct V Haus Sales Order (SO).
 
@@ -2236,8 +2236,7 @@ No markdown.
 No explanation.
 No notes.
 No comments.
-No extra text.
-`;
+No extra text.`;
 
   const response = await withTimeout(
     openai.chat.completions.create({
