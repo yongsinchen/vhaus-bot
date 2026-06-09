@@ -26,6 +26,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
+const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
 // ── Working days helper ───────────────────────────────────────────
@@ -1908,6 +1909,260 @@ app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
   res.json({ success: true });
 });
 
+
+// ── DO OCR — Extract Delivery Order ──────────────────────────────
+const extractDOFromImage = async (base64Image) => {
+  const prompt = `You are a delivery order (DO) OCR assistant for V Haus Living (PG) Sdn Bhd, a furniture company in Penang, Malaysia.
+
+Extract all information from this supplier delivery order image.
+
+Return ONLY valid JSON with no extra text, no markdown, no explanation.
+
+Use this exact structure:
+{
+  "doNumber": "",
+  "supplier": "",
+  "doDate": "YYYY-MM-DD or empty",
+  "items": [
+    {
+      "itemCode": "",
+      "itemName": "",
+      "quantity": "",
+      "soNumber": "",
+      "isShowroom": false
+    }
+  ]
+}
+
+Rules:
+- doNumber: look for DO No, Delivery Order No, Package#, D/O No, or similar reference number.
+- supplier: the company name at the top of the document (not V Haus Living).
+- doDate: look for Date, Package Date, Delivery Date. Convert to YYYY-MM-DD. Use today if not found.
+- items: extract ALL line items from the DO.
+
+For each item:
+- itemCode: product/item code if shown (e.g. PMG MT8801-130, BD-WD-OU-WL-6, PL M2506). Leave empty if not shown.
+- itemName: full item description/name.
+- quantity: the quantity number and unit (e.g. "1 UNIT", "2 PCS", "1 PACK", "6.00 UNIT"). Include unit if shown.
+- soNumber: the customer SO/PO number linked to this specific item.
+
+SO Number extraction rules (VERY IMPORTANT):
+Look for SO numbers linked to each item. They appear in many formats:
+- "SO: 11576" or "SO:11576" — use the number directly
+- "PO: 31065" or "PO:31065" — use the number (e.g. 31065)
+- "PO:11632" inline in description — use 11632
+- Handwritten number at bottom or beside item (e.g. "11679")
+- "SO-26/05/0649" — extract the numeric part only (e.g. 0649 → look for the last numeric group)
+- If SO number appears at the TOP of the document (not per item), apply it to ALL items
+- If each item has its own SO/PO number, use that specific number per item
+
+Special cases:
+- "PO:YC" or "PO: YC" means this is a showroom/display item. Set soNumber to "" and isShowroom to true.
+- If no SO number can be found for an item, set soNumber to "" and isShowroom to false.
+- Sub-components marked with * or • under a main item are part of the same item — combine into one entry.
+- Ignore items that are clearly accessories with no SO reference (e.g. spare parts, packing materials).
+
+Return valid JSON only.`;
+
+  const response = await withTimeout(
+    openai.chat.completions.create({
+      model: "gpt-4o",
+      max_tokens: 2000,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}`, detail: "high" } }
+        ]
+      }]
+    }),
+    60000,
+    "DO extraction timeout"
+  );
+
+  const raw = response.choices?.[0]?.message?.content?.trim() || "";
+  if (!raw) throw new Error("AI returned empty response");
+  const clean = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+  try { return JSON.parse(clean); }
+  catch (err) { throw new Error("AI returned invalid JSON for DO"); }
+};
+
+// ── Handle DO Group Photo ─────────────────────────────────────────
+const handleDOPhoto = async (chatId, base64Image) => {
+  await sendMessage(chatId, "📦 Processing delivery order...");
+
+  let doData;
+  try {
+    doData = await extractDOFromImage(base64Image);
+  } catch (err) {
+    await sendMessage(chatId, `❌ Could not read the DO.\n\nReason: ${err.message}\n\nPlease try again with a clearer photo.`);
+    return;
+  }
+
+  if (!doData.items || doData.items.length === 0) {
+    await sendMessage(chatId, "❌ No items found in the DO. Please try again with a clearer photo.");
+    return;
+  }
+
+  const arrivalDate = new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
+  const results = { updated: [], notFound: [], showroom: [], duplicate: [] };
+
+  for (const item of doData.items) {
+    // Showroom items — log to do_review
+    if (item.isShowroom || !item.soNumber) {
+      await supabase.from("do_review").insert({
+        do_number: doData.doNumber || null,
+        supplier: doData.supplier || null,
+        do_date: doData.doDate || arrivalDate,
+        so_number: item.soNumber || null,
+        item_code: item.itemCode || null,
+        item_name: item.itemName || null,
+        quantity: item.quantity || null,
+        reason: item.isShowroom ? "showroom" : "no_so",
+        status: "Pending",
+      });
+      if (item.isShowroom) results.showroom.push(item.itemName);
+      else results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
+      continue;
+    }
+
+    // Find matching orders by SO number
+    const { data: orders } = await supabase
+      .from("orders")
+      .select("id, so_number, items, status")
+      .eq("so_number", item.soNumber)
+      .in("status", ["Pending", "In Progress"]);
+
+    if (!orders || orders.length === 0) {
+      await supabase.from("do_review").insert({
+        do_number: doData.doNumber || null,
+        supplier: doData.supplier || null,
+        do_date: doData.doDate || arrivalDate,
+        so_number: item.soNumber,
+        item_code: item.itemCode || null,
+        item_name: item.itemName || null,
+        quantity: item.quantity || null,
+        reason: "so_not_found",
+        status: "Pending",
+      });
+      results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
+      continue;
+    }
+
+    let updatedAny = false;
+    let alreadyHasDate = false;
+
+    for (const order of orders) {
+      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+      let matched = false;
+
+      const updatedItems = items.map(oi => {
+        // Match by item code first, then by name (case-insensitive partial match)
+        const codeMatch = item.itemCode && oi.itemCode &&
+          oi.itemCode.toLowerCase().trim() === item.itemCode.toLowerCase().trim();
+        const nameMatch = item.itemName && oi.itemName &&
+          (oi.itemName.toLowerCase().includes(item.itemName.toLowerCase().substring(0, 8)) ||
+           item.itemName.toLowerCase().includes(oi.itemName.toLowerCase().substring(0, 8)));
+
+        if (codeMatch || nameMatch) {
+          matched = true;
+          if (oi.arrivalDate) {
+            alreadyHasDate = true;
+            return oi; // keep existing date, flag as duplicate
+          }
+          return { ...oi, arrivalDate };
+        }
+        return oi;
+      });
+
+      if (matched) {
+        if (alreadyHasDate) {
+          // Duplicate — flag for review
+          await supabase.from("do_review").insert({
+            do_number: doData.doNumber || null,
+            supplier: doData.supplier || null,
+            do_date: doData.doDate || arrivalDate,
+            so_number: item.soNumber,
+            item_code: item.itemCode || null,
+            item_name: item.itemName || null,
+            quantity: item.quantity || null,
+            reason: "duplicate_arrival",
+            status: "Pending",
+          });
+          results.duplicate.push({ itemName: item.itemName, soNumber: item.soNumber });
+        } else {
+          await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
+          results.updated.push({ itemName: item.itemName, soNumber: item.soNumber });
+          updatedAny = true;
+        }
+      }
+    }
+
+    if (!updatedAny && !alreadyHasDate) {
+      // Item not matched in any order items
+      await supabase.from("do_review").insert({
+        do_number: doData.doNumber || null,
+        supplier: doData.supplier || null,
+        do_date: doData.doDate || arrivalDate,
+        so_number: item.soNumber,
+        item_code: item.itemCode || null,
+        item_name: item.itemName || null,
+        quantity: item.quantity || null,
+        reason: "item_not_matched",
+        status: "Pending",
+      });
+      results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
+    }
+  }
+
+  // Build reply
+  const lines = [
+    `📦 *DO Processed — ${doData.supplier || "Unknown Supplier"}*`,
+    `DO#: ${doData.doNumber || "-"} | Date: ${doData.doDate || arrivalDate}`,
+    `Arrival date set to: *${arrivalDate}*`,
+    ``,
+  ];
+
+  if (results.updated.length > 0) {
+    lines.push(`✅ *${results.updated.length} item(s) updated:*`);
+    results.updated.forEach(r => lines.push(`  • ${r.itemName} (SO ${r.soNumber})`));
+    lines.push(``);
+  }
+
+  if (results.duplicate.length > 0) {
+    lines.push(`⚠️ *${results.duplicate.length} item(s) already have arrival date — sent to review:*`);
+    results.duplicate.forEach(r => lines.push(`  • ${r.itemName} (SO ${r.soNumber})`));
+    lines.push(``);
+  }
+
+  if (results.showroom.length > 0) {
+    lines.push(`🏷️ *${results.showroom.length} showroom item(s) logged:*`);
+    results.showroom.forEach(name => lines.push(`  • ${name}`));
+    lines.push(``);
+  }
+
+  if (results.notFound.length > 0) {
+    lines.push(`❌ *${results.notFound.length} item(s) unmatched — check web app DO Review:*`);
+    results.notFound.forEach(r => lines.push(`  • ${r.itemName}${r.soNumber ? ` (SO ${r.soNumber})` : ""}`));
+  }
+
+  if (results.notFound.length > 0 || results.duplicate.length > 0) {
+    lines.push(``);
+    lines.push(`_Check DO Review tab in web app to resolve unmatched items._`);
+    if (ADMIN_CHAT_ID) {
+      await sendMessage(ADMIN_CHAT_ID,
+        `📦 *DO Review Required*\n\n` +
+        `Supplier: ${doData.supplier || "-"}\n` +
+        `DO#: ${doData.doNumber || "-"}\n\n` +
+        `${results.duplicate.length} duplicate(s), ${results.notFound.length} unmatched item(s).\n` +
+        `🔗 https://vhaus-delivery.vercel.app`
+      );
+    }
+  }
+
+  await sendMessage(chatId, lines.join("\n"));
+};
+
 // ── Service Pending API ──────────────────────────────────────────
 
 // GET /service-pending
@@ -1978,6 +2233,53 @@ app.delete("/service-pending/:id", async (req, res) => {
   res.json({ success: true });
 });
 
+// ── DO Review API ────────────────────────────────────────────────
+
+// GET /do-review — list all pending DO review items
+app.get("/do-review", async (req, res) => {
+  const { data, error } = await supabase
+    .from("do_review")
+    .select("*")
+    .eq("status", "Pending")
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// PATCH /do-review/:id/resolve — mark as resolved (admin linked manually)
+app.patch("/do-review/:id/resolve", async (req, res) => {
+  const { id } = req.params;
+  const { so_number, item_code, arrival_date } = req.body;
+
+  // If admin provides SO + item to link, update the order item
+  if (so_number && item_code) {
+    const date = arrival_date || new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
+    const { data: orders } = await supabase.from("orders").select("id, items").eq("so_number", so_number).in("status", ["Pending", "In Progress"]);
+    for (const order of (orders || [])) {
+      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+      const updated = items.map(oi => {
+        if (oi.itemCode === item_code || (oi.itemName && oi.itemName.toLowerCase().includes(item_code.toLowerCase()))) {
+          return { ...oi, arrivalDate: date };
+        }
+        return oi;
+      });
+      await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
+    }
+  }
+
+  const { error } = await supabase.from("do_review").update({ status: "Resolved" }).eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// PATCH /do-review/:id/dismiss — dismiss (not applicable)
+app.patch("/do-review/:id/dismiss", async (req, res) => {
+  const { id } = req.params;
+  const { error } = await supabase.from("do_review").update({ status: "Dismissed" }).eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── Telegram Webhook ──────────────────────────────────────────────
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200);
@@ -1992,6 +2294,19 @@ app.post("/telegram/webhook", async (req, res) => {
     if (String(chatId) === String(DELIVERY_GROUP_CHAT_ID)) {
       if (message.text) {
         await handleDeliveryTemplate(chatId, message.text);
+      }
+      return;
+    }
+
+    // ── Group C: DO (Supplier Delivery Order) photos ──────────────
+    if (String(chatId) === String(DO_GROUP_CHAT_ID)) {
+      if (message.photo && message.photo.length > 0) {
+        const photo = message.photo[message.photo.length - 1];
+        const fileUrl = await getFileUrl(photo.file_id);
+        const base64Image = await downloadImageAsBase64(fileUrl);
+        await handleDOPhoto(chatId, base64Image);
+      } else if (message.text) {
+        await sendMessage(chatId, "📷 Please send a photo of the supplier delivery order to process it.");
       }
       return;
     }
