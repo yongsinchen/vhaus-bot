@@ -964,66 +964,49 @@ Reply YES / CANCEL or correct again.`);
 
     // step: waiting_so — waiting for SO + optional trip number
     if (session.step === "waiting_so") {
-      // Parse: "11576 trip 2" or "11576 2" or just "11576"
       const tripMatch = text.match(/(\d+)\s+(?:trip\s*)?(\d+)/i);
       const soOnly = text.match(/^(\d+)$/);
       const soNumber = tripMatch ? tripMatch[1] : (soOnly ? soOnly[1] : text.trim());
       const tripNo = tripMatch ? parseInt(tripMatch[2]) : null;
 
-      // Look up in order_trips or orders
       if (tripNo) {
         const { data: trip } = await supabase
-          .from("order_trips")
-          .select("*")
-          .eq("so_number", soNumber)
-          .eq("trip_no", tripNo)
-          .maybeSingle();
-
+          .from("order_trips").select("*")
+          .eq("so_number", soNumber).eq("trip_no", tripNo).maybeSingle();
         if (!trip) {
-          await sendMessage(chatId, `❌ Trip ${tripNo} for SO *${soNumber}* not found.
-Please check and try again.`);
+          await sendMessage(chatId, `❌ Trip ${tripNo} for SO *${soNumber}* not found.\nPlease check and try again.`);
           return true;
         }
         if (trip.status === "Completed" || trip.status === "Cancelled") {
           await sendMessage(chatId, `❌ Trip ${tripNo} is already *${trip.status}* and cannot be rescheduled.`);
           return true;
         }
-
         setSession(key, "reschedule", "waiting_date", { soNumber, tripNo, tripId: trip.id, currentDate: trip.scheduled_date, isTrip: true });
         await sendMessage(chatId,
-          `📋 *SO ${soNumber} — Trip ${tripNo} of ${trip.total_trips}*
-` +
-          `📅 Currently scheduled: *${fmtDate(trip.scheduled_date)}*
-
-` +
-          `What is the new date?
-_e.g. 5/3, 5/3/2026, tmr_`
+          `📋 *SO ${soNumber} — Trip ${tripNo} of ${trip.total_trips}*\n` +
+          `📅 Currently scheduled: *${fmtDate(trip.scheduled_date)}*\n\n` +
+          `What is the new date?\n_e.g. 5/3, 5/3/2026, tmr, TBC_`
         );
       } else {
-        // Single trip order — update delivery_date on orders
+        // Find order — check both Delivery and Service types
         const { data: order } = await supabase
-          .from("orders").select("id, so_number, customer_name, delivery_date")
-          .eq("so_number", soNumber).eq("type", "Delivery").maybeSingle();
-
+          .from("orders").select("id, so_number, customer_name, delivery_date, type")
+          .eq("so_number", soNumber).in("type", ["Delivery", "Service"]).maybeSingle();
         if (!order) {
-          await sendMessage(chatId, `❌ SO *${soNumber}* not found.
-Please check and try again.`);
+          await sendMessage(chatId, `❌ SO *${soNumber}* not found.\nPlease check and try again.`);
           return true;
         }
-
+        const label = order.type === "Service" ? "🔧 Service" : "🚚 Delivery";
         setSession(key, "reschedule", "waiting_date", { soNumber, orderId: order.id, currentDate: order.delivery_date, customerName: order.customer_name, isTrip: false });
         await sendMessage(chatId,
-          `📋 *SO ${soNumber}* — ${order.customer_name || ""}
-` +
-          `📅 Currently scheduled: *${fmtDate(order.delivery_date)}*
-
-` +
-          `What is the new date?
-_e.g. 5/3, 5/3/2026, tmr_`
+          `📋 *SO ${soNumber}* — ${order.customer_name || ""} _(${label})_\n` +
+          `📅 Currently scheduled: *${fmtDate(order.delivery_date)}*\n\n` +
+          `What is the new date?\n_e.g. 5/3, 5/3/2026, tmr, TBC_`
         );
       }
       return true;
     }
+
 
      // step: waiting_date
      if (session.step === "waiting_date") {
@@ -1197,62 +1180,37 @@ _Admin has been notified._`);
 // ── Bot: /start and /help command ───────────────────────────────
 const handleStartCommand = async (chatId, from) => {
   const name = from?.first_name || "there";
-  await sendMessage(chatId,
-    `👋 Hello ${name}! Welcome to *V Haus Living (PG) Bot*
-
-` +
-    `Here is what I can do:
-
-` +
-    `━━━━━━━━━━━━━━━━━━━━
-` +
-    `📷 *Submit a Sales Order*
-` +
-    `Send me a photo of the handwritten sales order.
-` +
-    `I will extract all details and show you a preview.
-` +
-    `Reply *YES* to save, *CANCEL* to discard,
-` +
-    `or tell me what to correct naturally.
-
-` +
-    `_e.g. "balance is 3840", "delivery date is 10/6"_
-
-` +
-    `━━━━━━━━━━━━━━━━━━━━
-` +
-    `📅 *Update Delivery Date*
-` +
-    `Send a message in this format:
-` +
-    `SO: 31074
-` +
-    `DELIVERY DATE: 10/6
-` +
-    `optional remark here
-
-` +
-    `━━━━━━━━━━━━━━━━━━━━
-` +
-    `🚨 *Flag a Wrong Order*
-` +
-    `If you saved an order with wrong info:
-` +
-    `/flag 31074 balance should be 3840
-
-` +
-    `━━━━━━━━━━━━━━━━━━━━
-` +
-    `🗓 *Check Delivery Schedule*
-` +
-    `/schedule 15/6
-
-` +
-    `━━━━━━━━━━━━━━━━━━━━
-` +
-    `Type /help anytime to see this menu again.`
-  );
+  const lines = [
+    `👋 Hello ${name}! Welcome to *V Haus Living (PG) Bot*`,
+    ``,
+    `Reply with a number to get started:`,
+    ``,
+    `1️⃣ *New Order* — Send a sales order photo`,
+    `2️⃣ *Reschedule* — Change a delivery or service date`,
+    `3️⃣ *Flag Wrong Order* — Report incorrect order info`,
+    `4️⃣ *Help* — Show this menu`,
+    ``,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `📷 *1 — New Order*`,
+    `Select 1, then send the sales order photo.`,
+    `Bot extracts all details → you confirm or correct.`,
+    `If wardrobe/fitting detected → bot asks how many trips.`,
+    ``,
+    `📅 *2 — Reschedule*`,
+    `Select 2, then enter the SO number.`,
+    `For multi-trip: enter SO + trip number e.g. _11576 Trip 2_`,
+    `Bot shows current date → you enter new date.`,
+    `Accepted formats: 5/3, 5/3/2026, tmr, TBC`,
+    ``,
+    `🚨 *3 — Flag Wrong Order*`,
+    `Select 3, enter SO number, then describe the issue.`,
+    `Admin will be notified to fix it.`,
+    ``,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `_Type /help anytime to see this menu._`,
+    `_Type cancel anytime to go back._`,
+  ];
+  await sendMessage(chatId, lines.join("\n"));
 };
 
 // ── Bot: /flag command ────────────────────────────────────────────
@@ -1414,14 +1372,32 @@ const handleDeliveryTemplate = async (chatId, text) => {
   const parsed = parseDeliveryTemplate(text);
   if (!parsed) {
     await sendMessage(chatId,
-      "⚠️ Could not read the template. Please use this format:\n\n" +
+      "⚠️ *Could not read the delivery report.*\n\n" +
+      "Please use this exact format:\n\n" +
+      "```\n" +
       "DELIVERY\n" +
       "SO: 11576\n" +
       "Driver: Seng\n" +
       "Kelindan: San\n" +
-      "Status: settle / no settle\n" +
-      "4/6/2026\n" +
-      "optional note"
+      "Status: settle\n" +
+      "9/6/2026\n" +
+      "optional note here\n" +
+      "```\n\n" +
+      "⚠️ *Common mistakes:*\n" +
+      "• Status must be *settle* or *no settle*\n" +
+      "• SO number must be correct\n" +
+      "• Date format: d/m/yyyy or d/m"
+    );
+    return true;
+  }
+  // Validate required fields
+  if (!parsed.soNumber || !parsed.driver || !parsed.statusRaw) {
+    await sendMessage(chatId,
+      "⚠️ *Missing required fields.*\n\n" +
+      (!parsed.soNumber ? "❌ SO number not found\n" : "") +
+      (!parsed.driver ? "❌ Driver name not found\n" : "") +
+      (!parsed.statusRaw ? "❌ Status (settle/no settle) not found\n" : "") +
+      "\nPlease check and resend."
     );
     return true;
   }
@@ -1621,6 +1597,16 @@ app.get("/order-trips/so/:soNumber", async (req, res) => {
     .order("trip_no");
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
+});
+
+// POST /order-trips/so/:soNumber/cancel-remaining already exists above
+// Additional: PATCH /order-trips/:id/cancel — cancel a single trip
+app.patch("/order-trips/:id/cancel", async (req, res) => {
+  const { id } = req.params;
+  const { data, error } = await supabase
+    .from("order_trips").update({ status: "Cancelled" }).eq("id", id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 // PATCH /order-trips/:id — update trip (date, status, driver, helper)
