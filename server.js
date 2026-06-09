@@ -10,9 +10,8 @@ const app = express();
 // ── CORS — must be before all routes ─────────────────────────────
 app.use(cors({
   origin: ["https://vhaus-delivery.vercel.app", "https://pulseos.vercel.app", "https://pulseos-my.vercel.app", "http://localhost:3000"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-user-id"],
-  methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
 app.options("*", cors());
 app.use(express.json());
@@ -29,17 +28,6 @@ const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
 const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
-
-// ── Telegram user lookup ─────────────────────────────────────────
-const getTelegramUser = async (telegramId) => {
-  const { data } = await supabase
-    .from("users")
-    .select("*, companies(id, name, code)")
-    .eq("telegram_id", String(telegramId))
-    .eq("is_active", true)
-    .single();
-  return data || null;
-};
 
 // ── Working days helper ───────────────────────────────────────────
 const getNextWorkingDays = (n, fromDate = null) => {
@@ -674,7 +662,6 @@ const saveOrderToSupabase = async (draft) => {
     items: JSON.stringify(draft.items || []),
     is_multi_trip: draft.isMultiTrip || false,
     planned_trips: draft.plannedTrips || 1,
-    company_id: draft.companyId || null,
   };
 
   const { error } = await supabase.from("orders").insert(payload);
@@ -836,7 +823,7 @@ Example: /${isApprove ? "approve" : "reject"} 11576`);
 const showMenu = async (chatId, intro = "") => {
   const lines = [
     intro || null,
-    "🏠 *PulseOS Bot*",
+    "🏠 *V Haus Living Bot*",
     "",
     "What would you like to do?",
     "",
@@ -1195,7 +1182,7 @@ _Admin has been notified._`);
 const handleStartCommand = async (chatId, from) => {
   const name = from?.first_name || "there";
   const lines = [
-    `👋 Hello ${name}! Welcome to *PulseOS Bot*`,
+    `👋 Hello ${name}! Welcome to *V Haus Living (PG) Bot*`,
     ``,
     `Reply with a number to get started:`,
     ``,
@@ -1701,11 +1688,10 @@ app.delete("/delivery/vehicles/:id", async (req, res) => {
 
 // GET /delivery/routes?date=2026-07-15
 app.get("/delivery/routes", async (req, res) => {
-  const { date, company_id } = req.query;
+  const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
-  let routesQuery = supabase.from("delivery_routes").select("*").eq("delivery_date", date);
-  if (company_id) routesQuery = routesQuery.eq("company_id", company_id);
-  const { data: routes, error: routeErr } = await routesQuery.order("created_at");
+  const { data: routes, error: routeErr } = await supabase
+    .from("delivery_routes").select("*").eq("delivery_date", date).order("created_at");
   if (routeErr) return res.status(500).json({ error: routeErr.message });
   const routesWithOrders = await Promise.all(routes.map(async (route) => {
     const { data: routeOrders } = await supabase
@@ -2455,10 +2441,11 @@ const handleDOPhoto = async (chatId, base64Image) => {
 
 // GET /service-pending
 app.get("/service-pending", async (req, res) => {
-  const { company_id } = req.query;
-  let query = supabase.from("service_pending").select("*").eq("status", "Pending").order("created_at", { ascending: false });
-  if (company_id) query = query.eq("company_id", company_id);
-  const { data, error } = await query;
+  const { data, error } = await supabase
+    .from("service_pending")
+    .select("*")
+    .eq("status", "Pending")
+    .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -2520,67 +2507,257 @@ app.delete("/service-pending/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// ── Auth Profile API ─────────────────────────────────────────────
-app.get("/auth/profile", async (req, res) => {
-  const userId = req.query.uid;
-  if (!userId) return res.status(400).json({ error: "Missing user ID" });
 
-  const { data: user, error } = await supabase
-    .from("users")
-    .select("*")
-    .eq("id", userId)
-    .single();
+// ── AI Auto-Scheduler ─────────────────────────────────────────────
 
-  if (error || !user) return res.status(404).json({ error: "User not found" });
+// GET /auto-schedule/orders?date=&company_id= — get unassigned orders with AI duration suggestions
+app.get("/auto-schedule/orders", async (req, res) => {
+  const { date, company_id } = req.query;
+  if (!date) return res.status(400).json({ error: "date required" });
 
-  let company = null;
-  if (user.company_id) {
-    const { data: companyData } = await supabase
-      .from("companies")
-      .select("id, name, code")
-      .eq("id", user.company_id)
+  // Get unassigned orders for the date
+  let query = supabase.from("orders").select("*")
+    .eq("delivery_date", date)
+    .in("status", ["Pending", "In Progress"]);
+  if (company_id) query = query.eq("company_id", company_id);
+  const { data: orders, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Get assigned order IDs for this date
+  const { data: assigned } = await supabase
+    .from("delivery_route_orders")
+    .select("order_id, delivery_routes!inner(delivery_date)")
+    .eq("delivery_routes.delivery_date", date);
+  const assignedIds = new Set((assigned || []).map(a => a.order_id));
+  const unassigned = (orders || []).filter(o => !assignedIds.has(o.id));
+
+  // For each order, get AI duration suggestion from history
+  const ordersWithSuggestions = await Promise.all(unassigned.map(async (order) => {
+    const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+    const itemKeywords = items.map(i => i.itemName).filter(Boolean).join(", ");
+
+    // Detect item type
+    const isWardrobe = itemKeywords.toLowerCase().match(/wardrobe|almari|fitting|installation/);
+    const itemType = order.type === "Service" ? "Service" : isWardrobe ? "Wardrobe" : "Delivery";
+
+    // Look up duration history for similar jobs
+    let suggestedDuration = null;
+    if (company_id) {
+      const { data: history } = await supabase
+        .from("duration_history")
+        .select("duration_minutes")
+        .eq("company_id", company_id)
+        .eq("item_type", itemType)
+        .order("created_at", { ascending: false })
+        .limit(10);
+
+      if (history && history.length > 0) {
+        const avg = Math.round(history.reduce((s, h) => s + h.duration_minutes, 0) / history.length);
+        suggestedDuration = avg;
+      } else {
+        // Default suggestions
+        suggestedDuration = itemType === "Wardrobe" ? 210 : itemType === "Service" ? 120 : 90;
+      }
+    }
+
+    return {
+      ...order,
+      items,
+      itemType,
+      itemKeywords,
+      suggestedDuration,
+      estimatedDuration: order.estimated_duration || suggestedDuration,
+    };
+  }));
+
+  // Get available vehicles
+  let vQuery = supabase.from("delivery_vehicles").select("*").eq("status", "Active");
+  if (company_id) vQuery = vQuery.eq("company_id", company_id);
+  const { data: vehicles } = await vQuery;
+
+  // Get company settings (base location, work hours)
+  const { data: settings } = company_id
+    ? await supabase.from("company_settings").select("*").eq("company_id", company_id).single()
+    : { data: null };
+
+  res.json({
+    orders: ordersWithSuggestions,
+    vehicles: vehicles || [],
+    settings: settings || { work_start: "09:00", work_end: "20:00", base_address: "Bukit Mertajam, Pulau Pinang" },
+  });
+});
+
+// POST /auto-schedule/generate — AI generates the schedule
+app.post("/auto-schedule/generate", async (req, res) => {
+  const { date, company_id, orders, vehicles, settings } = req.body;
+  if (!date || !orders || !vehicles) return res.status(400).json({ error: "Missing required fields" });
+
+  if (orders.length === 0) return res.status(400).json({ error: "No orders to schedule" });
+  if (vehicles.length === 0) return res.status(400).json({ error: "No vehicles available" });
+
+  const baseAddress = settings?.base_address || "Bukit Mertajam, Pulau Pinang";
+  const workStart = settings?.work_start || "09:00";
+  const workEnd = settings?.work_end || "20:00";
+
+  const prompt = `You are a delivery route scheduler for a furniture company in Penang/Kedah, Malaysia.
+
+Schedule the following orders across the available vehicles for ${date}.
+
+BASE LOCATION: ${baseAddress}
+WORKING HOURS: ${workStart} to ${workEnd}
+VEHICLES: ${vehicles.length} lorry/lorries available
+
+ORDERS TO SCHEDULE:
+${orders.map((o, i) => `
+Order ${i+1}:
+  SO: ${o.so_number}
+  Customer: ${o.customer_name}
+  Address: ${o.address}
+  Type: ${o.itemType} (${o.type})
+  Items: ${o.itemKeywords}
+  Duration: ${o.estimatedDuration} minutes
+  Time preference: ${o.time_slot || "No preference"}
+  Balance: ${parseFloat(o.balance) > 0 ? "RM " + o.balance + " outstanding" : "Settled"}
+`).join("")}
+
+VEHICLES:
+${vehicles.map((v, i) => "Vehicle " + (i+1) + ": " + (v.vehicle_plate || "No plate") + " - Driver: " + (v.driver_name || "TBD")).join("\n")}
+
+SCHEDULING RULES:
+1. Group orders by area to minimize travel time (Bukit Mertajam, Georgetown, Simpang Ampat, Seberang Jaya, Kepala Batas, Alor Setar etc are different areas)
+2. Schedule Wardrobe/fitting jobs EARLY in the day (they take 3-4 hours)
+3. Respect time preferences (morning=9AM-12PM, afternoon=12PM-3PM, evening=3PM-6PM, specific time = hard constraint)
+4. Service jobs go LAST (most variable)
+5. Factor in ~20-30 min travel between nearby areas, ~45-60 min between far areas
+6. Last stop must finish early enough to return to base by ${workEnd}
+7. If orders cannot all fit, flag overflow orders
+8. Distribute evenly across vehicles if multiple vehicles
+
+Return ONLY valid JSON, no markdown:
+{
+  "vehicles": [
+    {
+      "vehicle_id": "vehicle id or plate",
+      "vehicle_plate": "plate number",
+      "driver_name": "driver name",
+      "stops": [
+        {
+          "so_number": "SO number",
+          "customer_name": "name",
+          "address": "address",
+          "area": "detected area name",
+          "start_time": "09:00",
+          "end_time": "10:30",
+          "duration_minutes": 90,
+          "sequence": 1,
+          "notes": "any notes e.g. wardrobe assembly, collect balance"
+        }
+      ],
+      "return_time": "estimated return to base time",
+      "total_minutes": 0,
+      "warnings": []
+    }
+  ],
+  "overflow": [
+    {
+      "so_number": "SO number",
+      "reason": "why it cannot fit"
+    }
+  ],
+  "summary": "brief summary of the proposed schedule"
+}`;
+
+  try {
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: "gpt-4o",
+        max_tokens: 3000,
+        messages: [{ role: "user", content: prompt }]
+      }),
+      60000,
+      "Auto-scheduler timeout"
+    );
+
+    const raw = response.choices?.[0]?.message?.content?.trim() || "";
+    const clean = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+    const schedule = JSON.parse(clean);
+    res.json({ success: true, schedule });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /auto-schedule/approve — create routes from approved schedule
+app.post("/auto-schedule/approve", async (req, res) => {
+  const { date, company_id, schedule, durations } = req.body;
+  if (!date || !schedule) return res.status(400).json({ error: "Missing required fields" });
+
+  const createdRoutes = [];
+
+  for (const vehicle of schedule.vehicles) {
+    if (!vehicle.stops || vehicle.stops.length === 0) continue;
+
+    // Create route
+    const { data: route, error: routeErr } = await supabase
+      .from("delivery_routes")
+      .insert({
+        delivery_date: date,
+        lorry_plate: vehicle.vehicle_plate || null,
+        driver_name: vehicle.driver_name || null,
+        company_id: company_id || null,
+        status: "Confirmed",
+        notes: `Auto-scheduled. Est. return: ${vehicle.return_time || "-"}`,
+      })
+      .select()
       .single();
-    company = companyData || null;
+
+    if (routeErr) { console.error("Route create error:", routeErr); continue; }
+
+    // Add orders to route with sequence + time slots
+    for (const stop of vehicle.stops) {
+      const { data: order } = await supabase
+        .from("orders")
+        .select("id, estimated_duration")
+        .eq("so_number", stop.so_number)
+        .single();
+
+      if (!order) continue;
+
+      const timeRange = stop.start_time && stop.end_time
+        ? `${stop.start_time} - ${stop.end_time}`
+        : null;
+
+      await supabase.from("delivery_route_orders").insert({
+        route_id: route.id,
+        order_id: order.id,
+        sequence_no: stop.sequence,
+        scheduled_time_range: timeRange,
+        route_note: stop.notes || null,
+      });
+
+      // Update order time_slot
+      if (timeRange) {
+        await supabase.from("orders").update({ time_slot: timeRange }).eq("id", order.id);
+      }
+    }
+
+    createdRoutes.push(route);
   }
 
-  res.json({ ...user, companies: company });
-});
+  // Save duration history for learning
+  if (durations && durations.length > 0 && company_id) {
+    for (const d of durations) {
+      await supabase.from("duration_history").insert({
+        company_id,
+        item_type: d.itemType,
+        item_keywords: d.itemKeywords,
+        area: d.area,
+        duration_minutes: d.duration_minutes,
+      });
+    }
+  }
 
-// ── Admin User Management API ────────────────────────────────────
-// Uses Supabase service role key to create/update auth users
-
-// POST /admin/users — create new user
-app.post("/admin/users", async (req, res) => {
-  const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
-  if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
-
-  // Create auth user
-  const { data: authData, error: authErr } = await supabase.auth.admin.createUser({
-    email, password, email_confirm: true,
-  });
-  if (authErr) return res.status(400).json({ success: false, error: authErr.message });
-
-  // Create user profile
-  const { error: profileErr } = await supabase.from("users").insert({
-    id: authData.user.id,
-    name, email, role,
-    company_id: company_id || null,
-    telegram_id: telegram_id || null,
-    salesman_name: salesman_name || null,
-    is_active: true,
-  });
-  if (profileErr) return res.status(500).json({ success: false, error: profileErr.message });
-  res.json({ success: true, userId: authData.user.id });
-});
-
-// PATCH /admin/users/:id/password — update user password
-app.patch("/admin/users/:id/password", async (req, res) => {
-  const { id } = req.params;
-  const { password } = req.body;
-  if (!password) return res.status(400).json({ error: "Password required." });
-  const { error } = await supabase.auth.admin.updateUserById(id, { password });
-  if (error) return res.status(400).json({ success: false, error: error.message });
-  res.json({ success: true });
+  res.json({ success: true, routes: createdRoutes });
 });
 
 // ── DO Review API ────────────────────────────────────────────────
@@ -2659,22 +2836,6 @@ app.post("/telegram/webhook", async (req, res) => {
         await sendMessage(chatId, "📷 Please send a photo of the supplier delivery order to process it.");
       }
       return;
-    }
-
-    // ── Auth check for Group A (salesman bot) ─────────────────────
-    // Allow /start and /help without auth so unregistered users get a useful message
-    const isPublicCommand = message.text && ["/start", "/help", "4", "help"].includes(message.text.trim().toLowerCase());
-    if (!isPublicCommand) {
-      const telegramUser = await getTelegramUser(userId);
-      if (!telegramUser) {
-        await sendMessage(chatId,
-          `❌ *Not Registered*\n\nYour Telegram account is not linked to this system.\n\nPlease contact your manager to set up your account.`
-        );
-        return;
-      }
-      // Attach company_id to the draft key context
-      message._companyId = telegramUser.company_id;
-      message._telegramUser = telegramUser;
     }
 
     // ── Text messages ─────────────────────────────────────────────
