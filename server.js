@@ -17,8 +17,6 @@ app.use(cors({
 app.options("*", cors());
 app.use(express.json());
 
-
-//testing adding some notes to change the update
 // ── Clients ───────────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -2523,9 +2521,8 @@ app.delete("/service-pending/:id", async (req, res) => {
 });
 
 // ── Auth Profile API ─────────────────────────────────────────────
-// Uses service role key — bypasses RLS entirely
 app.get("/auth/profile", async (req, res) => {
-  const userId = req.headers["x-user-id"];
+  const userId = req.query.uid;
   if (!userId) return res.status(400).json({ error: "Missing user ID" });
 
   const { data: user, error } = await supabase
@@ -2536,7 +2533,6 @@ app.get("/auth/profile", async (req, res) => {
 
   if (error || !user) return res.status(404).json({ error: "User not found" });
 
-  // Load company if exists
   let company = null;
   if (user.company_id) {
     const { data: companyData } = await supabase
