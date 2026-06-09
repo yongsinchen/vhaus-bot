@@ -9,7 +9,7 @@ const app = express();
 
 // ── CORS — must be before all routes ─────────────────────────────
 app.use(cors({
-  origin: ["https://vhaus-delivery.vercel.app", "https://pulseos-my.vercel.app", "http://localhost:3000"],
+  origin: ["https://vhaus-delivery.vercel.app", "https://pulseos.vercel.app", "http://localhost:3000"],
   methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","Authorization"]
 }));
@@ -2517,6 +2517,34 @@ app.delete("/service-pending/:id", async (req, res) => {
   const { error } = await supabase.from("service_pending").update({ status: "Removed" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
+});
+
+// ── Auth Profile API ─────────────────────────────────────────────
+// Uses service role key — bypasses RLS entirely
+app.get("/auth/profile", async (req, res) => {
+  const userId = req.headers["x-user-id"];
+  if (!userId) return res.status(400).json({ error: "Missing user ID" });
+
+  const { data: user, error } = await supabase
+    .from("users")
+    .select("*")
+    .eq("id", userId)
+    .single();
+
+  if (error || !user) return res.status(404).json({ error: "User not found" });
+
+  // Load company if exists
+  let company = null;
+  if (user.company_id) {
+    const { data: companyData } = await supabase
+      .from("companies")
+      .select("id, name, code")
+      .eq("id", user.company_id)
+      .single();
+    company = companyData || null;
+  }
+
+  res.json({ ...user, companies: company });
 });
 
 // ── Admin User Management API ────────────────────────────────────
