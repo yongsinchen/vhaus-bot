@@ -9,7 +9,7 @@ const app = express();
 
 // ── CORS — must be before all routes ─────────────────────────────
 app.use(cors({
-  origin: ["https://vhaus-delivery.vercel.app", "https://pulseos.vercel.app", "http://localhost:3000"],
+  origin: ["https://vhaus-delivery.vercel.app", "https://pulseos-my.vercel.app", "http://localhost:3000"],
   methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","Authorization"]
 }));
