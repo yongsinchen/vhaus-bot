@@ -29,6 +29,17 @@ const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
 const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
+// ── Telegram user lookup ─────────────────────────────────────────
+const getTelegramUser = async (telegramId) => {
+  const { data } = await supabase
+    .from("users")
+    .select("*, companies(id, name, code)")
+    .eq("telegram_id", String(telegramId))
+    .eq("is_active", true)
+    .single();
+  return data || null;
+};
+
 // ── Working days helper ───────────────────────────────────────────
 const getNextWorkingDays = (n, fromDate = null) => {
   const days = [];
@@ -662,6 +673,7 @@ const saveOrderToSupabase = async (draft) => {
     items: JSON.stringify(draft.items || []),
     is_multi_trip: draft.isMultiTrip || false,
     planned_trips: draft.plannedTrips || 1,
+    company_id: draft.companyId || null,
   };
 
   const { error } = await supabase.from("orders").insert(payload);
@@ -823,7 +835,7 @@ Example: /${isApprove ? "approve" : "reject"} 11576`);
 const showMenu = async (chatId, intro = "") => {
   const lines = [
     intro || null,
-    "🏠 *V Haus Living Bot*",
+    "🏠 *PulseOS Bot*",
     "",
     "What would you like to do?",
     "",
@@ -1182,7 +1194,7 @@ _Admin has been notified._`);
 const handleStartCommand = async (chatId, from) => {
   const name = from?.first_name || "there";
   const lines = [
-    `👋 Hello ${name}! Welcome to *V Haus Living (PG) Bot*`,
+    `👋 Hello ${name}! Welcome to *PulseOS Bot*`,
     ``,
     `Reply with a number to get started:`,
     ``,
@@ -1688,10 +1700,11 @@ app.delete("/delivery/vehicles/:id", async (req, res) => {
 
 // GET /delivery/routes?date=2026-07-15
 app.get("/delivery/routes", async (req, res) => {
-  const { date } = req.query;
+  const { date, company_id } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
-  const { data: routes, error: routeErr } = await supabase
-    .from("delivery_routes").select("*").eq("delivery_date", date).order("created_at");
+  let routesQuery = supabase.from("delivery_routes").select("*").eq("delivery_date", date);
+  if (company_id) routesQuery = routesQuery.eq("company_id", company_id);
+  const { data: routes, error: routeErr } = await routesQuery.order("created_at");
   if (routeErr) return res.status(500).json({ error: routeErr.message });
   const routesWithOrders = await Promise.all(routes.map(async (route) => {
     const { data: routeOrders } = await supabase
@@ -2441,11 +2454,10 @@ const handleDOPhoto = async (chatId, base64Image) => {
 
 // GET /service-pending
 app.get("/service-pending", async (req, res) => {
-  const { data, error } = await supabase
-    .from("service_pending")
-    .select("*")
-    .eq("status", "Pending")
-    .order("created_at", { ascending: false });
+  const { company_id } = req.query;
+  let query = supabase.from("service_pending").select("*").eq("status", "Pending").order("created_at", { ascending: false });
+  if (company_id) query = query.eq("company_id", company_id);
+  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -2504,6 +2516,43 @@ app.delete("/service-pending/:id", async (req, res) => {
   const { id } = req.params;
   const { error } = await supabase.from("service_pending").update({ status: "Removed" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// ── Admin User Management API ────────────────────────────────────
+// Uses Supabase service role key to create/update auth users
+
+// POST /admin/users — create new user
+app.post("/admin/users", async (req, res) => {
+  const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
+  if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
+
+  // Create auth user
+  const { data: authData, error: authErr } = await supabase.auth.admin.createUser({
+    email, password, email_confirm: true,
+  });
+  if (authErr) return res.status(400).json({ success: false, error: authErr.message });
+
+  // Create user profile
+  const { error: profileErr } = await supabase.from("users").insert({
+    id: authData.user.id,
+    name, email, role,
+    company_id: company_id || null,
+    telegram_id: telegram_id || null,
+    salesman_name: salesman_name || null,
+    is_active: true,
+  });
+  if (profileErr) return res.status(500).json({ success: false, error: profileErr.message });
+  res.json({ success: true, userId: authData.user.id });
+});
+
+// PATCH /admin/users/:id/password — update user password
+app.patch("/admin/users/:id/password", async (req, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: "Password required." });
+  const { error } = await supabase.auth.admin.updateUserById(id, { password });
+  if (error) return res.status(400).json({ success: false, error: error.message });
   res.json({ success: true });
 });
 
@@ -2583,6 +2632,22 @@ app.post("/telegram/webhook", async (req, res) => {
         await sendMessage(chatId, "📷 Please send a photo of the supplier delivery order to process it.");
       }
       return;
+    }
+
+    // ── Auth check for Group A (salesman bot) ─────────────────────
+    // Allow /start and /help without auth so unregistered users get a useful message
+    const isPublicCommand = message.text && ["/start", "/help", "4", "help"].includes(message.text.trim().toLowerCase());
+    if (!isPublicCommand) {
+      const telegramUser = await getTelegramUser(userId);
+      if (!telegramUser) {
+        await sendMessage(chatId,
+          `❌ *Not Registered*\n\nYour Telegram account is not linked to this system.\n\nPlease contact your manager to set up your account.`
+        );
+        return;
+      }
+      // Attach company_id to the draft key context
+      message._companyId = telegramUser.company_id;
+      message._telegramUser = telegramUser;
     }
 
     // ── Text messages ─────────────────────────────────────────────
