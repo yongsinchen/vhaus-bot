@@ -17,6 +17,8 @@ app.use(cors({
 app.options("*", cors());
 app.use(express.json());
 
+
+//testing adding some notes to change the update
 // ── Clients ───────────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
