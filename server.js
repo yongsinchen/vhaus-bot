@@ -2834,32 +2834,6 @@ app.get("/auth/profile", async (req, res) => {
   res.json({ ...user, companies: company });
 });
 
-// ── Admin User Management API ─────────────────────────────────────
-app.post("/admin/users", async (req, res) => {
-  const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
-  if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
-  const { data: authData, error: authErr } = await supabase.auth.admin.createUser({ email, password, email_confirm: true });
-  if (authErr) return res.status(400).json({ success: false, error: authErr.message });
-  const { error: profileErr } = await supabase.from("users").insert({
-    id: authData.user.id, name, email, role,
-    company_id: company_id || null,
-    telegram_id: telegram_id || null,
-    salesman_name: salesman_name || null,
-    is_active: true,
-  });
-  if (profileErr) return res.status(500).json({ success: false, error: profileErr.message });
-  res.json({ success: true, userId: authData.user.id });
-});
-
-app.patch("/admin/users/:id/password", async (req, res) => {
-  const { id } = req.params;
-  const { password } = req.body;
-  if (!password) return res.status(400).json({ error: "Password required." });
-  const { error } = await supabase.auth.admin.updateUserById(id, { password });
-  if (error) return res.status(400).json({ success: false, error: error.message });
-  res.json({ success: true });
-});
-
 // ── DO Review API ────────────────────────────────────────────────
 
 // GET /do-review — list all pending DO review items
@@ -2922,6 +2896,17 @@ app.get("/auth/profile", async (req, res) => {
 });
 
 // ── Admin User Management API ─────────────────────────────────────
+
+// GET /admin/users/list — list all users (service role bypasses RLS)
+app.get("/admin/users/list", async (req, res) => {
+  const { company_id } = req.query;
+  let query = supabase.from("users").select("*, companies(name, code)").order("name");
+  if (company_id) query = query.eq("company_id", company_id);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
 app.post("/admin/users", async (req, res) => {
   const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
   if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
