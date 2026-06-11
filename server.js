@@ -2946,6 +2946,32 @@ app.patch("/admin/users/:id/password", async (req, res) => {
 });
 
 // ── Services API ──────────────────────────────────────────────────
+
+// GET /services/unscheduled — service orders with no delivery_date
+app.get("/services/unscheduled", async (req, res) => {
+  const { company_id } = req.query;
+  let query = supabase.from("orders").select("*")
+    .eq("type", "Service")
+    .is("delivery_date", null)
+    .not("status", "in", '("Delivered","Serviced","Cancelled")')
+    .order("created_at", { ascending: false });
+  if (company_id) query = query.eq("company_id", company_id);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// PATCH /orders/:id/set-date — set delivery date on an order
+app.patch("/orders/:id/set-date", async (req, res) => {
+  const { id } = req.params;
+  const { delivery_date } = req.body;
+  const { data, error } = await supabase.from("orders")
+    .update({ delivery_date: delivery_date || null })
+    .eq("id", id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 app.get("/services", async (req, res) => {
   const { company_id, salesman, status } = req.query;
   let query = supabase.from("orders").select("*").eq("type", "Service").order("created_at", { ascending: false });
