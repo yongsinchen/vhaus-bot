@@ -29,6 +29,30 @@ const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
 const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
+// ── Supabase Storage — Upload image ──────────────────────────────
+const uploadImageToStorage = async (base64Image, bucket, filename) => {
+  try {
+    const buffer = Buffer.from(base64Image, "base64");
+    const { error } = await supabase.storage
+      .from(bucket)
+      .upload(filename, buffer, { contentType: "image/jpeg", upsert: true });
+    if (error) { console.error("Storage upload error:", error.message); return null; }
+    const { data: urlData } = supabase.storage.from(bucket).getPublicUrl(filename);
+    return urlData?.publicUrl || null;
+  } catch (e) { console.error("uploadImageToStorage error:", e.message); return null; }
+};
+
+// ── Telegram user lookup ─────────────────────────────────────────
+const getTelegramUser = async (telegramId) => {
+  const { data } = await supabase
+    .from("users")
+    .select("*, companies(id, name, code)")
+    .eq("telegram_id", String(telegramId))
+    .eq("is_active", true)
+    .single();
+  return data || null;
+};
+
 // ── Working days helper ───────────────────────────────────────────
 const getNextWorkingDays = (n, fromDate = null) => {
   const days = [];
@@ -643,6 +667,14 @@ const saveOrderToSupabase = async (draft) => {
     };
   }
 
+  // Upload SO photo to Supabase Storage if available
+  let photoUrl = null;
+  if (draft.photoBase64) {
+    const month = new Date().toISOString().slice(0, 7);
+    const filename = `${month}/SO-${String(draft.soNumber || Date.now()).replace(/[^a-zA-Z0-9]/g, "-")}.jpg`;
+    photoUrl = await uploadImageToStorage(draft.photoBase64, "sales-order-photos", filename);
+  }
+
   const payload = {
     so_number: draft.soNumber || null,
     customer_name: draft.customerName || null,
@@ -662,6 +694,8 @@ const saveOrderToSupabase = async (draft) => {
     items: JSON.stringify(draft.items || []),
     is_multi_trip: draft.isMultiTrip || false,
     planned_trips: draft.plannedTrips || 1,
+    company_id: draft.companyId || null,
+    ...(photoUrl && { photo_url: photoUrl }),
   };
 
   const { error } = await supabase.from("orders").insert(payload);
@@ -2279,6 +2313,25 @@ const handleDOPhoto = async (chatId, base64Image) => {
   }
 
   const arrivalDate = new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
+
+  // Upload DO photo to Supabase Storage
+  let doPhotoUrl = null;
+  const doMonth = new Date().toISOString().slice(0, 7);
+  const safeSupplier = (doData.supplier || "unknown").replace(/[^a-zA-Z0-9]/g, "-").substring(0, 30);
+  const doFilename = `${doMonth}/DO-${safeSupplier}-${Date.now()}.jpg`;
+  doPhotoUrl = await uploadImageToStorage(base64Image, "supplier-do-photos", doFilename);
+
+  // Create supplier_deliveries record
+  const { data: supplierDelivery } = await supabase.from("supplier_deliveries").insert({
+    do_number: doData.doNumber || null,
+    supplier: doData.supplier || null,
+    do_date: doData.doDate || arrivalDate,
+    supplier_reference: doData.supplierReference || null,
+    photo_url: doPhotoUrl,
+    status: "Processed",
+  }).select().single();
+  const supplierDeliveryId = supplierDelivery?.id || null;
+
   const results = { updated: [], notFound: [], showroom: [], duplicate: [] };
 
   for (const item of doData.items) {
@@ -2294,6 +2347,7 @@ const handleDOPhoto = async (chatId, base64Image) => {
         quantity: item.quantity || null,
         reason: item.isShowroom ? "showroom" : "no_so",
         status: "Pending",
+        supplier_delivery_id: supplierDeliveryId || null,
       });
       if (item.isShowroom) results.showroom.push(item.itemName);
       else results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
@@ -2318,6 +2372,7 @@ const handleDOPhoto = async (chatId, base64Image) => {
         quantity: item.quantity || null,
         reason: "so_not_found",
         status: "Pending",
+        supplier_delivery_id: supplierDeliveryId || null,
       });
       results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
       continue;
@@ -2362,6 +2417,7 @@ const handleDOPhoto = async (chatId, base64Image) => {
             quantity: item.quantity || null,
             reason: "duplicate_arrival",
             status: "Pending",
+        supplier_delivery_id: supplierDeliveryId || null,
           });
           results.duplicate.push({ itemName: item.itemName, soNumber: item.soNumber });
         } else {
@@ -2384,6 +2440,7 @@ const handleDOPhoto = async (chatId, base64Image) => {
         quantity: item.quantity || null,
         reason: "item_not_matched",
         status: "Pending",
+        supplier_delivery_id: supplierDeliveryId || null,
       });
       results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
     }
@@ -2450,53 +2507,56 @@ app.get("/service-pending", async (req, res) => {
   res.json(data);
 });
 
-// POST /service-pending/:id/convert — convert to Service order
+// POST /service-pending/:id/convert — Option B: new service order linked to original
 app.post("/service-pending/:id/convert", async (req, res) => {
   const { id } = req.params;
-  const { remark: adminRemark } = req.body || {};
+  const { remark: adminRemark, delivery_date } = req.body || {};
 
   const { data: sp, error: spErr } = await supabase
     .from("service_pending").select("*").eq("id", id).single();
   if (spErr || !sp) return res.status(404).json({ error: "Service pending not found" });
 
-  // Get original order — filter by type=Delivery to avoid duplicates
-  const { data: order, error: orderErr } = await supabase
+  // Get original delivery order for customer info
+  const { data: origOrder } = await supabase
     .from("orders").select("*").eq("so_number", sp.so_number).eq("type", "Delivery").maybeSingle();
-  if (orderErr || !order) return res.status(404).json({ error: `Original delivery order for SO ${sp.so_number} not found` });
 
   // Get next SV number
   const svNumber = await getNextSvNumber();
 
-  // Build service note
-  const serviceNote = `${sp.so_number}${sp.note ? ` — ${sp.note}` : ""}`;
-
-  // Build remark combining existing remark + driver info + admin remark
-  const remarkParts = [
-    order.remark || null,
-    `Converted from Service Pending`,
-    `Driver: ${sp.driver}${sp.helper ? ` | Helper: ${sp.helper}` : ""}`,
+  const serviceNote = [
+    `Linked to SO: ${sp.so_number}`,
     sp.note ? `Issue: ${sp.note}` : null,
+    `Driver: ${sp.driver}${sp.helper ? ` | Helper: ${sp.helper}` : ""}`,
     adminRemark ? `Admin note: ${adminRemark}` : null,
-  ].filter(Boolean);
+  ].filter(Boolean).join(" | ");
 
-  // UPDATE the existing order — change type to Service, set sv_number
-  const { data: updatedOrder, error: updateErr } = await supabase
-    .from("orders")
-    .update({
-      type: "Service",
+  // CREATE NEW service order (original delivery stays intact)
+  const { data: newOrder, error: insertErr } = await supabase
+    .from("orders").insert({
+      so_number: sp.so_number,
       sv_number: svNumber,
+      customer_name: origOrder?.customer_name || null,
+      address: origOrder?.address || null,
+      contact: origOrder?.contact || null,
+      salesman: origOrder?.salesman || null,
+      order_amount: origOrder?.order_amount || null,
+      balance: origOrder?.balance || null,
+      delivery_date: delivery_date || null,
+      type: "Service",
       service_note: serviceNote,
-      remark: remarkParts.join(" | "),
+      remark: serviceNote,
       status: "Pending",
-    })
-    .eq("id", order.id)
-    .select().single();
-  if (updateErr) return res.status(500).json({ error: updateErr.message });
+      items: origOrder?.items || JSON.stringify([]),
+      linked_so: sp.so_number,
+      company_id: origOrder?.company_id || null,
+      photo_url: origOrder?.photo_url || null,
+    }).select().single();
+  if (insertErr) return res.status(500).json({ error: insertErr.message });
 
   // Mark service_pending as Converted
   await supabase.from("service_pending").update({ status: "Converted" }).eq("id", id);
 
-  res.json({ success: true, svNumber, order: updatedOrder });
+  res.json({ success: true, svNumber, order: newOrder });
 });
 
 // DELETE /service-pending/:id — remove (not applicable)
@@ -2847,6 +2907,107 @@ app.patch("/do-review/:id/dismiss", async (req, res) => {
   res.json({ success: true });
 });
 
+// ── Auth Profile API ─────────────────────────────────────────────
+app.get("/auth/profile", async (req, res) => {
+  const userId = req.query.uid;
+  if (!userId) return res.status(400).json({ error: "Missing user ID" });
+  const { data: user, error } = await supabase.from("users").select("*").eq("id", userId).single();
+  if (error || !user) return res.status(404).json({ error: "User not found" });
+  let company = null;
+  if (user.company_id) {
+    const { data: companyData } = await supabase.from("companies").select("id, name, code").eq("id", user.company_id).single();
+    company = companyData || null;
+  }
+  res.json({ ...user, companies: company });
+});
+
+// ── Admin User Management API ─────────────────────────────────────
+app.post("/admin/users", async (req, res) => {
+  const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
+  if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
+  const { data: authData, error: authErr } = await supabase.auth.admin.createUser({ email, password, email_confirm: true });
+  if (authErr) return res.status(400).json({ success: false, error: authErr.message });
+  const { error: profileErr } = await supabase.from("users").insert({
+    id: authData.user.id, name, email, role,
+    company_id: company_id || null, telegram_id: telegram_id || null,
+    salesman_name: salesman_name || null, is_active: true,
+  });
+  if (profileErr) return res.status(500).json({ success: false, error: profileErr.message });
+  res.json({ success: true, userId: authData.user.id });
+});
+
+app.patch("/admin/users/:id/password", async (req, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: "Password required." });
+  const { error } = await supabase.auth.admin.updateUserById(id, { password });
+  if (error) return res.status(400).json({ success: false, error: error.message });
+  res.json({ success: true });
+});
+
+// ── Services API ──────────────────────────────────────────────────
+app.get("/services", async (req, res) => {
+  const { company_id, salesman, status } = req.query;
+  let query = supabase.from("orders").select("*").eq("type", "Service").order("created_at", { ascending: false });
+  if (company_id) query = query.eq("company_id", company_id);
+  if (status) query = query.eq("status", status);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  let result = data || [];
+  if (salesman) {
+    const name = salesman.toLowerCase().trim();
+    result = result.filter(o => (o.salesman || "").split("/").map(s => s.trim().toLowerCase()).includes(name));
+  }
+  res.json(result);
+});
+
+// ── Supplier Deliveries API ───────────────────────────────────────
+app.get("/supplier-deliveries", async (req, res) => {
+  const { company_id, supplier, from_date, to_date, limit = 100 } = req.query;
+  let query = supabase.from("supplier_deliveries").select("*").order("created_at", { ascending: false }).limit(parseInt(limit));
+  if (company_id) query = query.eq("company_id", company_id);
+  if (supplier) query = query.ilike("supplier", `%${supplier}%`);
+  if (from_date) query = query.gte("do_date", from_date);
+  if (to_date) query = query.lte("do_date", to_date);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ── DO Review API ─────────────────────────────────────────────────
+app.get("/do-review", async (req, res) => {
+  const { data, error } = await supabase.from("do_review").select("*").eq("status", "Pending").order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.patch("/do-review/:id/resolve", async (req, res) => {
+  const { id } = req.params;
+  const { so_number, item_code, arrival_date } = req.body;
+  if (so_number && item_code) {
+    const date = arrival_date || new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
+    const { data: orders } = await supabase.from("orders").select("id, items").eq("so_number", so_number).in("status", ["Pending", "In Progress"]);
+    for (const order of (orders || [])) {
+      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+      const updated = items.map(oi => {
+        if (oi.itemCode === item_code || (oi.itemName && oi.itemName.toLowerCase().includes(item_code.toLowerCase()))) return { ...oi, arrivalDate: date };
+        return oi;
+      });
+      await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
+    }
+  }
+  const { error } = await supabase.from("do_review").update({ status: "Resolved" }).eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.patch("/do-review/:id/dismiss", async (req, res) => {
+  const { id } = req.params;
+  const { error } = await supabase.from("do_review").update({ status: "Dismissed" }).eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── Telegram Webhook ──────────────────────────────────────────────
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200);
@@ -2876,6 +3037,22 @@ app.post("/telegram/webhook", async (req, res) => {
         await sendMessage(chatId, "📷 Please send a photo of the supplier delivery order to process it.");
       }
       return;
+    }
+
+    // ── Auth check for Group A (salesman bot) ─────────────────────
+    const isPublicCommand = message.text && ["/start", "/help", "4", "help"].includes(message.text.trim().toLowerCase());
+    if (!isPublicCommand) {
+      const telegramUser = await getTelegramUser(userId);
+      if (!telegramUser) {
+        await sendMessage(chatId, `❌ *Not Registered*
+
+Your Telegram account is not linked to this system.
+
+Please contact your manager to set up your account.`);
+        return;
+      }
+      message._companyId = telegramUser.company_id;
+      message._telegramUser = telegramUser;
     }
 
     // ── Text messages ─────────────────────────────────────────────
@@ -2963,6 +3140,10 @@ app.post("/telegram/webhook", async (req, res) => {
       await sendMessage(chatId, "❌ Could not find SO Number in the image. Please try again with a clearer image.");
       return;
     }
+
+    // Attach photo + company to draft for storage on save
+    data.photoBase64 = base64Image;
+    if (message._telegramUser?.company_id) data.companyId = message._telegramUser.company_id;
 
     const normalized = normalizeDeliveryDate(data.deliveryDate, data.orderDate);
     data.deliveryDate = normalized.deliveryDate;
