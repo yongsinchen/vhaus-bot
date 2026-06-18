@@ -652,9 +652,13 @@ const saveOrderToSupabase = async (draft) => {
     ? (baseRemark ? `${baseRemark} | ${normalized.remarkNote}` : normalized.remarkNote)
     : baseRemark || null;
 
-  // ✅ Duplicate SO check AFTER declaring 'existing'
-  const { data: existing } = await supabase
-    .from("orders").select("id").eq("so_number", draft.soNumber).maybeSingle();
+  // ✅ Duplicate SO check — company-scoped to match UNIQUE(company_id, so_number)
+  // SO numbers are pre-printed per company, so the same number can legitimately
+  // exist across different companies — only a duplicate WITHIN a company is blocked.
+  let dupQuery = supabase
+    .from("orders").select("id").eq("so_number", draft.soNumber).is("deleted_at", null);
+  if (draft.companyId) dupQuery = dupQuery.eq("company_id", draft.companyId);
+  const { data: existing } = await dupQuery.maybeSingle();
 
   if (existing) {
     return {
@@ -695,6 +699,9 @@ const saveOrderToSupabase = async (draft) => {
     is_multi_trip: draft.isMultiTrip || false,
     planned_trips: draft.plannedTrips || 1,
     company_id: draft.companyId || null,
+    branch_id: draft.branchId || null,
+    created_by_user_id: draft.createdByUserId || null,
+    main_salesman_user_id: draft.mainSalesmanUserId || null,
     ...(photoUrl && { photo_url: photoUrl }),
   };
 
@@ -3152,9 +3159,15 @@ Please contact your manager to set up your account.`);
       return;
     }
 
-    // Attach photo + company to draft for storage on save
+    // Attach photo + company/branch + user attribution to draft for storage on save
     data.photoBase64 = base64Image;
     if (message._telegramUser?.company_id) data.companyId = message._telegramUser.company_id;
+    if (message._telegramUser?.branch_id)  data.branchId  = message._telegramUser.branch_id;
+    if (message._telegramUser?.id) {
+      data.createdByUserId = message._telegramUser.id;
+      // Default credited salesman to the submitter; refined below if OCR salesman matches another user
+      data.mainSalesmanUserId = message._telegramUser.id;
+    }
 
     const normalized = normalizeDeliveryDate(data.deliveryDate, data.orderDate);
     data.deliveryDate = normalized.deliveryDate;
