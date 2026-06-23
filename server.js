@@ -3356,6 +3356,7 @@ Example: [{"code":"SF-001","name":"3-Seater Sofa","unit_cost":450,"unit_price":7
 Do NOT include any explanation. Return the JSON array only.`;
 
 app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("file"), async (req, res) => {
+  try {
   const { company_id, id: created_by } = req.user;
   const { supplier_id, category_id } = req.body;
   const file = req.file;
@@ -3365,10 +3366,16 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
   const isXlsx = ["xlsx", "xls", "csv"].includes(ext);
   const source_type = isXlsx ? "xlsx" : ext === "pdf" ? "pdf" : "photo";
 
-  // Upload to Supabase Storage
-  const storagePath = `catalogue-imports/${company_id}/${Date.now()}-${file.originalname}`;
-  await supabase.storage.from("catalogue-imports").upload(storagePath, file.buffer, { contentType: file.mimetype, upsert: false });
-  const { data: { publicUrl } } = supabase.storage.from("catalogue-imports").getPublicUrl(storagePath);
+  // Upload to Supabase Storage (non-fatal)
+  let publicUrl = null;
+  try {
+    const storagePath = `catalogue-imports/${company_id}/${Date.now()}-${file.originalname}`;
+    await supabase.storage.from("catalogue-imports").upload(storagePath, file.buffer, { contentType: file.mimetype, upsert: false });
+    const { data } = supabase.storage.from("catalogue-imports").getPublicUrl(storagePath);
+    publicUrl = data?.publicUrl || null;
+  } catch (storageErr) {
+    console.error("Storage upload error (non-fatal):", storageErr.message);
+  }
 
   // Create job
   const { data: job, error: jobError } = await supabase.from("catalogue_import_jobs")
@@ -3416,6 +3423,7 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
 
   await supabase.from("catalogue_import_jobs").update({ status: "review", ai_raw_output: parsedRows }).eq("id", job.id);
   res.json({ job_id: job.id, rows, source_type });
+  } catch (err) { console.error("catalogue-import/upload error:", err); res.status(500).json({ error: err.message }); }
 });
 
 app.get("/catalogue-import/:job_id", requireRole(MANAGE_ROLES), async (req, res) => {
