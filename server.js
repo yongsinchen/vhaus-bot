@@ -3431,47 +3431,59 @@ async function processJobAsync(jobId, fileBuffer) {
       const MAX_PAGES = 200;
 
       if (isPdf) {
-        const { pdf } = await import("pdf-to-img");
-        const os = require("os");
-        const fs = require("fs");
-        const path = require("path");
-        const tmpPath = path.join(os.tmpdir(), `catalogue-${jobId}.pdf`);
-        fs.writeFileSync(tmpPath, buffer);
-        let n = 0;
-        try {
-          for await (const image of await pdf(tmpPath, { scale: 2 })) {
-            pageBuffers.push(Buffer.from(image));
-            n++;
-            if (n >= MAX_PAGES) break;
+        // Split PDF into batches of single-page PDFs using pdf-lib
+        const { PDFDocument } = require("pdf-lib");
+        const srcDoc = await PDFDocument.load(buffer);
+        const totalPages = Math.min(srcDoc.getPageCount(), MAX_PAGES);
+
+        const totalBatches = Math.ceil(totalPages / PAGES_PER_BATCH);
+        await supabase.from("catalogue_import_jobs").update({ pages_total: totalBatches, pages_processed: 0 }).eq("id", jobId);
+
+        for (let b = 0; b < totalBatches; b++) {
+          const startPage = b * PAGES_PER_BATCH;
+          const endPage = Math.min(startPage + PAGES_PER_BATCH, totalPages);
+          try {
+            // Create a small PDF with just this batch of pages
+            const batchDoc = await PDFDocument.create();
+            const copied = await batchDoc.copyPages(srcDoc, Array.from({ length: endPage - startPage }, (_, i) => startPage + i));
+            copied.forEach(p => batchDoc.addPage(p));
+            const batchPdfBytes = await batchDoc.save();
+            const b64 = Buffer.from(batchPdfBytes).toString("base64");
+
+            const resp = await openai.chat.completions.create({
+              model: "gpt-4o", max_tokens: 8000,
+              messages: [{ role: "user", content: [
+                { type: "file", file: { filename: "catalogue.pdf", file_data: `data:application/pdf;base64,${b64}` } },
+                { type: "text", text: CATALOGUE_VISION_PROMPT },
+              ] }],
+            });
+            const rows = parseAiJson(resp.choices[0].message.content);
+            parsedRows.push(...rows);
+          } catch (batchErr) {
+            console.error(`Job ${jobId} batch ${b + 1}/${totalBatches} error (skipping):`, batchErr.message);
           }
-        } finally {
-          try { fs.unlinkSync(tmpPath); } catch {}
+          await supabase.from("catalogue_import_jobs").update({ pages_processed: b + 1 }).eq("id", jobId);
+          if (b < totalBatches - 1) await sleep(2000);
         }
       } else {
-        pageBuffers.push(buffer);
-      }
-
-      const totalBatches = Math.ceil(pageBuffers.length / PAGES_PER_BATCH);
-      await supabase.from("catalogue_import_jobs").update({ pages_total: totalBatches, pages_processed: 0 }).eq("id", jobId);
-
-      for (let b = 0; b < totalBatches; b++) {
-        const batch = pageBuffers.slice(b * PAGES_PER_BATCH, (b + 1) * PAGES_PER_BATCH);
+        // Single image
+        const totalBatches = 1;
+        await supabase.from("catalogue_import_jobs").update({ pages_total: totalBatches, pages_processed: 0 }).eq("id", jobId);
         try {
-          const imageContent = batch.map(buf => ({
-            type: "image_url",
-            image_url: { url: `data:image/png;base64,${buf.toString("base64")}`, detail: "high" },
-          }));
+          const b64 = buffer.toString("base64");
           const resp = await openai.chat.completions.create({
-            model: "gpt-4o", max_tokens: 8000,
-            messages: [{ role: "user", content: [...imageContent, { type: "text", text: CATALOGUE_VISION_PROMPT }] }],
+            model: "gpt-4o", max_tokens: 4000,
+            messages: [{ role: "user", content: [
+              { type: "image_url", image_url: { url: `data:image/png;base64,${b64}`, detail: "high" } },
+              { type: "text", text: CATALOGUE_VISION_PROMPT },
+            ] }],
           });
           const rows = parseAiJson(resp.choices[0].message.content);
           parsedRows.push(...rows);
-        } catch (batchErr) {
-          console.error(`Job ${jobId} batch ${b + 1}/${totalBatches} error (skipping):`, batchErr.message);
+        } catch (imgErr) {
+          console.error(`Job ${jobId} image error:`, imgErr.message);
         }
-        await supabase.from("catalogue_import_jobs").update({ pages_processed: b + 1 }).eq("id", jobId);
-        if (b < totalBatches - 1) await sleep(2000);
+        await supabase.from("catalogue_import_jobs").update({ pages_processed: 1 }).eq("id", jobId);
       }
     }
 
