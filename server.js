@@ -3279,7 +3279,7 @@ app.get("/products", async (req, res) => {
     const { company_id, search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
     let query = supabase
       .from("products")
-      .select("id, code, name, description, unit_cost, unit_price, is_standard, reorder_point, is_active, created_at, suppliers(id,name), product_categories(id,name)", { count: "exact" })
+      .select("id, code, name, description, color, unit_cost, unit_price, is_standard, reorder_point, is_active, created_at, suppliers(id,name), product_categories(id,name)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (company_id) query = query.eq("company_id", company_id);
@@ -3296,10 +3296,10 @@ app.get("/products", async (req, res) => {
 
 app.post("/products", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { code, name, description, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point } = req.body;
+    const { code, name, description, color, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: req.user.company_id, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, reorder_point: reorder_point ?? 0, is_active: true })
+      .insert({ company_id: req.user.company_id, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, reorder_point: reorder_point ?? 0, is_active: true })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}" already exists` });
@@ -3311,9 +3311,9 @@ app.post("/products", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.put("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { code, name, description, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point, is_active } = req.body;
+    const { code, name, description, color, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point, is_active } = req.body;
     const { data, error } = await supabase.from("products")
-      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, reorder_point, is_active })
+      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, reorder_point, is_active })
       .eq("id", req.params.id).eq("company_id", req.user.company_id)
       .select().single();
     if (error) {
@@ -3345,6 +3345,8 @@ const normaliseImportRow = (raw) => {
   return {
     product_code: find("code","Code","item_code","Item Code","SKU","sku","Model","model").toUpperCase(),
     product_name: find("name","Name","item_name","Item Name","Product","product","Description","description"),
+    color:        find("color","Color","Colour","colour","color_code","Color Code"),
+    supplier_name: find("supplier","Supplier","company","Company","brand","Brand","manufacturer","Manufacturer"),
     unit_cost:    toNum(find("cost","Cost","unit_cost","Unit Cost","Buy Price","buy_price","purchase_price")),
     unit_price:   toNum(find("price","Price","unit_price","Unit Price","Sell Price","sell_price","selling_price")),
   };
@@ -3352,8 +3354,8 @@ const normaliseImportRow = (raw) => {
 
 const CATALOGUE_VISION_PROMPT = `You are a catalogue parser. Extract every product from this catalogue page.
 Return ONLY a JSON array (no markdown, no prose) where each element has exactly these keys:
-  code (string, uppercase), name (string), unit_cost (number or null), unit_price (number or null)
-Example: [{"code":"SF-001","name":"3-Seater Sofa","unit_cost":450,"unit_price":799}]
+  code (string, uppercase), name (string), color (string or null), supplier (string or null — the brand/company/manufacturer), unit_cost (number or null), unit_price (number or null)
+Example: [{"code":"SF-001","name":"3-Seater Sofa","color":"Walnut Brown","supplier":"ABC Furniture Co","unit_cost":450,"unit_price":799}]
 Do NOT include any explanation. Return the JSON array only.`;
 
 const parseAiJson = (text) => {
@@ -3379,6 +3381,7 @@ async function finaliseJob(jobId, companyId, parsedRows) {
   }
   const stagingRows = parsedRows.map(r => ({
     job_id: jobId, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null,
+    color: r.color || null, supplier_name: r.supplier_name || null,
     unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingCodes.has(r.product_code) ? "duplicate" : "import",
   }));
   const { error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
@@ -3597,7 +3600,7 @@ app.put("/catalogue-import/:job_id/rows", requireRole(MANAGE_ROLES), async (req,
     if (!Array.isArray(rows)) return res.status(400).json({ error: "rows must be an array" });
     const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
     if (!job) return res.status(404).json({ error: "Job not found" });
-    await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
+    await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, color: r.color || null, supplier_name: r.supplier_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3617,13 +3620,23 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const { data: existing } = await supabase.from("products").select("code").eq("company_id", company_id).in("code", codes);
     const existingCodes = new Set((existing || []).map(p => p.code));
 
+    // Build supplier name → id lookup for per-row supplier assignment
+    const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
+    const supplierMap = new Map((allSuppliers || []).map(s => [s.name.toLowerCase(), s.id]));
+
     let imported = 0, skipped = skippedCount;
     const rowUpdates = [];
 
     for (const row of toImport) {
       if (existingCodes.has(row.product_code)) { skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
+      // Resolve supplier: per-row supplier_name > job-level supplier_id
+      let supplierId = job.supplier_id || null;
+      if (row.supplier_name) {
+        const matched = supplierMap.get(row.supplier_name.toLowerCase());
+        if (matched) supplierId = matched;
+      }
       const { data: product, error: insertErr } = await supabase.from("products")
-        .insert({ company_id, supplier_id: job.supplier_id || null, category_id: job.category_id || null, code: row.product_code, name: row.product_name, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
+        .insert({ company_id, supplier_id: supplierId, category_id: job.category_id || null, code: row.product_code, name: row.product_name, color: row.color || null, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
         .select("id").single();
       if (insertErr) { skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
