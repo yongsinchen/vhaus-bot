@@ -3387,17 +3387,13 @@ async function finaliseJob(jobId, companyId, parsedRows) {
 }
 
 // Background async processor for PDF and image files
-async function processJobAsync(jobId) {
+async function processJobAsync(jobId, fileBuffer) {
   try {
     const { data: job } = await supabase.from("catalogue_import_jobs")
       .select("*").eq("id", jobId).single();
     if (!job || job.status !== "processing") return;
 
-    // Retrieve file from Supabase Storage
-    const storagePath = (job.source_url || "").split("/catalogue-imports/").pop();
-    const { data: fileData, error: dlErr } = await supabase.storage.from("catalogue-imports").download(storagePath);
-    if (dlErr || !fileData) throw new Error("Could not download file from storage: " + (dlErr?.message || "not found"));
-    const buffer = Buffer.from(await fileData.arrayBuffer());
+    const buffer = fileBuffer;
 
     let parsedRows = [];
 
@@ -3536,7 +3532,7 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
     }
 
     // PDF / Image: fire background processing, return immediately
-    processJobAsync(job.id);
+    processJobAsync(job.id, file.buffer);
     res.json({ job_id: job.id, status: "processing" });
   } catch (err) {
     console.error("catalogue-import/upload error:", err);
