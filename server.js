@@ -4,6 +4,7 @@ const cors = require("cors");
 const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
+const multer = require("multer");
 
 const app = express();
 
@@ -3193,6 +3194,282 @@ Please contact your manager to set up your account.`);
   } catch (err) {
     console.error("Webhook error:", err);
   }
+});
+
+// ── Product Master Routes ─────────────────────────────────────────
+// requireRole: verifies Bearer token against Supabase auth, attaches user to req
+const requireRole = (allowedRoles) => async (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const { data: { user: authUser }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !authUser) return res.status(401).json({ error: "Invalid token" });
+    const { data: profile } = await supabase
+      .from("users")
+      .select("id, role, company_id, branch_id, is_active")
+      .eq("id", authUser.id)
+      .single();
+    if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
+    if (!allowedRoles.includes(profile.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    req.user = profile;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// Multer — memory storage for catalogue file uploads (max 20 MB)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+const MANAGE_ROLES = ["master", "manager", "company_admin"];
+
+// ── GET /suppliers ───────────────────────────────────────────────
+app.get("/suppliers", async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    let query = supabase.from("suppliers").select("id, name, code, contact, is_active, created_at").order("name");
+    if (company_id) query = query.eq("company_id", company_id);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ suppliers: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/suppliers", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, code, contact } = req.body;
+    if (!name) return res.status(400).json({ error: "name is required" });
+    const { data, error } = await supabase
+      .from("suppliers")
+      .insert({ company_id: req.user.company_id, name: name.trim(), code: code?.trim() || null, contact: contact || null })
+      .select().single();
+    if (error) throw error;
+    res.status(201).json({ supplier: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /categories ──────────────────────────────────────────────
+app.get("/categories", async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    let query = supabase.from("product_categories").select("id, name, parent_id, created_at").order("name");
+    if (company_id) query = query.eq("company_id", company_id);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ categories: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/categories", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, parent_id } = req.body;
+    if (!name) return res.status(400).json({ error: "name is required" });
+    const { data, error } = await supabase
+      .from("product_categories")
+      .insert({ company_id: req.user.company_id, name: name.trim(), parent_id: parent_id || null })
+      .select().single();
+    if (error) throw error;
+    res.status(201).json({ category: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /products ────────────────────────────────────────────────
+app.get("/products", async (req, res) => {
+  try {
+    const { company_id, search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
+    let query = supabase
+      .from("products")
+      .select("id, code, name, description, unit_cost, unit_price, is_standard, reorder_point, is_active, created_at, suppliers(id,name), product_categories(id,name)", { count: "exact" })
+      .order("name")
+      .range((page - 1) * limit, page * limit - 1);
+    if (company_id) query = query.eq("company_id", company_id);
+    if (search) query = query.or(`name.ilike.%${search}%,code.ilike.%${search}%`);
+    if (supplier_id) query = query.eq("supplier_id", supplier_id);
+    if (category_id) query = query.eq("category_id", category_id);
+    if (is_active === "true") query = query.eq("is_active", true);
+    if (is_active === "false") query = query.eq("is_active", false);
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ products: data || [], total: count || 0, page: Number(page), limit: Number(limit) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/products", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { code, name, description, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point } = req.body;
+    if (!code || !name) return res.status(400).json({ error: "code and name are required" });
+    const { data, error } = await supabase.from("products")
+      .insert({ company_id: req.user.company_id, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, reorder_point: reorder_point ?? 0, is_active: true })
+      .select().single();
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}" already exists` });
+      throw error;
+    }
+    res.status(201).json({ product: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { code, name, description, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point, is_active } = req.body;
+    const { data, error } = await supabase.from("products")
+      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, reorder_point, is_active })
+      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .select().single();
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}" already exists` });
+      throw error;
+    }
+    if (!data) return res.status(404).json({ error: "Product not found" });
+    res.json({ product: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/products/:id/toggle", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data: existing } = await supabase.from("products").select("is_active").eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+    if (!existing) return res.status(404).json({ error: "Product not found" });
+    const { data, error } = await supabase.from("products").update({ is_active: !existing.is_active }).eq("id", req.params.id).select("id, is_active").single();
+    if (error) throw error;
+    res.json({ product: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Catalogue Import Routes ───────────────────────────────────────
+const XLSX = require("xlsx");
+
+const normaliseImportRow = (raw) => {
+  const find = (...keys) => { for (const k of keys) { const v = raw[k] ?? raw[k?.toLowerCase()] ?? raw[k?.toUpperCase()]; if (v !== undefined && v !== null && v !== "") return String(v).trim(); } return ""; };
+  const toNum = (v) => { const n = parseFloat(String(v).replace(/[^0-9.]/g, "")); return isNaN(n) ? null : n; };
+  return {
+    product_code: find("code","Code","item_code","Item Code","SKU","sku","Model","model").toUpperCase(),
+    product_name: find("name","Name","item_name","Item Name","Product","product","Description","description"),
+    unit_cost:    toNum(find("cost","Cost","unit_cost","Unit Cost","Buy Price","buy_price","purchase_price")),
+    unit_price:   toNum(find("price","Price","unit_price","Unit Price","Sell Price","sell_price","selling_price")),
+  };
+};
+
+const CATALOGUE_VISION_PROMPT = `You are a catalogue parser. Extract every product from this catalogue page.
+Return ONLY a JSON array (no markdown, no prose) where each element has exactly these keys:
+  code (string, uppercase), name (string), unit_cost (number or null), unit_price (number or null)
+Example: [{"code":"SF-001","name":"3-Seater Sofa","unit_cost":450,"unit_price":799}]
+Do NOT include any explanation. Return the JSON array only.`;
+
+app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("file"), async (req, res) => {
+  const { company_id, id: created_by } = req.user;
+  const { supplier_id, category_id } = req.body;
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: "No file uploaded" });
+
+  const ext = file.originalname.split(".").pop().toLowerCase();
+  const isXlsx = ["xlsx", "xls", "csv"].includes(ext);
+  const source_type = isXlsx ? "xlsx" : ext === "pdf" ? "pdf" : "photo";
+
+  // Upload to Supabase Storage
+  const storagePath = `catalogue-imports/${company_id}/${Date.now()}-${file.originalname}`;
+  await supabase.storage.from("catalogue-imports").upload(storagePath, file.buffer, { contentType: file.mimetype, upsert: false });
+  const { data: { publicUrl } } = supabase.storage.from("catalogue-imports").getPublicUrl(storagePath);
+
+  // Create job
+  const { data: job, error: jobError } = await supabase.from("catalogue_import_jobs")
+    .insert({ company_id, supplier_id: supplier_id || null, category_id: category_id || null, source_type, source_url: publicUrl || null, status: "processing", created_by })
+    .select().single();
+  if (jobError) return res.status(500).json({ error: jobError.message });
+
+  // Parse file
+  let parsedRows = [];
+  try {
+    if (isXlsx) {
+      const wb = XLSX.read(file.buffer, { type: "buffer" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      parsedRows = rows.map(normaliseImportRow).filter(r => r.product_code || r.product_name);
+    } else {
+      const base64 = file.buffer.toString("base64");
+      const isImage = file.mimetype.startsWith("image/");
+      const contentParts = isImage
+        ? [{ type: "image_url", image_url: { url: `data:${file.mimetype};base64,${base64}`, detail: "high" } }, { type: "text", text: CATALOGUE_VISION_PROMPT }]
+        : [{ type: "text", text: `${CATALOGUE_VISION_PROMPT}\n\nPDF base64 (first 200k chars):\n${base64.slice(0, 200000)}` }];
+      const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: contentParts }] });
+      const text = resp.choices[0].message.content.trim().replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+      const items = JSON.parse(text);
+      parsedRows = (Array.isArray(items) ? items : items.items ?? []).map(normaliseImportRow).filter(r => r.product_code || r.product_name);
+    }
+  } catch (parseErr) {
+    await supabase.from("catalogue_import_jobs").update({ status: "failed" }).eq("id", job.id);
+    return res.status(422).json({ error: "Failed to parse file: " + parseErr.message });
+  }
+
+  if (parsedRows.length === 0) {
+    await supabase.from("catalogue_import_jobs").update({ status: "failed" }).eq("id", job.id);
+    return res.status(422).json({ error: "No products found in file" });
+  }
+
+  // Duplicate check
+  const codes = parsedRows.map(r => r.product_code).filter(Boolean);
+  const { data: existing } = await supabase.from("products").select("code").eq("company_id", company_id).in("code", codes);
+  const existingCodes = new Set((existing || []).map(p => p.code));
+
+  const stagingRows = parsedRows.map(r => ({ job_id: job.id, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingCodes.has(r.product_code) ? "duplicate" : "import" }));
+  const { data: rows, error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
+  if (rowsError) return res.status(500).json({ error: rowsError.message });
+
+  await supabase.from("catalogue_import_jobs").update({ status: "review", ai_raw_output: parsedRows }).eq("id", job.id);
+  res.json({ job_id: job.id, rows, source_type });
+});
+
+app.get("/catalogue-import/:job_id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data: job, error } = await supabase.from("catalogue_import_jobs")
+      .select("*, catalogue_import_rows(*)")
+      .eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
+    if (error || !job) return res.status(404).json({ error: "Job not found" });
+    res.json({ job });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/catalogue-import/:job_id/rows", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { rows } = req.body;
+    if (!Array.isArray(rows)) return res.status(400).json({ error: "rows must be an array" });
+    const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { company_id } = req.user;
+    const { data: job, error } = await supabase.from("catalogue_import_jobs").select("*, catalogue_import_rows(*)").eq("id", req.params.job_id).eq("company_id", company_id).single();
+    if (error || !job) return res.status(404).json({ error: "Job not found" });
+    if (job.status === "done") return res.status(409).json({ error: "Job already committed" });
+
+    const toImport = (job.catalogue_import_rows || []).filter(r => r.action === "import");
+    const skippedCount = (job.catalogue_import_rows || []).filter(r => r.action !== "import").length;
+
+    // Re-check duplicates at commit time
+    const codes = toImport.map(r => r.product_code).filter(Boolean);
+    const { data: existing } = await supabase.from("products").select("code").eq("company_id", company_id).in("code", codes);
+    const existingCodes = new Set((existing || []).map(p => p.code));
+
+    let imported = 0, skipped = skippedCount;
+    const rowUpdates = [];
+
+    for (const row of toImport) {
+      if (existingCodes.has(row.product_code)) { skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
+      const { data: product, error: insertErr } = await supabase.from("products")
+        .insert({ company_id, supplier_id: job.supplier_id || null, category_id: job.category_id || null, code: row.product_code, name: row.product_name, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
+        .select("id").single();
+      if (insertErr) { skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
+      else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
+    }
+
+    await Promise.all(rowUpdates.map(u => supabase.from("catalogue_import_rows").update({ action: u.action, product_id: u.product_id }).eq("id", u.id)));
+    await supabase.from("catalogue_import_jobs").update({ status: "done", rows_imported: imported, rows_skipped: skipped }).eq("id", job.id);
+    res.json({ imported, skipped, total: toImport.length + skippedCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Health Check ──────────────────────────────────────────────────
