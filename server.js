@@ -3391,16 +3391,40 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
       parsedRows = rows.map(normaliseImportRow).filter(r => r.product_code || r.product_name);
-    } else {
+    } else if (file.mimetype.startsWith("image/")) {
       const base64 = file.buffer.toString("base64");
-      const isImage = file.mimetype.startsWith("image/");
-      const contentParts = isImage
-        ? [{ type: "image_url", image_url: { url: `data:${file.mimetype};base64,${base64}`, detail: "high" } }, { type: "text", text: CATALOGUE_VISION_PROMPT }]
-        : [{ type: "text", text: `${CATALOGUE_VISION_PROMPT}\n\nPDF base64 (first 200k chars):\n${base64.slice(0, 200000)}` }];
-      const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: contentParts }] });
+      const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: [
+        { type: "image_url", image_url: { url: `data:${file.mimetype};base64,${base64}`, detail: "high" } },
+        { type: "text", text: CATALOGUE_VISION_PROMPT },
+      ] }] });
       const text = resp.choices[0].message.content.trim().replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
       const items = JSON.parse(text);
       parsedRows = (Array.isArray(items) ? items : items.items ?? []).map(normaliseImportRow).filter(r => r.product_code || r.product_name);
+    } else {
+      // PDF: render pages to PNG, send each as vision request
+      const { pdf } = await import("pdf-to-img");
+      const pages = [];
+      let pageNum = 0;
+      for await (const image of await pdf(file.buffer, { scale: 2 })) {
+        pages.push(image);
+        pageNum++;
+        if (pageNum >= 5) break;
+      }
+      for (const pageBuf of pages) {
+        try {
+          const b64 = Buffer.from(pageBuf).toString("base64");
+          const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: [
+            { type: "image_url", image_url: { url: `data:image/png;base64,${b64}`, detail: "high" } },
+            { type: "text", text: CATALOGUE_VISION_PROMPT },
+          ] }] });
+          const text = resp.choices[0].message.content.trim().replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+          const items = JSON.parse(text);
+          const rows = (Array.isArray(items) ? items : items.items ?? []).map(normaliseImportRow).filter(r => r.product_code || r.product_name);
+          parsedRows.push(...rows);
+        } catch (pageErr) {
+          console.error("PDF page parse error (skipping):", pageErr.message);
+        }
+      }
     }
   } catch (parseErr) {
     await supabase.from("catalogue_import_jobs").update({ status: "failed" }).eq("id", job.id);
