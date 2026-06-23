@@ -3430,11 +3430,20 @@ async function processJobAsync(jobId, fileBuffer) {
 
       if (isPdf) {
         const { pdf } = await import("pdf-to-img");
+        const os = require("os");
+        const fs = require("fs");
+        const path = require("path");
+        const tmpPath = path.join(os.tmpdir(), `catalogue-${jobId}.pdf`);
+        fs.writeFileSync(tmpPath, buffer);
         let n = 0;
-        for await (const image of await pdf(new Uint8Array(buffer), { scale: 2 })) {
-          pageBuffers.push(Buffer.from(image));
-          n++;
-          if (n >= 50) break;
+        try {
+          for await (const image of await pdf(tmpPath, { scale: 2 })) {
+            pageBuffers.push(Buffer.from(image));
+            n++;
+            if (n >= 50) break;
+          }
+        } finally {
+          try { fs.unlinkSync(tmpPath); } catch {}
         }
       } else {
         pageBuffers.push(buffer);
