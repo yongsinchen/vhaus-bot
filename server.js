@@ -3424,9 +3424,11 @@ async function processJobAsync(jobId, fileBuffer) {
         if (i < chunks.length - 1) await sleep(1000);
       }
     } else {
-      // image_ocr: render PDF pages to PNG or use single image
+      // image_ocr: render PDF pages to PNG or use single image, batched 4 pages per API call
       const isPdf = job.source_type === "pdf";
       const pageBuffers = [];
+      const PAGES_PER_BATCH = 4;
+      const MAX_PAGES = 200;
 
       if (isPdf) {
         const { pdf } = await import("pdf-to-img");
@@ -3440,7 +3442,7 @@ async function processJobAsync(jobId, fileBuffer) {
           for await (const image of await pdf(tmpPath, { scale: 2 })) {
             pageBuffers.push(Buffer.from(image));
             n++;
-            if (n >= 50) break;
+            if (n >= MAX_PAGES) break;
           }
         } finally {
           try { fs.unlinkSync(tmpPath); } catch {}
@@ -3449,22 +3451,27 @@ async function processJobAsync(jobId, fileBuffer) {
         pageBuffers.push(buffer);
       }
 
-      await supabase.from("catalogue_import_jobs").update({ pages_total: pageBuffers.length, pages_processed: 0 }).eq("id", jobId);
+      const totalBatches = Math.ceil(pageBuffers.length / PAGES_PER_BATCH);
+      await supabase.from("catalogue_import_jobs").update({ pages_total: totalBatches, pages_processed: 0 }).eq("id", jobId);
 
-      for (let i = 0; i < pageBuffers.length; i++) {
+      for (let b = 0; b < totalBatches; b++) {
+        const batch = pageBuffers.slice(b * PAGES_PER_BATCH, (b + 1) * PAGES_PER_BATCH);
         try {
-          const b64 = pageBuffers[i].toString("base64");
-          const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: [
-            { type: "image_url", image_url: { url: `data:image/png;base64,${b64}`, detail: "high" } },
-            { type: "text", text: CATALOGUE_VISION_PROMPT },
-          ] }] });
+          const imageContent = batch.map(buf => ({
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${buf.toString("base64")}`, detail: "high" },
+          }));
+          const resp = await openai.chat.completions.create({
+            model: "gpt-4o", max_tokens: 8000,
+            messages: [{ role: "user", content: [...imageContent, { type: "text", text: CATALOGUE_VISION_PROMPT }] }],
+          });
           const rows = parseAiJson(resp.choices[0].message.content);
           parsedRows.push(...rows);
-        } catch (pageErr) {
-          console.error(`Job ${jobId} page ${i + 1} error (skipping):`, pageErr.message);
+        } catch (batchErr) {
+          console.error(`Job ${jobId} batch ${b + 1}/${totalBatches} error (skipping):`, batchErr.message);
         }
-        await supabase.from("catalogue_import_jobs").update({ pages_processed: i + 1 }).eq("id", jobId);
-        if (i < pageBuffers.length - 1) await sleep(1000);
+        await supabase.from("catalogue_import_jobs").update({ pages_processed: b + 1 }).eq("id", jobId);
+        if (b < totalBatches - 1) await sleep(2000);
       }
     }
 
