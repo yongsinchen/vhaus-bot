@@ -3337,6 +3337,7 @@ app.patch("/products/:id/toggle", requireRole(MANAGE_ROLES), async (req, res) =>
 
 // ── Catalogue Import Routes ───────────────────────────────────────
 const XLSX = require("xlsx");
+const pdfParse = require("pdf-parse");
 
 const normaliseImportRow = (raw) => {
   const find = (...keys) => { for (const k of keys) { const v = raw[k] ?? raw[k?.toLowerCase()] ?? raw[k?.toUpperCase()]; if (v !== undefined && v !== null && v !== "") return String(v).trim(); } return ""; };
@@ -3355,99 +3356,192 @@ Return ONLY a JSON array (no markdown, no prose) where each element has exactly 
 Example: [{"code":"SF-001","name":"3-Seater Sofa","unit_cost":450,"unit_price":799}]
 Do NOT include any explanation. Return the JSON array only.`;
 
-app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("file"), async (req, res) => {
-  try {
-  const { company_id, id: created_by } = req.user;
-  const { supplier_id, category_id } = req.body;
-  const file = req.file;
-  if (!file) return res.status(400).json({ error: "No file uploaded" });
+const parseAiJson = (text) => {
+  const clean = text.trim().replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+  const parsed = JSON.parse(clean);
+  return (Array.isArray(parsed) ? parsed : parsed.items ?? parsed.products ?? [])
+    .map(normaliseImportRow).filter(r => r.product_code || r.product_name);
+};
 
-  const ext = file.originalname.split(".").pop().toLowerCase();
-  const isXlsx = ["xlsx", "xls", "csv"].includes(ext);
-  const source_type = isXlsx ? "xlsx" : ext === "pdf" ? "pdf" : "photo";
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Upload to Supabase Storage (non-fatal)
-  let publicUrl = null;
-  try {
-    const storagePath = `catalogue-imports/${company_id}/${Date.now()}-${file.originalname}`;
-    await supabase.storage.from("catalogue-imports").upload(storagePath, file.buffer, { contentType: file.mimetype, upsert: false });
-    const { data } = supabase.storage.from("catalogue-imports").getPublicUrl(storagePath);
-    publicUrl = data?.publicUrl || null;
-  } catch (storageErr) {
-    console.error("Storage upload error (non-fatal):", storageErr.message);
+// Finish a job: duplicate-check, insert staging rows, set status to review
+async function finaliseJob(jobId, companyId, parsedRows) {
+  if (parsedRows.length === 0) {
+    await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: "No products found in file" }).eq("id", jobId);
+    return;
   }
+  const codes = parsedRows.map(r => r.product_code).filter(Boolean);
+  let existingCodes = new Set();
+  if (codes.length > 0) {
+    const { data: existing } = await supabase.from("products").select("code").eq("company_id", companyId).in("code", codes);
+    existingCodes = new Set((existing || []).map(p => p.code));
+  }
+  const stagingRows = parsedRows.map(r => ({
+    job_id: jobId, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null,
+    unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingCodes.has(r.product_code) ? "duplicate" : "import",
+  }));
+  const { error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
+  if (rowsError) throw new Error(rowsError.message);
+  await supabase.from("catalogue_import_jobs").update({ status: "review", ai_raw_output: parsedRows, pages_processed: null }).eq("id", jobId);
+}
 
-  // Create job
-  const { data: job, error: jobError } = await supabase.from("catalogue_import_jobs")
-    .insert({ company_id, supplier_id: supplier_id || null, category_id: category_id || null, source_type, source_url: publicUrl || null, status: "processing", created_by })
-    .select().single();
-  if (jobError) return res.status(500).json({ error: jobError.message });
-
-  // Parse file
-  let parsedRows = [];
+// Background async processor for PDF and image files
+async function processJobAsync(jobId) {
   try {
-    if (isXlsx) {
-      const wb = XLSX.read(file.buffer, { type: "buffer" });
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-      parsedRows = rows.map(normaliseImportRow).filter(r => r.product_code || r.product_name);
-    } else if (file.mimetype.startsWith("image/")) {
-      const base64 = file.buffer.toString("base64");
-      const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: [
-        { type: "image_url", image_url: { url: `data:${file.mimetype};base64,${base64}`, detail: "high" } },
-        { type: "text", text: CATALOGUE_VISION_PROMPT },
-      ] }] });
-      const text = resp.choices[0].message.content.trim().replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-      const items = JSON.parse(text);
-      parsedRows = (Array.isArray(items) ? items : items.items ?? []).map(normaliseImportRow).filter(r => r.product_code || r.product_name);
-    } else {
-      // PDF: render pages to PNG, send each as vision request
-      const { pdf } = await import("pdf-to-img");
-      const pages = [];
-      let pageNum = 0;
-      for await (const image of await pdf(file.buffer, { scale: 2 })) {
-        pages.push(image);
-        pageNum++;
-        if (pageNum >= 5) break;
+    const { data: job } = await supabase.from("catalogue_import_jobs")
+      .select("*").eq("id", jobId).single();
+    if (!job || job.status !== "processing") return;
+
+    // Retrieve file from Supabase Storage
+    const storagePath = (job.source_url || "").split("/catalogue-imports/").pop();
+    const { data: fileData, error: dlErr } = await supabase.storage.from("catalogue-imports").download(storagePath);
+    if (dlErr || !fileData) throw new Error("Could not download file from storage: " + (dlErr?.message || "not found"));
+    const buffer = Buffer.from(await fileData.arrayBuffer());
+
+    let parsedRows = [];
+
+    if (job.parse_method === "text_layer") {
+      // Text-based PDF: chunk text and send to GPT-4o as text
+      const pdfData = await pdfParse(buffer);
+      const fullText = pdfData.text || "";
+      const CHUNK_SIZE = 100000;
+      const chunks = [];
+      for (let i = 0; i < fullText.length; i += CHUNK_SIZE) {
+        chunks.push(fullText.slice(i, i + CHUNK_SIZE));
       }
-      for (const pageBuf of pages) {
+      if (chunks.length === 0) chunks.push("");
+
+      await supabase.from("catalogue_import_jobs").update({ pages_total: chunks.length, pages_processed: 0 }).eq("id", jobId);
+
+      for (let i = 0; i < chunks.length; i++) {
         try {
-          const b64 = Buffer.from(pageBuf).toString("base64");
+          const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: [
+            { type: "text", text: CATALOGUE_VISION_PROMPT + "\n\nCatalogue text:\n" + chunks[i] },
+          ] }] });
+          const rows = parseAiJson(resp.choices[0].message.content);
+          parsedRows.push(...rows);
+        } catch (chunkErr) {
+          console.error(`Job ${jobId} text chunk ${i + 1} error (skipping):`, chunkErr.message);
+        }
+        await supabase.from("catalogue_import_jobs").update({ pages_processed: i + 1 }).eq("id", jobId);
+        if (i < chunks.length - 1) await sleep(1000);
+      }
+    } else {
+      // image_ocr: render PDF pages to PNG or use single image
+      const isPdf = job.source_type === "pdf";
+      const pageBuffers = [];
+
+      if (isPdf) {
+        const { pdf } = await import("pdf-to-img");
+        let n = 0;
+        for await (const image of await pdf(buffer, { scale: 2 })) {
+          pageBuffers.push(Buffer.from(image));
+          n++;
+          if (n >= 50) break;
+        }
+      } else {
+        pageBuffers.push(buffer);
+      }
+
+      await supabase.from("catalogue_import_jobs").update({ pages_total: pageBuffers.length, pages_processed: 0 }).eq("id", jobId);
+
+      for (let i = 0; i < pageBuffers.length; i++) {
+        try {
+          const b64 = pageBuffers[i].toString("base64");
           const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: [
             { type: "image_url", image_url: { url: `data:image/png;base64,${b64}`, detail: "high" } },
             { type: "text", text: CATALOGUE_VISION_PROMPT },
           ] }] });
-          const text = resp.choices[0].message.content.trim().replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-          const items = JSON.parse(text);
-          const rows = (Array.isArray(items) ? items : items.items ?? []).map(normaliseImportRow).filter(r => r.product_code || r.product_name);
+          const rows = parseAiJson(resp.choices[0].message.content);
           parsedRows.push(...rows);
         } catch (pageErr) {
-          console.error("PDF page parse error (skipping):", pageErr.message);
+          console.error(`Job ${jobId} page ${i + 1} error (skipping):`, pageErr.message);
         }
+        await supabase.from("catalogue_import_jobs").update({ pages_processed: i + 1 }).eq("id", jobId);
+        if (i < pageBuffers.length - 1) await sleep(1000);
       }
     }
-  } catch (parseErr) {
-    await supabase.from("catalogue_import_jobs").update({ status: "failed" }).eq("id", job.id);
-    return res.status(422).json({ error: "Failed to parse file: " + parseErr.message });
+
+    await finaliseJob(jobId, job.company_id, parsedRows);
+  } catch (err) {
+    console.error(`processJobAsync ${jobId} fatal error:`, err);
+    await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: err.message }).eq("id", jobId);
   }
+}
 
-  if (parsedRows.length === 0) {
-    await supabase.from("catalogue_import_jobs").update({ status: "failed" }).eq("id", job.id);
-    return res.status(422).json({ error: "No products found in file" });
+app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("file"), async (req, res) => {
+  try {
+    const { company_id, id: created_by } = req.user;
+    const { supplier_id, category_id } = req.body;
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+
+    const ext = file.originalname.split(".").pop().toLowerCase();
+    const isXlsx = ["xlsx", "xls", "csv"].includes(ext);
+    const isImage = file.mimetype.startsWith("image/");
+    const source_type = isXlsx ? "xlsx" : ext === "pdf" ? "pdf" : "photo";
+
+    // Upload to Supabase Storage (non-fatal)
+    let publicUrl = null;
+    try {
+      const storagePath = `catalogue-imports/${company_id}/${Date.now()}-${file.originalname}`;
+      await supabase.storage.from("catalogue-imports").upload(storagePath, file.buffer, { contentType: file.mimetype, upsert: false });
+      const { data } = supabase.storage.from("catalogue-imports").getPublicUrl(storagePath);
+      publicUrl = data?.publicUrl || null;
+    } catch (storageErr) {
+      console.error("Storage upload error (non-fatal):", storageErr.message);
+    }
+
+    // Determine parse_method for PDF
+    let parseMethod = null;
+    if (!isXlsx && !isImage) {
+      try {
+        const pdfData = await pdfParse(file.buffer);
+        const textLen = (pdfData.text || "").length;
+        const pageCount = pdfData.numpages || 1;
+        parseMethod = (textLen / pageCount) > 100 ? "text_layer" : "image_ocr";
+      } catch {
+        parseMethod = "image_ocr";
+      }
+    } else if (isImage) {
+      parseMethod = "image_ocr";
+    }
+
+    // Create job
+    const { data: job, error: jobError } = await supabase.from("catalogue_import_jobs")
+      .insert({
+        company_id, supplier_id: supplier_id || null, category_id: category_id || null,
+        source_type, source_url: publicUrl || null, status: "processing",
+        parse_method: parseMethod, started_at: new Date().toISOString(), created_by,
+      })
+      .select().single();
+    if (jobError) return res.status(500).json({ error: jobError.message });
+
+    // XLSX: synchronous parse, return rows immediately
+    if (isXlsx) {
+      try {
+        const wb = XLSX.read(file.buffer, { type: "buffer" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rawRows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+        const parsedRows = rawRows.map(normaliseImportRow).filter(r => r.product_code || r.product_name);
+        await finaliseJob(job.id, company_id, parsedRows);
+        const { data: updatedJob } = await supabase.from("catalogue_import_jobs")
+          .select("*, catalogue_import_rows(*)").eq("id", job.id).single();
+        return res.json({ job_id: job.id, status: "review", rows: updatedJob?.catalogue_import_rows || [] });
+      } catch (parseErr) {
+        await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: parseErr.message }).eq("id", job.id);
+        return res.status(422).json({ error: "Failed to parse file: " + parseErr.message });
+      }
+    }
+
+    // PDF / Image: fire background processing, return immediately
+    processJobAsync(job.id);
+    res.json({ job_id: job.id, status: "processing" });
+  } catch (err) {
+    console.error("catalogue-import/upload error:", err);
+    res.status(500).json({ error: err.message });
   }
-
-  // Duplicate check
-  const codes = parsedRows.map(r => r.product_code).filter(Boolean);
-  const { data: existing } = await supabase.from("products").select("code").eq("company_id", company_id).in("code", codes);
-  const existingCodes = new Set((existing || []).map(p => p.code));
-
-  const stagingRows = parsedRows.map(r => ({ job_id: job.id, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingCodes.has(r.product_code) ? "duplicate" : "import" }));
-  const { data: rows, error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
-  if (rowsError) return res.status(500).json({ error: rowsError.message });
-
-  await supabase.from("catalogue_import_jobs").update({ status: "review", ai_raw_output: parsedRows }).eq("id", job.id);
-  res.json({ job_id: job.id, rows, source_type });
-  } catch (err) { console.error("catalogue-import/upload error:", err); res.status(500).json({ error: err.message }); }
 });
 
 app.get("/catalogue-import/:job_id", requireRole(MANAGE_ROLES), async (req, res) => {
@@ -3456,6 +3550,19 @@ app.get("/catalogue-import/:job_id", requireRole(MANAGE_ROLES), async (req, res)
       .select("*, catalogue_import_rows(*)")
       .eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
     if (error || !job) return res.status(404).json({ error: "Job not found" });
+
+    // Timeout guard: if processing for more than 15 minutes, mark as failed
+    if (job.status === "processing" && job.started_at) {
+      const elapsed = Date.now() - new Date(job.started_at).getTime();
+      if (elapsed > 15 * 60 * 1000) {
+        await supabase.from("catalogue_import_jobs")
+          .update({ status: "failed", error_message: "Processing timed out — please re-upload" })
+          .eq("id", job.id);
+        job.status = "failed";
+        job.error_message = "Processing timed out — please re-upload";
+      }
+    }
+
     res.json({ job });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
