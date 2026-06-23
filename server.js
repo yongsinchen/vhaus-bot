@@ -3431,7 +3431,7 @@ async function processJobAsync(jobId, fileBuffer) {
       if (isPdf) {
         const { pdf } = await import("pdf-to-img");
         let n = 0;
-        for await (const image of await pdf(buffer, { scale: 2 })) {
+        for await (const image of await pdf(new Uint8Array(buffer), { scale: 2 })) {
           pageBuffers.push(Buffer.from(image));
           n++;
           if (n >= 50) break;
