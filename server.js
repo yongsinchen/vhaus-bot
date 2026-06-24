@@ -2912,6 +2912,20 @@ app.patch("/do-review/:id/dismiss", async (req, res) => {
   res.json({ success: true });
 });
 
+// PATCH /do-review/:id/add-to-stock — match to product master and add to inventory
+app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { product_id, warehouse_id, quantity } = req.body;
+    if (!product_id || !warehouse_id) return res.status(400).json({ error: "product_id and warehouse_id required" });
+    const { data: review } = await supabase.from("do_review").select("*").eq("id", req.params.id).single();
+    if (!review) return res.status(404).json({ error: "Review item not found" });
+    const qty = Number(quantity) || 1;
+    await adjustStock(req.user.company_id, warehouse_id, product_id, qty, "in", "do", review.supplier_delivery_id, `DO #${review.do_number} — ${review.item_name}`, req.user.id);
+    await supabase.from("do_review").update({ status: "Resolved" }).eq("id", req.params.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Auth Profile API ─────────────────────────────────────────────
 app.get("/auth/profile", async (req, res) => {
   const userId = req.query.uid;
