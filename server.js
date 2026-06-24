@@ -51,7 +51,26 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
   }
 };
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
+const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
+
+const requireAuth = async (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const { data: { user: authUser }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !authUser) return res.status(401).json({ error: "Invalid token", reason: authErr?.message || "no user" });
+    const { data: profile, error: profErr } = await supabase
+      .from("users")
+      .select("id, role, company_id, branch_id, name, salesman_name, is_active")
+      .eq("id", authUser.id)
+      .single();
+    if (profErr) return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
+    if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
+    req.user = profile;
+    next();
+  } catch (err) { res.status(500).json({ error: err.message }); }
+};
 
 // ── Supabase Storage — Upload image ──────────────────────────────
 const uploadImageToStorage = async (base64Image, bucket, filename) => {
@@ -4689,34 +4708,6 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
 });
 
 // ── Sales Order Routes ────────────────────────────────────────────
-// requireAuth: verify Bearer token, attach profile (no specific role required)
-const requireAuth = async (req, res, next) => {
-  try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
-    if (!token) return res.status(401).json({ error: "Unauthorized" });
-    const { data: { user: authUser }, error: authErr } = await supabase.auth.getUser(token);
-    if (authErr || !authUser) {
-      console.error("requireAuth invalid token:", authErr?.message);
-      return res.status(401).json({ error: "Invalid token", reason: authErr?.message || "no user" });
-    }
-    const { data: profile, error: profErr } = await supabase
-      .from("users")
-      .select("id, role, company_id, branch_id, name, salesman_name, is_active")
-      .eq("id", authUser.id)
-      .single();
-    if (profErr) {
-      console.error("requireAuth profile error:", profErr.message);
-      return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
-    }
-    if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
-    req.user = profile;
-    next();
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
-
-const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
 
 // Generate a readable order number: SO + YYMMDD + 4-digit sequence for the day
 async function nextOrderNumber(company_id) {
@@ -4792,7 +4783,7 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
     if (error) throw error;
     if (role === "salesman" && salesman_name) {
       const name = salesman_name.toLowerCase().trim();
-      data = (data || []).filter(o => (o.salesman_name || "").toLowerCase().trim() === name);
+      data = (data || []).filter(o => (o.salesman_name || "").toLowerCase().split("/").map(s => s.trim()).includes(name));
     }
     res.json({ orders: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5131,10 +5122,10 @@ app.patch("/purchase-order-items/:id/receive", requireAuth, async (req, res) => 
       if (po) await recordLeadTime(po.company_id, po.supplier_id, data.product_id, po.created_at, rcvDate);
     } catch {}
 
-    // Stock in if warehouse specified
+    // Stock in if warehouse specified (uses "po_receive" type to avoid double-count with DO confirm-all)
     if (warehouse_id && data.product_id) {
       try {
-        await adjustStock(req.user.company_id, warehouse_id, data.product_id, Number(received_qty) || data.quantity, "in", "do", data.po_id, `PO receive`, req.user.id);
+        await adjustStock(req.user.company_id, warehouse_id, data.product_id, Number(received_qty) || data.quantity, "in", "po_receive", data.po_id, `PO receive`, req.user.id);
       } catch {}
     }
 
