@@ -3227,7 +3227,7 @@ const MANAGE_ROLES = ["master", "manager", "company_admin"];
 app.get("/suppliers", async (req, res) => {
   try {
     const { company_id } = req.query;
-    let query = supabase.from("suppliers").select("id, name, code, contact, is_active, created_at").order("name");
+    let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, is_active, created_at").order("name");
     if (company_id) query = query.eq("company_id", company_id);
     const { data, error } = await query;
     if (error) throw error;
@@ -3235,16 +3235,43 @@ app.get("/suppliers", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Parse an incoming cost_divisor value → positive number, or null (= no derived costing)
+const parseCostDivisor = (v) => {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
 app.post("/suppliers", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { name, code, contact } = req.body;
+    const { name, code, contact, cost_divisor } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
     const { data, error } = await supabase
       .from("suppliers")
-      .insert({ company_id: req.user.company_id, name: name.trim(), code: code?.trim() || null, contact: contact || null })
+      .insert({ company_id: req.user.company_id, name: name.trim(), code: code?.trim() || null, contact: contact || null, cost_divisor: parseCostDivisor(cost_divisor) })
       .select().single();
     if (error) throw error;
     res.status(201).json({ supplier: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, code, contact, cost_divisor, is_active } = req.body;
+    const patch = {};
+    if (name !== undefined) patch.name = name.trim();
+    if (code !== undefined) patch.code = code?.trim() || null;
+    if (contact !== undefined) patch.contact = contact || null;
+    if (cost_divisor !== undefined) patch.cost_divisor = parseCostDivisor(cost_divisor);
+    if (is_active !== undefined) patch.is_active = is_active;
+    const { data, error } = await supabase
+      .from("suppliers")
+      .update(patch)
+      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .select().single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Supplier not found" });
+    res.json({ supplier: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3367,8 +3394,17 @@ const parseAiJson = (text) => {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// Derive unit_cost from unit_price when the supplier uses a divisor-based cost
+// (e.g. cost_divisor = 3 → a catalogue price of RM 2000 yields a cost of RM 666.67).
+const applyCostDivisor = (row, costDivisor) => {
+  if (costDivisor && costDivisor > 0 && row.unit_price != null) {
+    return { ...row, unit_cost: Math.round((row.unit_price / costDivisor) * 100) / 100 };
+  }
+  return row;
+};
+
 // Finish a job: duplicate-check, insert staging rows, set status to review
-async function finaliseJob(jobId, companyId, parsedRows) {
+async function finaliseJob(jobId, companyId, parsedRows, costDivisor = null) {
   if (parsedRows.length === 0) {
     await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: "No products found in file" }).eq("id", jobId);
     return;
@@ -3379,7 +3415,7 @@ async function finaliseJob(jobId, companyId, parsedRows) {
     const { data: existing } = await supabase.from("products").select("code").eq("company_id", companyId).in("code", codes);
     existingCodes = new Set((existing || []).map(p => p.code));
   }
-  const stagingRows = parsedRows.map(r => ({
+  const stagingRows = parsedRows.map(r => applyCostDivisor(r, costDivisor)).map(r => ({
     job_id: jobId, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null,
     color: r.color || null, supplier_name: r.supplier_name || null,
     unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingCodes.has(r.product_code) ? "duplicate" : "import",
@@ -3490,7 +3526,7 @@ async function processJobAsync(jobId, fileBuffer) {
       }
     }
 
-    await finaliseJob(jobId, job.company_id, parsedRows);
+    await finaliseJob(jobId, job.company_id, parsedRows, job.cost_divisor);
   } catch (err) {
     console.error(`processJobAsync ${jobId} fatal error:`, err);
     await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: err.message }).eq("id", jobId);
@@ -3503,6 +3539,21 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
     const { supplier_id, category_id } = req.body;
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No file uploaded" });
+
+    // Resolve costing rule for this import. A cost_divisor in the request is an
+    // explicit choice (number = derive cost from price, blank = use catalogue cost)
+    // and is persisted on the supplier so it is remembered next time. When the
+    // field is absent, fall back to the supplier's saved default.
+    let costDivisor = null;
+    if (req.body.cost_divisor !== undefined) {
+      costDivisor = parseCostDivisor(req.body.cost_divisor);
+      if (supplier_id) {
+        await supabase.from("suppliers").update({ cost_divisor: costDivisor }).eq("id", supplier_id).eq("company_id", company_id);
+      }
+    } else if (supplier_id) {
+      const { data: sup } = await supabase.from("suppliers").select("cost_divisor").eq("id", supplier_id).eq("company_id", company_id).single();
+      costDivisor = sup?.cost_divisor ?? null;
+    }
 
     const ext = file.originalname.split(".").pop().toLowerCase();
     const isXlsx = ["xlsx", "xls", "csv"].includes(ext);
@@ -3540,7 +3591,7 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
       .insert({
         company_id, supplier_id: supplier_id || null, category_id: category_id || null,
         source_type, source_url: publicUrl || null, status: "processing",
-        parse_method: parseMethod, started_at: new Date().toISOString(), created_by,
+        parse_method: parseMethod, cost_divisor: costDivisor, started_at: new Date().toISOString(), created_by,
       })
       .select().single();
     if (jobError) return res.status(500).json({ error: jobError.message });
@@ -3552,7 +3603,7 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
         const ws = wb.Sheets[wb.SheetNames[0]];
         const rawRows = XLSX.utils.sheet_to_json(ws, { defval: "" });
         const parsedRows = rawRows.map(normaliseImportRow).filter(r => r.product_code || r.product_name);
-        await finaliseJob(job.id, company_id, parsedRows);
+        await finaliseJob(job.id, company_id, parsedRows, costDivisor);
         const { data: updatedJob } = await supabase.from("catalogue_import_jobs")
           .select("*, catalogue_import_rows(*)").eq("id", job.id).single();
         return res.json({ job_id: job.id, status: "review", rows: updatedJob?.catalogue_import_rows || [] });
