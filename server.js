@@ -3472,6 +3472,7 @@ const normaliseImportRow = (raw) => {
     product_name: find("name","Name","item_name","Item Name","Product","product","Description","description"),
     color:        find("color","Color","Colour","colour","color_code","Color Code"),
     size:         find("size","Size","dimension","Dimension","dimensions","Dimensions","variant","Variant","option","Option","spec","Spec"),
+    category_name: find("category","Category","type","Type","product_type","Product Type","group","Group"),
     supplier_name: find("supplier","Supplier","company","Company","brand","Brand","manufacturer","Manufacturer"),
     unit_cost:    toNum(find("cost","Cost","unit_cost","Unit Cost","Buy Price","buy_price","purchase_price")),
     unit_price:   toNum(find("price","Price","unit_price","Unit Price","Sell Price","sell_price","selling_price")),
@@ -3480,11 +3481,11 @@ const normaliseImportRow = (raw) => {
 
 const CATALOGUE_VISION_PROMPT = `You are a catalogue parser. Extract every product from this catalogue page.
 Return ONLY a JSON array (no markdown, no prose) where each element has exactly these keys:
-  code (string, uppercase), name (string), color (string or null), size (string or null — the size/dimensions/variant label), supplier (string or null — the brand/company/manufacturer), unit_cost (number or null), unit_price (number or null)
+  code (string, uppercase), name (string), color (string or null), size (string or null — the size/dimensions/variant label), category (string or null — the product category/type, e.g. "Sofa", "Bed Frame", "Dining Table", "Wardrobe", "Lighting"), supplier (string or null — the brand/company/manufacturer), unit_cost (number or null), unit_price (number or null)
 IMPORTANT: If one product (same code) is offered in several sizes/variants at different prices, output a SEPARATE entry for EACH size — repeat the same code and name, and put that size's dimensions/label in "size" with its own unit_price.
 Example: [
-  {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W800 x D600 x H750mm (1 Drawer)","supplier":null,"unit_cost":null,"unit_price":690},
-  {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W1200 x D600 x H750mm (2 Drawers)","supplier":null,"unit_cost":null,"unit_price":750}
+  {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W800 x D600 x H750mm (1 Drawer)","category":"Desk","supplier":null,"unit_cost":null,"unit_price":690},
+  {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W1200 x D600 x H750mm (2 Drawers)","category":"Desk","supplier":null,"unit_cost":null,"unit_price":750}
 ]
 Do NOT include any explanation. Return the JSON array only.`;
 
@@ -3541,7 +3542,7 @@ async function finaliseJob(jobId, companyId, parsedRows, costDivisor = null, col
   }
   const stagingRows = rows.map(r => applyCostDivisor(r, costDivisor)).map(r => ({
     job_id: jobId, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null,
-    color: r.color || null, size: r.size || null, supplier_name: r.supplier_name || null,
+    color: r.color || null, size: r.size || null, category_name: r.category_name || null, supplier_name: r.supplier_name || null,
     unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingKeys.has(variantKey(r.product_code, r.size, r.color)) ? "duplicate" : "import",
   }));
   const { error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
@@ -3784,7 +3785,7 @@ app.put("/catalogue-import/:job_id/rows", requireRole(MANAGE_ROLES), async (req,
     if (!Array.isArray(rows)) return res.status(400).json({ error: "rows must be an array" });
     const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
     if (!job) return res.status(404).json({ error: "Job not found" });
-    await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, color: r.color || null, size: r.size || null, supplier_name: r.supplier_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
+    await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, color: r.color || null, size: r.size || null, category_name: r.category_name || null, supplier_name: r.supplier_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3832,6 +3833,18 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
     const supplierMap = new Map((allSuppliers || []).map(s => [s.name.toLowerCase(), s.id]));
 
+    // Build category name → id lookup; auto-create missing categories
+    const { data: allCategories } = await supabase.from("product_categories").select("id, name").eq("company_id", company_id);
+    const categoryMap = new Map((allCategories || []).map(c => [c.name.toLowerCase(), c.id]));
+    const uniqueCatNames = [...new Set(toImport.map(r => r.category_name?.trim()).filter(Boolean))];
+    for (const catName of uniqueCatNames) {
+      if (!categoryMap.has(catName.toLowerCase())) {
+        const { data: newCat } = await supabase.from("product_categories")
+          .insert({ company_id, name: catName }).select("id, name").single();
+        if (newCat) categoryMap.set(newCat.name.toLowerCase(), newCat.id);
+      }
+    }
+
     let imported = 0, skipped = skippedCount;
     const rowUpdates = [];
 
@@ -3843,8 +3856,14 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         const matched = supplierMap.get(row.supplier_name.toLowerCase());
         if (matched) supplierId = matched;
       }
+      // Resolve category: per-row category_name > job-level category_id
+      let categoryId = job.category_id || null;
+      if (row.category_name) {
+        const matched = categoryMap.get(row.category_name.toLowerCase());
+        if (matched) categoryId = matched;
+      }
       const { data: product, error: insertErr } = await supabase.from("products")
-        .insert({ company_id, supplier_id: supplierId, category_id: job.category_id || null, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
+        .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
         .select("id").single();
       if (insertErr) { skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
