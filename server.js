@@ -4239,7 +4239,7 @@ async function nextDONumber(company_id) {
   return `DO${ymd}-${String((count || 0) + 1).padStart(3, "0")}`;
 }
 
-app.post("/sales-orders/:id/generate-do", requireAuth, async (req, res) => {
+app.post("/sales-orders/:id/generate-do", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
   try {
     const { company_id } = req.user;
     const { item_ids, warehouse_id } = req.body;
@@ -4275,7 +4275,7 @@ app.post("/sales-orders/:id/generate-do", requireAuth, async (req, res) => {
   } catch (err) { console.error("generate-do error:", err); res.status(500).json({ error: err.message }); }
 });
 
-app.get("/delivery-notes", requireAuth, async (req, res) => {
+app.get("/delivery-notes", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
   try {
     const { status } = req.query;
     let query = supabase.from("delivery_notes")
@@ -4289,7 +4289,7 @@ app.get("/delivery-notes", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch("/delivery-notes/:id/status", requireAuth, async (req, res) => {
+app.patch("/delivery-notes/:id/status", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
   try {
     const { status } = req.body;
     const { data, error } = await supabase.from("delivery_notes")
