@@ -3872,7 +3872,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
       const { data: product, error: insertErr } = await supabase.from("products")
         .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
         .select("id").single();
-      if (insertErr) { console.error("Product insert error:", insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
+      if (insertErr) { console.error("Product insert error:", insertErr.code, insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: insertErr.message, product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
       // Prevent two identical variants within the same batch from both inserting
       if (!insertErr) existingKeys.add(variantKey(row.product_code, row.size, row.color));
@@ -3880,7 +3880,8 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
 
     await Promise.all(rowUpdates.map(u => supabase.from("catalogue_import_rows").update({ action: u.action, product_id: u.product_id }).eq("id", u.id)));
     await supabase.from("catalogue_import_jobs").update({ status: "done", rows_imported: imported, rows_skipped: skipped }).eq("id", job.id);
-    res.json({ imported, skipped, total: toImport.length + skippedCount });
+    const errors = rowUpdates.filter(u => u.error_message).map(u => u.error_message);
+    res.json({ imported, skipped, total: toImport.length + skippedCount, errors: [...new Set(errors)] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
