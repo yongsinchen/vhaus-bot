@@ -3856,6 +3856,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const rowUpdates = [];
 
     for (const row of toImport) {
+      if (!row.product_code || !row.product_name) { skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: "Missing code or name", product_id: null }); continue; }
       if (existingKeys.has(variantKey(row.product_code, row.product_name, row.size, row.color))) { console.log("Duplicate skip:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
       // Resolve supplier: per-row supplier_name > job-level supplier_id
       let supplierId = job.supplier_id || null;
