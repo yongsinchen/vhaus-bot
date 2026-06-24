@@ -3223,6 +3223,18 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150
 
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
 
+// ── GET /branches ────────────────────────────────────────────────
+app.get("/branches", async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    let query = supabase.from("branches").select("id, name, company_id").order("name");
+    if (company_id) query = query.eq("company_id", company_id);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ branches: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── GET /suppliers ───────────────────────────────────────────────
 app.get("/suppliers", async (req, res) => {
   try {
@@ -4014,19 +4026,22 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { company_id, id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method } = req.body;
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method,
+            branch_id, salesman_names } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
     const subtotal = items.reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
     const order_number = await nextOrderNumber(company_id);
+    const resolvedSalesman = salesman_names || salesman_name || name || null;
 
     const { data: order, error: orderErr } = await supabase
       .from("sales_orders")
       .insert({
         company_id, order_number, customer_name,
         customer_contact: customer_contact || null, customer_address: customer_address || null,
-        salesman_name: salesman_name || name || null, status: status || "draft",
+        salesman_name: resolvedSalesman, status: status || "draft",
+        branch_id: branch_id || null,
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
@@ -4067,7 +4082,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { company_id } = req.user;
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method } = req.body;
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method,
+            branch_id, salesman_names } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("id").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
@@ -4075,7 +4091,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const subtotal = (items || []).reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
     const { error: updErr } = await supabase.from("sales_orders").update({
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
-      status, notes: notes || null, subtotal,
+      salesman_name: salesman_names || null, status, notes: notes || null, subtotal,
+      branch_id: branch_id || null,
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
