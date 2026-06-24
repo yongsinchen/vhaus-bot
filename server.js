@@ -3227,7 +3227,7 @@ const MANAGE_ROLES = ["master", "manager", "company_admin"];
 app.get("/suppliers", async (req, res) => {
   try {
     const { company_id } = req.query;
-    let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, is_active, created_at").order("name");
+    let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at").order("name");
     if (company_id) query = query.eq("company_id", company_id);
     const { data, error } = await query;
     if (error) throw error;
@@ -3242,13 +3242,17 @@ const parseCostDivisor = (v) => {
   return Number.isFinite(n) && n > 0 ? n : null;
 };
 
+// Colour interpretation per supplier: "split" → "A / B" means two colour variants;
+// "combined" (default) → "A/B" is one two-tone colour kept as-is.
+const parseColorMode = (v) => (v === "split" ? "split" : "combined");
+
 app.post("/suppliers", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { name, code, contact, cost_divisor } = req.body;
+    const { name, code, contact, cost_divisor, color_mode } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
     const { data, error } = await supabase
       .from("suppliers")
-      .insert({ company_id: req.user.company_id, name: name.trim(), code: code?.trim() || null, contact: contact || null, cost_divisor: parseCostDivisor(cost_divisor) })
+      .insert({ company_id: req.user.company_id, name: name.trim(), code: code?.trim() || null, contact: contact || null, cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode) })
       .select().single();
     if (error) throw error;
     res.status(201).json({ supplier: data });
@@ -3257,12 +3261,13 @@ app.post("/suppliers", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.put("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { name, code, contact, cost_divisor, is_active } = req.body;
+    const { name, code, contact, cost_divisor, color_mode, is_active } = req.body;
     const patch = {};
     if (name !== undefined) patch.name = name.trim();
     if (code !== undefined) patch.code = code?.trim() || null;
     if (contact !== undefined) patch.contact = contact || null;
     if (cost_divisor !== undefined) patch.cost_divisor = parseCostDivisor(cost_divisor);
+    if (color_mode !== undefined) patch.color_mode = parseColorMode(color_mode);
     if (is_active !== undefined) patch.is_active = is_active;
     const { data, error } = await supabase
       .from("suppliers")
@@ -3501,24 +3506,43 @@ const applyCostDivisor = (row, costDivisor) => {
   return row;
 };
 
+// Split a colour string like "Natural / Walnut" into its individual colours.
+const splitColours = (color) => String(color || "").split("/").map(c => c.trim()).filter(Boolean);
+
+// Variant identity: a product is unique per company on code + size + colour.
+const variantKey = (code, size, color) =>
+  `${(code || "").toUpperCase()}||${(size || "").trim().toLowerCase()}||${(color || "").trim().toLowerCase()}`;
+
+// When the supplier treats "A / B" as separate colour options, expand each row
+// with a multi-colour value into one row per colour. Otherwise keep rows as-is.
+const expandColourVariants = (rows, colorMode) => {
+  if (colorMode !== "split") return rows;
+  const out = [];
+  for (const r of rows) {
+    const colours = splitColours(r.color);
+    if (colours.length > 1) colours.forEach(c => out.push({ ...r, color: c }));
+    else out.push(r);
+  }
+  return out;
+};
+
 // Finish a job: duplicate-check, insert staging rows, set status to review
-async function finaliseJob(jobId, companyId, parsedRows, costDivisor = null) {
+async function finaliseJob(jobId, companyId, parsedRows, costDivisor = null, colorMode = "combined") {
   if (parsedRows.length === 0) {
     await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: "No products found in file" }).eq("id", jobId);
     return;
   }
-  // Existing products are keyed by code + size, so a new size of an existing code is not a duplicate
-  const variantKey = (code, size) => `${(code || "").toUpperCase()}||${(size || "").trim().toLowerCase()}`;
-  const codes = parsedRows.map(r => r.product_code).filter(Boolean);
+  const rows = expandColourVariants(parsedRows, colorMode);
+  const codes = rows.map(r => r.product_code).filter(Boolean);
   let existingKeys = new Set();
   if (codes.length > 0) {
-    const { data: existing } = await supabase.from("products").select("code, size").eq("company_id", companyId).in("code", codes);
-    existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.size)));
+    const { data: existing } = await supabase.from("products").select("code, size, color").eq("company_id", companyId).in("code", codes);
+    existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.size, p.color)));
   }
-  const stagingRows = parsedRows.map(r => applyCostDivisor(r, costDivisor)).map(r => ({
+  const stagingRows = rows.map(r => applyCostDivisor(r, costDivisor)).map(r => ({
     job_id: jobId, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null,
     color: r.color || null, size: r.size || null, supplier_name: r.supplier_name || null,
-    unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingKeys.has(variantKey(r.product_code, r.size)) ? "duplicate" : "import",
+    unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingKeys.has(variantKey(r.product_code, r.size, r.color)) ? "duplicate" : "import",
   }));
   const { error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
   if (rowsError) throw new Error(rowsError.message);
@@ -3626,7 +3650,7 @@ async function processJobAsync(jobId, fileBuffer) {
       }
     }
 
-    await finaliseJob(jobId, job.company_id, parsedRows, job.cost_divisor);
+    await finaliseJob(jobId, job.company_id, parsedRows, job.cost_divisor, job.color_mode);
   } catch (err) {
     console.error(`processJobAsync ${jobId} fatal error:`, err);
     await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: err.message }).eq("id", jobId);
@@ -3655,6 +3679,13 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
     } else if (supplier_id) {
       const { data: sup } = await supabase.from("suppliers").select("cost_divisor").eq("id", supplier_id).eq("company_id", company_id).single();
       costDivisor = sup?.cost_divisor ?? null;
+    }
+
+    // Resolve colour mode from the selected supplier (default: combined = no split)
+    let colorMode = "combined";
+    if (supplier_id) {
+      const { data: supC } = await supabase.from("suppliers").select("color_mode").eq("id", supplier_id).eq("company_id", company_id).single();
+      colorMode = supC?.color_mode === "split" ? "split" : "combined";
     }
 
     const ext = file.originalname.split(".").pop().toLowerCase();
@@ -3693,7 +3724,7 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
       .insert({
         company_id, supplier_id: supplier_id || null, category_id: category_id || null,
         source_type, source_url: publicUrl || null, status: "processing",
-        parse_method: parseMethod, cost_divisor: costDivisor, started_at: new Date().toISOString(), created_by,
+        parse_method: parseMethod, cost_divisor: costDivisor, color_mode: colorMode, started_at: new Date().toISOString(), created_by,
       })
       .select().single();
     if (jobError) return res.status(500).json({ error: jobError.message });
@@ -3705,7 +3736,7 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
         const ws = wb.Sheets[wb.SheetNames[0]];
         const rawRows = XLSX.utils.sheet_to_json(ws, { defval: "" });
         const parsedRows = rawRows.map(normaliseImportRow).filter(r => r.product_code || r.product_name);
-        await finaliseJob(job.id, company_id, parsedRows, costDivisor);
+        await finaliseJob(job.id, company_id, parsedRows, costDivisor, colorMode);
         const { data: updatedJob } = await supabase.from("catalogue_import_jobs")
           .select("*, catalogue_import_rows(*)").eq("id", job.id).single();
         return res.json({ job_id: job.id, status: "review", rows: updatedJob?.catalogue_import_rows || [] });
@@ -3758,6 +3789,30 @@ app.put("/catalogue-import/:job_id/rows", requireRole(MANAGE_ROLES), async (req,
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// POST /catalogue-import/:job_id/rows/:row_id/split — split one review row whose
+// colour holds several options (e.g. "Natural / Walnut") into one row per colour.
+app.post("/catalogue-import/:job_id/rows/:row_id/split", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { job_id, row_id } = req.params;
+    const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", job_id).eq("company_id", req.user.company_id).single();
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    const { data: row } = await supabase.from("catalogue_import_rows").select("*").eq("id", row_id).eq("job_id", job_id).single();
+    if (!row) return res.status(404).json({ error: "Row not found" });
+
+    const colours = splitColours(row.color);
+    if (colours.length < 2) return res.status(400).json({ error: "Nothing to split — colour has a single value" });
+
+    // First colour stays on the original row; the rest become new rows.
+    await supabase.from("catalogue_import_rows").update({ color: colours[0] }).eq("id", row_id);
+    const { id, created_at, ...rest } = row;
+    const newRows = colours.slice(1).map(c => ({ ...rest, color: c, product_id: null, action: "import" }));
+    await supabase.from("catalogue_import_rows").insert(newRows);
+
+    const { data: allRows } = await supabase.from("catalogue_import_rows").select("*").eq("job_id", job_id);
+    res.json({ ok: true, rows: allRows || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { company_id } = req.user;
@@ -3768,11 +3823,10 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const toImport = (job.catalogue_import_rows || []).filter(r => r.action === "import");
     const skippedCount = (job.catalogue_import_rows || []).filter(r => r.action !== "import").length;
 
-    // Re-check duplicates at commit time, keyed by code + size
-    const variantKey = (code, size) => `${(code || "").toUpperCase()}||${(size || "").trim().toLowerCase()}`;
+    // Re-check duplicates at commit time, keyed by code + size + colour
     const codes = toImport.map(r => r.product_code).filter(Boolean);
-    const { data: existing } = await supabase.from("products").select("code, size").eq("company_id", company_id).in("code", codes);
-    const existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.size)));
+    const { data: existing } = await supabase.from("products").select("code, size, color").eq("company_id", company_id).in("code", codes);
+    const existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.size, p.color)));
 
     // Build supplier name → id lookup for per-row supplier assignment
     const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
@@ -3782,7 +3836,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const rowUpdates = [];
 
     for (const row of toImport) {
-      if (existingKeys.has(variantKey(row.product_code, row.size))) { skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
+      if (existingKeys.has(variantKey(row.product_code, row.size, row.color))) { skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
       // Resolve supplier: per-row supplier_name > job-level supplier_id
       let supplierId = job.supplier_id || null;
       if (row.supplier_name) {
@@ -3795,7 +3849,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
       if (insertErr) { skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
       // Prevent two identical variants within the same batch from both inserting
-      if (!insertErr) existingKeys.add(variantKey(row.product_code, row.size));
+      if (!insertErr) existingKeys.add(variantKey(row.product_code, row.size, row.color));
     }
 
     await Promise.all(rowUpdates.map(u => supabase.from("catalogue_import_rows").update({ action: u.action, product_id: u.product_id }).eq("id", u.id)));
