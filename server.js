@@ -3052,10 +3052,19 @@ app.put("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) 
 
 app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
+    // Reverse any stock movements from this DO
+    const { data: movements } = await supabase.from("stock_movements")
+      .select("id, warehouse_id, product_id, quantity")
+      .eq("reference_type", "do").eq("reference_id", req.params.id);
+    for (const m of (movements || [])) {
+      if (m.quantity > 0) {
+        await adjustStock(req.user.company_id, m.warehouse_id, m.product_id, -m.quantity, "adjustment", "do_reversal", req.params.id, "DO deleted — stock reversed", req.user.id);
+      }
+    }
     await supabase.from("do_review").delete().eq("supplier_delivery_id", req.params.id);
     const { error } = await supabase.from("supplier_deliveries").delete().eq("id", req.params.id);
     if (error) throw error;
-    res.json({ ok: true });
+    res.json({ ok: true, reversed: (movements || []).length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
