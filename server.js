@@ -3334,7 +3334,7 @@ app.get("/products", async (req, res) => {
     const { company_id, search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
     let query = supabase
       .from("products")
-      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, reorder_point, is_active, created_at, suppliers(id,name), product_categories(id,name)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, suppliers(id,name), product_categories(id,name)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (company_id) query = query.eq("company_id", company_id);
@@ -3351,10 +3351,10 @@ app.get("/products", async (req, res) => {
 
 app.post("/products", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point } = req.body;
+    const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: req.user.company_id, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, reorder_point: reorder_point ?? 0, is_active: true })
+      .insert({ company_id: req.user.company_id, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -3366,9 +3366,9 @@ app.post("/products", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.put("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, reorder_point, is_active } = req.body;
+    const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
     const { data, error } = await supabase.from("products")
-      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, reorder_point, is_active })
+      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
       .eq("id", req.params.id).eq("company_id", req.user.company_id)
       .select().single();
     if (error) {
@@ -3439,6 +3439,7 @@ app.patch("/products/bulk", requireRole(MANAGE_ROLES), async (req, res) => {
     if (set.reorder_point !== undefined) patch.reorder_point = Number(set.reorder_point) || 0;
     if (set.unit_cost !== undefined) patch.unit_cost = set.unit_cost != null ? Number(set.unit_cost) : null;
     if (set.unit_price !== undefined) patch.unit_price = set.unit_price != null ? Number(set.unit_price) : null;
+    if (set.is_customizable !== undefined) patch.is_customizable = set.is_customizable;
 
     let updated = 0;
     if (Object.keys(patch).length > 0) {
@@ -3474,6 +3475,7 @@ const normaliseImportRow = (raw) => {
     product_name: find("name","Name","item_name","Item Name","Product","product","Description","description"),
     color:        find("color","Color","Colour","colour","color_code","Color Code"),
     size:         find("size","Size","dimension","Dimension","dimensions","Dimensions","variant","Variant","option","Option","spec","Spec"),
+    is_customizable: ["true","yes","1"].includes(find("customizable","Customizable","custom","Custom","is_customizable").toLowerCase()),
     category_name: find("category","Category","type","Type","product_type","Product Type","group","Group"),
     supplier_name: find("supplier","Supplier","company","Company","brand","Brand","manufacturer","Manufacturer"),
     unit_cost:    toNum(find("cost","Cost","unit_cost","Unit Cost","Buy Price","buy_price","purchase_price")),
@@ -3483,11 +3485,11 @@ const normaliseImportRow = (raw) => {
 
 const CATALOGUE_VISION_PROMPT = `You are a catalogue parser. Extract every product from this catalogue page.
 Return ONLY a JSON array (no markdown, no prose) where each element has exactly these keys:
-  code (string, uppercase), name (string), color (string or null), size (string or null — the size/dimensions/variant label), category (string or null — the product category/type, e.g. "Sofa", "Bed Frame", "Dining Table", "Wardrobe", "Lighting"), supplier (string or null — the brand/company/manufacturer), unit_cost (number or null), unit_price (number or null)
+  code (string, uppercase), name (string), color (string or null), size (string or null — the size/dimensions/variant label), customizable (boolean — true if the product supports custom sizing or dimensions, e.g. items offered in multiple sizes or with "CUSTOMIZE" mentioned), category (string or null — the product category/type, e.g. "Sofa", "Bed Frame", "Dining Table", "Wardrobe", "Lighting"), supplier (string or null — the brand/company/manufacturer), unit_cost (number or null), unit_price (number or null)
 IMPORTANT: If one product (same code) is offered in several sizes/variants at different prices, output a SEPARATE entry for EACH size — repeat the same code and name, and put that size's dimensions/label in "size" with its own unit_price.
 Example: [
-  {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W800 x D600 x H750mm (1 Drawer)","category":"Desk","supplier":null,"unit_cost":null,"unit_price":690},
-  {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W1200 x D600 x H750mm (2 Drawers)","category":"Desk","supplier":null,"unit_cost":null,"unit_price":750}
+  {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W800 x D600 x H750mm (1 Drawer)","customizable":false,"category":"Desk","supplier":null,"unit_cost":null,"unit_price":690},
+  {"code":"2222","name":"Sofa 4FT","color":null,"size":"W48\" D41\" H17\"","customizable":true,"category":"Sofa","supplier":null,"unit_cost":null,"unit_price":672}
 ]
 Do NOT include any explanation. Return the JSON array only.`;
 
@@ -3544,7 +3546,7 @@ async function finaliseJob(jobId, companyId, parsedRows, costDivisor = null, col
   }
   const stagingRows = rows.map(r => applyCostDivisor(r, costDivisor)).map(r => ({
     job_id: jobId, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null,
-    color: r.color || null, size: r.size || null, category_name: r.category_name || null, supplier_name: r.supplier_name || null,
+    color: r.color || null, size: r.size || null, is_customizable: r.is_customizable || false, category_name: r.category_name || null, supplier_name: r.supplier_name || null,
     unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingKeys.has(variantKey(r.product_code, r.size, r.color)) ? "duplicate" : "import",
   }));
   const { error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
@@ -3787,7 +3789,7 @@ app.put("/catalogue-import/:job_id/rows", requireRole(MANAGE_ROLES), async (req,
     if (!Array.isArray(rows)) return res.status(400).json({ error: "rows must be an array" });
     const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
     if (!job) return res.status(404).json({ error: "Job not found" });
-    await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, color: r.color || null, size: r.size || null, category_name: r.category_name || null, supplier_name: r.supplier_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
+    await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, color: r.color || null, size: r.size || null, is_customizable: r.is_customizable || false, category_name: r.category_name || null, supplier_name: r.supplier_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3865,7 +3867,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         if (matched) categoryId = matched;
       }
       const { data: product, error: insertErr } = await supabase.from("products")
-        .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
+        .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
         .select("id").single();
       if (insertErr) { console.error("Product insert error:", insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
