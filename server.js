@@ -4145,6 +4145,19 @@ app.post("/sales-orders/upload-attachment", requireAuth, upload.single("file"), 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// PATCH /sales-orders/:id/signature — save customer signature data URL
+app.patch("/sales-orders/:id/signature", requireAuth, async (req, res) => {
+  try {
+    const { signature } = req.body;
+    const { data, error } = await supabase.from("sales_orders")
+      .update({ customer_signature: signature || null })
+      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .select("id, customer_signature").single();
+    if (error) throw error;
+    res.json({ ok: true, signature: data.customer_signature });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Health Check ──────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "ok", message: "V Haus Telegram Bot Server" }));
 
