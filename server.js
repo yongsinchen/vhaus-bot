@@ -4374,9 +4374,12 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
       }
 
       let matched = false;
-      // Extract meaningful keywords from DO item (skip short words, dimensions, country codes)
+      // Extract meaningful keywords from DO item — expand abbreviations, skip noise
+      const ABBREV = { pil: "pillow", mat: "mattress", tbl: "table", chr: "chair", cab: "cabinet", drs: "dresser", bfr: "bedframe", stl: "stool" };
+      const SKIP = /^(mal|sg|pcs|unit|set|ctn|box|dun|cs\d*|qty|\+)$/;
       const doKeywords = (item.itemName || "").split(/[\s,\-\/]+/)
-        .map(w => w.toLowerCase().trim()).filter(w => w.length > 2 && !/^\d+x?\d*c?m?$/.test(w) && !/^(mal|sg|pcs|unit|set|ctn|box|dun|mat)$/.test(w));
+        .map(w => w.toLowerCase().trim()).filter(w => w.length > 2 && !/^\d+x?\d*c?m?$/.test(w) && !SKIP.test(w))
+        .map(w => ABBREV[w] || w);
       for (const order of orders) {
         const oItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
         const updatedItems = oItems.map(oi => {
