@@ -3223,7 +3223,37 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150
 
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
 
-// ── GET /branches ────────────────────────────────────────────────
+// ── Company Settings ─────────────────────────────────────────────
+app.get("/company-settings", async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { data } = await supabase.from("company_settings").select("*").eq("company_id", company_id).maybeSingle();
+    res.json({ settings: data || {} });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/company-settings", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { company_id } = req.user;
+    const { company_name, registration_no, address, hotline, bank_account, branches_display, work_start, work_end, base_address } = req.body;
+    const row = { company_id, company_name, registration_no, address, hotline, bank_account, branches_display, work_start: work_start || "09:00", work_end: work_end || "18:00", base_address, updated_at: new Date().toISOString() };
+    const { data: existing } = await supabase.from("company_settings").select("id").eq("company_id", company_id).maybeSingle();
+    let result;
+    if (existing) {
+      const { data, error } = await supabase.from("company_settings").update(row).eq("id", existing.id).select().single();
+      if (error) throw error;
+      result = data;
+    } else {
+      const { data, error } = await supabase.from("company_settings").insert(row).select().single();
+      if (error) throw error;
+      result = data;
+    }
+    res.json({ settings: result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Branches CRUD ────────────────────────────────────────────────
 app.get("/branches", async (req, res) => {
   try {
     const { company_id } = req.query;
@@ -3232,6 +3262,33 @@ app.get("/branches", async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
     res.json({ branches: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/branches", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: "name is required" });
+    const { data, error } = await supabase.from("branches").insert({ company_id: req.user.company_id, name: name.trim() }).select().single();
+    if (error) throw error;
+    res.status(201).json({ branch: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/branches/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name } = req.body;
+    const { data, error } = await supabase.from("branches").update({ name: name.trim() }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    if (error) throw error;
+    res.json({ branch: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/branches/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { error } = await supabase.from("branches").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    if (error) throw error;
+    res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3337,6 +3394,24 @@ app.post("/categories", requireRole(MANAGE_ROLES), async (req, res) => {
       .select().single();
     if (error) throw error;
     res.status(201).json({ category: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/categories/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, parent_id } = req.body;
+    const { data, error } = await supabase.from("product_categories").update({ name: name.trim(), parent_id: parent_id || null }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    if (error) throw error;
+    res.json({ category: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/categories/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    await supabase.from("products").update({ category_id: null }).eq("category_id", req.params.id).eq("company_id", req.user.company_id);
+    const { error } = await supabase.from("product_categories").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    if (error) throw error;
+    res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
