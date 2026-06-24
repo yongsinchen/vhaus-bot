@@ -3437,6 +3437,8 @@ app.patch("/products/bulk", requireRole(MANAGE_ROLES), async (req, res) => {
     if (set.is_active !== undefined) patch.is_active = set.is_active;
     if (set.is_standard !== undefined) patch.is_standard = set.is_standard;
     if (set.reorder_point !== undefined) patch.reorder_point = Number(set.reorder_point) || 0;
+    if (set.unit_cost !== undefined) patch.unit_cost = set.unit_cost != null ? Number(set.unit_cost) : null;
+    if (set.unit_price !== undefined) patch.unit_price = set.unit_price != null ? Number(set.unit_price) : null;
 
     let updated = 0;
     if (Object.keys(patch).length > 0) {
