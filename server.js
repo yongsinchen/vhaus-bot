@@ -3849,7 +3849,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const rowUpdates = [];
 
     for (const row of toImport) {
-      if (existingKeys.has(variantKey(row.product_code, row.size, row.color))) { skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
+      if (existingKeys.has(variantKey(row.product_code, row.size, row.color))) { console.log("Duplicate skip:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
       // Resolve supplier: per-row supplier_name > job-level supplier_id
       let supplierId = job.supplier_id || null;
       if (row.supplier_name) {
@@ -3865,7 +3865,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
       const { data: product, error: insertErr } = await supabase.from("products")
         .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
         .select("id").single();
-      if (insertErr) { skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
+      if (insertErr) { console.error("Product insert error:", insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
       // Prevent two identical variants within the same batch from both inserting
       if (!insertErr) existingKeys.add(variantKey(row.product_code, row.size, row.color));
