@@ -4042,6 +4042,127 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Web DO Upload ────────────────────────────────────────────────
+// Reuses the same OCR + matching logic as the Telegram flow
+app.post("/do-upload", requireRole(["master", "manager", "company_admin", "salesman"]), upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    const base64Image = file.buffer.toString("base64");
+
+    let doData;
+    try {
+      doData = await extractDOFromImage(base64Image);
+    } catch (err) {
+      return res.status(422).json({ error: "Could not read the DO: " + err.message });
+    }
+
+    if (!doData.items || doData.items.length === 0) {
+      return res.status(422).json({ error: "No items found in the DO" });
+    }
+
+    const arrivalDate = new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
+
+    // Upload photo to storage
+    let doPhotoUrl = null;
+    const doMonth = new Date().toISOString().slice(0, 7);
+    const safeSupplier = (doData.supplier || "unknown").replace(/[^a-zA-Z0-9]/g, "-").substring(0, 30);
+    const doFilename = `${doMonth}/DO-${safeSupplier}-${Date.now()}.jpg`;
+    doPhotoUrl = await uploadImageToStorage(base64Image, "supplier-do-photos", doFilename);
+
+    // Create supplier_deliveries record
+    const { data: supplierDelivery } = await supabase.from("supplier_deliveries").insert({
+      do_number: doData.doNumber || null,
+      supplier: doData.supplier || null,
+      do_date: doData.doDate || arrivalDate,
+      supplier_reference: doData.supplierReference || null,
+      photo_url: doPhotoUrl,
+      status: "Processed",
+      company_id: req.user.company_id,
+    }).select().single();
+    const supplierDeliveryId = supplierDelivery?.id || null;
+
+    const results = { updated: [], review: [], showroom: [] };
+
+    for (const item of doData.items) {
+      if (item.isShowroom || !item.soNumber) {
+        await supabase.from("do_review").insert({
+          do_number: doData.doNumber || null, supplier: doData.supplier || null,
+          do_date: doData.doDate || arrivalDate, so_number: item.soNumber || null,
+          item_code: item.itemCode || null, item_name: item.itemName || null,
+          quantity: item.quantity || null, reason: item.isShowroom ? "showroom" : "no_so",
+          status: "Pending", supplier_delivery_id: supplierDeliveryId,
+        });
+        if (item.isShowroom) results.showroom.push(item.itemName);
+        else results.review.push({ item: item.itemName, reason: "no_so" });
+        continue;
+      }
+
+      // Match against legacy orders
+      const { data: orders } = await supabase.from("orders")
+        .select("id, so_number, items, status")
+        .eq("so_number", item.soNumber).in("status", ["Pending", "In Progress"]);
+
+      if (!orders || orders.length === 0) {
+        await supabase.from("do_review").insert({
+          do_number: doData.doNumber || null, supplier: doData.supplier || null,
+          do_date: doData.doDate || arrivalDate, so_number: item.soNumber,
+          item_code: item.itemCode || null, item_name: item.itemName || null,
+          quantity: item.quantity || null, reason: "so_not_found",
+          status: "Pending", supplier_delivery_id: supplierDeliveryId,
+        });
+        results.review.push({ item: item.itemName, reason: "so_not_found" });
+        continue;
+      }
+
+      let matched = false;
+      for (const order of orders) {
+        const oItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+        const updatedItems = oItems.map(oi => {
+          const codeMatch = item.itemCode && oi.itemCode && oi.itemCode.toLowerCase().trim() === item.itemCode.toLowerCase().trim();
+          const nameMatch = item.itemName && oi.itemName && (oi.itemName.toLowerCase().includes(item.itemName.toLowerCase().substring(0, 8)) || item.itemName.toLowerCase().includes(oi.itemName.toLowerCase().substring(0, 8)));
+          if ((codeMatch || nameMatch) && !oi.arrivalDate) { matched = true; return { ...oi, arrivalDate }; }
+          return oi;
+        });
+        if (matched) {
+          await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
+          results.updated.push({ item: item.itemName, so: item.soNumber });
+
+          // Also try to mark PO items as received
+          try {
+            const { data: poItems } = await supabase.from("purchase_order_items")
+              .select("id, po_id, quantity")
+              .or(`product_code.eq.${item.itemCode},product_name.ilike.%${(item.itemName || "").substring(0, 10)}%`);
+            for (const pi of (poItems || [])) {
+              await supabase.from("purchase_order_items").update({ received_qty: pi.quantity, received_date: arrivalDate }).eq("id", pi.id);
+              await updatePOStatus(pi.po_id);
+            }
+          } catch {}
+          break;
+        }
+      }
+
+      if (!matched) {
+        await supabase.from("do_review").insert({
+          do_number: doData.doNumber || null, supplier: doData.supplier || null,
+          do_date: doData.doDate || arrivalDate, so_number: item.soNumber,
+          item_code: item.itemCode || null, item_name: item.itemName || null,
+          quantity: item.quantity || null, reason: "item_not_matched",
+          status: "Pending", supplier_delivery_id: supplierDeliveryId,
+        });
+        results.review.push({ item: item.itemName, reason: "item_not_matched" });
+      }
+    }
+
+    res.json({
+      supplier: doData.supplier, do_number: doData.doNumber, do_date: doData.doDate || arrivalDate,
+      photo_url: doPhotoUrl, total_items: doData.items.length,
+      matched: results.updated.length, pending_review: results.review.length,
+      showroom: results.showroom.length, results,
+    });
+  } catch (err) { console.error("do-upload error:", err); res.status(500).json({ error: err.message }); }
+});
+
 // ── Sales Order Routes ────────────────────────────────────────────
 // requireAuth: verify Bearer token, attach profile (no specific role required)
 const requireAuth = async (req, res, next) => {
