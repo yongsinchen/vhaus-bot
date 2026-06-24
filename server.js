@@ -3923,6 +3923,50 @@ async function nextOrderNumber(company_id) {
   return `SO${ymd}-${seq}`;
 }
 
+// Map sales-order status → delivery (orders table) status
+function deliveryStatusFromSO(s) {
+  if (s === "delivered") return "Delivered";
+  if (s === "cancelled") return "Cancelled";
+  return "Pending";
+}
+
+// Mirror a sales order into the legacy `orders` table so the dashboard,
+// calendar, and delivery routes pick it up. Keyed by so_number + company_id.
+async function syncSalesOrderToDelivery(order, items) {
+  try {
+    const deliveryItems = (items || []).map(it => ({
+      itemCode: it.product_code || "",
+      itemName: [it.product_name, it.size, it.color, it.custom_dimensions].filter(Boolean).join(" "),
+      unit: String(it.quantity || 1),
+      supplier: it.supplier_name || "",
+      itemOrderDate: "", supplierSentDate: "", arrivalDate: "",
+    }));
+    const row = {
+      company_id: order.company_id,
+      so_number: order.order_number,
+      customer_name: order.customer_name,
+      address: order.customer_address || null,
+      contact: order.customer_contact || null,
+      order_date: (order.created_at || new Date().toISOString()).slice(0, 10),
+      salesman: order.salesman_name || null,
+      order_amount: order.subtotal || 0,
+      balance: order.subtotal || 0,
+      delivery_date: order.delivery_date || null,
+      time_slot: order.delivery_time_slot || null,
+      type: order.delivery_type || "Delivery",
+      remark: order.remark || null,
+      status: deliveryStatusFromSO(order.status),
+      items: JSON.stringify(deliveryItems),
+    };
+    const { data: existing } = await supabase.from("orders")
+      .select("id").eq("company_id", order.company_id).eq("so_number", order.order_number).maybeSingle();
+    if (existing) await supabase.from("orders").update(row).eq("id", existing.id);
+    else await supabase.from("orders").insert(row);
+  } catch (e) {
+    console.error("syncSalesOrderToDelivery error:", e.message);
+  }
+}
+
 // GET /sales-orders — list; salesmen see only their own
 app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
@@ -4003,6 +4047,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (itemsErr) throw itemsErr;
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", order.id).single();
+    await syncSalesOrderToDelivery(full, full.sales_order_items);
     res.status(201).json({ order: full });
   } catch (err) { console.error("POST /sales-orders error:", err); res.status(500).json({ error: err.message }); }
 });
@@ -4043,6 +4088,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     }
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
+    await syncSalesOrderToDelivery(full, full.sales_order_items);
     res.json({ order: full });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4054,9 +4100,10 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
     const { status } = req.body;
     const { data, error } = await supabase.from("sales_orders")
       .update({ status }).eq("id", req.params.id).eq("company_id", req.user.company_id)
-      .select("id, status").single();
+      .select("*, sales_order_items(*)").single();
     if (error) throw error;
-    res.json({ order: data });
+    await syncSalesOrderToDelivery(data, data.sales_order_items);
+    res.json({ order: { id: data.id, status: data.status } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4064,8 +4111,13 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
 app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     if (!["master", "manager", "company_admin"].includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    const company_id = req.user.company_id;
+    const { data: existing } = await supabase.from("sales_orders").select("order_number").eq("id", req.params.id).eq("company_id", company_id).single();
+    const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", company_id);
     if (error) throw error;
+    if (existing?.order_number) {
+      await supabase.from("orders").delete().eq("company_id", company_id).eq("so_number", existing.order_number);
+    }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
