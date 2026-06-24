@@ -3253,6 +3253,71 @@ app.post("/company-settings", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Spec Options Library ─────────────────────────────────────────
+app.get("/spec-options", async (req, res) => {
+  try {
+    const { company_id, label } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    let query = supabase.from("spec_options").select("*").eq("company_id", company_id).order("label").order("value");
+    if (label) query = query.eq("label", label);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ options: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/spec-options/pending", async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { data, error } = await supabase.from("spec_options").select("*")
+      .eq("company_id", company_id).eq("is_approved", false).order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json({ options: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/spec-options", requireAuth, async (req, res) => {
+  try {
+    const { label, value, is_approved } = req.body;
+    if (!label || !value) return res.status(400).json({ error: "label and value required" });
+    const isAdmin = ["master", "manager", "company_admin"].includes(req.user.role);
+    const { data, error } = await supabase.from("spec_options")
+      .upsert({ company_id: req.user.company_id, label: label.trim(), value: value.trim(), is_approved: is_approved !== undefined ? is_approved : isAdmin, added_by: req.user.id },
+        { onConflict: "company_id,label,value", ignoreDuplicates: true })
+      .select().single();
+    if (error && error.code !== "23505") throw error;
+    res.json({ option: data || { label, value } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/spec-options/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { value } = req.body;
+    const { data, error } = await supabase.from("spec_options").update({ value: value.trim() })
+      .eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    if (error) throw error;
+    res.json({ option: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/spec-options/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { error } = await supabase.from("spec_options").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/spec-options/:id/approve", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("spec_options").update({ is_approved: true })
+      .eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    if (error) throw error;
+    res.json({ option: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Branches CRUD ────────────────────────────────────────────────
 app.get("/branches", async (req, res) => {
   try {
