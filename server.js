@@ -4253,6 +4253,162 @@ app.patch("/sales-orders/:id/signature", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Purchase Order Routes ─────────────────────────────────────────
+
+async function nextPONumber(company_id) {
+  const now = new Date();
+  const ymd = now.toISOString().slice(2, 10).replace(/-/g, "");
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+  const { count } = await supabase
+    .from("purchase_orders")
+    .select("id", { count: "exact", head: true })
+    .eq("company_id", company_id)
+    .gte("created_at", dayStart);
+  return `PO${ymd}-${String((count || 0) + 1).padStart(3, "0")}`;
+}
+
+async function updatePOStatus(poId) {
+  const { data: items } = await supabase.from("purchase_order_items").select("quantity, received_qty").eq("po_id", poId);
+  if (!items || items.length === 0) return;
+  const allReceived = items.every(i => (i.received_qty || 0) >= (i.quantity || 1));
+  const someReceived = items.some(i => (i.received_qty || 0) > 0);
+  const status = allReceived ? "received" : someReceived ? "partial" : null;
+  if (status) await supabase.from("purchase_orders").update({ status, updated_at: new Date().toISOString() }).eq("id", poId);
+}
+
+// POST /sales-orders/:id/submit-po — generate POs from a sales order
+app.post("/sales-orders/:id/submit-po", requireAuth, async (req, res) => {
+  try {
+    if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const { company_id } = req.user;
+    const { item_ids } = req.body;
+
+    const { data: order } = await supabase.from("sales_orders")
+      .select("*, sales_order_items(*)").eq("id", req.params.id).eq("company_id", company_id).single();
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    let items = order.sales_order_items || [];
+    if (Array.isArray(item_ids) && item_ids.length > 0) {
+      items = items.filter(i => item_ids.includes(i.id));
+    }
+
+    const productIds = items.map(i => i.product_id).filter(Boolean);
+    const { data: products } = await supabase.from("products")
+      .select("id, supplier_id, suppliers(id, name)").in("id", productIds.length ? productIds : ["_"]);
+    const prodMap = new Map((products || []).map(p => [p.id, p]));
+
+    const grouped = {};
+    const noSupplier = [];
+    for (const item of items) {
+      const prod = prodMap.get(item.product_id);
+      const supplierId = prod?.supplier_id;
+      if (!supplierId) { noSupplier.push(item); continue; }
+      if (!grouped[supplierId]) grouped[supplierId] = { supplier_id: supplierId, supplier_name: prod.suppliers?.name || "", items: [] };
+      grouped[supplierId].items.push(item);
+    }
+
+    const createdPOs = [];
+    for (const group of Object.values(grouped)) {
+      const po_number = await nextPONumber(company_id);
+      const { data: po, error: poErr } = await supabase.from("purchase_orders")
+        .insert({ company_id, po_number, supplier_id: group.supplier_id, sales_order_id: order.id, status: "draft", created_by: req.user.id })
+        .select().single();
+      if (poErr) throw poErr;
+
+      const poItems = group.items.map(it => ({
+        po_id: po.id, sales_order_item_id: it.id,
+        product_id: it.product_id, product_code: it.product_code, product_name: it.product_name,
+        size: it.size, color: it.color,
+        quantity: Number(it.quantity) || 1, unit_cost: it.unit_cost ?? null,
+        line_total: (Number(it.unit_cost) || 0) * (Number(it.quantity) || 1),
+      }));
+      await supabase.from("purchase_order_items").insert(poItems);
+      createdPOs.push({ ...po, supplier_name: group.supplier_name, item_count: group.items.length });
+    }
+
+    res.json({ created: createdPOs, skipped_no_supplier: noSupplier.length });
+  } catch (err) { console.error("submit-po error:", err); res.status(500).json({ error: err.message }); }
+});
+
+// GET /purchase-orders
+app.get("/purchase-orders", requireAuth, async (req, res) => {
+  try {
+    const { company_id } = req.user;
+    const { status, supplier_id, search } = req.query;
+    let query = supabase.from("purchase_orders")
+      .select("*, purchase_order_items(*), suppliers(id, name)")
+      .eq("company_id", company_id)
+      .order("created_at", { ascending: false });
+    if (status) query = query.eq("status", status);
+    if (supplier_id) query = query.eq("supplier_id", supplier_id);
+    if (search) query = query.or(`po_number.ilike.%${search}%`);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ orders: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /purchase-orders/:id
+app.get("/purchase-orders/:id", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("purchase_orders")
+      .select("*, purchase_order_items(*), suppliers(id, name)")
+      .eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+    if (error || !data) return res.status(404).json({ error: "PO not found" });
+    res.json({ order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /purchase-orders/:id
+app.put("/purchase-orders/:id", requireAuth, async (req, res) => {
+  try {
+    const { expected_date, notes } = req.body;
+    const { data, error } = await supabase.from("purchase_orders")
+      .update({ expected_date: expected_date || null, notes: notes || null, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    if (error) throw error;
+    res.json({ order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /purchase-orders/:id/status
+app.patch("/purchase-orders/:id/status", requireAuth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const { data, error } = await supabase.from("purchase_orders")
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .select("id, status").single();
+    if (error) throw error;
+    res.json({ order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /purchase-orders/:id — draft only
+app.delete("/purchase-orders/:id", requireAuth, async (req, res) => {
+  try {
+    const { data: po } = await supabase.from("purchase_orders").select("status").eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+    if (!po) return res.status(404).json({ error: "PO not found" });
+    if (po.status !== "draft") return res.status(400).json({ error: "Only draft POs can be deleted" });
+    await supabase.from("purchase_order_items").delete().eq("po_id", req.params.id);
+    await supabase.from("purchase_orders").delete().eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /purchase-order-items/:id/receive
+app.patch("/purchase-order-items/:id/receive", requireAuth, async (req, res) => {
+  try {
+    const { received_qty, received_date } = req.body;
+    const { data, error } = await supabase.from("purchase_order_items")
+      .update({ received_qty: Number(received_qty) || 0, received_date: received_date || new Date().toISOString().slice(0, 10) })
+      .eq("id", req.params.id).select("id, po_id, received_qty").single();
+    if (error) throw error;
+    await updatePOStatus(data.po_id);
+    res.json({ item: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Health Check ──────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "ok", message: "V Haus Telegram Bot Server" }));
 
