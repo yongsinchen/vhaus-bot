@@ -3343,6 +3343,166 @@ app.delete("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Warehouse Zones & Racks ──────────────────────────────────────
+app.get("/warehouses/:id/zones", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("warehouse_zones").select("*, warehouse_racks(*)").eq("warehouse_id", req.params.id).order("name");
+    if (error) throw error;
+    res.json({ zones: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/warehouses/:id/zones", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, description } = req.body;
+    if (!name) return res.status(400).json({ error: "name required" });
+    const { data, error } = await supabase.from("warehouse_zones").insert({ warehouse_id: req.params.id, name: name.trim(), description: description || null }).select().single();
+    if (error) throw error;
+    res.status(201).json({ zone: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/warehouse-zones/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, description } = req.body;
+    const { data, error } = await supabase.from("warehouse_zones").update({ name: name?.trim(), description }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ zone: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/warehouse-zones/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    await supabase.from("warehouse_racks").delete().eq("zone_id", req.params.id);
+    await supabase.from("warehouse_zones").delete().eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/warehouse-zones/:id/racks", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { code, description } = req.body;
+    if (!code) return res.status(400).json({ error: "code required" });
+    const { data, error } = await supabase.from("warehouse_racks").insert({ zone_id: req.params.id, code: code.trim().toUpperCase(), description: description || null }).select().single();
+    if (error) throw error;
+    res.status(201).json({ rack: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/warehouse-racks/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    await supabase.from("warehouse_racks").delete().eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Package Labels ───────────────────────────────────────────────
+function generateQRCode() {
+  const d = new Date().toISOString().slice(2, 10).replace(/-/g, "");
+  const r = Math.random().toString(36).substring(2, 6).toUpperCase();
+  return `PKG-${d}-${r}`;
+}
+
+app.post("/package-labels/generate", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { supplier_delivery_id, items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
+    const labels = [];
+    for (const item of items) {
+      const cartons = Number(item.carton_count) || 1;
+      for (let c = 1; c <= cartons; c++) {
+        labels.push({
+          company_id: req.user.company_id,
+          supplier_delivery_id: supplier_delivery_id || null,
+          product_id: item.product_id || null,
+          product_code: item.product_code || null,
+          product_name: item.product_name || null,
+          so_number: item.so_number || null,
+          carton_number: c,
+          total_cartons: cartons,
+          qr_code: generateQRCode(),
+          warehouse_id: item.warehouse_id || null,
+          zone_id: item.zone_id || null,
+          rack_id: item.rack_id || null,
+          location_code: item.location_code || null,
+          status: "pending",
+        });
+      }
+    }
+    const { data, error } = await supabase.from("package_labels").insert(labels).select();
+    if (error) throw error;
+    res.json({ labels: data || [], count: labels.length });
+  } catch (err) { console.error("generate labels error:", err); res.status(500).json({ error: err.message }); }
+});
+
+app.get("/package-labels", async (req, res) => {
+  try {
+    const { company_id, supplier_delivery_id, so_number, status } = req.query;
+    let query = supabase.from("package_labels").select("*").order("created_at", { ascending: false });
+    if (company_id) query = query.eq("company_id", company_id);
+    if (supplier_delivery_id) query = query.eq("supplier_delivery_id", supplier_delivery_id);
+    if (so_number) query = query.eq("so_number", so_number);
+    if (status) query = query.eq("status", status);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ labels: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/package-labels/validate/:qr_code", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("package_labels").select("*").eq("qr_code", req.params.qr_code).single();
+    if (error || !data) return res.status(404).json({ error: "Package not found" });
+    res.json({ label: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/package-labels/:id/assign-location", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { zone_id, rack_id, location_code } = req.body;
+    const { data, error } = await supabase.from("package_labels")
+      .update({ zone_id, rack_id, location_code, status: "stored" })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ label: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/package-labels/:id/scan", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
+  try {
+    const { status } = req.body;
+    const update = { status };
+    if (status === "picked") { update.picked_at = new Date().toISOString(); update.picked_by = req.user.id; }
+    const { data, error } = await supabase.from("package_labels").update(update).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ label: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/package-labels/confirm-all", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { supplier_delivery_id, warehouse_id } = req.body;
+    if (!supplier_delivery_id) return res.status(400).json({ error: "supplier_delivery_id required" });
+    const { data: labels } = await supabase.from("package_labels")
+      .select("*").eq("supplier_delivery_id", supplier_delivery_id).eq("status", "pending");
+    let stocked = 0;
+    const seen = new Set();
+    for (const label of (labels || [])) {
+      await supabase.from("package_labels").update({ status: "received" }).eq("id", label.id);
+      if (label.product_id && !seen.has(label.product_id)) {
+        seen.add(label.product_id);
+        const wh = warehouse_id || label.warehouse_id;
+        if (wh) {
+          const totalQty = (labels || []).filter(l => l.product_id === label.product_id).length;
+          await adjustStock(req.user.company_id, wh, label.product_id, totalQty, "in", "do", supplier_delivery_id, `DO received — ${label.product_name}`, req.user.id);
+          stocked++;
+        }
+      }
+    }
+    res.json({ confirmed: (labels || []).length, stocked });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Inventory Routes ─────────────────────────────────────────────
 async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type, reference_type, reference_id, notes, created_by) {
   const { data: existing } = await supabase.from("inventory")
