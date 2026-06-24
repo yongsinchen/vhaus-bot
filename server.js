@@ -4322,7 +4322,8 @@ app.post("/sales-orders/:id/submit-po", requireAuth, async (req, res) => {
         quantity: Number(it.quantity) || 1, unit_cost: it.unit_cost ?? null,
         line_total: (Number(it.unit_cost) || 0) * (Number(it.quantity) || 1),
       }));
-      await supabase.from("purchase_order_items").insert(poItems);
+      const { error: itemsErr } = await supabase.from("purchase_order_items").insert(poItems);
+      if (itemsErr) { console.error("PO items insert error:", itemsErr); throw itemsErr; }
       createdPOs.push({ ...po, supplier_name: group.supplier_name, item_count: group.items.length });
     }
 
