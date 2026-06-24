@@ -3277,7 +3277,7 @@ app.get("/spec-options/pending", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/spec-options", requireAuth, async (req, res) => {
+app.post("/spec-options", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
   try {
     const { label, value, is_approved } = req.body;
     if (!label || !value) return res.status(400).json({ error: "label and value required" });
