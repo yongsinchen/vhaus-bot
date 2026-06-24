@@ -3385,6 +3385,37 @@ app.patch("/products/:id/toggle", requireRole(MANAGE_ROLES), async (req, res) =>
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// DELETE /products/:id — remove a product (unlinks any catalogue import rows first)
+app.delete("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const company_id = req.user.company_id;
+    const id = req.params.id;
+    await supabase.from("catalogue_import_rows").update({ product_id: null }).eq("product_id", id);
+    const { error } = await supabase.from("products").delete().eq("id", id).eq("company_id", company_id);
+    if (error) {
+      if (error.code === "23503") return res.status(409).json({ error: "Product is referenced elsewhere and can't be deleted" });
+      throw error;
+    }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /products/bulk-delete — remove many products at once. body: { ids: [] }
+app.post("/products/bulk-delete", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const company_id = req.user.company_id;
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "ids must be a non-empty array" });
+    await supabase.from("catalogue_import_rows").update({ product_id: null }).in("product_id", ids);
+    const { data, error } = await supabase.from("products").delete().eq("company_id", company_id).in("id", ids).select("id");
+    if (error) {
+      if (error.code === "23503") return res.status(409).json({ error: "Some products are referenced elsewhere and can't be deleted" });
+      throw error;
+    }
+    res.json({ ok: true, deleted: data?.length || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // PATCH /products/bulk — apply the same changes to many products at once.
 // body: { ids: [], set: { supplier_id?, category_id?, is_active?, is_standard?, reorder_point? }, cost_divisor? }
 // Provided keys in `set` are written to every product; cost_divisor (when > 0)
