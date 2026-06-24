@@ -4397,15 +4397,35 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
             }
           } catch {}
 
-          // Check if item exists in product master
+          // Check if item exists in product master (fuzzy match)
           try {
-            if (item.itemCode) {
-              const { data: masterMatch } = await supabase.from("products")
-                .select("id").eq("company_id", req.user.company_id).eq("code", item.itemCode.toUpperCase()).limit(1);
-              if (!masterMatch || masterMatch.length === 0) {
-                if (!results.unrecognized) results.unrecognized = [];
-                results.unrecognized.push({ code: item.itemCode, name: item.itemName, so: item.soNumber });
+            const cid = req.user.company_id;
+            const code = (item.itemCode || "").toUpperCase().trim();
+            const name = (item.itemName || "").trim();
+            // Extract keywords from DO item name (skip short words, dimensions, abbreviations)
+            const keywords = name.split(/[\s,\-\/]+/).filter(w => w.length > 2 && !/^\d+x?\d*c?m?$/i.test(w) && !/^(MAL|SG|PCS|UNIT|SET|CTN|BOX)$/i.test(w));
+            let found = false;
+            // 1. Exact code match
+            if (code) {
+              const { data: m1 } = await supabase.from("products").select("id").eq("company_id", cid).eq("code", code).limit(1);
+              if (m1?.length) found = true;
+            }
+            // 2. Partial code match (code contained in product code or vice versa)
+            if (!found && code.length >= 3) {
+              const { data: m2 } = await supabase.from("products").select("id").eq("company_id", cid).ilike("code", `%${code}%`).limit(1);
+              if (m2?.length) found = true;
+            }
+            // 3. Keyword search in product name (try longest keywords first)
+            if (!found && keywords.length > 0) {
+              const sorted = [...keywords].sort((a, b) => b.length - a.length);
+              for (const kw of sorted.slice(0, 3)) {
+                const { data: m3 } = await supabase.from("products").select("id").eq("company_id", cid).ilike("name", `%${kw}%`).limit(1);
+                if (m3?.length) { found = true; break; }
               }
+            }
+            if (!found) {
+              if (!results.unrecognized) results.unrecognized = [];
+              results.unrecognized.push({ code: item.itemCode, name: item.itemName, so: item.soNumber });
             }
           } catch {}
           break;
