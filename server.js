@@ -3377,7 +3377,7 @@ app.delete("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 app.get("/categories", async (req, res) => {
   try {
     const { company_id } = req.query;
-    let query = supabase.from("product_categories").select("id, name, parent_id, created_at").order("name");
+    let query = supabase.from("product_categories").select("id, name, parent_id, spec_labels, created_at").order("name");
     if (company_id) query = query.eq("company_id", company_id);
     const { data, error } = await query;
     if (error) throw error;
@@ -3401,7 +3401,10 @@ app.post("/categories", requireRole(MANAGE_ROLES), async (req, res) => {
 app.put("/categories/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { name, parent_id } = req.body;
-    const { data, error } = await supabase.from("product_categories").update({ name: name.trim(), parent_id: parent_id || null }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    const { spec_labels } = req.body;
+    const update = { name: name.trim(), parent_id: parent_id || null };
+    if (spec_labels !== undefined) update.spec_labels = spec_labels;
+    const { data, error } = await supabase.from("product_categories").update(update).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
     if (error) throw error;
     res.json({ category: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
