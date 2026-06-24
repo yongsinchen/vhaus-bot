@@ -3236,8 +3236,8 @@ app.get("/company-settings", async (req, res) => {
 app.post("/company-settings", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { company_id } = req.user;
-    const { company_name, registration_no, address, hotline, bank_account, branches_display, work_start, work_end, base_address } = req.body;
-    const row = { company_id, company_name, registration_no, address, hotline, bank_account, branches_display, work_start: work_start || "09:00", work_end: work_end || "18:00", base_address, updated_at: new Date().toISOString() };
+    const { company_name, registration_no, address, hotline, bank_account, branches_display, work_start, work_end, base_address, countries } = req.body;
+    const row = { company_id, company_name, registration_no, address, hotline, bank_account, branches_display, work_start: work_start || "09:00", work_end: work_end || "18:00", base_address, countries: countries || null, updated_at: new Date().toISOString() };
     const { data: existing } = await supabase.from("company_settings").select("id").eq("company_id", company_id).maybeSingle();
     let result;
     if (existing) {
@@ -4103,7 +4103,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const { company_id, id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method,
-            branch_id, salesman_names } = req.body;
+            branch_id, salesman_names, country, gst_rate, gst_amount } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
@@ -4121,6 +4121,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
+        country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null,
         subtotal, notes: notes || null, created_by,
       })
       .select().single();
@@ -4159,7 +4160,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method,
-            branch_id, salesman_names } = req.body;
+            branch_id, salesman_names, country, gst_rate, gst_amount } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("id").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
@@ -4172,6 +4173,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
+      country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null,
     }).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
