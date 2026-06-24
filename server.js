@@ -3886,6 +3886,198 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Sales Order Routes ────────────────────────────────────────────
+// requireAuth: verify Bearer token, attach profile (no specific role required)
+const requireAuth = async (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const { data: { user: authUser }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !authUser) return res.status(401).json({ error: "Invalid token" });
+    const { data: profile } = await supabase
+      .from("users")
+      .select("id, role, company_id, branch_id, name, salesman_name, is_active")
+      .eq("id", authUser.id)
+      .single();
+    if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
+    req.user = profile;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
+
+// Generate a readable order number: SO + YYMMDD + 4-digit sequence for the day
+async function nextOrderNumber(company_id) {
+  const now = new Date();
+  const ymd = now.toISOString().slice(2, 10).replace(/-/g, "");
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+  const { count } = await supabase
+    .from("sales_orders")
+    .select("id", { count: "exact", head: true })
+    .eq("company_id", company_id)
+    .gte("created_at", dayStart);
+  const seq = String((count || 0) + 1).padStart(3, "0");
+  return `SO${ymd}-${seq}`;
+}
+
+// GET /sales-orders — list; salesmen see only their own
+app.get("/sales-orders", requireAuth, async (req, res) => {
+  try {
+    const { company_id, role, salesman_name } = req.user;
+    const { status, search } = req.query;
+    let query = supabase
+      .from("sales_orders")
+      .select("*, sales_order_items(*)")
+      .eq("company_id", company_id)
+      .order("created_at", { ascending: false });
+    if (status) query = query.eq("status", status);
+    if (search) query = query.or(`order_number.ilike.%${search}%,customer_name.ilike.%${search}%`);
+    let { data, error } = await query;
+    if (error) throw error;
+    if (role === "salesman" && salesman_name) {
+      const name = salesman_name.toLowerCase().trim();
+      data = (data || []).filter(o => (o.salesman_name || "").toLowerCase().trim() === name);
+    }
+    res.json({ orders: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /sales-orders/:id
+app.get("/sales-orders/:id", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("sales_orders")
+      .select("*, sales_order_items(*)")
+      .eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+    if (error || !data) return res.status(404).json({ error: "Order not found" });
+    res.json({ order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /sales-orders — create order with line items
+app.post("/sales-orders", requireAuth, async (req, res) => {
+  try {
+    if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const { company_id, id: created_by, salesman_name, name } = req.user;
+    const { customer_name, customer_contact, customer_address, status, notes, items } = req.body;
+    if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
+
+    const subtotal = items.reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+    const order_number = await nextOrderNumber(company_id);
+
+    const { data: order, error: orderErr } = await supabase
+      .from("sales_orders")
+      .insert({
+        company_id, order_number, customer_name,
+        customer_contact: customer_contact || null, customer_address: customer_address || null,
+        salesman_name: salesman_name || name || null, status: status || "draft",
+        subtotal, notes: notes || null, created_by,
+      })
+      .select().single();
+    if (orderErr) throw orderErr;
+
+    const itemRows = items.map(it => ({
+      order_id: order.id,
+      product_id: it.product_id || null,
+      product_code: it.product_code || null,
+      product_name: it.product_name || null,
+      size: it.size || null,
+      color: it.color || null,
+      is_custom: it.is_custom === true,
+      custom_dimensions: it.custom_dimensions || null,
+      quantity: Number(it.quantity) || 1,
+      unit_price: it.unit_price ?? null,
+      unit_cost: it.unit_cost ?? null,
+      line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
+      attachment_url: it.attachment_url || null,
+      notes: it.notes || null,
+    }));
+    const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
+    if (itemsErr) throw itemsErr;
+
+    const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", order.id).single();
+    res.status(201).json({ order: full });
+  } catch (err) { console.error("POST /sales-orders error:", err); res.status(500).json({ error: err.message }); }
+});
+
+// PUT /sales-orders/:id — update order + replace items
+app.put("/sales-orders/:id", requireAuth, async (req, res) => {
+  try {
+    if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const { company_id } = req.user;
+    const { id } = req.params;
+    const { customer_name, customer_contact, customer_address, status, notes, items } = req.body;
+
+    const { data: existing } = await supabase.from("sales_orders").select("id").eq("id", id).eq("company_id", company_id).single();
+    if (!existing) return res.status(404).json({ error: "Order not found" });
+
+    const subtotal = (items || []).reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+    const { error: updErr } = await supabase.from("sales_orders").update({
+      customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
+      status, notes: notes || null, subtotal,
+    }).eq("id", id).eq("company_id", company_id);
+    if (updErr) throw updErr;
+
+    if (Array.isArray(items)) {
+      await supabase.from("sales_order_items").delete().eq("order_id", id);
+      const itemRows = items.map(it => ({
+        order_id: id, product_id: it.product_id || null, product_code: it.product_code || null,
+        product_name: it.product_name || null, size: it.size || null, color: it.color || null,
+        is_custom: it.is_custom === true, custom_dimensions: it.custom_dimensions || null,
+        quantity: Number(it.quantity) || 1, unit_price: it.unit_price ?? null, unit_cost: it.unit_cost ?? null,
+        line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
+        attachment_url: it.attachment_url || null, notes: it.notes || null,
+      }));
+      const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
+      if (itemsErr) throw itemsErr;
+    }
+
+    const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
+    res.json({ order: full });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /sales-orders/:id/status
+app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
+  try {
+    if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const { status } = req.body;
+    const { data, error } = await supabase.from("sales_orders")
+      .update({ status }).eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .select("id, status").single();
+    if (error) throw error;
+    res.json({ order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /sales-orders/:id
+app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
+  try {
+    if (!["master", "manager", "company_admin"].includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /sales-orders/upload-attachment — upload a drawing/site measurement, returns URL
+app.post("/sales-orders/upload-attachment", requireAuth, upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    const ext = file.originalname.split(".").pop();
+    const path = `order-attachments/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+    if (upErr) return res.status(500).json({ error: "Upload failed: " + upErr.message });
+    const { data } = supabase.storage.from("order-attachments").getPublicUrl(path);
+    res.json({ url: data?.publicUrl || null });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Health Check ──────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "ok", message: "V Haus Telegram Bot Server" }));
 
