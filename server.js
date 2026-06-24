@@ -3580,7 +3580,7 @@ async function processJobAsync(jobId, fileBuffer) {
 
       for (let i = 0; i < chunks.length; i++) {
         try {
-          const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 4000, messages: [{ role: "user", content: [
+          const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 16000, messages: [{ role: "user", content: [
             { type: "text", text: CATALOGUE_VISION_PROMPT + "\n\nCatalogue text:\n" + chunks[i] },
           ] }] });
           const rows = parseAiJson(resp.choices[0].message.content);
@@ -3595,7 +3595,7 @@ async function processJobAsync(jobId, fileBuffer) {
       // image_ocr: render PDF pages to PNG or use single image, batched 4 pages per API call
       const isPdf = job.source_type === "pdf";
       const pageBuffers = [];
-      const PAGES_PER_BATCH = 4;
+      const PAGES_PER_BATCH = 2;
       const MAX_PAGES = 200;
 
       if (isPdf) {
@@ -3619,7 +3619,7 @@ async function processJobAsync(jobId, fileBuffer) {
             const b64 = Buffer.from(batchPdfBytes).toString("base64");
 
             const resp = await openai.chat.completions.create({
-              model: "gpt-4o", max_tokens: 8000,
+              model: "gpt-4o", max_tokens: 16000,
               messages: [{ role: "user", content: [
                 { type: "file", file: { filename: "catalogue.pdf", file_data: `data:application/pdf;base64,${b64}` } },
                 { type: "text", text: CATALOGUE_VISION_PROMPT },
@@ -3640,7 +3640,7 @@ async function processJobAsync(jobId, fileBuffer) {
         try {
           const b64 = buffer.toString("base64");
           const resp = await openai.chat.completions.create({
-            model: "gpt-4o", max_tokens: 4000,
+            model: "gpt-4o", max_tokens: 16000,
             messages: [{ role: "user", content: [
               { type: "image_url", image_url: { url: `data:image/png;base64,${b64}`, detail: "high" } },
               { type: "text", text: CATALOGUE_VISION_PROMPT },
@@ -3716,7 +3716,9 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
         const pdfData = await pdfParse(file.buffer);
         const textLen = (pdfData.text || "").length;
         const pageCount = pdfData.numpages || 1;
-        parseMethod = (textLen / pageCount) > 100 ? "text_layer" : "image_ocr";
+        // Prefer image_ocr for tabular/catalogue PDFs — text extraction loses table structure
+        // Only use text_layer for very text-heavy documents (>2000 chars/page avg)
+        parseMethod = (textLen / pageCount) > 2000 ? "text_layer" : "image_ocr";
       } catch {
         parseMethod = "image_ocr";
       }
