@@ -3547,7 +3547,9 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
     let costDivisor = null;
     if (req.body.cost_divisor !== undefined) {
       costDivisor = parseCostDivisor(req.body.cost_divisor);
-      if (supplier_id) {
+      // Only persist a real divisor. Choosing "use catalogue cost" (blank) must
+      // NOT wipe the supplier's saved rule — clearing is done from supplier settings.
+      if (supplier_id && costDivisor) {
         await supabase.from("suppliers").update({ cost_divisor: costDivisor }).eq("id", supplier_id).eq("company_id", company_id);
       }
     } else if (supplier_id) {
