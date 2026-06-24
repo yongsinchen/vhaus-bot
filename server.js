@@ -3275,6 +3275,29 @@ app.put("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// DELETE /suppliers/:id — blocked when products reference it unless ?force=true,
+// in which case those products are unassigned (supplier_id set to null) first.
+app.delete("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const company_id = req.user.company_id;
+    const id = req.params.id;
+    const force = req.query.force === "true";
+    const { count } = await supabase.from("products")
+      .select("id", { count: "exact", head: true })
+      .eq("company_id", company_id).eq("supplier_id", id);
+    const productCount = count || 0;
+    if (productCount > 0 && !force) {
+      return res.status(409).json({ error: "Supplier is used by products", product_count: productCount });
+    }
+    if (productCount > 0) {
+      await supabase.from("products").update({ supplier_id: null }).eq("company_id", company_id).eq("supplier_id", id);
+    }
+    const { error } = await supabase.from("suppliers").delete().eq("id", id).eq("company_id", company_id);
+    if (error) throw error;
+    res.json({ ok: true, products_unassigned: productCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── GET /categories ──────────────────────────────────────────────
 app.get("/categories", async (req, res) => {
   try {
@@ -3359,6 +3382,45 @@ app.patch("/products/:id/toggle", requireRole(MANAGE_ROLES), async (req, res) =>
     const { data, error } = await supabase.from("products").update({ is_active: !existing.is_active }).eq("id", req.params.id).select("id, is_active").single();
     if (error) throw error;
     res.json({ product: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /products/bulk — apply the same changes to many products at once.
+// body: { ids: [], set: { supplier_id?, category_id?, is_active?, is_standard?, reorder_point? }, cost_divisor? }
+// Provided keys in `set` are written to every product; cost_divisor (when > 0)
+// recomputes each product's unit_cost from its own unit_price.
+app.patch("/products/bulk", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const company_id = req.user.company_id;
+    const { ids, set = {}, cost_divisor } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "ids must be a non-empty array" });
+
+    const patch = {};
+    if (set.supplier_id !== undefined) patch.supplier_id = set.supplier_id || null;
+    if (set.category_id !== undefined) patch.category_id = set.category_id || null;
+    if (set.is_active !== undefined) patch.is_active = set.is_active;
+    if (set.is_standard !== undefined) patch.is_standard = set.is_standard;
+    if (set.reorder_point !== undefined) patch.reorder_point = Number(set.reorder_point) || 0;
+
+    let updated = 0;
+    if (Object.keys(patch).length > 0) {
+      const { data, error } = await supabase.from("products").update(patch).eq("company_id", company_id).in("id", ids).select("id");
+      if (error) throw error;
+      updated = data?.length || 0;
+    }
+
+    const divisor = parseCostDivisor(cost_divisor);
+    if (divisor) {
+      const { data: prods } = await supabase.from("products").select("id, unit_price").eq("company_id", company_id).in("id", ids);
+      const withPrice = (prods || []).filter(p => p.unit_price != null);
+      await Promise.all(withPrice.map(p =>
+        supabase.from("products").update({ unit_cost: Math.round((p.unit_price / divisor) * 100) / 100 }).eq("id", p.id).eq("company_id", company_id)
+      ));
+      updated = Math.max(updated, withPrice.length);
+    }
+
+    if (Object.keys(patch).length === 0 && !divisor) return res.status(400).json({ error: "No changes provided" });
+    res.json({ ok: true, updated, count: ids.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
