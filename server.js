@@ -3483,10 +3483,11 @@ const normaliseImportRow = (raw) => {
   };
 };
 
-const CATALOGUE_VISION_PROMPT = `You are a catalogue parser. Extract every product from this catalogue page.
+const CATALOGUE_VISION_PROMPT = `You are a catalogue parser. Extract EVERY SINGLE product/row from this catalogue page. Do NOT skip or summarize — output ALL rows.
 Return ONLY a JSON array (no markdown, no prose) where each element has exactly these keys:
   code (string, uppercase), name (string), color (string or null), size (string or null — the size/dimensions/variant label), customizable (boolean — true if the product supports custom sizing or dimensions, e.g. items offered in multiple sizes or with "CUSTOMIZE" mentioned), category (string or null — the product category/type, e.g. "Sofa", "Bed Frame", "Dining Table", "Wardrobe", "Lighting"), supplier (string or null — the brand/company/manufacturer), unit_cost (number or null), unit_price (number or null)
 IMPORTANT: If one product (same code) is offered in several sizes/variants at different prices, output a SEPARATE entry for EACH size — repeat the same code and name, and put that size's dimensions/label in "size" with its own unit_price.
+IMPORTANT: Include add-ons, accessories, pillows, upgrades, motors — every line item with a price is a separate product entry. Do NOT skip any row.
 Example: [
   {"code":"SD886","name":"Study Desk","color":"Natural / Walnut","size":"W800 x D600 x H750mm (1 Drawer)","customizable":false,"category":"Desk","supplier":null,"unit_cost":null,"unit_price":690},
   {"code":"2222","name":"Sofa 4FT","color":null,"size":"W48\" D41\" H17\"","customizable":true,"category":"Sofa","supplier":null,"unit_cost":null,"unit_price":672}
@@ -3595,7 +3596,7 @@ async function processJobAsync(jobId, fileBuffer) {
       // image_ocr: render PDF pages to PNG or use single image, batched 4 pages per API call
       const isPdf = job.source_type === "pdf";
       const pageBuffers = [];
-      const PAGES_PER_BATCH = 2;
+      const PAGES_PER_BATCH = 1;
       const MAX_PAGES = 200;
 
       if (isPdf) {
