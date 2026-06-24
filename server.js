@@ -3266,10 +3266,10 @@ app.get("/warehouses", async (req, res) => {
 
 app.post("/warehouses", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { name, type, address } = req.body;
+    const { name, type, address, pic, contact } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
     const { data, error } = await supabase.from("warehouses")
-      .insert({ company_id: req.user.company_id, name: name.trim(), type: type || "warehouse", address: address || null, is_active: true })
+      .insert({ company_id: req.user.company_id, name: name.trim(), type: type || "warehouse", address: address || null, pic: pic || null, contact: contact || null, is_active: true })
       .select().single();
     if (error) throw error;
     res.status(201).json({ warehouse: data });
@@ -3278,9 +3278,9 @@ app.post("/warehouses", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.put("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { name, type, address } = req.body;
+    const { name, type, address, pic, contact } = req.body;
     const { data, error } = await supabase.from("warehouses")
-      .update({ name: name?.trim(), type, address }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+      .update({ name: name?.trim(), type, address, pic: pic || null, contact: contact || null }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
     if (error) throw error;
     res.json({ warehouse: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3397,6 +3397,43 @@ app.get("/stock-movements", async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
     res.json({ movements: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /inventory/import — bulk import from xlsx/csv
+app.post("/inventory/import", requireRole(MANAGE_ROLES), upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+    const { warehouse_id } = req.body;
+    if (!file || !warehouse_id) return res.status(400).json({ error: "file and warehouse_id required" });
+    const XLSX = require("xlsx");
+    const wb = XLSX.read(file.buffer, { type: "buffer" });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+    const company_id = req.user.company_id;
+    let imported = 0, skipped = 0, errors = [];
+
+    for (const row of rows) {
+      const code = String(row.code || row.Code || row.product_code || row.SKU || "").trim().toUpperCase();
+      const name = String(row.name || row.Name || row.product_name || "").trim();
+      const qty = Number(row.quantity || row.qty || row.Quantity || row.Qty || 0);
+      if (!code && !name) { skipped++; continue; }
+      if (qty <= 0) { skipped++; continue; }
+
+      // Find product by code (and optionally name/size/color)
+      let query = supabase.from("products").select("id").eq("company_id", company_id);
+      if (code) query = query.eq("code", code);
+      else query = query.ilike("name", `%${name}%`);
+      const { data: prods } = await query.limit(1);
+
+      if (!prods || prods.length === 0) { errors.push(`${code || name}: product not found`); skipped++; continue; }
+
+      await adjustStock(company_id, warehouse_id, prods[0].id, qty, "adjustment", "adjustment", null, "Bulk import", req.user.id);
+      imported++;
+    }
+
+    res.json({ imported, skipped, errors: errors.slice(0, 20) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
