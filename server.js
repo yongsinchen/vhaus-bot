@@ -4319,8 +4319,11 @@ app.post("/sales-orders/:id/submit-po", requireAuth, async (req, res) => {
         po_id: po.id, sales_order_item_id: it.id,
         product_id: it.product_id, product_code: it.product_code, product_name: it.product_name,
         size: it.size, color: it.color,
+        custom_dimensions: it.custom_dimensions || null,
+        attachment_url: it.attachment_url || null,
         quantity: Number(it.quantity) || 1, unit_cost: it.unit_cost ?? null,
         line_total: (Number(it.unit_cost) || 0) * (Number(it.quantity) || 1),
+        notes: it.notes || null,
       }));
       const { error: itemsErr } = await supabase.from("purchase_order_items").insert(poItems);
       if (itemsErr) { console.error("PO items insert error:", itemsErr); throw itemsErr; }
