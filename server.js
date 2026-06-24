@@ -3253,6 +3253,153 @@ app.post("/company-settings", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Warehouses CRUD ──────────────────────────────────────────────
+app.get("/warehouses", async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { data, error } = await supabase.from("warehouses").select("*").eq("company_id", company_id).eq("is_active", true).order("name");
+    if (error) throw error;
+    res.json({ warehouses: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/warehouses", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, type, address } = req.body;
+    if (!name) return res.status(400).json({ error: "name required" });
+    const { data, error } = await supabase.from("warehouses")
+      .insert({ company_id: req.user.company_id, name: name.trim(), type: type || "warehouse", address: address || null, is_active: true })
+      .select().single();
+    if (error) throw error;
+    res.status(201).json({ warehouse: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, type, address } = req.body;
+    const { data, error } = await supabase.from("warehouses")
+      .update({ name: name?.trim(), type, address }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    if (error) throw error;
+    res.json({ warehouse: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    await supabase.from("warehouses").update({ is_active: false }).eq("id", req.params.id).eq("company_id", req.user.company_id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Inventory Routes ─────────────────────────────────────────────
+async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type, reference_type, reference_id, notes, created_by) {
+  const { data: existing } = await supabase.from("inventory")
+    .select("id, quantity").eq("warehouse_id", warehouse_id).eq("product_id", product_id).maybeSingle();
+  const newQty = (existing?.quantity || 0) + qty_delta;
+  if (existing) {
+    await supabase.from("inventory").update({ quantity: newQty, updated_at: new Date().toISOString() }).eq("id", existing.id);
+  } else {
+    await supabase.from("inventory").insert({ company_id, warehouse_id, product_id, quantity: newQty, reserved_qty: 0 });
+  }
+  await supabase.from("stock_movements").insert({
+    company_id, warehouse_id, product_id, type, quantity: qty_delta,
+    reference_type, reference_id, notes, created_by,
+  });
+  return newQty;
+}
+
+async function recordLeadTime(company_id, supplier_id, product_id, po_created_at, do_received_at) {
+  if (!po_created_at || !do_received_at) return;
+  const lead_days = Math.round((new Date(do_received_at) - new Date(po_created_at)) / (1000 * 60 * 60 * 24));
+  if (lead_days < 0 || lead_days > 365) return;
+  await supabase.from("supplier_lead_times").insert({
+    company_id, supplier_id: supplier_id || null, product_id: product_id || null,
+    po_created_at, do_received_at, lead_days,
+  });
+}
+
+app.get("/inventory", async (req, res) => {
+  try {
+    const { company_id, warehouse_id, low_stock } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    let query = supabase.from("inventory")
+      .select("*, products(id, code, name, color, size, unit_cost, reorder_point, suppliers(id, name)), warehouses(id, name, type)")
+      .eq("company_id", company_id);
+    if (warehouse_id) query = query.eq("warehouse_id", warehouse_id);
+    const { data, error } = await query;
+    if (error) throw error;
+    let items = data || [];
+    if (low_stock === "true") {
+      items = items.filter(i => i.products && i.quantity <= (i.products.reorder_point || 0));
+    }
+    res.json({ inventory: items });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/inventory/summary", async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { data, error } = await supabase.from("inventory")
+      .select("product_id, quantity, reserved_qty, products(id, code, name, color, size, reorder_point)")
+      .eq("company_id", company_id);
+    if (error) throw error;
+    const grouped = {};
+    (data || []).forEach(r => {
+      if (!grouped[r.product_id]) grouped[r.product_id] = { product: r.products, total_qty: 0, total_reserved: 0 };
+      grouped[r.product_id].total_qty += r.quantity || 0;
+      grouped[r.product_id].total_reserved += r.reserved_qty || 0;
+    });
+    res.json({ summary: Object.values(grouped) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/inventory/adjust", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { warehouse_id, product_id, quantity, notes } = req.body;
+    if (!warehouse_id || !product_id || quantity == null) return res.status(400).json({ error: "warehouse_id, product_id, quantity required" });
+    const { data: current } = await supabase.from("inventory")
+      .select("quantity").eq("warehouse_id", warehouse_id).eq("product_id", product_id).maybeSingle();
+    const delta = Number(quantity) - (current?.quantity || 0);
+    const newQty = await adjustStock(req.user.company_id, warehouse_id, product_id, delta, "adjustment", "adjustment", null, notes || "Manual adjustment", req.user.id);
+    res.json({ ok: true, new_quantity: newQty });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/inventory/transfer", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { from_warehouse_id, to_warehouse_id, product_id, quantity, notes } = req.body;
+    if (!from_warehouse_id || !to_warehouse_id || !product_id || !quantity) return res.status(400).json({ error: "Missing fields" });
+    const qty = Number(quantity);
+    if (qty <= 0) return res.status(400).json({ error: "Quantity must be positive" });
+    const { data: fromStock } = await supabase.from("inventory")
+      .select("quantity").eq("warehouse_id", from_warehouse_id).eq("product_id", product_id).maybeSingle();
+    if ((fromStock?.quantity || 0) < qty) return res.status(400).json({ error: `Insufficient stock (have ${fromStock?.quantity || 0})` });
+    await adjustStock(req.user.company_id, from_warehouse_id, product_id, -qty, "transfer", "transfer", to_warehouse_id, `Transfer to ${to_warehouse_id}`, req.user.id);
+    await adjustStock(req.user.company_id, to_warehouse_id, product_id, qty, "transfer", "transfer", from_warehouse_id, `Transfer from ${from_warehouse_id}`, req.user.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/stock-movements", async (req, res) => {
+  try {
+    const { company_id, warehouse_id, type, limit: lim } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    let query = supabase.from("stock_movements")
+      .select("*, products(code, name), warehouses(name)")
+      .eq("company_id", company_id)
+      .order("created_at", { ascending: false })
+      .limit(Number(lim) || 100);
+    if (warehouse_id) query = query.eq("warehouse_id", warehouse_id);
+    if (type) query = query.eq("type", type);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ movements: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Spec Options Library ─────────────────────────────────────────
 app.get("/spec-options", async (req, res) => {
   try {
@@ -4592,12 +4739,27 @@ app.delete("/purchase-orders/:id", requireAuth, async (req, res) => {
 // PATCH /purchase-order-items/:id/receive
 app.patch("/purchase-order-items/:id/receive", requireAuth, async (req, res) => {
   try {
-    const { received_qty, received_date } = req.body;
+    const { received_qty, received_date, warehouse_id } = req.body;
+    const rcvDate = received_date || new Date().toISOString().slice(0, 10);
     const { data, error } = await supabase.from("purchase_order_items")
-      .update({ received_qty: Number(received_qty) || 0, received_date: received_date || new Date().toISOString().slice(0, 10) })
-      .eq("id", req.params.id).select("id, po_id, received_qty").single();
+      .update({ received_qty: Number(received_qty) || 0, received_date: rcvDate })
+      .eq("id", req.params.id).select("id, po_id, product_id, received_qty, quantity").single();
     if (error) throw error;
     await updatePOStatus(data.po_id);
+
+    // Record lead time
+    try {
+      const { data: po } = await supabase.from("purchase_orders").select("supplier_id, created_at, company_id").eq("id", data.po_id).single();
+      if (po) await recordLeadTime(po.company_id, po.supplier_id, data.product_id, po.created_at, rcvDate);
+    } catch {}
+
+    // Stock in if warehouse specified
+    if (warehouse_id && data.product_id) {
+      try {
+        await adjustStock(req.user.company_id, warehouse_id, data.product_id, Number(received_qty) || data.quantity, "in", "do", data.po_id, `PO receive`, req.user.id);
+      } catch {}
+    }
+
     res.json({ item: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
