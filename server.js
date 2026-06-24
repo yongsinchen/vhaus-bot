@@ -2993,6 +2993,26 @@ app.get("/supplier-deliveries", async (req, res) => {
   res.json(data || []);
 });
 
+app.put("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { do_number, supplier, do_date, supplier_reference } = req.body;
+    const { data, error } = await supabase.from("supplier_deliveries")
+      .update({ do_number, supplier, do_date, supplier_reference })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ delivery: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    await supabase.from("do_review").delete().eq("supplier_delivery_id", req.params.id);
+    const { error } = await supabase.from("supplier_deliveries").delete().eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── DO Review API ─────────────────────────────────────────────────
 app.get("/do-review", async (req, res) => {
   const { data, error } = await supabase.from("do_review").select("*").eq("status", "Pending").order("created_at", { ascending: false });
@@ -4317,6 +4337,16 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
 
     if (!doData.items || doData.items.length === 0) {
       return res.status(422).json({ error: "No items found in the DO" });
+    }
+
+    // Duplicate DO check
+    if (doData.doNumber) {
+      const { data: existing } = await supabase.from("supplier_deliveries")
+        .select("id, do_number, supplier, created_at")
+        .eq("do_number", doData.doNumber).limit(1);
+      if (existing && existing.length > 0) {
+        return res.status(409).json({ error: `DO #${doData.doNumber} already exists (uploaded ${new Date(existing[0].created_at).toLocaleDateString()})` });
+      }
     }
 
     const arrivalDate = new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
