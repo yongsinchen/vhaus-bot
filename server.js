@@ -3016,6 +3016,15 @@ app.get("/supplier-deliveries", async (req, res) => {
   res.json(data || []);
 });
 
+app.get("/supplier-deliveries/:id", async (req, res) => {
+  try {
+    const { data: delivery, error } = await supabase.from("supplier_deliveries").select("*").eq("id", req.params.id).single();
+    if (error || !delivery) return res.status(404).json({ error: "Not found" });
+    const { data: reviews } = await supabase.from("do_review").select("*").eq("supplier_delivery_id", delivery.id).order("created_at");
+    res.json({ delivery, items: reviews || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.put("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { do_number, supplier, do_date, supplier_reference } = req.body;
