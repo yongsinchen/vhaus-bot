@@ -3365,9 +3365,14 @@ app.delete("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 // ── Warehouse Zones & Racks ──────────────────────────────────────
 app.get("/warehouses/:id/zones", async (req, res) => {
   try {
-    const { data, error } = await supabase.from("warehouse_zones").select("*, warehouse_racks(*)").eq("warehouse_id", req.params.id).order("name");
+    const { data: zoneData, error } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).order("name");
     if (error) throw error;
-    res.json({ zones: data || [] });
+    const zones = zoneData || [];
+    for (const z of zones) {
+      const { data: racks } = await supabase.from("warehouse_racks").select("*").eq("zone_id", z.id).order("code");
+      z.warehouse_racks = racks || [];
+    }
+    res.json({ zones });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
