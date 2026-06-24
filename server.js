@@ -4374,12 +4374,23 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
       }
 
       let matched = false;
+      // Extract meaningful keywords from DO item (skip short words, dimensions, country codes)
+      const doKeywords = (item.itemName || "").split(/[\s,\-\/]+/)
+        .map(w => w.toLowerCase().trim()).filter(w => w.length > 2 && !/^\d+x?\d*c?m?$/.test(w) && !/^(mal|sg|pcs|unit|set|ctn|box|dun|mat)$/.test(w));
       for (const order of orders) {
         const oItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
         const updatedItems = oItems.map(oi => {
-          const codeMatch = item.itemCode && oi.itemCode && oi.itemCode.toLowerCase().trim() === item.itemCode.toLowerCase().trim();
-          const nameMatch = item.itemName && oi.itemName && (oi.itemName.toLowerCase().includes(item.itemName.toLowerCase().substring(0, 8)) || item.itemName.toLowerCase().includes(oi.itemName.toLowerCase().substring(0, 8)));
-          if ((codeMatch || nameMatch) && !oi.arrivalDate) { matched = true; return { ...oi, arrivalDate }; }
+          const oiCode = (oi.itemCode || "").toLowerCase().trim();
+          const oiName = (oi.itemName || "").toLowerCase();
+          const doCode = (item.itemCode || "").toLowerCase().trim();
+          // 1. Exact code match
+          const codeMatch = doCode && oiCode && oiCode === doCode;
+          // 2. Code contained in order item name or vice versa
+          const codeInName = doCode && doCode.length >= 3 && (oiName.includes(doCode) || (oiCode && doCode.includes(oiCode)));
+          // 3. Keyword match: at least 2 DO keywords found in order item name, or 1 keyword >= 5 chars
+          const kwMatches = doKeywords.filter(kw => oiName.includes(kw) || oiCode.includes(kw));
+          const keywordMatch = kwMatches.length >= 2 || kwMatches.some(kw => kw.length >= 5);
+          if ((codeMatch || codeInName || keywordMatch) && !oi.arrivalDate) { matched = true; return { ...oi, arrivalDate }; }
           return oi;
         });
         if (matched) {
