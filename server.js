@@ -3219,7 +3219,7 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
 };
 
 // Multer — memory storage for catalogue file uploads (max 20 MB)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
 
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
 
