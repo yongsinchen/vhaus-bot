@@ -4226,6 +4226,80 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Generate Outbound DO ─────────────────────────────────────────
+async function nextDONumber(company_id) {
+  const now = new Date();
+  const ymd = now.toISOString().slice(2, 10).replace(/-/g, "");
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+  const { count } = await supabase
+    .from("delivery_notes")
+    .select("id", { count: "exact", head: true })
+    .eq("company_id", company_id)
+    .gte("created_at", dayStart);
+  return `DO${ymd}-${String((count || 0) + 1).padStart(3, "0")}`;
+}
+
+app.post("/sales-orders/:id/generate-do", requireAuth, async (req, res) => {
+  try {
+    const { company_id } = req.user;
+    const { item_ids, warehouse_id } = req.body;
+
+    const { data: order } = await supabase.from("sales_orders")
+      .select("*, sales_order_items(*)").eq("id", req.params.id).eq("company_id", company_id).single();
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    let items = order.sales_order_items || [];
+    if (Array.isArray(item_ids) && item_ids.length > 0) items = items.filter(i => item_ids.includes(i.id));
+    if (items.length === 0) return res.status(400).json({ error: "No items selected" });
+
+    const do_number = await nextDONumber(company_id);
+    const { data: dn, error } = await supabase.from("delivery_notes").insert({
+      company_id, do_number, sales_order_id: order.id,
+      customer_name: order.customer_name, customer_address: order.customer_address,
+      customer_contact: order.customer_contact, delivery_date: order.delivery_date,
+      warehouse_id: warehouse_id || null, status: "pending",
+      created_by: req.user.id,
+    }).select().single();
+    if (error) throw error;
+
+    const dnItems = items.map(it => ({
+      delivery_note_id: dn.id, sales_order_item_id: it.id,
+      product_id: it.product_id, product_code: it.product_code, product_name: it.product_name,
+      size: it.size, color: it.color, custom_dimensions: it.custom_dimensions,
+      quantity: Number(it.quantity) || 1,
+    }));
+    const { error: itemsErr } = await supabase.from("delivery_note_items").insert(dnItems);
+    if (itemsErr) throw itemsErr;
+
+    res.json({ do_number: dn.do_number, delivery_note: dn, item_count: items.length });
+  } catch (err) { console.error("generate-do error:", err); res.status(500).json({ error: err.message }); }
+});
+
+app.get("/delivery-notes", requireAuth, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = supabase.from("delivery_notes")
+      .select("*, delivery_note_items(*)")
+      .eq("company_id", req.user.company_id)
+      .order("created_at", { ascending: false });
+    if (status) query = query.eq("status", status);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ notes: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/delivery-notes/:id/status", requireAuth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const { data, error } = await supabase.from("delivery_notes")
+      .update({ status }).eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .select("id, status").single();
+    if (error) throw error;
+    res.json({ note: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Web DO Upload ────────────────────────────────────────────────
 // Reuses the same OCR + matching logic as the Telegram flow
 app.post("/do-upload", requireRole(["master", "manager", "company_admin", "salesman"]), upload.single("file"), async (req, res) => {
@@ -4322,6 +4396,18 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
               await updatePOStatus(pi.po_id);
             }
           } catch {}
+
+          // Check if item exists in product master
+          try {
+            if (item.itemCode) {
+              const { data: masterMatch } = await supabase.from("products")
+                .select("id").eq("company_id", req.user.company_id).eq("code", item.itemCode.toUpperCase()).limit(1);
+              if (!masterMatch || masterMatch.length === 0) {
+                if (!results.unrecognized) results.unrecognized = [];
+                results.unrecognized.push({ code: item.itemCode, name: item.itemName, so: item.soNumber });
+              }
+            }
+          } catch {}
           break;
         }
       }
@@ -4342,7 +4428,8 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
       supplier: doData.supplier, do_number: doData.doNumber, do_date: doData.doDate || arrivalDate,
       photo_url: doPhotoUrl, total_items: doData.items.length,
       matched: results.updated.length, pending_review: results.review.length,
-      showroom: results.showroom.length, results,
+      showroom: results.showroom.length, unrecognized: (results.unrecognized || []).length,
+      results,
     });
   } catch (err) { console.error("do-upload error:", err); res.status(500).json({ error: err.message }); }
 });
