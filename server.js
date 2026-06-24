@@ -3949,8 +3949,8 @@ async function syncSalesOrderToDelivery(order, items) {
       contact: order.customer_contact || null,
       order_date: (order.created_at || new Date().toISOString()).slice(0, 10),
       salesman: order.salesman_name || null,
-      order_amount: order.subtotal || 0,
-      balance: order.subtotal || 0,
+      order_amount: (Number(order.subtotal) || 0) - (Number(order.discount) || 0),
+      balance: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) - (Number(order.deposit) || 0),
       delivery_date: order.delivery_date || null,
       time_slot: order.delivery_time_slot || null,
       type: order.delivery_type || "Delivery",
@@ -4007,7 +4007,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { company_id, id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark } = req.body;
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
@@ -4022,6 +4022,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         salesman_name: salesman_name || name || null, status: status || "draft",
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
+        discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
         subtotal, notes: notes || null, created_by,
       })
       .select().single();
@@ -4059,7 +4060,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { company_id } = req.user;
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark } = req.body;
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("id").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
@@ -4070,6 +4071,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       status, notes: notes || null, subtotal,
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
+      discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
     }).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
