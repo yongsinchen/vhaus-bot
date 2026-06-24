@@ -30,6 +30,29 @@ const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
 const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
+// ── Auth middleware (used by all protected routes) ───────────────
+const requireRole = (allowedRoles) => async (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const { data: { user: authUser }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !authUser) return res.status(401).json({ error: "Invalid token" });
+    const { data: profile } = await supabase
+      .from("users")
+      .select("id, role, company_id, branch_id, is_active")
+      .eq("id", authUser.id)
+      .single();
+    if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
+    if (!allowedRoles.includes(profile.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    req.user = profile;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+const MANAGE_ROLES = ["master", "manager", "company_admin"];
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
+
 // ── Supabase Storage — Upload image ──────────────────────────────
 const uploadImageToStorage = async (base64Image, bucket, filename) => {
   try {
@@ -3217,31 +3240,6 @@ Please contact your manager to set up your account.`);
 });
 
 // ── Product Master Routes ─────────────────────────────────────────
-// requireRole: verifies Bearer token against Supabase auth, attaches user to req
-const requireRole = (allowedRoles) => async (req, res, next) => {
-  try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
-    if (!token) return res.status(401).json({ error: "Unauthorized" });
-    const { data: { user: authUser }, error: authErr } = await supabase.auth.getUser(token);
-    if (authErr || !authUser) return res.status(401).json({ error: "Invalid token" });
-    const { data: profile } = await supabase
-      .from("users")
-      .select("id, role, company_id, branch_id, is_active")
-      .eq("id", authUser.id)
-      .single();
-    if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
-    if (!allowedRoles.includes(profile.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    req.user = profile;
-    next();
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
-
-// Multer — memory storage for catalogue file uploads (max 20 MB)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
-
-const MANAGE_ROLES = ["master", "manager", "company_admin"];
 
 // ── Company Settings ─────────────────────────────────────────────
 app.get("/company-settings", async (req, res) => {
