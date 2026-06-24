@@ -3893,12 +3893,19 @@ const requireAuth = async (req, res, next) => {
     const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
     if (!token) return res.status(401).json({ error: "Unauthorized" });
     const { data: { user: authUser }, error: authErr } = await supabase.auth.getUser(token);
-    if (authErr || !authUser) return res.status(401).json({ error: "Invalid token" });
-    const { data: profile } = await supabase
+    if (authErr || !authUser) {
+      console.error("requireAuth invalid token:", authErr?.message);
+      return res.status(401).json({ error: "Invalid token", reason: authErr?.message || "no user" });
+    }
+    const { data: profile, error: profErr } = await supabase
       .from("users")
       .select("id, role, company_id, branch_id, name, salesman_name, is_active")
       .eq("id", authUser.id)
       .single();
+    if (profErr) {
+      console.error("requireAuth profile error:", profErr.message);
+      return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
+    }
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     req.user = profile;
     next();
