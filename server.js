@@ -3962,7 +3962,8 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { company_id, id: created_by, salesman_name, name } = req.user;
-    const { customer_name, customer_contact, customer_address, status, notes, items } = req.body;
+    const { customer_name, customer_contact, customer_address, status, notes, items,
+            delivery_date, delivery_time_slot, delivery_type, remark } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
@@ -3975,6 +3976,8 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         company_id, order_number, customer_name,
         customer_contact: customer_contact || null, customer_address: customer_address || null,
         salesman_name: salesman_name || name || null, status: status || "draft",
+        delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
+        delivery_type: delivery_type || "Delivery", remark: remark || null,
         subtotal, notes: notes || null, created_by,
       })
       .select().single();
@@ -4010,7 +4013,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { company_id } = req.user;
     const { id } = req.params;
-    const { customer_name, customer_contact, customer_address, status, notes, items } = req.body;
+    const { customer_name, customer_contact, customer_address, status, notes, items,
+            delivery_date, delivery_time_slot, delivery_type, remark } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("id").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
@@ -4019,6 +4023,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { error: updErr } = await supabase.from("sales_orders").update({
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
       status, notes: notes || null, subtotal,
+      delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
+      delivery_type: delivery_type || "Delivery", remark: remark || null,
     }).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
