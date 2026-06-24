@@ -3267,9 +3267,10 @@ app.get("/branches", async (req, res) => {
 
 app.post("/branches", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { name } = req.body;
+    const { name, code } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
-    const { data, error } = await supabase.from("branches").insert({ company_id: req.user.company_id, name: name.trim() }).select().single();
+    const branchCode = code || name.trim().toUpperCase().replace(/\s+/g, "_").slice(0, 20);
+    const { data, error } = await supabase.from("branches").insert({ company_id: req.user.company_id, name: name.trim(), code: branchCode }).select().single();
     if (error) throw error;
     res.status(201).json({ branch: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
