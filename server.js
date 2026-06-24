@@ -3516,8 +3516,8 @@ const applyCostDivisor = (row, costDivisor) => {
 const splitColours = (color) => String(color || "").split("/").map(c => c.trim()).filter(Boolean);
 
 // Variant identity: a product is unique per company on code + size + colour.
-const variantKey = (code, size, color) =>
-  `${(code || "").toUpperCase()}||${(size || "").trim().toLowerCase()}||${(color || "").trim().toLowerCase()}`;
+const variantKey = (code, name, size, color) =>
+  `${(code || "").toUpperCase()}||${(name || "").trim().toLowerCase()}||${(size || "").trim().toLowerCase()}||${(color || "").trim().toLowerCase()}`;
 
 // When the supplier treats "A / B" as separate colour options, expand each row
 // with a multi-colour value into one row per colour. Otherwise keep rows as-is.
@@ -3542,13 +3542,13 @@ async function finaliseJob(jobId, companyId, parsedRows, costDivisor = null, col
   const codes = rows.map(r => r.product_code).filter(Boolean);
   let existingKeys = new Set();
   if (codes.length > 0) {
-    const { data: existing } = await supabase.from("products").select("code, size, color").eq("company_id", companyId).in("code", codes);
-    existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.size, p.color)));
+    const { data: existing } = await supabase.from("products").select("code, name, size, color").eq("company_id", companyId).in("code", codes);
+    existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.name, p.size, p.color)));
   }
   const stagingRows = rows.map(r => applyCostDivisor(r, costDivisor)).map(r => ({
     job_id: jobId, raw_data: r, product_code: r.product_code || null, product_name: r.product_name || null,
     color: r.color || null, size: r.size || null, is_customizable: r.is_customizable || false, category_name: r.category_name || null, supplier_name: r.supplier_name || null,
-    unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingKeys.has(variantKey(r.product_code, r.size, r.color)) ? "duplicate" : "import",
+    unit_cost: r.unit_cost, unit_price: r.unit_price, action: existingKeys.has(variantKey(r.product_code, r.product_name, r.size, r.color)) ? "duplicate" : "import",
   }));
   const { error: rowsError } = await supabase.from("catalogue_import_rows").insert(stagingRows).select();
   if (rowsError) throw new Error(rowsError.message);
@@ -3833,8 +3833,8 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
 
     // Re-check duplicates at commit time, keyed by code + size + colour
     const codes = toImport.map(r => r.product_code).filter(Boolean);
-    const { data: existing } = await supabase.from("products").select("code, size, color").eq("company_id", company_id).in("code", codes);
-    const existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.size, p.color)));
+    const { data: existing } = await supabase.from("products").select("code, name, size, color").eq("company_id", company_id).in("code", codes);
+    const existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.name, p.size, p.color)));
 
     // Build supplier name → id lookup for per-row supplier assignment
     const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
@@ -3856,7 +3856,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const rowUpdates = [];
 
     for (const row of toImport) {
-      if (existingKeys.has(variantKey(row.product_code, row.size, row.color))) { console.log("Duplicate skip:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
+      if (existingKeys.has(variantKey(row.product_code, row.product_name, row.size, row.color))) { console.log("Duplicate skip:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
       // Resolve supplier: per-row supplier_name > job-level supplier_id
       let supplierId = job.supplier_id || null;
       if (row.supplier_name) {
@@ -3875,7 +3875,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
       if (insertErr) { console.error("Product insert error:", insertErr.code, insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: insertErr.message, product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
       // Prevent two identical variants within the same batch from both inserting
-      if (!insertErr) existingKeys.add(variantKey(row.product_code, row.size, row.color));
+      if (!insertErr) existingKeys.add(variantKey(row.product_code, row.product_name, row.size, row.color));
     }
 
     await Promise.all(rowUpdates.map(u => supabase.from("catalogue_import_rows").update({ action: u.action, product_id: u.product_id }).eq("id", u.id)));
