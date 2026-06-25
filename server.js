@@ -4067,6 +4067,162 @@ app.patch("/package-labels/:id/load", requireRole(MANAGE_ROLES), async (req, res
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Auto-Ready Check + Missing Item Alerts ──────────────────────
+app.get("/delivery-readiness", requireAuth, async (req, res) => {
+  try {
+    const { company_id, date, days = 3 } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const startDate = date || new Date().toISOString().slice(0, 10);
+    const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
+
+    // Get all orders with delivery_date in range
+    const { data: allOrders } = await supabase.from("orders")
+      .select("id, so_number, customer_name, delivery_date, status, items, balance")
+      .eq("company_id", company_id).in("status", ["Pending", "Confirmed", "In Progress"]);
+    const orders = (allOrders || []).filter(o => {
+      const dd = (o.delivery_date || "").trim();
+      return dd >= startDate && dd <= endDate;
+    });
+
+    const results = [];
+    for (const order of orders) {
+      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+      const totalItems = Array.isArray(items) ? items.length : 0;
+
+      // Check item arrival status
+      const arrivedItems = Array.isArray(items) ? items.filter(i => i.arrivalDate).length : 0;
+      const missingItems = Array.isArray(items) ? items.filter(i => i.itemName && !i.arrivalDate).map(i => i.itemName) : [];
+
+      // Check warehouse packings
+      const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", order.id);
+      const oiIds = (orderItems || []).map(oi => oi.id);
+      let packedCount = 0, storedCount = 0, pickedCount = 0;
+      if (oiIds.length > 0) {
+        const { data: packings } = await supabase.from("order_item_packings").select("status").in("order_item_id", oiIds);
+        for (const p of (packings || [])) {
+          if (p.status === "packed") packedCount++;
+          if (p.status === "put_away") storedCount++;
+          if (p.status === "picked" || p.status === "loaded") pickedCount++;
+        }
+      }
+      // Also check package_labels fallback
+      const { data: labels } = await supabase.from("package_labels").select("status").eq("so_number", order.so_number);
+      if ((labels || []).length > 0 && packedCount === 0 && storedCount === 0) {
+        for (const l of labels) {
+          if (l.status === "stored" || l.status === "put_away") storedCount++;
+          if (l.status === "picked" || l.status === "loaded") pickedCount++;
+        }
+      }
+
+      // Check balance
+      const hasBalance = parseFloat(order.balance) > 0;
+
+      // Determine readiness
+      const alerts = [];
+      if (missingItems.length > 0) alerts.push({ type: "missing_items", severity: "high", message: `${missingItems.length} item(s) not arrived`, items: missingItems });
+      if (totalItems > 0 && storedCount === 0 && pickedCount === 0 && packedCount === 0) alerts.push({ type: "no_packages", severity: "medium", message: "No items in warehouse (no QR labels)" });
+      if (storedCount > 0 && pickedCount === 0) alerts.push({ type: "not_picked", severity: "medium", message: `${storedCount} item(s) stored but not picked yet` });
+      if (hasBalance) alerts.push({ type: "balance", severity: "low", message: `Outstanding balance: RM ${order.balance}` });
+
+      const isReady = missingItems.length === 0 && alerts.filter(a => a.severity === "high").length === 0;
+
+      results.push({
+        order_id: order.id, so_number: order.so_number, customer_name: order.customer_name,
+        delivery_date: order.delivery_date, status: order.status,
+        total_items: totalItems, arrived_items: arrivedItems, missing_items: missingItems,
+        packed: packedCount, stored: storedCount, picked: pickedCount,
+        balance: order.balance, is_ready: isReady, alerts,
+      });
+    }
+
+    // Auto-update is_ready on delivery_schedules
+    for (const r of results) {
+      await supabase.from("delivery_schedules").update({ is_ready: r.is_ready }).eq("order_id", r.order_id);
+    }
+
+    results.sort((a, b) => (a.delivery_date || "").localeCompare(b.delivery_date || ""));
+    res.json({ orders: results, ready: results.filter(r => r.is_ready).length, total: results.length });
+  } catch (err) { console.error("delivery-readiness error:", err); res.status(500).json({ error: err.message }); }
+});
+
+// ── Smart Scheduling: area grouping + suggestions ───────────────
+app.get("/scheduling-suggest", requireAuth, async (req, res) => {
+  try {
+    const { company_id, date } = req.query;
+    if (!company_id || !date) return res.status(400).json({ error: "company_id and date required" });
+
+    // Get unassigned orders for this date
+    const { data: allOrders } = await supabase.from("orders")
+      .select("id, so_number, customer_name, address, delivery_date, status, items, balance, time_slot, order_area")
+      .eq("company_id", company_id).in("status", ["Pending", "Confirmed", "In Progress"]);
+    const orders = (allOrders || []).filter(o => (o.delivery_date || "").trim() === date);
+
+    // Check which are already scheduled
+    const { data: existingSchedules } = await supabase.from("delivery_schedules").select("order_id").eq("scheduled_date", date);
+    const scheduledIds = new Set((existingSchedules || []).map(s => s.order_id));
+    const unassigned = orders.filter(o => !scheduledIds.has(o.id));
+
+    // Extract area from address (postal code or known area keywords)
+    const areaKeywords = {
+      "bukit mertajam": "BM", "bm": "BM", "simpang ampat": "SA", "alma": "BM",
+      "seberang jaya": "SJ", "butterworth": "BW", "perai": "PR", "penang": "PG", "georgetown": "GT",
+      "batu kawan": "BK", "nibong tebal": "NT", "jawi": "JW", "sungai petani": "SP",
+      "kulim": "KL", "bayan lepas": "BL", "jelutong": "JL", "air itam": "AI",
+      "tanjung bungah": "TB", "gurney": "GT", "pulau tikus": "PT",
+      "ideal venice": "BK", "eco meadows": "SA", "bandar cassia": "BK",
+    };
+
+    function extractArea(address) {
+      if (!address) return "Unknown";
+      const lower = address.toLowerCase();
+      // Try postal code first (5-digit Malaysian)
+      const postalMatch = lower.match(/\b(\d{5})\b/);
+      if (postalMatch) {
+        const code = postalMatch[1];
+        if (code.startsWith("14")) return "BM/SA";
+        if (code.startsWith("13")) return "BW/PR/SJ";
+        if (code.startsWith("11")) return "PG Island";
+        if (code.startsWith("10")) return "GT/PG";
+        if (code.startsWith("08") || code.startsWith("09")) return "SP/KL";
+      }
+      // Try keyword matching
+      for (const [keyword, area] of Object.entries(areaKeywords)) {
+        if (lower.includes(keyword)) return area;
+      }
+      return "Other";
+    }
+
+    // Group by area
+    const areaGroups = {};
+    for (const order of unassigned) {
+      const area = extractArea(order.address);
+      if (!areaGroups[area]) areaGroups[area] = [];
+      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+      areaGroups[area].push({
+        ...order,
+        _area: area,
+        _item_count: Array.isArray(items) ? items.length : 0,
+        _has_balance: parseFloat(order.balance) > 0,
+      });
+    }
+
+    // Get vehicles for capacity reference
+    const { data: vehicles } = await supabase.from("delivery_vehicles").select("*").eq("company_id", company_id).eq("status", "Active");
+
+    // Build suggestions: one team per area group
+    const suggestions = Object.entries(areaGroups).map(([area, orders]) => ({
+      area,
+      order_count: orders.length,
+      item_count: orders.reduce((s, o) => s + o._item_count, 0),
+      orders: orders.sort((a, b) => (a.time_slot || "zzz").localeCompare(b.time_slot || "zzz")),
+    }));
+
+    suggestions.sort((a, b) => b.order_count - a.order_count);
+
+    res.json({ suggestions, vehicles: vehicles || [], unassigned_count: unassigned.length, total_orders: orders.length });
+  } catch (err) { console.error("scheduling-suggest error:", err); res.status(500).json({ error: err.message }); }
+});
+
 // ── Inventory Routes ─────────────────────────────────────────────
 async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type, reference_type, reference_id, notes, created_by) {
   const { data: existing } = await supabase.from("inventory")
