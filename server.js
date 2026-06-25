@@ -4818,7 +4818,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { company_id, id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method,
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
@@ -4836,7 +4836,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         branch_id: branch_id || null,
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
-        discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
+        discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
         country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
         subtotal, notes: notes || null, created_by,
       })
@@ -4875,7 +4875,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { company_id } = req.user;
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method,
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
@@ -4924,7 +4924,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       branch_id: branch_id || null,
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
-      discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
+      discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
     };
     if (amendmentNote) {
@@ -4957,9 +4957,23 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
 app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { status } = req.body;
+    const { status, cancel_reason } = req.body;
+    // Only master/manager can re-confirm amended orders
+    if (status === "confirmed") {
+      const { data: existing } = await supabase.from("sales_orders").select("status").eq("id", req.params.id).single();
+      if (existing?.status === "amended" && !["master", "manager"].includes(req.user.role)) {
+        return res.status(403).json({ error: "Only manager can re-confirm amended orders" });
+      }
+    }
+    // Cancel requires reason
+    if (status === "cancelled" && !cancel_reason?.trim()) {
+      return res.status(400).json({ error: "Cancel reason is required" });
+    }
+    const updateData = { status };
+    if (status === "cancelled" && cancel_reason) updateData.notes = supabase.raw ? cancel_reason : cancel_reason;
     const { data, error } = await supabase.from("sales_orders")
-      .update({ status }).eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .update(status === "cancelled" ? { status, notes: cancel_reason } : { status })
+      .eq("id", req.params.id).eq("company_id", req.user.company_id)
       .select("*, sales_order_items(*)").single();
     if (error) throw error;
     await syncSalesOrderToDelivery(data, data.sales_order_items);
@@ -4972,7 +4986,10 @@ app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     if (!["master", "manager", "company_admin"].includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const company_id = req.user.company_id;
-    const { data: existing } = await supabase.from("sales_orders").select("order_number").eq("id", req.params.id).eq("company_id", company_id).single();
+    const { data: existing } = await supabase.from("sales_orders").select("order_number, status").eq("id", req.params.id).eq("company_id", company_id).single();
+    if (existing && ["confirmed", "delivered"].includes(existing.status)) {
+      return res.status(400).json({ error: "Cannot delete a " + existing.status + " order. Cancel it first." });
+    }
     const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", company_id);
     if (error) throw error;
     if (existing?.order_number) {
