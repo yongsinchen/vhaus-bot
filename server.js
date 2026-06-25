@@ -3820,39 +3820,57 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
     if (!company_id) return res.status(400).json({ error: "company_id required" });
     const startDate = date || new Date().toISOString().slice(0, 10);
     const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
-    // Get scheduled deliveries
+    const seenSO = new Set();
+    const pickItems = [];
+
+    // Source 1: delivery_schedules (new system)
     const { data: schedules } = await supabase.from("delivery_schedules")
       .select("*, orders(id, so_number, customer_name, address)")
       .gte("scheduled_date", startDate).lte("scheduled_date", endDate).in("status", ["scheduled", "picking"]);
-    // For each order, find packings that need picking
-    const pickItems = [];
     for (const sched of (schedules || [])) {
       if (!sched.orders?.id) continue;
-      // Find packings via order_items → order_item_packings
-      const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", sched.orders.id);
-      const oiIds = (orderItems || []).map(oi => oi.id);
-      if (oiIds.length === 0) continue;
-      const { data: packings } = await supabase.from("order_item_packings")
-        .select("*").in("order_item_id", oiIds).in("status", ["put_away"]);
-      for (const p of (packings || [])) {
-        // Enrich with order_item info
-        const { data: oi } = await supabase.from("order_items").select("product_name, product_code").eq("id", p.order_item_id).maybeSingle();
-        pickItems.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: sched.orders.customer_name, _so_number: sched.orders.so_number, _delivery_date: sched.scheduled_date });
-      }
-      // Also check package_labels as fallback
-      if (packings?.length === 0) {
-        const { data: labels } = await supabase.from("package_labels")
-          .select("*").eq("so_number", sched.orders.so_number).eq("status", "stored");
-        for (const l of (labels || [])) {
-          pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, _product_name: l.product_name, _product_code: l.product_code, _customer: sched.orders.customer_name, _so_number: l.so_number, _delivery_date: sched.scheduled_date, location_code: l.location_code, _source: "package_labels" });
-        }
-      }
+      seenSO.add(sched.orders.so_number);
+      await addPickItemsForOrder(sched.orders.id, sched.orders.so_number, sched.orders.customer_name, sched.scheduled_date, pickItems);
     }
-    // Sort by location for efficient walking
+
+    // Source 2: orders with delivery_date in range (covers old system + direct scheduling)
+    const { data: orders } = await supabase.from("orders")
+      .select("id, so_number, customer_name, delivery_date, status")
+      .eq("company_id", company_id)
+      .gte("delivery_date", startDate).lte("delivery_date", endDate)
+      .in("status", ["Pending", "Confirmed", "In Progress"]);
+    for (const order of (orders || [])) {
+      if (seenSO.has(order.so_number)) continue;
+      seenSO.add(order.so_number);
+      await addPickItemsForOrder(order.id, order.so_number, order.customer_name, order.delivery_date, pickItems);
+    }
+
     pickItems.sort((a, b) => (a.location_code || "ZZZ").localeCompare(b.location_code || "ZZZ"));
-    res.json({ items: pickItems, schedule_count: (schedules || []).length });
+    res.json({ items: pickItems, schedule_count: (schedules || []).length, order_count: (orders || []).length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+async function addPickItemsForOrder(orderId, soNumber, customerName, deliveryDate, pickItems) {
+  // Check order_item_packings first
+  const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", orderId);
+  const oiIds = (orderItems || []).map(oi => oi.id);
+  let found = false;
+  if (oiIds.length > 0) {
+    const { data: packings } = await supabase.from("order_item_packings").select("*").in("order_item_id", oiIds).in("status", ["put_away"]);
+    for (const p of (packings || [])) {
+      const { data: oi } = await supabase.from("order_items").select("product_name, product_code").eq("id", p.order_item_id).maybeSingle();
+      pickItems.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate });
+      found = true;
+    }
+  }
+  // Fallback to package_labels
+  if (!found) {
+    const { data: labels } = await supabase.from("package_labels").select("*").eq("so_number", soNumber).in("status", ["stored", "put_away"]);
+    for (const l of (labels || [])) {
+      pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, location_code: l.location_code, _product_name: l.product_name, _product_code: l.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate, _source: "package_labels" });
+    }
+  }
+}
 
 // ── Unified Loading List ────────────────────────────────────────
 app.get("/unified-loading-list", requireAuth, async (req, res) => {
