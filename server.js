@@ -4171,7 +4171,7 @@ async function processJobAsync(jobId, fileBuffer) {
       // image_ocr: render PDF pages to PNG or use single image, batched 4 pages per API call
       const isPdf = job.source_type === "pdf";
       const pageBuffers = [];
-      const PAGES_PER_BATCH = 1;
+      const PAGES_PER_BATCH = 5;
       const MAX_PAGES = 200;
 
       if (isPdf) {
@@ -4207,7 +4207,7 @@ async function processJobAsync(jobId, fileBuffer) {
             console.error(`Job ${jobId} batch ${b + 1}/${totalBatches} error (skipping):`, batchErr.message);
           }
           await supabase.from("catalogue_import_jobs").update({ pages_processed: b + 1 }).eq("id", jobId);
-          if (b < totalBatches - 1) await sleep(2000);
+          if (b < totalBatches - 1) await sleep(1000);
         }
       } else {
         // Single image
