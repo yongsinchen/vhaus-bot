@@ -3835,14 +3835,17 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
 
     // Source 2: orders with delivery_date in range (text column, string compare works for YYYY-MM-DD)
     console.log(`[pick-list] company=${company_id} range=${startDate} to ${endDate}`);
-    const { data: orders, error: ordErr } = await supabase.from("orders")
+    // Fetch ALL upcoming orders for this company, filter delivery_date in JS to avoid text/date issues
+    const { data: allOrders, error: ordErr } = await supabase.from("orders")
       .select("id, so_number, customer_name, delivery_date, status, items")
       .eq("company_id", company_id)
-      .neq("delivery_date", "").not("delivery_date", "is", null)
-      .gte("delivery_date", startDate).lte("delivery_date", endDate)
       .in("status", ["Pending", "Confirmed", "In Progress"]);
     if (ordErr) console.error("[pick-list] orders query error:", ordErr.message);
-    console.log(`[pick-list] found ${(orders||[]).length} orders, ${(schedules||[]).length} schedules`);
+    const orders = (allOrders || []).filter(o => {
+      const dd = (o.delivery_date || "").trim();
+      return dd >= startDate && dd <= endDate;
+    });
+    console.log(`[pick-list] total=${(allOrders||[]).length} filtered=${orders.length} schedules=${(schedules||[]).length}`);
     for (const order of (orders || [])) {
       if (!order.so_number || seenSO.has(order.so_number)) continue;
       seenSO.add(order.so_number);
