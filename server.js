@@ -4878,19 +4878,59 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived } = req.body;
 
-    const { data: existing } = await supabase.from("sales_orders").select("id").eq("id", id).eq("company_id", company_id).single();
+    const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
 
+    // Detect amendments on confirmed/delivered orders
+    let finalStatus = status;
+    let amendmentNote = null;
+    const wasConfirmed = ["confirmed", "delivered"].includes(existing.status);
+    if (wasConfirmed && Array.isArray(items)) {
+      const oldItems = existing.sales_order_items || [];
+      const changes = [];
+      // Check for new items
+      const oldNames = new Set(oldItems.map(i => (i.product_name || "").toLowerCase()));
+      const newItems = items.filter(i => !oldNames.has((i.product_name || "").toLowerCase()));
+      if (newItems.length > 0) changes.push(`+${newItems.length} new item${newItems.length > 1 ? "s" : ""}: ${newItems.map(i => i.product_name || i.product_code).join(", ")}`);
+      // Check for removed items
+      const newNames = new Set(items.map(i => (i.product_name || "").toLowerCase()));
+      const removed = oldItems.filter(i => !newNames.has((i.product_name || "").toLowerCase()));
+      if (removed.length > 0) changes.push(`-${removed.length} removed: ${removed.map(i => i.product_name || i.product_code).join(", ")}`);
+      // Check for price changes
+      const oldPriceMap = new Map(oldItems.map(i => [(i.product_name || "").toLowerCase(), Number(i.unit_price) || 0]));
+      for (const ni of items) {
+        const key = (ni.product_name || "").toLowerCase();
+        const oldPrice = oldPriceMap.get(key);
+        if (oldPrice !== undefined && oldPrice !== (Number(ni.unit_price) || 0)) {
+          changes.push(`${ni.product_name}: RM${oldPrice} → RM${Number(ni.unit_price) || 0}`);
+        }
+      }
+      // Check subtotal change
+      const newSubtotal = items.reduce((s, it) => s + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+      const oldSubtotal = Number(existing.subtotal) || 0;
+      if (Math.abs(newSubtotal - oldSubtotal) > 0.01) {
+        changes.push(`Total: RM${oldSubtotal.toFixed(2)} → RM${newSubtotal.toFixed(2)}`);
+      }
+      if (changes.length > 0) {
+        finalStatus = "amended";
+        amendmentNote = `[${new Date().toISOString().slice(0, 16).replace("T", " ")}] Amended by ${req.user.name || req.user.salesman_name || "user"}: ${changes.join("; ")}`;
+      }
+    }
+
     const subtotal = (items || []).reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
-    const { error: updErr } = await supabase.from("sales_orders").update({
+    const updateData = {
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
-      salesman_name: salesman_names || null, status, notes: notes || null, subtotal,
+      salesman_name: salesman_names || null, status: finalStatus, notes: notes || null, subtotal,
       branch_id: branch_id || null,
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
-    }).eq("id", id).eq("company_id", company_id);
+    };
+    if (amendmentNote) {
+      updateData.notes = [amendmentNote, notes || ""].filter(Boolean).join("\n");
+    }
+    const { error: updErr } = await supabase.from("sales_orders").update(updateData).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
     if (Array.isArray(items)) {
