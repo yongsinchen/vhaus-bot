@@ -2935,6 +2935,7 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
 
   const { error } = await supabase.from("do_review").update({ status: "Resolved" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
+  await autoAdvanceDOStatus(id);
   res.json({ success: true });
 });
 
@@ -2943,8 +2944,22 @@ app.patch("/do-review/:id/dismiss", requireAuth, async (req, res) => {
   const { id } = req.params;
   const { error } = await supabase.from("do_review").update({ status: "Dismissed" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
+  await autoAdvanceDOStatus(id);
   res.json({ success: true });
 });
+
+// Auto-advance supplier_delivery status when all review items are resolved/dismissed
+async function autoAdvanceDOStatus(reviewItemId) {
+  try {
+    const { data: item } = await supabase.from("do_review").select("supplier_delivery_id").eq("id", reviewItemId).single();
+    if (!item?.supplier_delivery_id) return;
+    const sdId = item.supplier_delivery_id;
+    const { data: pending } = await supabase.from("do_review").select("id").eq("supplier_delivery_id", sdId).eq("status", "Pending");
+    if ((pending || []).length === 0) {
+      await supabase.from("supplier_deliveries").update({ status: "Reviewed" }).eq("id", sdId);
+    }
+  } catch (e) { console.error("autoAdvanceDOStatus error:", e.message); }
+}
 
 // PATCH /do-review/:id/add-to-stock — match to product master and add to inventory
 app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, res) => {
@@ -2956,6 +2971,7 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
     const qty = Number(quantity) || 1;
     await adjustStock(req.user.company_id, warehouse_id, product_id, qty, "in", "do", review.supplier_delivery_id, `DO #${review.do_number} — ${review.item_name}`, req.user.id);
     await supabase.from("do_review").update({ status: "Resolved" }).eq("id", req.params.id);
+    await autoAdvanceDOStatus(req.params.id);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3040,12 +3056,13 @@ app.get("/services", requireAuth, async (req, res) => {
 
 // ── Supplier Deliveries API ───────────────────────────────────────
 app.get("/supplier-deliveries", requireAuth, async (req, res) => {
-  const { company_id, supplier, from_date, to_date, limit = 100 } = req.query;
+  const { company_id, supplier, from_date, to_date, status, limit = 100 } = req.query;
   let query = supabase.from("supplier_deliveries").select("*").order("created_at", { ascending: false }).limit(parseInt(limit));
   if (company_id) query = query.eq("company_id", company_id);
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
   if (to_date) query = query.lte("do_date", to_date);
+  if (status) query = query.eq("status", status);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -3399,6 +3416,11 @@ app.post("/package-labels/generate", requireRole(MANAGE_ROLES), async (req, res)
   try {
     const { supplier_delivery_id, items } = req.body;
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
+    // Prevent duplicate label generation
+    if (supplier_delivery_id) {
+      const { data: existing } = await supabase.from("package_labels").select("id").eq("supplier_delivery_id", supplier_delivery_id).limit(1);
+      if ((existing || []).length > 0) return res.status(400).json({ error: "Labels already generated for this DO. Use reprint instead." });
+    }
     const labels = [];
     for (const item of items) {
       const cartons = Number(item.carton_count) || 1;
@@ -3423,6 +3445,10 @@ app.post("/package-labels/generate", requireRole(MANAGE_ROLES), async (req, res)
     }
     const { data, error } = await supabase.from("package_labels").insert(labels).select();
     if (error) throw error;
+    // Auto-advance DO status to Labeled
+    if (supplier_delivery_id) {
+      await supabase.from("supplier_deliveries").update({ status: "Labeled" }).eq("id", supplier_delivery_id);
+    }
     res.json({ labels: data || [], count: labels.length });
   } catch (err) { console.error("generate labels error:", err); res.status(500).json({ error: err.message }); }
 });
@@ -3489,6 +3515,13 @@ app.post("/package-labels/confirm-all", requireRole(MANAGE_ROLES), async (req, r
           await adjustStock(req.user.company_id, wh, label.product_id, totalQty, "in", "do", supplier_delivery_id, `DO received — ${label.product_name}`, req.user.id);
           stocked++;
         }
+      }
+    }
+    // Auto-advance DO status to Completed
+    if (supplier_delivery_id) {
+      const { data: remaining } = await supabase.from("package_labels").select("id").eq("supplier_delivery_id", supplier_delivery_id).eq("status", "pending");
+      if ((remaining || []).length === 0) {
+        await supabase.from("supplier_deliveries").update({ status: "Completed" }).eq("id", supplier_delivery_id);
       }
     }
     res.json({ confirmed: (labels || []).length, stocked });
