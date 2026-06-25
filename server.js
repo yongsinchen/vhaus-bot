@@ -3834,12 +3834,15 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
     }
 
     // Source 2: orders with delivery_date in range (text column, string compare works for YYYY-MM-DD)
-    const { data: orders } = await supabase.from("orders")
+    console.log(`[pick-list] company=${company_id} range=${startDate} to ${endDate}`);
+    const { data: orders, error: ordErr } = await supabase.from("orders")
       .select("id, so_number, customer_name, delivery_date, status, items")
       .eq("company_id", company_id)
       .neq("delivery_date", "").not("delivery_date", "is", null)
       .gte("delivery_date", startDate).lte("delivery_date", endDate)
       .in("status", ["Pending", "Confirmed", "In Progress"]);
+    if (ordErr) console.error("[pick-list] orders query error:", ordErr.message);
+    console.log(`[pick-list] found ${(orders||[]).length} orders, ${(schedules||[]).length} schedules`);
     for (const order of (orders || [])) {
       if (!order.so_number || seenSO.has(order.so_number)) continue;
       seenSO.add(order.so_number);
