@@ -3365,7 +3365,7 @@ app.post("/warehouses/:id/zones", requireRole(MANAGE_ROLES), async (req, res) =>
   try {
     const { name, description } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
-    const { data, error } = await supabase.from("warehouse_zones").insert({ warehouse_id: req.params.id, name: name.trim(), description: description || null }).select().single();
+    const { data, error } = await supabase.from("warehouse_zones").insert({ warehouse_id: req.params.id, company_id: req.user.company_id, name: name.trim(), code: name.trim().substring(0, 10).toUpperCase().replace(/\s+/g, "-") }).select().single();
     if (error) throw error;
     res.status(201).json({ zone: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
