@@ -4720,12 +4720,17 @@ async function nextOrderNumber(company_id) {
   const now = new Date();
   const ymd = now.toISOString().slice(2, 10).replace(/-/g, "");
   const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+  // Count existing orders today + find max sequence to avoid duplicates
   const { count } = await supabase
     .from("sales_orders")
     .select("id", { count: "exact", head: true })
     .eq("company_id", company_id)
     .gte("created_at", dayStart);
-  const seq = String((count || 0) + 1).padStart(3, "0");
+  const { data: lastOrder } = await supabase.from("sales_orders")
+    .select("order_number").eq("company_id", company_id)
+    .like("order_number", `SO${ymd}%`).order("order_number", { ascending: false }).limit(1);
+  const lastSeq = lastOrder?.[0]?.order_number ? parseInt(lastOrder[0].order_number.slice(-3)) || 0 : 0;
+  const seq = String(Math.max((count || 0) + 1, lastSeq + 1)).padStart(3, "0");
   return `SO${ymd}-${seq}`;
 }
 
@@ -4755,8 +4760,8 @@ async function syncSalesOrderToDelivery(order, items) {
       contact: order.customer_contact || null,
       order_date: (order.created_at || new Date().toISOString()).slice(0, 10),
       salesman: order.salesman_name || null,
-      order_amount: (Number(order.subtotal) || 0) - (Number(order.discount) || 0),
-      balance: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) - (Number(order.deposit) || 0),
+      order_amount: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) + (!order.gst_waived ? (Number(order.gst_amount) || 0) : 0),
+      balance: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) + (!order.gst_waived ? (Number(order.gst_amount) || 0) : 0) - (Number(order.deposit) || 0),
       delivery_date: order.delivery_date || null,
       time_slot: order.delivery_time_slot || null,
       type: order.delivery_type || "Delivery",
@@ -4884,7 +4889,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null,
-      country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null,
+      country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
     }).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
@@ -4945,7 +4950,14 @@ app.post("/sales-orders/upload-attachment", requireAuth, upload.single("file"), 
     const ext = file.originalname.split(".").pop();
     const path = `order-attachments/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
-    if (upErr) return res.status(500).json({ error: "Upload failed: " + upErr.message });
+    if (upErr) {
+      // Fallback: try catalogue-imports bucket if order-attachments doesn't exist
+      const fallbackPath = `order-attachments/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const { error: upErr2 } = await supabase.storage.from("catalogue-imports").upload(fallbackPath, file.buffer, { contentType: file.mimetype, upsert: false });
+      if (upErr2) return res.status(500).json({ error: "Upload failed: " + upErr.message + " / fallback: " + upErr2.message });
+      const { data: d2 } = supabase.storage.from("catalogue-imports").getPublicUrl(fallbackPath);
+      return res.json({ url: d2?.publicUrl || null });
+    }
     const { data } = supabase.storage.from("order-attachments").getPublicUrl(path);
     res.json({ url: data?.publicUrl || null });
   } catch (err) { res.status(500).json({ error: err.message }); }
