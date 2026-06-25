@@ -3392,7 +3392,8 @@ app.post("/warehouse-zones/:id/racks", requireRole(MANAGE_ROLES), async (req, re
   try {
     const { code, description } = req.body;
     if (!code) return res.status(400).json({ error: "code required" });
-    const { data, error } = await supabase.from("warehouse_racks").insert({ zone_id: req.params.id, code: code.trim().toUpperCase(), description: description || null }).select().single();
+    const qr_code = `RACK-${code.trim().toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    const { data, error } = await supabase.from("warehouse_racks").insert({ zone_id: req.params.id, code: code.trim().toUpperCase(), description: description || null, qr_code }).select().single();
     if (error) throw error;
     res.status(201).json({ rack: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3525,6 +3526,147 @@ app.post("/package-labels/confirm-all", requireRole(MANAGE_ROLES), async (req, r
       }
     }
     res.json({ confirmed: (labels || []).length, stocked });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Rack QR Validation ──────────────────────────────────────────
+app.get("/warehouse-racks/validate/:qr_code", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("warehouse_racks").select("*, warehouse_zones(id, name, warehouse_id)").eq("qr_code", req.params.qr_code).single();
+    if (error || !data) return res.status(404).json({ error: "Rack not found" });
+    res.json({ rack: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Print all rack QRs for a warehouse
+app.get("/warehouses/:id/rack-qrs", requireAuth, async (req, res) => {
+  try {
+    const { data: zones } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).order("name");
+    const racks = [];
+    for (const z of (zones || [])) {
+      const { data: rackData } = await supabase.from("warehouse_racks").select("*").eq("zone_id", z.id).order("code");
+      for (const r of (rackData || [])) {
+        racks.push({ ...r, zone_name: z.name });
+      }
+    }
+    res.json({ racks });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Store: two-scan (item QR → rack QR) ─────────────────────────
+app.patch("/package-labels/:id/store", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { rack_id, rack_qr_code, location_code } = req.body;
+    let finalRackId = rack_id;
+    let finalLocation = location_code;
+    if (rack_qr_code && !rack_id) {
+      const { data: rack } = await supabase.from("warehouse_racks").select("id, code, zone_id, warehouse_zones(name, warehouse_id)").eq("qr_code", rack_qr_code).single();
+      if (!rack) return res.status(404).json({ error: "Rack QR not found" });
+      finalRackId = rack.id;
+      finalLocation = `${rack.warehouse_zones?.name || ""}-${rack.code}`.replace(/^-/, "");
+    }
+    const { data, error } = await supabase.from("package_labels")
+      .update({ rack_id: finalRackId, zone_id: null, location_code: finalLocation, status: "stored" })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ label: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Pick List: items needed for upcoming deliveries ─────────────
+app.get("/pick-list", requireAuth, async (req, res) => {
+  try {
+    const { company_id, date, days = 3 } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const startDate = date || new Date().toISOString().slice(0, 10);
+    const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
+    // Get orders scheduled for delivery in date range
+    const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, delivery_date, status, items")
+      .eq("company_id", company_id).gte("delivery_date", startDate).lte("delivery_date", endDate)
+      .in("status", ["Pending", "Confirmed", "In Progress"]);
+    // Get package labels that are stored (ready to pick)
+    const { data: allLabels } = await supabase.from("package_labels").select("*")
+      .eq("company_id", company_id).eq("status", "stored");
+    const labelMap = new Map();
+    for (const l of (allLabels || [])) {
+      const key = l.so_number?.toLowerCase();
+      if (key) { if (!labelMap.has(key)) labelMap.set(key, []); labelMap.get(key).push(l); }
+    }
+    const pickItems = [];
+    for (const order of (orders || [])) {
+      const soKey = (order.so_number || "").toLowerCase();
+      const labels = labelMap.get(soKey) || [];
+      for (const label of labels) {
+        pickItems.push({ ...label, delivery_date: order.delivery_date, customer_name: order.customer_name, order_status: order.status });
+      }
+    }
+    pickItems.sort((a, b) => (a.location_code || "").localeCompare(b.location_code || ""));
+    res.json({ items: pickItems, order_count: (orders || []).length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Pick: mark item as picked ───────────────────────────────────
+app.patch("/package-labels/:id/pick", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("package_labels")
+      .update({ status: "picked", picked_at: new Date().toISOString(), picked_by: req.user.id })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ label: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Loading List: packages for a specific delivery route ────────
+app.get("/loading-list", requireAuth, async (req, res) => {
+  try {
+    const { company_id, route_id, date } = req.query;
+    if (!route_id && !date) return res.status(400).json({ error: "route_id or date required" });
+    // Get orders on this route
+    let orderIds = [];
+    if (route_id) {
+      const { data: routeOrders } = await supabase.from("delivery_route_orders").select("order_id").eq("route_id", route_id);
+      orderIds = (routeOrders || []).map(ro => ro.order_id);
+    }
+    // Get SO numbers for these orders
+    let soNumbers = [];
+    if (orderIds.length > 0) {
+      const { data: orders } = await supabase.from("orders").select("so_number, customer_name").in("id", orderIds);
+      soNumbers = (orders || []).map(o => ({ so: o.so_number, customer: o.customer_name }));
+    } else if (date) {
+      const { data: orders } = await supabase.from("orders").select("so_number, customer_name")
+        .eq("company_id", company_id).eq("delivery_date", date).in("status", ["Confirmed", "Out for Delivery"]);
+      soNumbers = (orders || []).map(o => ({ so: o.so_number, customer: o.customer_name }));
+    }
+    // Get picked packages for these SOs
+    const labels = [];
+    for (const { so, customer } of soNumbers) {
+      const { data: pkgs } = await supabase.from("package_labels").select("*")
+        .eq("so_number", so).in("status", ["picked", "loaded"]);
+      for (const p of (pkgs || [])) labels.push({ ...p, customer_name: customer });
+    }
+    res.json({ items: labels, route_id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Load: scan item onto truck + validate route ─────────────────
+app.patch("/package-labels/:id/load", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { route_id } = req.body;
+    const { data: label } = await supabase.from("package_labels").select("*").eq("id", req.params.id).single();
+    if (!label) return res.status(404).json({ error: "Package not found" });
+    // Validate: does this package belong to the given route?
+    if (route_id && label.so_number) {
+      const { data: order } = await supabase.from("orders").select("id").eq("so_number", label.so_number).single();
+      if (order) {
+        const { data: onRoute } = await supabase.from("delivery_route_orders").select("id").eq("route_id", route_id).eq("order_id", order.id).maybeSingle();
+        if (!onRoute) return res.json({ label, warning: `This item (SO: ${label.so_number}) is NOT on this route` });
+      }
+    }
+    const { data, error } = await supabase.from("package_labels")
+      .update({ status: "loaded", loaded_at: new Date().toISOString(), loaded_by: req.user.id })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ label: data, valid: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
