@@ -1659,7 +1659,7 @@ const handleDeliveryTemplate = async (chatId, text) => {
 // ── Order Trips API ──────────────────────────────────────────────
 
 // GET /order-trips?date=2026-06-15  — trips scheduled for a date (for delivery schedule UI)
-app.get("/order-trips", async (req, res) => {
+app.get("/order-trips", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
   const { data, error } = await supabase
@@ -1673,7 +1673,7 @@ app.get("/order-trips", async (req, res) => {
 });
 
 // GET /order-trips/so/:soNumber — all trips for a specific SO
-app.get("/order-trips/so/:soNumber", async (req, res) => {
+app.get("/order-trips/so/:soNumber", requireAuth, async (req, res) => {
   const { soNumber } = req.params;
   const { data, error } = await supabase
     .from("order_trips")
@@ -1686,7 +1686,7 @@ app.get("/order-trips/so/:soNumber", async (req, res) => {
 
 // POST /order-trips/so/:soNumber/cancel-remaining already exists above
 // Additional: PATCH /order-trips/:id/cancel — cancel a single trip
-app.patch("/order-trips/:id/cancel", async (req, res) => {
+app.patch("/order-trips/:id/cancel", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { data, error } = await supabase
     .from("order_trips").update({ status: "Cancelled" }).eq("id", id).select().single();
@@ -1695,11 +1695,20 @@ app.patch("/order-trips/:id/cancel", async (req, res) => {
 });
 
 // PATCH /order-trips/:id — update trip (date, status, driver, helper)
-app.patch("/order-trips/:id", async (req, res) => {
+app.patch("/order-trips/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
+  const { scheduled_date, status, driver, helper, trip_no, vehicle_id, remark } = req.body;
+  const updates = {};
+  if (scheduled_date !== undefined) updates.scheduled_date = scheduled_date;
+  if (status !== undefined) updates.status = status;
+  if (driver !== undefined) updates.driver = driver;
+  if (helper !== undefined) updates.helper = helper;
+  if (trip_no !== undefined) updates.trip_no = trip_no;
+  if (vehicle_id !== undefined) updates.vehicle_id = vehicle_id;
+  if (remark !== undefined) updates.remark = remark;
   const { data, error } = await supabase
     .from("order_trips")
-    .update(req.body)
+    .update(updates)
     .eq("id", id)
     .select()
     .single();
@@ -1708,7 +1717,7 @@ app.patch("/order-trips/:id", async (req, res) => {
 });
 
 // POST /order-trips/so/:soNumber/cancel-remaining — cancel all scheduled trips after a given trip_no
-app.post("/order-trips/so/:soNumber/cancel-remaining", async (req, res) => {
+app.post("/order-trips/so/:soNumber/cancel-remaining", requireRole(MANAGE_ROLES), async (req, res) => {
   const { soNumber } = req.params;
   const { after_trip_no } = req.body;
   const { error } = await supabase
@@ -1724,7 +1733,7 @@ app.post("/order-trips/so/:soNumber/cancel-remaining", async (req, res) => {
 // ── Delivery Vehicle API ──────────────────────────────────────────
 
 // GET /delivery/vehicles
-app.get("/delivery/vehicles", async (req, res) => {
+app.get("/delivery/vehicles", requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from("delivery_vehicles")
     .select("*")
@@ -1734,7 +1743,7 @@ app.get("/delivery/vehicles", async (req, res) => {
 });
 
 // POST /delivery/vehicles
-app.post("/delivery/vehicles", async (req, res) => {
+app.post("/delivery/vehicles", requireRole(MANAGE_ROLES), async (req, res) => {
   const { driver_name, vehicle_plate, vehicle_type, status } = req.body;
   if (!driver_name && !vehicle_plate) return res.status(400).json({ error: "driver_name or vehicle_plate is required" });
   const { data, error } = await supabase
@@ -1747,11 +1756,17 @@ app.post("/delivery/vehicles", async (req, res) => {
 });
 
 // PATCH /delivery/vehicles/:id
-app.patch("/delivery/vehicles/:id", async (req, res) => {
+app.patch("/delivery/vehicles/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
+  const { driver_name, vehicle_plate, vehicle_type, status } = req.body;
+  const updates = {};
+  if (driver_name !== undefined) updates.driver_name = driver_name;
+  if (vehicle_plate !== undefined) updates.vehicle_plate = vehicle_plate;
+  if (vehicle_type !== undefined) updates.vehicle_type = vehicle_type;
+  if (status !== undefined) updates.status = status;
   const { data, error } = await supabase
     .from("delivery_vehicles")
-    .update(req.body)
+    .update(updates)
     .eq("id", id)
     .select()
     .single();
@@ -1760,7 +1775,7 @@ app.patch("/delivery/vehicles/:id", async (req, res) => {
 });
 
 // DELETE /delivery/vehicles/:id
-app.delete("/delivery/vehicles/:id", async (req, res) => {
+app.delete("/delivery/vehicles/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { error } = await supabase.from("delivery_vehicles").delete().eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
@@ -1771,7 +1786,7 @@ app.delete("/delivery/vehicles/:id", async (req, res) => {
 
 
 // GET /delivery/routes?date=2026-07-15
-app.get("/delivery/routes", async (req, res) => {
+app.get("/delivery/routes", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
   const { data: routes, error: routeErr } = await supabase
@@ -1790,7 +1805,7 @@ app.get("/delivery/routes", async (req, res) => {
 
 
 // GET /delivery/unassigned?date=2026-07-15
-app.get("/delivery/unassigned", async (req, res) => {
+app.get("/delivery/unassigned", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
   const { data: orders, error: ordErr } = await supabase.from("orders").select("*").eq("delivery_date", date);
@@ -1804,7 +1819,7 @@ app.get("/delivery/unassigned", async (req, res) => {
 }); 
 
 // POST /delivery/routes — with duplicate vehicle validation
-app.post("/delivery/routes", async (req, res) => {
+app.post("/delivery/routes", requireRole(MANAGE_ROLES), async (req, res) => {
   const { delivery_date, lorry_plate, driver_name, area, notes, vehicle_id } = req.body;
   if (!delivery_date) return res.status(400).json({ error: "delivery_date is required" });
 
@@ -1834,7 +1849,7 @@ const getMalaysiaDate = () => new Intl.DateTimeFormat("en-CA", {
 }).format(new Date());
 
 // PATCH /delivery/routes/:id
-app.patch("/delivery/routes/:id", async (req, res) => {
+app.patch("/delivery/routes/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
 
   const { data: current } = await supabase.from("delivery_routes").select("status, delivery_date").eq("id", id).single();
@@ -1912,7 +1927,7 @@ app.patch("/delivery/routes/:id", async (req, res) => {
 });
 
 // DELETE /delivery/routes/:id
-app.delete("/delivery/routes/:id", async (req, res) => {
+app.delete("/delivery/routes/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { data: current } = await supabase.from("delivery_routes").select("status").eq("id", id).single();
   if (current?.status === "Out for Delivery" || current?.status === "Delivered" || current?.status === "Confirmed") {
@@ -1926,7 +1941,7 @@ app.delete("/delivery/routes/:id", async (req, res) => {
 // ── Delivery Route Orders API ─────────────────────────────────────
 
 // POST /delivery/routes/:routeId/orders
-app.post("/delivery/routes/:routeId/orders", async (req, res) => {
+app.post("/delivery/routes/:routeId/orders", requireRole(MANAGE_ROLES), async (req, res) => {
   const { routeId } = req.params;
   const { order_id, sequence_no, scheduled_time_range, route_note } = req.body;
 
@@ -1948,7 +1963,7 @@ app.post("/delivery/routes/:routeId/orders", async (req, res) => {
 
 
 // PATCH /delivery/routes/:routeId/orders/:orderId
-app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+app.patch("/delivery/routes/:routeId/orders/:orderId", requireRole(MANAGE_ROLES), async (req, res) => {
   const { routeId, orderId } = req.params;
   const { sequence_no, scheduled_time_range, route_note } = req.body;
 
@@ -1978,7 +1993,7 @@ app.patch("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
 });
 
 // DELETE /delivery/routes/:routeId/orders/:orderId
-app.delete("/delivery/routes/:routeId/orders/:orderId", async (req, res) => {
+app.delete("/delivery/routes/:routeId/orders/:orderId", requireRole(MANAGE_ROLES), async (req, res) => {
   const { routeId, orderId } = req.params;
 
   // Lock check
@@ -2547,7 +2562,7 @@ const handleDOPhoto = async (chatId, base64Image) => {
 // ── Service Pending API ──────────────────────────────────────────
 
 // GET /service-pending
-app.get("/service-pending", async (req, res) => {
+app.get("/service-pending", requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from("service_pending")
     .select("*")
@@ -2558,7 +2573,7 @@ app.get("/service-pending", async (req, res) => {
 });
 
 // POST /service-pending/:id/convert — Option B: new service order linked to original
-app.post("/service-pending/:id/convert", async (req, res) => {
+app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { remark: adminRemark, delivery_date } = req.body || {};
 
@@ -2610,7 +2625,7 @@ app.post("/service-pending/:id/convert", async (req, res) => {
 });
 
 // DELETE /service-pending/:id — remove (not applicable)
-app.delete("/service-pending/:id", async (req, res) => {
+app.delete("/service-pending/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { error } = await supabase.from("service_pending").update({ status: "Removed" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
@@ -2621,7 +2636,7 @@ app.delete("/service-pending/:id", async (req, res) => {
 // ── AI Auto-Scheduler ─────────────────────────────────────────────
 
 // GET /auto-schedule/orders?date=&company_id= — get unassigned orders with AI duration suggestions
-app.get("/auto-schedule/orders", async (req, res) => {
+app.get("/auto-schedule/orders", requireAuth, async (req, res) => {
   const { date, company_id } = req.query;
   if (!date) return res.status(400).json({ error: "date required" });
 
@@ -2698,7 +2713,7 @@ app.get("/auto-schedule/orders", async (req, res) => {
 });
 
 // POST /auto-schedule/generate — AI generates the schedule
-app.post("/auto-schedule/generate", async (req, res) => {
+app.post("/auto-schedule/generate", requireRole(MANAGE_ROLES), async (req, res) => {
   const { date, company_id, orders, vehicles, settings } = req.body;
   if (!date || !orders || !vehicles) return res.status(400).json({ error: "Missing required fields" });
 
@@ -2798,7 +2813,7 @@ Return ONLY valid JSON, no markdown:
 });
 
 // POST /auto-schedule/approve — create routes from approved schedule
-app.post("/auto-schedule/approve", async (req, res) => {
+app.post("/auto-schedule/approve", requireRole(MANAGE_ROLES), async (req, res) => {
   const { date, company_id, schedule, durations } = req.body;
   if (!date || !schedule) return res.status(400).json({ error: "Missing required fields" });
 
@@ -2871,23 +2886,23 @@ app.post("/auto-schedule/approve", async (req, res) => {
 });
 
 // ── Auth Profile API ─────────────────────────────────────────────
-app.get("/auth/profile", async (req, res) => {
-  const userId = req.query.uid;
-  if (!userId) return res.status(400).json({ error: "Missing user ID" });
-  const { data: user, error } = await supabase.from("users").select("*").eq("id", userId).single();
-  if (error || !user) return res.status(404).json({ error: "User not found" });
-  let company = null;
-  if (user.company_id) {
-    const { data: companyData } = await supabase.from("companies").select("id, name, code").eq("id", user.company_id).single();
-    company = companyData || null;
-  }
-  res.json({ ...user, companies: company });
+app.get("/auth/profile", requireAuth, async (req, res) => {
+  try {
+    const { data: user, error } = await supabase.from("users").select("*").eq("id", req.user.id).single();
+    if (error || !user) return res.status(404).json({ error: "User not found" });
+    let company = null;
+    if (user.company_id) {
+      const { data: companyData } = await supabase.from("companies").select("id, name, code").eq("id", user.company_id).single();
+      company = companyData || null;
+    }
+    res.json({ ...user, companies: company });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── DO Review API ────────────────────────────────────────────────
 
 // GET /do-review — list all pending DO review items
-app.get("/do-review", async (req, res) => {
+app.get("/do-review", requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from("do_review")
     .select("*")
@@ -2898,7 +2913,7 @@ app.get("/do-review", async (req, res) => {
 });
 
 // PATCH /do-review/:id/resolve — mark as resolved (admin linked manually)
-app.patch("/do-review/:id/resolve", async (req, res) => {
+app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
   const { id } = req.params;
   const { so_number, item_code, arrival_date } = req.body;
 
@@ -2924,7 +2939,7 @@ app.patch("/do-review/:id/resolve", async (req, res) => {
 });
 
 // PATCH /do-review/:id/dismiss — dismiss (not applicable)
-app.patch("/do-review/:id/dismiss", async (req, res) => {
+app.patch("/do-review/:id/dismiss", requireAuth, async (req, res) => {
   const { id } = req.params;
   const { error } = await supabase.from("do_review").update({ status: "Dismissed" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
@@ -2945,24 +2960,10 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Auth Profile API ─────────────────────────────────────────────
-app.get("/auth/profile", async (req, res) => {
-  const userId = req.query.uid;
-  if (!userId) return res.status(400).json({ error: "Missing user ID" });
-  const { data: user, error } = await supabase.from("users").select("*").eq("id", userId).single();
-  if (error || !user) return res.status(404).json({ error: "User not found" });
-  let company = null;
-  if (user.company_id) {
-    const { data: companyData } = await supabase.from("companies").select("id, name, code").eq("id", user.company_id).single();
-    company = companyData || null;
-  }
-  res.json({ ...user, companies: company });
-});
-
 // ── Admin User Management API ─────────────────────────────────────
 
 // GET /admin/users/list — list all users (service role bypasses RLS)
-app.get("/admin/users/list", async (req, res) => {
+app.get("/admin/users/list", requireRole(["master", "manager"]), async (req, res) => {
   const { company_id } = req.query;
   let query = supabase.from("users").select("*, companies(name, code)").order("name");
   if (company_id) query = query.eq("company_id", company_id);
@@ -2971,7 +2972,7 @@ app.get("/admin/users/list", async (req, res) => {
   res.json(data || []);
 });
 
-app.post("/admin/users", async (req, res) => {
+app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) => {
   const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
   if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
   const { data: authData, error: authErr } = await supabase.auth.admin.createUser({ email, password, email_confirm: true });
@@ -2998,7 +2999,7 @@ app.patch("/admin/users/:id/password", requireRole(["master", "manager"]), async
 // ── Services API ──────────────────────────────────────────────────
 
 // GET /services/unscheduled — service orders with no delivery_date
-app.get("/services/unscheduled", async (req, res) => {
+app.get("/services/unscheduled", requireAuth, async (req, res) => {
   const { company_id } = req.query;
   let query = supabase.from("orders").select("*")
     .eq("type", "Service")
@@ -3012,7 +3013,7 @@ app.get("/services/unscheduled", async (req, res) => {
 });
 
 // PATCH /orders/:id/set-date — set delivery date on an order
-app.patch("/orders/:id/set-date", async (req, res) => {
+app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { delivery_date } = req.body;
   const { data, error } = await supabase.from("orders")
@@ -3022,7 +3023,7 @@ app.patch("/orders/:id/set-date", async (req, res) => {
   res.json(data);
 });
 
-app.get("/services", async (req, res) => {
+app.get("/services", requireAuth, async (req, res) => {
   const { company_id, salesman, status } = req.query;
   let query = supabase.from("orders").select("*").eq("type", "Service").order("created_at", { ascending: false });
   if (company_id) query = query.eq("company_id", company_id);
@@ -3038,7 +3039,7 @@ app.get("/services", async (req, res) => {
 });
 
 // ── Supplier Deliveries API ───────────────────────────────────────
-app.get("/supplier-deliveries", async (req, res) => {
+app.get("/supplier-deliveries", requireAuth, async (req, res) => {
   const { company_id, supplier, from_date, to_date, limit = 100 } = req.query;
   let query = supabase.from("supplier_deliveries").select("*").order("created_at", { ascending: false }).limit(parseInt(limit));
   if (company_id) query = query.eq("company_id", company_id);
@@ -3050,7 +3051,7 @@ app.get("/supplier-deliveries", async (req, res) => {
   res.json(data || []);
 });
 
-app.get("/supplier-deliveries/:id", async (req, res) => {
+app.get("/supplier-deliveries/:id", requireAuth, async (req, res) => {
   try {
     const { data: delivery, error } = await supabase.from("supplier_deliveries").select("*").eq("id", req.params.id).single();
     if (error || !delivery) return res.status(404).json({ error: "Not found" });
@@ -3086,40 +3087,6 @@ app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, re
     if (error) throw error;
     res.json({ ok: true, reversed: (movements || []).length });
   } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ── DO Review API ─────────────────────────────────────────────────
-app.get("/do-review", async (req, res) => {
-  const { data, error } = await supabase.from("do_review").select("*").eq("status", "Pending").order("created_at", { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
-});
-
-app.patch("/do-review/:id/resolve", async (req, res) => {
-  const { id } = req.params;
-  const { so_number, item_code, arrival_date } = req.body;
-  if (so_number && item_code) {
-    const date = arrival_date || new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
-    const { data: orders } = await supabase.from("orders").select("id, items").eq("so_number", so_number).in("status", ["Pending", "In Progress"]);
-    for (const order of (orders || [])) {
-      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-      const updated = items.map(oi => {
-        if (oi.itemCode === item_code || (oi.itemName && oi.itemName.toLowerCase().includes(item_code.toLowerCase()))) return { ...oi, arrivalDate: date };
-        return oi;
-      });
-      await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
-    }
-  }
-  const { error } = await supabase.from("do_review").update({ status: "Resolved" }).eq("id", id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
-});
-
-app.patch("/do-review/:id/dismiss", async (req, res) => {
-  const { id } = req.params;
-  const { error } = await supabase.from("do_review").update({ status: "Dismissed" }).eq("id", id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
 });
 
 // ── Telegram Webhook ──────────────────────────────────────────────
@@ -3294,7 +3261,7 @@ Please contact your manager to set up your account.`);
 // ── Product Master Routes ─────────────────────────────────────────
 
 // ── Company Settings ─────────────────────────────────────────────
-app.get("/company-settings", async (req, res) => {
+app.get("/company-settings", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
@@ -3324,7 +3291,7 @@ app.post("/company-settings", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // ── Warehouses CRUD ──────────────────────────────────────────────
-app.get("/warehouses", async (req, res) => {
+app.get("/warehouses", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
@@ -3364,7 +3331,7 @@ app.delete("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // ── Warehouse Zones & Racks ──────────────────────────────────────
-app.get("/warehouses/:id/zones", async (req, res) => {
+app.get("/warehouses/:id/zones", requireAuth, async (req, res) => {
   try {
     const { data: zoneData, error } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).order("name");
     if (error) throw error;
@@ -3460,7 +3427,7 @@ app.post("/package-labels/generate", requireRole(MANAGE_ROLES), async (req, res)
   } catch (err) { console.error("generate labels error:", err); res.status(500).json({ error: err.message }); }
 });
 
-app.get("/package-labels", async (req, res) => {
+app.get("/package-labels", requireAuth, async (req, res) => {
   try {
     const { company_id, supplier_delivery_id, so_number, status } = req.query;
     let query = supabase.from("package_labels").select("*").order("created_at", { ascending: false });
@@ -3474,7 +3441,7 @@ app.get("/package-labels", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get("/package-labels/validate/:qr_code", async (req, res) => {
+app.get("/package-labels/validate/:qr_code", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase.from("package_labels").select("*").eq("qr_code", req.params.qr_code).single();
     if (error || !data) return res.status(404).json({ error: "Package not found" });
@@ -3555,7 +3522,7 @@ async function recordLeadTime(company_id, supplier_id, product_id, po_created_at
   });
 }
 
-app.get("/inventory", async (req, res) => {
+app.get("/inventory", requireAuth, async (req, res) => {
   try {
     const { company_id, warehouse_id, low_stock } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
@@ -3573,7 +3540,7 @@ app.get("/inventory", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get("/inventory/summary", async (req, res) => {
+app.get("/inventory/summary", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
@@ -3618,7 +3585,7 @@ app.post("/inventory/transfer", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get("/stock-movements", async (req, res) => {
+app.get("/stock-movements", requireAuth, async (req, res) => {
   try {
     const { company_id, warehouse_id, type, limit: lim } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
@@ -3673,7 +3640,7 @@ app.post("/inventory/import", requireRole(MANAGE_ROLES), upload.single("file"), 
 });
 
 // ── Spec Options Library ─────────────────────────────────────────
-app.get("/spec-options", async (req, res) => {
+app.get("/spec-options", requireAuth, async (req, res) => {
   try {
     const { company_id, label } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
@@ -3685,7 +3652,7 @@ app.get("/spec-options", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get("/spec-options/pending", async (req, res) => {
+app.get("/spec-options/pending", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
@@ -3738,7 +3705,7 @@ app.patch("/spec-options/:id/approve", requireRole(MANAGE_ROLES), async (req, re
 });
 
 // ── Branches CRUD ────────────────────────────────────────────────
-app.get("/branches", async (req, res) => {
+app.get("/branches", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     let query = supabase.from("branches").select("id, name, company_id").order("name");
@@ -3778,7 +3745,7 @@ app.delete("/branches/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // ── GET /suppliers ───────────────────────────────────────────────
-app.get("/suppliers", async (req, res) => {
+app.get("/suppliers", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at").order("name");
@@ -3858,7 +3825,7 @@ app.delete("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // ── GET /categories ──────────────────────────────────────────────
-app.get("/categories", async (req, res) => {
+app.get("/categories", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     let query = supabase.from("product_categories").select("id, name, parent_id, spec_labels, created_at").order("name");
@@ -3904,7 +3871,7 @@ app.delete("/categories/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // ── GET /products ────────────────────────────────────────────────
-app.get("/products", async (req, res) => {
+app.get("/products", requireAuth, async (req, res) => {
   try {
     const { company_id, search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
     let query = supabase
@@ -5144,7 +5111,7 @@ app.get("/purchase-orders/:id", requireAuth, async (req, res) => {
 });
 
 // PUT /purchase-orders/:id
-app.put("/purchase-orders/:id", requireAuth, async (req, res) => {
+app.put("/purchase-orders/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { expected_date, notes } = req.body;
     const { data, error } = await supabase.from("purchase_orders")
@@ -5156,7 +5123,7 @@ app.put("/purchase-orders/:id", requireAuth, async (req, res) => {
 });
 
 // PATCH /purchase-orders/:id/status
-app.patch("/purchase-orders/:id/status", requireAuth, async (req, res) => {
+app.patch("/purchase-orders/:id/status", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { status } = req.body;
     const { data, error } = await supabase.from("purchase_orders")
@@ -5181,7 +5148,7 @@ app.delete("/purchase-orders/:id", requireAuth, async (req, res) => {
 });
 
 // PATCH /purchase-order-items/:id/receive
-app.patch("/purchase-order-items/:id/receive", requireAuth, async (req, res) => {
+app.patch("/purchase-order-items/:id/receive", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { received_qty, received_date, warehouse_id } = req.body;
     const rcvDate = received_date || new Date().toISOString().slice(0, 10);
