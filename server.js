@@ -3354,7 +3354,7 @@ app.get("/warehouses/:id/zones", requireAuth, async (req, res) => {
     if (error) throw error;
     const zones = zoneData || [];
     for (const z of zones) {
-      const { data: racks } = await supabase.from("warehouse_racks").select("*").eq("zone_id", z.id).order("code");
+      const { data: racks } = await supabase.from("warehouse_racks").select("*").eq("zone_id", z.id).order("rack_code");
       z.warehouse_racks = racks || [];
     }
     res.json({ zones });
@@ -3393,7 +3393,7 @@ app.post("/warehouse-zones/:id/racks", requireRole(MANAGE_ROLES), async (req, re
     const { code, description } = req.body;
     if (!code) return res.status(400).json({ error: "code required" });
     const qr_code = `RACK-${code.trim().toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-    const { data, error } = await supabase.from("warehouse_racks").insert({ zone_id: req.params.id, code: code.trim().toUpperCase(), description: description || null, qr_code }).select().single();
+    const { data, error } = await supabase.from("warehouse_racks").insert({ zone_id: req.params.id, rack_code: code.trim().toUpperCase(), qr_code }).select().single();
     if (error) throw error;
     res.status(201).json({ rack: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3544,7 +3544,7 @@ app.get("/warehouses/:id/rack-qrs", requireAuth, async (req, res) => {
     const { data: zones } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).order("name");
     const racks = [];
     for (const z of (zones || [])) {
-      const { data: rackData } = await supabase.from("warehouse_racks").select("*").eq("zone_id", z.id).order("code");
+      const { data: rackData } = await supabase.from("warehouse_racks").select("*").eq("zone_id", z.id).order("rack_code");
       for (const r of (rackData || [])) {
         racks.push({ ...r, zone_name: z.name });
       }
@@ -3560,10 +3560,10 @@ app.patch("/package-labels/:id/store", requireRole(MANAGE_ROLES), async (req, re
     let finalRackId = rack_id;
     let finalLocation = location_code;
     if (rack_qr_code && !rack_id) {
-      const { data: rack } = await supabase.from("warehouse_racks").select("id, code, zone_id, warehouse_zones(name, warehouse_id)").eq("qr_code", rack_qr_code).single();
+      const { data: rack } = await supabase.from("warehouse_racks").select("id, rack_code, zone_id, warehouse_zones(name, warehouse_id)").eq("qr_code", rack_qr_code).single();
       if (!rack) return res.status(404).json({ error: "Rack QR not found" });
       finalRackId = rack.id;
-      finalLocation = `${rack.warehouse_zones?.name || ""}-${rack.code}`.replace(/^-/, "");
+      finalLocation = `${rack.warehouse_zones?.name || ""}-${rack.rack_code}`.replace(/^-/, "");
     }
     const { data, error } = await supabase.from("package_labels")
       .update({ rack_id: finalRackId, zone_id: null, location_code: finalLocation, status: "stored" })
