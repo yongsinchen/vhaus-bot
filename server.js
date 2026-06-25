@@ -2985,10 +2985,11 @@ app.post("/admin/users", async (req, res) => {
   res.json({ success: true, userId: authData.user.id });
 });
 
-app.patch("/admin/users/:id/password", async (req, res) => {
+app.patch("/admin/users/:id/password", requireRole(["master", "manager"]), async (req, res) => {
   const { id } = req.params;
   const { password } = req.body;
   if (!password) return res.status(400).json({ error: "Password required." });
+  if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
   const { error } = await supabase.auth.admin.updateUserById(id, { password });
   if (error) return res.status(400).json({ success: false, error: error.message });
   res.json({ success: true });
