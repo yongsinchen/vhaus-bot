@@ -3833,19 +3833,33 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
       await addPickItemsForOrder(sched.orders.id, sched.orders.so_number, sched.orders.customer_name, sched.scheduled_date, pickItems);
     }
 
-    // Source 2: orders with delivery_date in range (covers old system + direct scheduling)
+    // Source 2: orders with delivery_date in range (text column, string compare works for YYYY-MM-DD)
     const { data: orders } = await supabase.from("orders")
-      .select("id, so_number, customer_name, delivery_date, status")
+      .select("id, so_number, customer_name, delivery_date, status, items")
       .eq("company_id", company_id)
+      .neq("delivery_date", "").not("delivery_date", "is", null)
       .gte("delivery_date", startDate).lte("delivery_date", endDate)
       .in("status", ["Pending", "Confirmed", "In Progress"]);
     for (const order of (orders || [])) {
-      if (seenSO.has(order.so_number)) continue;
+      if (!order.so_number || seenSO.has(order.so_number)) continue;
       seenSO.add(order.so_number);
+      const beforeCount = pickItems.length;
       await addPickItemsForOrder(order.id, order.so_number, order.customer_name, order.delivery_date, pickItems);
+      // If no packages found, still show the order items so team knows what's coming
+      if (pickItems.length === beforeCount) {
+        const orderItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+        for (const item of (Array.isArray(orderItems) ? orderItems : [])) {
+          if (!item.itemName) continue;
+          pickItems.push({ id: `order-${order.id}-${item.itemCode || item.itemName}`, qr_code: null, status: "no_package", location_code: null, _product_name: item.itemName, _product_code: item.itemCode || "", _customer: order.customer_name, _so_number: order.so_number, _delivery_date: order.delivery_date, _source: "order_items_no_package" });
+        }
+      }
     }
 
-    pickItems.sort((a, b) => (a.location_code || "ZZZ").localeCompare(b.location_code || "ZZZ"));
+    pickItems.sort((a, b) => {
+      if (a.status === "no_package" && b.status !== "no_package") return 1;
+      if (b.status === "no_package" && a.status !== "no_package") return -1;
+      return (a.location_code || "ZZZ").localeCompare(b.location_code || "ZZZ");
+    });
     res.json({ items: pickItems, schedule_count: (schedules || []).length, order_count: (orders || []).length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
