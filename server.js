@@ -3909,7 +3909,7 @@ app.get("/products", async (req, res) => {
     const { company_id, search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
     let query = supabase
       .from("products")
-      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, suppliers(id,name), product_categories(id,name)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (company_id) query = query.eq("company_id", company_id);
