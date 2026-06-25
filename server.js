@@ -4786,12 +4786,19 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const { company_id, id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
-            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived } = req.body;
+            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
     const subtotal = items.reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
-    const order_number = await nextOrderNumber(company_id);
+    let order_number;
+    if (customOrderNumber?.trim()) {
+      const { data: dup } = await supabase.from("sales_orders").select("id").eq("company_id", company_id).eq("order_number", customOrderNumber.trim()).maybeSingle();
+      if (dup) return res.status(400).json({ error: `Order number "${customOrderNumber.trim()}" already exists` });
+      order_number = customOrderNumber.trim();
+    } else {
+      order_number = await nextOrderNumber(company_id);
+    }
     const resolvedSalesman = salesman_names || salesman_name || name || null;
 
     const { data: order, error: orderErr } = await supabase
