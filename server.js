@@ -3529,6 +3529,365 @@ app.post("/package-labels/confirm-all", requireRole(MANAGE_ROLES), async (req, r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ══════════════════════════════════════════════════════════════════
+// ── UNIFIED WMS: Packings, Teams, Schedules ─────────────────────
+// ══════════════════════════════════════════════════════════════════
+
+// ── Packings (order_item_packings) ──────────────────────────────
+function generatePackingQR() {
+  const d = new Date().toISOString().slice(2, 10).replace(/-/g, "");
+  const r = Math.random().toString(36).substring(2, 7).toUpperCase();
+  return `PKG-${d}-${r}`;
+}
+
+// Generate packings from a supplier delivery's items
+app.post("/packings/generate", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { supplier_delivery_id, items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
+    // Check for existing packings on this DO
+    if (supplier_delivery_id) {
+      const { data: existing } = await supabase.from("order_item_packings")
+        .select("id").eq("do_item_id", supplier_delivery_id).limit(1);
+      // Also check package_labels for backward compat
+      const { data: legacyLabels } = await supabase.from("package_labels")
+        .select("id").eq("supplier_delivery_id", supplier_delivery_id).limit(1);
+      if ((existing || []).length > 0 || (legacyLabels || []).length > 0) {
+        return res.status(400).json({ error: "Labels already generated for this DO. Use reprint instead." });
+      }
+    }
+    const packings = [];
+    for (const item of items) {
+      // Try to find the order_item to link
+      let orderItemId = item.order_item_id || null;
+      if (!orderItemId && item.so_number) {
+        const { data: order } = await supabase.from("orders").select("id").eq("so_number", item.so_number).maybeSingle();
+        if (order) {
+          const { data: oi } = await supabase.from("order_items").select("id")
+            .eq("order_id", order.id).ilike("product_name", `%${item.product_name || item.item_name || ""}%`).limit(1).maybeSingle();
+          if (oi) orderItemId = oi.id;
+        }
+      }
+      const cartons = Number(item.carton_count) || 1;
+      for (let c = 1; c <= cartons; c++) {
+        packings.push({
+          order_item_id: orderItemId,
+          do_item_id: null,
+          qty_packed: 1,
+          qr_code: generatePackingQR(),
+          qr_type: "order_unit",
+          status: "packed",
+          packed_by: req.user.id,
+        });
+      }
+    }
+    const { data, error } = await supabase.from("order_item_packings").insert(packings).select();
+    if (error) throw error;
+    // Also create package_labels for backward compat (print uses them)
+    const labels = (data || []).map((p, i) => {
+      const item = items[Math.min(Math.floor(i / (Number(items[0]?.carton_count) || 1)), items.length - 1)];
+      return {
+        company_id: req.user.company_id,
+        supplier_delivery_id: supplier_delivery_id || null,
+        product_code: item.product_code || item.item_code || null,
+        product_name: item.product_name || item.item_name || null,
+        so_number: item.so_number || null,
+        carton_number: (i % (Number(item.carton_count) || 1)) + 1,
+        total_cartons: Number(item.carton_count) || 1,
+        qr_code: p.qr_code,
+        warehouse_id: item.warehouse_id || null,
+        status: "pending",
+      };
+    });
+    if (labels.length > 0) await supabase.from("package_labels").insert(labels);
+    // Update DO status
+    if (supplier_delivery_id) {
+      await supabase.from("supplier_deliveries").update({ status: "Labeled" }).eq("id", supplier_delivery_id);
+    }
+    res.json({ packings: data || [], labels, count: packings.length });
+  } catch (err) { console.error("packings/generate error:", err); res.status(500).json({ error: err.message }); }
+});
+
+app.get("/packings", requireAuth, async (req, res) => {
+  try {
+    const { order_item_id, status, limit = 200 } = req.query;
+    let q = supabase.from("order_item_packings").select("*").order("packed_at", { ascending: false }).limit(Number(limit));
+    if (order_item_id) q = q.eq("order_item_id", order_item_id);
+    if (status) q = q.eq("status", status);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ packings: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/packings/validate/:qr_code", requireAuth, async (req, res) => {
+  try {
+    const { data: packing } = await supabase.from("order_item_packings").select("*").eq("qr_code", req.params.qr_code).maybeSingle();
+    if (packing) {
+      // Enrich with order info
+      if (packing.order_item_id) {
+        const { data: oi } = await supabase.from("order_items").select("*, orders(so_number, customer_name)").eq("id", packing.order_item_id).maybeSingle();
+        if (oi) { packing._order_item = oi; packing._so_number = oi.orders?.so_number; packing._customer = oi.orders?.customer_name; packing._product_name = oi.product_name; packing._product_code = oi.product_code; }
+      }
+      return res.json({ packing, source: "order_item_packings" });
+    }
+    // Fallback to package_labels
+    const { data: label } = await supabase.from("package_labels").select("*").eq("qr_code", req.params.qr_code).maybeSingle();
+    if (label) return res.json({ packing: { id: label.id, qr_code: label.qr_code, status: label.status, zone_id: label.zone_id, rack_id: label.rack_id, _product_name: label.product_name, _product_code: label.product_code, _so_number: label.so_number, _source: "package_labels" }, source: "package_labels" });
+    res.status(404).json({ error: "Package not found" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Put away: scan item QR + rack QR → link to location
+app.patch("/packings/:id/put-away", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { rack_qr_code, rack_id } = req.body;
+    let finalRackId = rack_id, finalZoneId = null, locationCode = null, rackLevel = null;
+    if (rack_qr_code && !rack_id) {
+      const { data: rack } = await supabase.from("warehouse_racks").select("id, rack_code, zone_id, warehouse_zones(name)").eq("qr_code", rack_qr_code).maybeSingle();
+      if (!rack) return res.status(404).json({ error: "Rack QR not found" });
+      finalRackId = rack.id;
+      finalZoneId = rack.zone_id;
+      locationCode = `${rack.warehouse_zones?.name || ""}-${rack.rack_code}`.replace(/^-/, "");
+    }
+    const { data, error } = await supabase.from("order_item_packings")
+      .update({ status: "put_away", zone_id: finalZoneId, rack_id: finalRackId, rack_level: rackLevel, put_away_at: new Date().toISOString() })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    // Also update package_labels if exists
+    await supabase.from("package_labels").update({ status: "stored", rack_id: finalRackId, zone_id: finalZoneId, location_code: locationCode }).eq("qr_code", data.qr_code);
+    // Log scan
+    await supabase.from("packing_qr_scans").insert({ packing_id: data.id, scanned_by: req.user.id, scan_type: "put_away", is_valid: true });
+    res.json({ packing: data, location_code: locationCode });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Pick
+app.patch("/packings/:id/pick", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("order_item_packings")
+      .update({ status: "picked", picked_at: new Date().toISOString() })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    await supabase.from("package_labels").update({ status: "picked", picked_at: new Date().toISOString(), picked_by: req.user.id }).eq("qr_code", data.qr_code);
+    await supabase.from("packing_qr_scans").insert({ packing_id: data.id, scanned_by: req.user.id, scan_type: "pick", is_valid: true });
+    res.json({ packing: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Load + validate
+app.patch("/packings/:id/load", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { team_id } = req.body;
+    const { data: packing } = await supabase.from("order_item_packings").select("*, order_items(order_id, product_name, orders(so_number))").eq("id", req.params.id).single();
+    if (!packing) return res.status(404).json({ error: "Packing not found" });
+    // Validate against team's scheduled orders
+    let warning = null;
+    if (team_id && packing.order_items?.order_id) {
+      const { data: sched } = await supabase.from("delivery_schedules")
+        .select("id").eq("team_id", team_id).eq("order_id", packing.order_items.order_id).maybeSingle();
+      if (!sched) warning = `This item (${packing.order_items.orders?.so_number || "?"}) is NOT assigned to this truck`;
+    }
+    const { data, error } = await supabase.from("order_item_packings")
+      .update({ status: "loaded", loaded_at: new Date().toISOString() })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    await supabase.from("package_labels").update({ status: "loaded", loaded_at: new Date().toISOString(), loaded_by: req.user.id }).eq("qr_code", data.qr_code);
+    await supabase.from("packing_qr_scans").insert({ packing_id: data.id, scanned_by: req.user.id, scan_type: "load", is_valid: !warning, warning_code: warning ? "wrong_team" : null });
+    res.json({ packing: data, warning, valid: !warning });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Delivery Teams ──────────────────────────────────────────────
+app.get("/delivery-teams", requireAuth, async (req, res) => {
+  try {
+    const { company_id, date } = req.query;
+    let q = supabase.from("delivery_teams").select("*, delivery_vehicles(vehicle_plate, vehicle_type), driver:users!delivery_teams_driver_id_fkey(name), helper:users!delivery_teams_helper_id_fkey(name)").order("created_at");
+    if (company_id) q = q.eq("company_id", company_id);
+    if (date) q = q.eq("team_date", date);
+    const { data, error } = await q;
+    if (error) {
+      // Fallback without joins if FK not detected
+      let q2 = supabase.from("delivery_teams").select("*").order("created_at");
+      if (company_id) q2 = q2.eq("company_id", company_id);
+      if (date) q2 = q2.eq("team_date", date);
+      const { data: d2 } = await q2;
+      return res.json({ teams: d2 || [] });
+    }
+    res.json({ teams: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/delivery-teams", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { vehicle_id, driver_id, helper_id, team_date } = req.body;
+    if (!driver_id || !team_date) return res.status(400).json({ error: "driver_id and team_date required" });
+    const { data, error } = await supabase.from("delivery_teams")
+      .insert({ company_id: req.user.company_id, vehicle_id, driver_id, helper_id: helper_id || null, team_date })
+      .select().single();
+    if (error) throw error;
+    res.status(201).json({ team: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/delivery-teams/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { vehicle_id, driver_id, helper_id } = req.body;
+    const { data, error } = await supabase.from("delivery_teams")
+      .update({ vehicle_id, driver_id, helper_id: helper_id || null })
+      .eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ team: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/delivery-teams/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    await supabase.from("delivery_schedules").delete().eq("team_id", req.params.id);
+    await supabase.from("delivery_teams").delete().eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Delivery Schedules ──────────────────────────────────────────
+app.get("/delivery-schedules", requireAuth, async (req, res) => {
+  try {
+    const { date, team_id, company_id } = req.query;
+    let q = supabase.from("delivery_schedules").select("*, orders(so_number, customer_name, address, contact, items, status, balance, type), delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate))").order("sort_order");
+    if (date) q = q.eq("scheduled_date", date);
+    if (team_id) q = q.eq("team_id", team_id);
+    if (company_id) {
+      const { data: teamIds } = await supabase.from("delivery_teams").select("id").eq("company_id", company_id);
+      if (teamIds?.length) q = q.in("team_id", teamIds.map(t => t.id));
+    }
+    const { data, error } = await q;
+    if (error) {
+      // Fallback without joins
+      let q2 = supabase.from("delivery_schedules").select("*").order("sort_order");
+      if (date) q2 = q2.eq("scheduled_date", date);
+      if (team_id) q2 = q2.eq("team_id", team_id);
+      const { data: d2 } = await q2;
+      return res.json({ schedules: d2 || [] });
+    }
+    res.json({ schedules: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/delivery-schedules", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { order_id, team_id, scheduled_date, area, slot, sort_order } = req.body;
+    if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
+    // Check for duplicate
+    const { data: dup } = await supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date).maybeSingle();
+    if (dup) return res.status(400).json({ error: "Order already scheduled for this date" });
+    const { data, error } = await supabase.from("delivery_schedules")
+      .insert({ order_id, team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null, sort_order: sort_order || 0, status: "scheduled", is_ready: false })
+      .select().single();
+    if (error) throw error;
+    res.status(201).json({ schedule: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { team_id, sort_order, status, slot, area, is_ready, notes } = req.body;
+    const updates = {};
+    if (team_id !== undefined) updates.team_id = team_id;
+    if (sort_order !== undefined) updates.sort_order = sort_order;
+    if (status !== undefined) updates.status = status;
+    if (slot !== undefined) updates.slot = slot;
+    if (area !== undefined) updates.area = area;
+    if (is_ready !== undefined) updates.is_ready = is_ready;
+    if (notes !== undefined) updates.notes = notes;
+    if (status === "delivered") updates.delivered_at = new Date().toISOString();
+    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ schedule: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    await supabase.from("delivery_schedules").delete().eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Unified Pick List ───────────────────────────────────────────
+app.get("/unified-pick-list", requireAuth, async (req, res) => {
+  try {
+    const { company_id, date, days = 3 } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const startDate = date || new Date().toISOString().slice(0, 10);
+    const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
+    // Get scheduled deliveries
+    const { data: schedules } = await supabase.from("delivery_schedules")
+      .select("*, orders(id, so_number, customer_name, address)")
+      .gte("scheduled_date", startDate).lte("scheduled_date", endDate).in("status", ["scheduled", "picking"]);
+    // For each order, find packings that need picking
+    const pickItems = [];
+    for (const sched of (schedules || [])) {
+      if (!sched.orders?.id) continue;
+      // Find packings via order_items → order_item_packings
+      const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", sched.orders.id);
+      const oiIds = (orderItems || []).map(oi => oi.id);
+      if (oiIds.length === 0) continue;
+      const { data: packings } = await supabase.from("order_item_packings")
+        .select("*").in("order_item_id", oiIds).in("status", ["put_away"]);
+      for (const p of (packings || [])) {
+        // Enrich with order_item info
+        const { data: oi } = await supabase.from("order_items").select("product_name, product_code").eq("id", p.order_item_id).maybeSingle();
+        pickItems.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: sched.orders.customer_name, _so_number: sched.orders.so_number, _delivery_date: sched.scheduled_date });
+      }
+      // Also check package_labels as fallback
+      if (packings?.length === 0) {
+        const { data: labels } = await supabase.from("package_labels")
+          .select("*").eq("so_number", sched.orders.so_number).eq("status", "stored");
+        for (const l of (labels || [])) {
+          pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, _product_name: l.product_name, _product_code: l.product_code, _customer: sched.orders.customer_name, _so_number: l.so_number, _delivery_date: sched.scheduled_date, location_code: l.location_code, _source: "package_labels" });
+        }
+      }
+    }
+    // Sort by location for efficient walking
+    pickItems.sort((a, b) => (a.location_code || "ZZZ").localeCompare(b.location_code || "ZZZ"));
+    res.json({ items: pickItems, schedule_count: (schedules || []).length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Unified Loading List ────────────────────────────────────────
+app.get("/unified-loading-list", requireAuth, async (req, res) => {
+  try {
+    const { team_id, date } = req.query;
+    if (!team_id && !date) return res.status(400).json({ error: "team_id or date required" });
+    let q = supabase.from("delivery_schedules").select("*, orders(id, so_number, customer_name)");
+    if (team_id) q = q.eq("team_id", team_id);
+    if (date) q = q.eq("scheduled_date", date);
+    q = q.in("status", ["scheduled", "picking", "loading"]);
+    const { data: schedules } = await q;
+    const items = [];
+    for (const sched of (schedules || [])) {
+      if (!sched.orders?.id) continue;
+      const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", sched.orders.id);
+      const oiIds = (orderItems || []).map(oi => oi.id);
+      if (oiIds.length > 0) {
+        const { data: packings } = await supabase.from("order_item_packings").select("*").in("order_item_id", oiIds).in("status", ["picked", "loaded"]);
+        for (const p of (packings || [])) {
+          const { data: oi } = await supabase.from("order_items").select("product_name, product_code").eq("id", p.order_item_id).maybeSingle();
+          items.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: sched.orders.customer_name, _so_number: sched.orders.so_number });
+        }
+      }
+      // Fallback to package_labels
+      const { data: labels } = await supabase.from("package_labels").select("*").eq("so_number", sched.orders.so_number).in("status", ["picked", "loaded"]);
+      for (const l of (labels || [])) {
+        if (!items.find(i => i.qr_code === l.qr_code)) {
+          items.push({ id: l.id, qr_code: l.qr_code, status: l.status, _product_name: l.product_name, _product_code: l.product_code, _customer: sched.orders.customer_name, _so_number: l.so_number, _source: "package_labels" });
+        }
+      }
+    }
+    res.json({ items, team_id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Rack QR Validation ──────────────────────────────────────────
 app.get("/warehouse-racks/validate/:qr_code", requireAuth, async (req, res) => {
   try {
@@ -4913,8 +5272,20 @@ async function syncSalesOrderToDelivery(order, items) {
     };
     const { data: existing } = await supabase.from("orders")
       .select("id").eq("company_id", order.company_id).eq("so_number", order.order_number).maybeSingle();
-    if (existing) await supabase.from("orders").update(row).eq("id", existing.id);
-    else await supabase.from("orders").insert(row);
+    let orderId;
+    if (existing) { await supabase.from("orders").update(row).eq("id", existing.id); orderId = existing.id; }
+    else { const { data: ins } = await supabase.from("orders").insert(row).select("id").single(); orderId = ins?.id; }
+    // Sync order_items so packings can link to them
+    if (orderId && Array.isArray(items) && items.length > 0) {
+      await supabase.from("order_items").delete().eq("order_id", orderId);
+      const oiRows = items.map(it => ({
+        order_id: orderId, product_id: it.product_id || null,
+        product_code: it.product_code || it.product_name || "", product_name: it.product_name || "",
+        qty: Number(it.quantity) || 1, unit_price: Number(it.unit_price) || 0, unit_cost: Number(it.unit_cost) || 0,
+        notes: it.notes || null,
+      }));
+      await supabase.from("order_items").insert(oiRows);
+    }
   } catch (e) {
     console.error("syncSalesOrderToDelivery error:", e.message);
   }
