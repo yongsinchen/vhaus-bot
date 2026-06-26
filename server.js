@@ -3054,6 +3054,137 @@ app.get("/services", requireAuth, async (req, res) => {
   res.json(result);
 });
 
+// ── Service Management (proper tables) ──────────────────────────
+
+// Service types: 1=warranty, 2=assembly, 3=exchange
+const SERVICE_TYPES = { 1: "Warranty Repair", 2: "Assembly/Installation", 3: "Exchange/Replacement" };
+
+app.get("/service-cases", requireAuth, async (req, res) => {
+  try {
+    const { company_id, status } = req.query;
+    let q = supabase.from("services").select("*, orders(so_number, customer_name, address, contact), assigned:users!services_assigned_to_fkey(name)").order("created_at", { ascending: false });
+    if (company_id) q = q.eq("company_id", company_id);
+    if (status) q = q.eq("status", status);
+    const { data, error } = await q;
+    if (error) {
+      // Fallback without joins
+      let q2 = supabase.from("services").select("*").order("created_at", { ascending: false });
+      if (company_id) q2 = q2.eq("company_id", company_id);
+      if (status) q2 = q2.eq("status", status);
+      const { data: d2 } = await q2;
+      return res.json({ services: d2 || [] });
+    }
+    res.json({ services: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/service-cases/:id", requireAuth, async (req, res) => {
+  try {
+    const { data: svc } = await supabase.from("services").select("*").eq("id", req.params.id).single();
+    if (!svc) return res.status(404).json({ error: "Service not found" });
+    // Load related data
+    const [legsRes, tripsRes, claimsRes, orderRes] = await Promise.all([
+      supabase.from("service_legs").select("*").eq("service_id", svc.id).order("leg_order"),
+      supabase.from("service_trips").select("*").eq("service_id", svc.id).order("trip_number"),
+      supabase.from("service_part_claims").select("*").eq("service_id", svc.id).order("created_at"),
+      svc.order_id ? supabase.from("orders").select("so_number, customer_name, address, contact, items").eq("id", svc.order_id).single() : { data: null },
+    ]);
+    res.json({ service: svc, legs: legsRes.data || [], trips: tripsRes.data || [], claims: claimsRes.data || [], order: orderRes.data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { order_id, service_type, description, assigned_to } = req.body;
+    if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange)" });
+    const { data, error } = await supabase.from("services").insert({
+      company_id: req.user.company_id, order_id: order_id || null,
+      service_type: Number(service_type), status: "open",
+      description: description || null, assigned_to: assigned_to || null,
+      created_by: req.user.id,
+    }).select().single();
+    if (error) throw error;
+    // Auto-create legs based on type
+    const legs = [];
+    if (service_type === 1 || service_type === 3) {
+      // Warranty or exchange: pick up + deliver back
+      legs.push({ service_id: data.id, leg_order: 1, from_location: "Customer", to_location: "Warehouse", status: "pending" });
+      legs.push({ service_id: data.id, leg_order: 2, from_location: "Warehouse", to_location: "Customer", status: "pending" });
+    } else if (service_type === 2) {
+      // Assembly: single visit
+      legs.push({ service_id: data.id, leg_order: 1, from_location: "Warehouse", to_location: "Customer", status: "pending" });
+    }
+    if (legs.length > 0) await supabase.from("service_legs").insert(legs);
+    res.status(201).json({ service: data, legs });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { status, description, assigned_to } = req.body;
+    const updates = {};
+    if (status !== undefined) updates.status = status;
+    if (description !== undefined) updates.description = description;
+    if (assigned_to !== undefined) updates.assigned_to = assigned_to;
+    if (status === "closed") updates.closed_at = new Date().toISOString();
+    const { data, error } = await supabase.from("services").update(updates).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ service: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Service Legs
+app.patch("/service-legs/:id", requireRole([...MANAGE_ROLES, "driver", "operation"]), async (req, res) => {
+  try {
+    const { status, team_id, scheduled_at, notes } = req.body;
+    const updates = {};
+    if (status !== undefined) updates.status = status;
+    if (team_id !== undefined) updates.team_id = team_id;
+    if (scheduled_at !== undefined) updates.scheduled_at = scheduled_at;
+    if (notes !== undefined) updates.notes = notes;
+    if (status === "completed") updates.completed_at = new Date().toISOString();
+    const { data, error } = await supabase.from("service_legs").update(updates).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    // Auto-advance service status
+    const { data: allLegs } = await supabase.from("service_legs").select("status").eq("service_id", data.service_id);
+    const allDone = (allLegs || []).every(l => l.status === "completed");
+    if (allDone) await supabase.from("services").update({ status: "resolved" }).eq("id", data.service_id);
+    else if (status === "in_progress") await supabase.from("services").update({ status: "in_progress" }).eq("id", data.service_id);
+    res.json({ leg: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Service Part Claims
+app.post("/service-part-claims", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { service_id, supplier_id, part_code, part_name, notes } = req.body;
+    if (!service_id) return res.status(400).json({ error: "service_id required" });
+    const { data, error } = await supabase.from("service_part_claims").insert({
+      service_id, supplier_id: supplier_id || null,
+      part_code: part_code || null, part_name: part_name || null,
+      claim_status: "pending", notes: notes || null,
+    }).select().single();
+    if (error) throw error;
+    await supabase.from("services").update({ status: "claiming" }).eq("id", service_id);
+    res.status(201).json({ claim: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/service-part-claims/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { claim_status, claim_ref, notes } = req.body;
+    const updates = {};
+    if (claim_status) updates.claim_status = claim_status;
+    if (claim_ref) updates.claim_ref = claim_ref;
+    if (notes !== undefined) updates.notes = notes;
+    if (claim_status === "submitted") updates.claimed_at = new Date().toISOString();
+    if (claim_status === "received") updates.received_at = new Date().toISOString();
+    const { data, error } = await supabase.from("service_part_claims").update(updates).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ claim: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Supplier Deliveries API ───────────────────────────────────────
 app.get("/supplier-deliveries", requireAuth, async (req, res) => {
   const { company_id, supplier, from_date, to_date, status, limit = 100 } = req.query;
