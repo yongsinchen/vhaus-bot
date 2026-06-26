@@ -398,4 +398,116 @@ async function migrate() {
   console.log(`UNION ALL SELECT 'Migration log entries', count(*) FROM legacy_order_migration_log;`);
 }
 
-migrate().catch(err => { console.error("Migration failed:", err); process.exit(1); });
+// ═══════════════════════════════════════════════════════════════════
+// ENRICH mode — updates existing sales_order_items with legacy data
+// ═══════════════════════════════════════════════════════════════════
+async function enrich() {
+  console.log(`\n${"═".repeat(60)}`);
+  console.log(`  ENRICH: Update existing items with legacy data`);
+  console.log(`  Mode: ${DRY_RUN ? "DRY RUN" : "⚠️  LIVE"}`);
+  console.log(`${"═".repeat(60)}\n`);
+
+  // Load all legacy orders with items
+  const { data: legacyOrders } = await supabase.from("orders").select("id, so_number, company_id, items")
+    .not("so_number", "is", null).not("items", "is", null);
+  console.log(`Legacy orders with items: ${(legacyOrders || []).length}`);
+
+  // Load all sales_orders with their items
+  const { data: salesOrders } = await supabase.from("sales_orders").select("id, order_number, company_id");
+  const soByNumber = new Map((salesOrders || []).map(so => [so.order_number, so]));
+  console.log(`Sales orders: ${(salesOrders || []).length}`);
+
+  // Load all sales_order_items
+  const { data: allItems } = await supabase.from("sales_order_items").select("id, order_id, product_id, product_name, product_code, arrival_date, supplier_name, legacy_item_json, requires_product_review");
+  const itemsByOrderId = {};
+  (allItems || []).forEach(it => { if (!itemsByOrderId[it.order_id]) itemsByOrderId[it.order_id] = []; itemsByOrderId[it.order_id].push(it); });
+  console.log(`Sales order items: ${(allItems || []).length}`);
+
+  const stats = { orders_processed: 0, items_enriched: 0, products_matched: 0, products_unmatched: 0, arrival_dates_set: 0, suppliers_set: 0, already_enriched: 0 };
+
+  for (const legacy of (legacyOrders || [])) {
+    const so = soByNumber.get(legacy.so_number);
+    if (!so) continue;
+
+    const legacyItems = parseItems(legacy.items);
+    if (!Array.isArray(legacyItems) || legacyItems.length === 0) continue;
+
+    const soItems = itemsByOrderId[so.id] || [];
+    if (soItems.length === 0) continue;
+
+    stats.orders_processed++;
+
+    // Match legacy items to sales_order_items by name/code
+    for (const soItem of soItems) {
+      // Skip if already enriched
+      if (soItem.legacy_item_json) { stats.already_enriched++; continue; }
+
+      // Find matching legacy item
+      const soName = (soItem.product_name || "").toLowerCase().trim();
+      const soCode = (soItem.product_code || "").toLowerCase().trim();
+      const legacyMatch = legacyItems.find(li => {
+        const liName = (li.itemName || "").toLowerCase().trim();
+        const liCode = (li.itemCode || "").toLowerCase().trim();
+        if (soCode && liCode && soCode === liCode) return true;
+        if (soName && liName && soName === liName) return true;
+        if (soName && liName && (soName.includes(liName) || liName.includes(soName))) return true;
+        return false;
+      });
+
+      if (!legacyMatch) continue;
+
+      // Product matching (if product_id is null)
+      let productId = soItem.product_id;
+      let needsReview = false;
+      if (!productId && so.company_id) {
+        const match = await matchProduct(so.company_id, legacyMatch.itemCode, legacyMatch.itemName, legacyMatch.size, legacyMatch.color);
+        if (match) { productId = match.id; stats.products_matched++; }
+        else { stats.products_unmatched++; needsReview = true; }
+      }
+
+      const updates = {
+        legacy_item_json: legacyMatch,
+        requires_product_review: needsReview,
+      };
+      if (productId && !soItem.product_id) updates.product_id = productId;
+      if (legacyMatch.arrivalDate && !soItem.arrival_date) { updates.arrival_date = parseDate(legacyMatch.arrivalDate); if (updates.arrival_date) stats.arrival_dates_set++; }
+      if (legacyMatch.supplier && !soItem.supplier_name) { updates.supplier_name = legacyMatch.supplier; stats.suppliers_set++; }
+      if (legacyMatch.itemOrderDate) updates.item_order_date = parseDate(legacyMatch.itemOrderDate);
+      if (legacyMatch.supplierSentDate) updates.supplier_sent_date = parseDate(legacyMatch.supplierSentDate);
+      if (legacyMatch.size && !soItem.size) updates.size = legacyMatch.size;
+      if (legacyMatch.color && !soItem.color) updates.color = legacyMatch.color;
+
+      if (!DRY_RUN) {
+        await supabase.from("sales_order_items").update(updates).eq("id", soItem.id);
+      }
+      stats.items_enriched++;
+    }
+
+    if (stats.orders_processed % 50 === 0) {
+      console.log(`  Progress: ${stats.orders_processed} orders, ${stats.items_enriched} items enriched`);
+    }
+  }
+
+  console.log(`\n${"═".repeat(60)}`);
+  console.log(`  ENRICH ${DRY_RUN ? "DRY RUN" : ""} SUMMARY`);
+  console.log(`${"═".repeat(60)}`);
+  console.log(`  Orders processed:        ${stats.orders_processed}`);
+  console.log(`  Items enriched:          ${stats.items_enriched}`);
+  console.log(`  Already enriched:        ${stats.already_enriched}`);
+  console.log(`  Products matched:        ${stats.products_matched}`);
+  console.log(`  Products unmatched:      ${stats.products_unmatched}`);
+  console.log(`  Arrival dates set:       ${stats.arrival_dates_set}`);
+  console.log(`  Suppliers set:           ${stats.suppliers_set}`);
+  console.log(`${"═".repeat(60)}\n`);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Mode selector
+// ═══════════════════════════════════════════════════════════════════
+const MODE = (process.env.MODE || "migrate").toLowerCase();
+
+if (MODE === "enrich") {
+  enrich().catch(err => { console.error("Enrich failed:", err); process.exit(1); });
+} else {
+  migrate().catch(err => { console.error("Migration failed:", err); process.exit(1); });
+}
