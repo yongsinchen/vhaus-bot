@@ -5767,6 +5767,90 @@ app.patch("/products/bulk", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Product Review Queue ─────────────────────────────────────────
+
+// GET unmatched items grouped by product_name+product_code
+app.get("/product-review-queue", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data: items } = await supabase.from("sales_order_items")
+      .select("id, order_id, product_id, product_code, product_name, size, color, supplier_name, quantity, unit_price, requires_product_review, legacy_item_json")
+      .eq("requires_product_review", true).is("product_id", null);
+    // Group by product_name + product_code
+    const groups = {};
+    for (const item of (items || [])) {
+      const key = `${(item.product_code || "").toLowerCase().trim()}|${(item.product_name || "").toLowerCase().trim()}`;
+      if (!groups[key]) {
+        groups[key] = {
+          product_code: item.product_code || "",
+          product_name: item.product_name || "",
+          size: item.size || "",
+          color: item.color || "",
+          supplier_name: item.supplier_name || "",
+          order_count: 0,
+          total_qty: 0,
+          item_ids: [],
+          sample_price: item.unit_price,
+        };
+      }
+      groups[key].order_count++;
+      groups[key].total_qty += Number(item.quantity) || 1;
+      groups[key].item_ids.push(item.id);
+      if (!groups[key].size && item.size) groups[key].size = item.size;
+      if (!groups[key].color && item.color) groups[key].color = item.color;
+      if (!groups[key].supplier_name && item.supplier_name) groups[key].supplier_name = item.supplier_name;
+    }
+    const queue = Object.values(groups).sort((a, b) => b.order_count - a.order_count);
+    res.json({ queue, total_items: (items || []).length, total_groups: queue.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST link items to existing product
+app.post("/product-review-queue/link", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { item_ids, product_id } = req.body;
+    if (!Array.isArray(item_ids) || !product_id) return res.status(400).json({ error: "item_ids and product_id required" });
+    const { error } = await supabase.from("sales_order_items")
+      .update({ product_id, requires_product_review: false, is_custom: false })
+      .in("id", item_ids);
+    if (error) throw error;
+    res.json({ ok: true, updated: item_ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST create product from review queue then link
+app.post("/product-review-queue/create-and-link", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { item_ids, product_code, product_name, size, color, supplier_id, category_id, unit_cost, unit_price } = req.body;
+    if (!item_ids || !product_name) return res.status(400).json({ error: "item_ids and product_name required" });
+    const { data: product, error: pErr } = await supabase.from("products").insert({
+      company_id: req.user.company_id,
+      code: (product_code || product_name.substring(0, 20)).toUpperCase().replace(/\s+/g, "-"),
+      name: product_name, size: size || null, color: color || null,
+      supplier_id: supplier_id || null, category_id: category_id || null,
+      unit_cost: unit_cost || null, unit_price: unit_price || null,
+      is_standard: true, is_active: true,
+    }).select("id").single();
+    if (pErr) throw pErr;
+    // Link all items
+    await supabase.from("sales_order_items")
+      .update({ product_id: product.id, requires_product_review: false, is_custom: false })
+      .in("id", item_ids);
+    res.json({ ok: true, product_id: product.id, linked: item_ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST dismiss — mark as custom (keep as-is)
+app.post("/product-review-queue/dismiss", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { item_ids } = req.body;
+    if (!Array.isArray(item_ids)) return res.status(400).json({ error: "item_ids required" });
+    await supabase.from("sales_order_items")
+      .update({ requires_product_review: false })
+      .in("id", item_ids);
+    res.json({ ok: true, dismissed: item_ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Catalogue Import Routes ───────────────────────────────────────
 const XLSX = require("xlsx");
 const pdfParse = require("pdf-parse");
