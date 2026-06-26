@@ -1966,8 +1966,8 @@ app.patch("/delivery/routes/:routeId/orders/:orderId", requireRole(MANAGE_ROLES)
 
   // Update sales_orders time slot, sync to legacy orders
   if (scheduled_time_range !== undefined) {
-    const { data: lo } = await supabase.from("orders").select("so_number").eq("id", orderId).single();
-    if (lo?.so_number) await updateSalesOrderField(lo.so_number, null, { delivery_time_slot: scheduled_time_range });
+    const soNum = await getLegacySoNumber(orderId);
+    if (soNum) await updateSalesOrderField(soNum, null, { delivery_time_slot: scheduled_time_range });
   }
 
   res.json(data);
@@ -2467,8 +2467,7 @@ const handleDOPhoto = async (chatId, base64Image) => {
           });
           results.duplicate.push({ itemName: item.itemName, soNumber: item.soNumber });
         } else {
-          await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
-          await syncItemArrivalsToSalesOrder(order.id);
+          await saveLegacyItemsAndSync(order.id, updatedItems);
           results.updated.push({ itemName: item.itemName, soNumber: item.soNumber });
           updatedAny = true;
         }
@@ -2598,9 +2597,7 @@ app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, 
   if (soErr) return res.status(500).json({ error: soErr.message });
 
   // Sync to legacy orders table
-  const { data: fullSo } = await supabase.from("sales_orders")
-    .select("*, sales_order_items(*)").eq("id", newSo.id).single();
-  if (fullSo) await syncSalesOrderToDelivery(fullSo, fullSo.sales_order_items);
+  const fullSo = await fetchFullAndSync(newSo.id);
 
   // Also update legacy sv_number on the mirrored orders row
   await supabase.from("orders").update({ sv_number: svNumber, linked_so: sp.so_number })
@@ -2852,8 +2849,8 @@ app.post("/auto-schedule/approve", requireRole(MANAGE_ROLES), async (req, res) =
 
       // Update sales_orders time slot, sync to legacy orders
       if (timeRange) {
-        const { data: lo } = await supabase.from("orders").select("so_number").eq("id", order.id).single();
-        if (lo?.so_number) await updateSalesOrderField(lo.so_number, null, { delivery_time_slot: timeRange });
+        const soNum = await getLegacySoNumber(order.id);
+        if (soNum) await updateSalesOrderField(soNum, null, { delivery_time_slot: timeRange });
       }
     }
 
@@ -2920,8 +2917,7 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
         }
         return oi;
       });
-      await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
-      await syncItemArrivalsToSalesOrder(order.id);
+      await saveLegacyItemsAndSync(order.id, updated);
     }
   }
 
@@ -3146,17 +3142,10 @@ app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
       if (rows.length > 0) await supabase.from("payment_allocations").insert(rows);
       // Update sales_orders deposit for each allocated order
       for (const a of rows) {
-        const { data: ord } = await supabase.from("orders").select("so_number, order_amount, balance").eq("id", a.order_id).single();
-        const newBal = Math.max(0, (parseFloat(ord?.balance) || 0) - a.amount);
-        const paidAmt = (parseFloat(ord?.order_amount) || 0) - newBal;
-        if (ord?.so_number) await updateSalesOrderField(ord.so_number, null, { deposit: Math.max(0, paidAmt) });
+        await syncPaymentDeposit(a.order_id, a.amount);
       }
     } else if (order_id) {
-      // Single order payment
-      const { data: ord } = await supabase.from("orders").select("so_number, order_amount, balance").eq("id", order_id).single();
-      const newBal = Math.max(0, (parseFloat(ord?.balance) || 0) - Number(amount));
-      const paidAmt = (parseFloat(ord?.order_amount) || 0) - newBal;
-      if (ord?.so_number) await updateSalesOrderField(ord.so_number, null, { deposit: Math.max(0, paidAmt) });
+      await syncPaymentDeposit(order_id, amount);
     }
     // Auto-recalculate commissions for affected orders
     const affectedOrderIds = Array.isArray(allocations) ? allocations.map(a => a.order_id) : order_id ? [order_id] : [];
@@ -3726,10 +3715,7 @@ app.post("/statements/:id/reconcile", requireRole(MANAGE_ROLES), async (req, res
       }).select().single();
       if (payment) {
         // Update sales_orders deposit, sync to legacy orders
-        const { data: ord } = await supabase.from("orders").select("so_number, order_amount, balance").eq("id", txn.matched_order_id).single();
-        const newBal = Math.max(0, (parseFloat(ord?.balance) || 0) - txn.amount);
-        const paidAmt = (parseFloat(ord?.order_amount) || 0) - newBal;
-        if (ord?.so_number) await updateSalesOrderField(ord.so_number, null, { deposit: Math.max(0, paidAmt) });
+        await syncPaymentDeposit(txn.matched_order_id, txn.amount);
         // Link payment
         await supabase.from("statement_transactions").update({ match_status: "reconciled", matched_payment_id: payment.id }).eq("id", txn.id);
         recorded++;
@@ -5037,7 +5023,7 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
     // Update sales_orders delivery status, sync to legacy orders
     if ((status === "delivered" || status === "Out for Delivery") && data.orders?.so_number) {
       const deliveryStatus = status === "delivered" ? "Delivered" : "Out for Delivery";
-      const soStatus = status === "delivered" ? "delivered" : "confirmed";
+      const soStatus = soStatusFromDelivery(status === "delivered" ? "Delivered" : "Out for Delivery");
       await updateSalesOrderField(data.orders.so_number, null, { status: soStatus, delivery_status: deliveryStatus });
     }
     res.json({ schedule: data });
@@ -5060,8 +5046,8 @@ app.post("/driver/schedule/:id/photo", requireRole(DRIVER_ROLES), upload.single(
     await supabase.from("delivery_schedules").update({ notes: ((sched?.notes || "") + `\nPhoto: ${photoUrl}`).trim() }).eq("id", req.params.id);
     // Update sales_orders photo, sync to legacy orders
     if (sched?.order_id) {
-      const { data: legacyOrder } = await supabase.from("orders").select("so_number").eq("id", sched.order_id).single();
-      if (legacyOrder?.so_number) await updateSalesOrderField(legacyOrder.so_number, null, { photo_url: photoUrl });
+      const soNum = await getLegacySoNumber(sched.order_id);
+      if (soNum) await updateSalesOrderField(soNum, null, { photo_url: photoUrl });
     }
     res.json({ url: photoUrl });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5079,11 +5065,8 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
       order_id: sched.order_id, amount: Number(amount), payment_method: method || "cash",
       reference_no: reference_no || null, recorded_by: req.user.id, notes: `Collected on delivery`,
     });
-    // Update sales_orders deposit (paid amount), sync to legacy orders
-    const { data: legacyOrd } = await supabase.from("orders").select("so_number, order_amount, balance").eq("id", sched.order_id).single();
-    const newBalance = Math.max(0, (parseFloat(legacyOrd?.balance) || 0) - Number(amount));
-    const paidAmount = (parseFloat(legacyOrd?.order_amount) || 0) - newBalance;
-    if (legacyOrd?.so_number) await updateSalesOrderField(legacyOrd.so_number, null, { deposit: Math.max(0, paidAmount) });
+    // Update sales_orders deposit, sync to legacy orders
+    await syncPaymentDeposit(sched.order_id, amount);
     try { await calculateCommission(sched.order_id, req.user.company_id); } catch (e) { console.error("commission recalc:", e.message); }
     res.json({ ok: true, new_balance: newBalance });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -6458,8 +6441,7 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
           return oi;
         });
         if (matched) {
-          await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
-          await syncItemArrivalsToSalesOrder(order.id);
+          await saveLegacyItemsAndSync(order.id, updatedItems);
           results.updated.push({ item: item.itemName, so: item.soNumber });
 
           // Also try to mark PO items as received
@@ -6545,8 +6527,7 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
       else if (item_code && (it.itemCode === item_code || it.itemName === item_code)) { it.arrivalDate = arrival_date || ""; updated = true; }
     });
     if (!updated) return res.status(404).json({ error: "Item not found" });
-    await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", req.params.id);
-    await syncItemArrivalsToSalesOrder(req.params.id);
+    await saveLegacyItemsAndSync(req.params.id, items);
     res.json({ ok: true, items });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6572,15 +6553,69 @@ async function nextOrderNumber(company_id) {
   return `SO${ymd}-${seq}`;
 }
 
+// ── Shared Helpers ───────────────────────────────────────────────
+
+// Map sales-order status → delivery (orders table) status
+function deliveryStatusFromSO(s) {
+  if (s === "delivered") return "Delivered";
+  if (s === "cancelled") return "Cancelled";
+  return "Pending";
+}
+
+// Map legacy delivery status → sales_orders business status
+function soStatusFromDelivery(legacyStatus) {
+  if (legacyStatus === "Delivered") return "delivered";
+  if (legacyStatus === "Cancelled") return "cancelled";
+  return "confirmed";
+}
+
+// Look up the so_number for a legacy order ID. Returns null if not found.
+async function getLegacySoNumber(legacyOrderId) {
+  const { data } = await supabase.from("orders").select("so_number").eq("id", legacyOrderId).single();
+  return data?.so_number || null;
+}
+
+// Fetch full sales_order with items and forward-sync to legacy orders.
+// This is the ONLY function allowed to call syncSalesOrderToDelivery().
+async function fetchFullAndSync(salesOrderId) {
+  const { data: full } = await supabase.from("sales_orders")
+    .select("*, sales_order_items(*)").eq("id", salesOrderId).single();
+  if (full) await syncSalesOrderToDelivery(full, full.sales_order_items);
+  return full;
+}
+
+// Calculate deposit (paid amount) and new balance from a legacy order after a payment.
+// Returns { deposit, newBalance }.
+function calculateDepositAndBalance(orderAmount, currentBalance, paymentAmount) {
+  const newBalance = Math.max(0, (parseFloat(currentBalance) || 0) - (parseFloat(paymentAmount) || 0));
+  const deposit = Math.max(0, (parseFloat(orderAmount) || 0) - newBalance);
+  return { deposit, newBalance };
+}
+
+// Update a legacy order's items JSON by setting arrivalDate on matching items.
+// `matchFn(item)` returns true for items that should be updated.
+// Returns { updated: boolean, items: array } — caller must save if updated.
+function applyItemArrival(itemsRaw, matchFn, arrivalDate) {
+  const items = typeof itemsRaw === "string" ? JSON.parse(itemsRaw || "[]") : (itemsRaw || []);
+  let updated = false;
+  const result = items.map(oi => {
+    if (matchFn(oi) && !oi.arrivalDate) { updated = true; return { ...oi, arrivalDate }; }
+    return oi;
+  });
+  return { updated, items: result };
+}
+
 // After updating legacy orders.items JSON with arrival dates, sync to sales_order_items.
 async function syncItemArrivalsToSalesOrder(legacyOrderId) {
   try {
-    const { data: legacyOrder } = await supabase.from("orders")
-      .select("so_number, items").eq("id", legacyOrderId).single();
-    if (!legacyOrder?.so_number) return;
+    const soNumber = await getLegacySoNumber(legacyOrderId);
+    if (!soNumber) return;
     const { data: so } = await supabase.from("sales_orders")
-      .select("id").eq("order_number", legacyOrder.so_number).maybeSingle();
+      .select("id").eq("order_number", soNumber).maybeSingle();
     if (!so) return;
+    const { data: legacyOrder } = await supabase.from("orders")
+      .select("items").eq("id", legacyOrderId).single();
+    if (!legacyOrder) return;
     const legacyItems = typeof legacyOrder.items === "string"
       ? JSON.parse(legacyOrder.items || "[]") : (legacyOrder.items || []);
     const { data: soItems } = await supabase.from("sales_order_items")
@@ -6602,24 +6637,13 @@ async function syncItemArrivalsToSalesOrder(legacyOrderId) {
   }
 }
 
-// Map sales-order status → delivery (orders table) status
-function deliveryStatusFromSO(s) {
-  if (s === "delivered") return "Delivered";
-  if (s === "cancelled") return "Cancelled";
-  return "Pending";
-}
-
-// Map legacy delivery status → sales_orders business status
-function soStatusFromDelivery(legacyStatus) {
-  if (legacyStatus === "Delivered") return "delivered";
-  if (legacyStatus === "Cancelled") return "cancelled";
-  return "confirmed";
+// Save legacy order items JSON and sync arrival dates to sales_order_items.
+async function saveLegacyItemsAndSync(legacyOrderId, items) {
+  await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", legacyOrderId);
+  await syncItemArrivalsToSalesOrder(legacyOrderId);
 }
 
 // Update sales_orders header fields, then forward-sync to legacy orders.
-// `soNumber` = the order_number in sales_orders (= so_number in orders).
-// `fields` = object with sales_orders column names to update.
-// Non-blocking: logs errors but never throws.
 async function updateSalesOrderField(soNumber, companyId, fields) {
   try {
     if (!soNumber) return;
@@ -6628,38 +6652,55 @@ async function updateSalesOrderField(soNumber, companyId, fields) {
     const { data: so } = await q.maybeSingle();
     if (!so) { console.warn(`[sync] No sales_order found for order_number=${soNumber}`); return; }
     await supabase.from("sales_orders").update(fields).eq("id", so.id);
-    const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", so.id).single();
-    if (full) await syncSalesOrderToDelivery(full, full.sales_order_items);
+    await fetchFullAndSync(so.id);
   } catch (e) {
     console.error(`[sync] updateSalesOrderField error for ${soNumber}:`, e.message);
   }
 }
 
 // Batch update sales_orders for multiple orders by so_number.
-// `entries` = [{ soNumber, fields }]
 async function batchUpdateSalesOrders(entries, companyId) {
   try {
     const soNumbers = entries.map(e => e.soNumber).filter(Boolean);
     if (soNumbers.length === 0) return;
+    // Group entries by identical fields for batch .in() updates
+    const byFields = new Map();
+    for (const entry of entries) {
+      const key = JSON.stringify(entry.fields);
+      if (!byFields.has(key)) byFields.set(key, []);
+      byFields.get(key).push(entry.soNumber);
+    }
     let q = supabase.from("sales_orders").select("id, order_number");
     if (companyId) q = q.eq("company_id", companyId);
     const { data: sos } = await q.in("order_number", soNumbers);
     if (!sos || sos.length === 0) return;
     const soMap = Object.fromEntries(sos.map(s => [s.order_number, s.id]));
-    for (const entry of entries) {
-      const soId = soMap[entry.soNumber];
-      if (!soId) continue;
-      await supabase.from("sales_orders").update(entry.fields).eq("id", soId);
+    // Batch update: one query per unique field set
+    for (const [fieldsJson, soNums] of byFields) {
+      const ids = soNums.map(sn => soMap[sn]).filter(Boolean);
+      if (ids.length === 0) continue;
+      await supabase.from("sales_orders").update(JSON.parse(fieldsJson)).in("id", ids);
     }
-    // Forward-sync each updated order
+    // Forward-sync each updated order via fetchFullAndSync
     const updatedIds = entries.map(e => soMap[e.soNumber]).filter(Boolean);
-    const { data: fullOrders } = await supabase.from("sales_orders")
-      .select("*, sales_order_items(*)").in("id", updatedIds);
-    for (const full of (fullOrders || [])) {
-      await syncSalesOrderToDelivery(full, full.sales_order_items);
+    for (const soId of updatedIds) {
+      await fetchFullAndSync(soId);
     }
   } catch (e) {
     console.error("[sync] batchUpdateSalesOrders error:", e.message);
+  }
+}
+
+// Update sales_orders deposit after a payment on a legacy order.
+async function syncPaymentDeposit(legacyOrderId, paymentAmount) {
+  try {
+    const { data: ord } = await supabase.from("orders")
+      .select("so_number, order_amount, balance").eq("id", legacyOrderId).single();
+    if (!ord?.so_number) return;
+    const { deposit } = calculateDepositAndBalance(ord.order_amount, ord.balance, paymentAmount);
+    await updateSalesOrderField(ord.so_number, null, { deposit });
+  } catch (e) {
+    console.error("[sync] syncPaymentDeposit error:", e.message);
   }
 }
 
@@ -6716,9 +6757,7 @@ async function createSalesOrderFromLegacy(draft) {
       await supabase.from("sales_order_items").insert(itemRows);
     }
 
-    const { data: full } = await supabase.from("sales_orders")
-      .select("*, sales_order_items(*)").eq("id", order.id).single();
-    if (full) await syncSalesOrderToDelivery(full, full.sales_order_items);
+    const full = await fetchFullAndSync(order.id);
     return { ok: true, id: order.id, order: full };
   } catch (e) {
     console.error("[sync] createSalesOrderFromLegacy error:", e.message);
@@ -6917,8 +6956,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
     if (itemsErr) throw itemsErr;
 
-    const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", order.id).single();
-    await syncSalesOrderToDelivery(full, full.sales_order_items);
+    const full = await fetchFullAndSync(order.id);
     res.status(201).json({ order: full });
   } catch (err) { console.error("POST /sales-orders error:", err); res.status(500).json({ error: err.message }); }
 });
@@ -7002,8 +7040,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       if (itemsErr) throw itemsErr;
     }
 
-    const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
-    await syncSalesOrderToDelivery(full, full.sales_order_items);
+    const full = await fetchFullAndSync(id);
     res.json({ order: full });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -7024,14 +7061,11 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
     if (status === "cancelled" && !cancel_reason?.trim()) {
       return res.status(400).json({ error: "Cancel reason is required" });
     }
-    const updateData = { status };
-    if (status === "cancelled" && cancel_reason) updateData.notes = supabase.raw ? cancel_reason : cancel_reason;
-    const { data, error } = await supabase.from("sales_orders")
-      .update(status === "cancelled" ? { status, notes: cancel_reason } : { status })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id)
-      .select("*, sales_order_items(*)").single();
+    const updatePayload = status === "cancelled" ? { status, notes: cancel_reason } : { status };
+    const { error } = await supabase.from("sales_orders")
+      .update(updatePayload).eq("id", req.params.id).eq("company_id", req.user.company_id);
     if (error) throw error;
-    await syncSalesOrderToDelivery(data, data.sales_order_items);
+    const data = await fetchFullAndSync(req.params.id);
     // Recalculate commission on status change (cancel claws back, confirm may enable)
     if (["cancelled", "confirmed", "amended"].includes(status)) {
       try {
