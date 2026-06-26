@@ -3411,7 +3411,8 @@ function getPayoutMonth(payoutDay) {
 app.get("/commissions", requireAuth, async (req, res) => {
   try {
     const { company_id, user_id, status, payout_month } = req.query;
-    let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance), users(name, salesman_name)").order("created_at", { ascending: false });
+    let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, company_id), users(name, salesman_name)").order("created_at", { ascending: false });
+    if (company_id) q = q.eq("orders.company_id", company_id);
     if (user_id) q = q.eq("user_id", user_id);
     if (status) q = q.eq("status", status);
     if (payout_month) q = q.eq("payout_month", payout_month);
@@ -3434,6 +3435,20 @@ app.post("/commissions/recalculate/:orderId", requireRole(MANAGE_ROLES), async (
     if (!order) return res.status(404).json({ error: "Order not found" });
     await calculateCommission(Number(req.params.orderId), order.company_id);
     res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Bulk recalculate all orders for a company
+app.post("/commissions/recalculate-all", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const { data: orders } = await supabase.from("orders").select("id")
+      .eq("company_id", req.user.company_id).gt("order_amount", 0)
+      .not("status", "in", '("Cancelled")').limit(500);
+    let calculated = 0;
+    for (const o of (orders || [])) {
+      try { await calculateCommission(o.id, req.user.company_id); calculated++; } catch {}
+    }
+    res.json({ calculated, total: (orders || []).length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
