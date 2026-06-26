@@ -4067,6 +4067,99 @@ app.patch("/package-labels/:id/load", requireRole(MANAGE_ROLES), async (req, res
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Driver Endpoints ────────────────────────────────────────────
+const DRIVER_ROLES = ["master", "manager", "company_admin", "driver", "operation"];
+
+// GET /driver/my-route — today's route for the logged-in driver
+app.get("/driver/my-route", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
+    // Find teams where this user is driver or helper
+    const { data: myTeams } = await supabase.from("delivery_teams").select("*")
+      .eq("team_date", date).or(`driver_id.eq.${userId},helper_id.eq.${userId}`);
+    if (!myTeams || myTeams.length === 0) {
+      // Fallback: find by vehicle assignment for drivers without user account
+      return res.json({ teams: [], schedules: [], date });
+    }
+    const teamIds = myTeams.map(t => t.id);
+    const { data: schedules } = await supabase.from("delivery_schedules")
+      .select("*, orders(id, so_number, customer_name, address, contact, items, balance, status, type, remark, time_slot, photo_url)")
+      .in("team_id", teamIds).order("sort_order");
+    // Enrich teams with vehicle info
+    for (const team of myTeams) {
+      if (team.vehicle_id) {
+        const { data: v } = await supabase.from("delivery_vehicles").select("vehicle_plate, driver_name").eq("id", team.vehicle_id).maybeSingle();
+        if (v) { team.vehicle_plate = v.vehicle_plate; team.driver_name = v.driver_name; }
+      }
+      team.schedules = (schedules || []).filter(s => s.team_id === team.id);
+    }
+    res.json({ teams: myTeams, date });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /driver/schedule/:id/status — driver updates delivery status
+app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, res) => {
+  try {
+    const { status } = req.body;
+    const updates = { status };
+    if (status === "arrived") updates.notes = (updates.notes || "") + `\nArrived: ${new Date().toLocaleString("en-MY", { timeZone: "Asia/Kuala_Lumpur" })}`;
+    if (status === "delivered") updates.delivered_at = new Date().toISOString();
+    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
+    if (error) throw error;
+    // Also update the order status in orders table
+    if (status === "delivered" && data.orders?.id) {
+      await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
+    }
+    if (status === "Out for Delivery" && data.orders?.id) {
+      await supabase.from("orders").update({ status: "Out for Delivery" }).eq("id", data.orders.id);
+    }
+    res.json({ schedule: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /driver/schedule/:id/photo — upload delivery proof photo
+app.post("/driver/schedule/:id/photo", requireRole(DRIVER_ROLES), upload.single("photo"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No photo" });
+    const ext = file.originalname.split(".").pop();
+    const path = `delivery-photos/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+    const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+    if (upErr) return res.status(500).json({ error: "Upload failed: " + upErr.message });
+    const { data: urlData } = supabase.storage.from("order-attachments").getPublicUrl(path);
+    const photoUrl = urlData?.publicUrl || null;
+    // Save on the schedule
+    const { data: sched } = await supabase.from("delivery_schedules").select("order_id, notes").eq("id", req.params.id).single();
+    await supabase.from("delivery_schedules").update({ notes: ((sched?.notes || "") + `\nPhoto: ${photoUrl}`).trim() }).eq("id", req.params.id);
+    // Also save on the order
+    if (sched?.order_id) {
+      await supabase.from("orders").update({ photo_url: photoUrl }).eq("id", sched.order_id);
+    }
+    res.json({ url: photoUrl });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /driver/schedule/:id/payment — record payment collected on delivery
+app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, res) => {
+  try {
+    const { amount, method, reference_no } = req.body;
+    if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
+    const { data: sched } = await supabase.from("delivery_schedules").select("order_id").eq("id", req.params.id).single();
+    if (!sched?.order_id) return res.status(404).json({ error: "Schedule not found" });
+    // Record payment
+    await supabase.from("payments").insert({
+      order_id: sched.order_id, amount: Number(amount), payment_method: method || "cash",
+      reference_no: reference_no || null, recorded_by: req.user.id, notes: `Collected on delivery`,
+    });
+    // Update order balance
+    const { data: order } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
+    const newBalance = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
+    await supabase.from("orders").update({ balance: newBalance }).eq("id", sched.order_id);
+    res.json({ ok: true, new_balance: newBalance });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Auto-Ready Check + Missing Item Alerts ──────────────────────
 app.get("/delivery-readiness", requireAuth, async (req, res) => {
   try {
