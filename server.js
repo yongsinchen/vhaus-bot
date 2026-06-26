@@ -3301,7 +3301,28 @@ app.delete("/commission-rules/:id", requireRole(["master", "manager"]), async (r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Calculate commission for an order
+// Commission cache — avoids re-fetching rules/incentives/users per order
+let _commCache = { ts: 0, rules: null, incentives: null, users: null, monthlySales: {} };
+async function getCommCache(companyId) {
+  const now = Date.now();
+  if (_commCache.companyId === companyId && now - _commCache.ts < 30000) return _commCache;
+  const [rulesRes, incRes, usersRes] = await Promise.all([
+    supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true),
+    supabase.from("product_incentives").select("*").eq("company_id", companyId).eq("is_active", true),
+    supabase.from("users").select("id, role, salesman_name, branch_id").eq("company_id", companyId).eq("is_active", true),
+  ]);
+  const today = new Date().toISOString().slice(0, 10);
+  _commCache = {
+    ts: now, companyId,
+    rules: rulesRes.data || [],
+    incentives: (incRes.data || []).filter(inc => (!inc.start_date || inc.start_date <= today) && (!inc.end_date || inc.end_date >= today)),
+    users: usersRes.data || [],
+    monthlySales: {},
+  };
+  return _commCache;
+}
+
+// Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
 async function calculateCommission(orderId, companyId) {
   const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, items, sales_channel")
     .eq("id", orderId).single();
@@ -3313,23 +3334,12 @@ async function calculateCommission(orderId, companyId) {
   const net = gross;
   const channel = order.sales_channel || "branch";
 
-  // Get rules matching this channel (fallback to 'branch' if no channel-specific rules)
-  let { data: rules } = await supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true).eq("channel", channel);
-  if (!rules || rules.length === 0) {
-    const { data: fallback } = await supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true).eq("channel", "branch");
-    rules = fallback || [];
-  }
-  if (!rules || rules.length === 0) return;
+  const cache = await getCommCache(companyId);
+  let rules = cache.rules.filter(r => r.channel === channel);
+  if (rules.length === 0) rules = cache.rules.filter(r => r.channel === "branch");
+  if (rules.length === 0) return;
 
-  // Get active product incentives
-  const today = new Date().toISOString().slice(0, 10);
-  const { data: incentives } = await supabase.from("product_incentives").select("*")
-    .eq("company_id", companyId).eq("is_active", true);
-  const activeIncentives = (incentives || []).filter(inc =>
-    (!inc.start_date || inc.start_date <= today) && (!inc.end_date || inc.end_date >= today)
-  );
-
-  // Calculate product incentive total for this order
+  // Product incentive total (no DB query — uses cached incentives)
   let productIncentiveTotal = 0;
   const orderItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
   if (Array.isArray(orderItems)) {
@@ -3337,7 +3347,7 @@ async function calculateCommission(orderId, companyId) {
       const itemCode = (item.itemCode || "").toLowerCase();
       const itemName = (item.itemName || "").toLowerCase();
       const qty = Number(item.unit) || 1;
-      const match = activeIncentives.find(inc =>
+      const match = cache.incentives.find(inc =>
         (inc.product_code && itemCode.includes(inc.product_code.toLowerCase())) ||
         (inc.product_name && itemName.includes(inc.product_name.toLowerCase()))
       );
@@ -3345,22 +3355,26 @@ async function calculateCommission(orderId, companyId) {
     }
   }
 
-  // Find salesman users
+  // Find salesman users (no DB query — uses cached users)
   const salesmanNames = (order.salesman || "").split("/").map(s => s.trim()).filter(Boolean);
 
   for (const name of salesmanNames) {
-    const { data: salesUser } = await supabase.from("users").select("id, role")
-      .eq("company_id", companyId).ilike("salesman_name", name).maybeSingle();
+    const salesUser = cache.users.find(u => u.salesman_name && u.salesman_name.toLowerCase() === name.toLowerCase());
     if (!salesUser) continue;
 
-    // Calculate this salesman's monthly cumulative sales
+    // Monthly cumulative sales — cache per salesman+month
     const monthStart = new Date(order.created_at || new Date());
     monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
-    const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
-    const { data: monthOrders } = await supabase.from("orders").select("order_amount")
-      .eq("company_id", companyId).ilike("salesman", `%${name}%`)
-      .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
-    const monthlySales = (monthOrders || []).reduce((s, o) => s + (Number(o.order_amount) || 0), 0);
+    const monthKey = `${salesUser.id}-${monthStart.toISOString().slice(0,7)}`;
+    let monthlySales = cache.monthlySales[monthKey];
+    if (monthlySales === undefined) {
+      const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
+      const { data: monthOrders } = await supabase.from("orders").select("order_amount")
+        .eq("company_id", companyId).ilike("salesman", `%${name}%`)
+        .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
+      monthlySales = (monthOrders || []).reduce((s, o) => s + (Number(o.order_amount) || 0), 0);
+      cache.monthlySales[monthKey] = monthlySales;
+    }
 
     // Find matching rule: per-salesman override first, then company tier
     const personalRules = (rules || []).filter(r => r.role_name === "salesman" && r.user_id === salesUser.id);
@@ -3455,6 +3469,9 @@ app.post("/commissions/recalculate/:orderId", requireRole(MANAGE_ROLES), async (
 // Bulk recalculate all orders for a company
 app.post("/commissions/recalculate-all", requireRole(["master", "manager"]), async (req, res) => {
   try {
+    // Prime the cache once before processing all orders
+    _commCache.ts = 0; // invalidate
+    await getCommCache(req.user.company_id);
     const { data: orders } = await supabase.from("orders").select("id")
       .eq("company_id", req.user.company_id).gt("order_amount", 0)
       .not("status", "in", '("Cancelled")').limit(500);
@@ -4695,13 +4712,54 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
       return dd >= startDate && dd <= endDate;
     });
     console.log(`[pick-list] total=${(allOrders||[]).length} filtered=${orders.length} schedules=${(schedules||[]).length}`);
-    for (const order of (orders || [])) {
+    // Batch-load ALL packings and labels upfront (2 queries instead of 3-4 per order)
+    const orderIds = orders.map(o => o.id);
+    let allOrderItems = [], allPackings = [], allLabels = [];
+    if (orderIds.length > 0) {
+      const { data: ois } = await supabase.from("order_items").select("id, order_id, product_name, product_code").in("order_id", orderIds);
+      allOrderItems = ois || [];
+      const oiIds = allOrderItems.map(oi => oi.id);
+      if (oiIds.length > 0) {
+        const { data: pks } = await supabase.from("order_item_packings").select("*").in("order_item_id", oiIds).in("status", ["put_away"]);
+        allPackings = pks || [];
+      }
+    }
+    const soNumbers = orders.map(o => o.so_number).filter(Boolean);
+    if (soNumbers.length > 0) {
+      const { data: lbs } = await supabase.from("package_labels").select("*").in("so_number", soNumbers).in("status", ["stored", "put_away"]);
+      allLabels = lbs || [];
+    }
+    // Build lookup maps
+    const oiByOrderId = {};
+    allOrderItems.forEach(oi => { if (!oiByOrderId[oi.order_id]) oiByOrderId[oi.order_id] = []; oiByOrderId[oi.order_id].push(oi); });
+    const packingsByOiId = {};
+    allPackings.forEach(p => { if (!packingsByOiId[p.order_item_id]) packingsByOiId[p.order_item_id] = []; packingsByOiId[p.order_item_id].push(p); });
+    const labelsBySo = {};
+    allLabels.forEach(l => { if (!labelsBySo[l.so_number]) labelsBySo[l.so_number] = []; labelsBySo[l.so_number].push(l); });
+
+    for (const order of orders) {
       if (!order.so_number || seenSO.has(order.so_number)) continue;
       seenSO.add(order.so_number);
-      const beforeCount = pickItems.length;
-      await addPickItemsForOrder(order.id, order.so_number, order.customer_name, order.delivery_date, pickItems);
-      // If no packages found, still show the order items so team knows what's coming
-      if (pickItems.length === beforeCount) {
+      let found = false;
+      // Check packings via order_items (no DB query — uses pre-loaded maps)
+      const ois = oiByOrderId[order.id] || [];
+      for (const oi of ois) {
+        const pks = packingsByOiId[oi.id] || [];
+        for (const p of pks) {
+          pickItems.push({ ...p, _product_name: oi.product_name, _product_code: oi.product_code, _customer: order.customer_name, _so_number: order.so_number, _delivery_date: order.delivery_date });
+          found = true;
+        }
+      }
+      // Fallback to package_labels (no DB query — uses pre-loaded map)
+      if (!found) {
+        const labels = labelsBySo[order.so_number] || [];
+        for (const l of labels) {
+          pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, location_code: l.location_code, _product_name: l.product_name, _product_code: l.product_code, _customer: order.customer_name, _so_number: order.so_number, _delivery_date: order.delivery_date, _source: "package_labels" });
+          found = true;
+        }
+      }
+      // No packages — show order items
+      if (!found) {
         const orderItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
         for (const item of (Array.isArray(orderItems) ? orderItems : [])) {
           if (!item.itemName) continue;
