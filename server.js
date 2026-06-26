@@ -3046,6 +3046,28 @@ app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) =>
   res.json(data);
 });
 
+// DELETE /orders/:id — delete legacy order + matching sales_order
+app.delete("/orders/:id", requireRole(["master", "manager", "company_admin"]), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const company_id = req.user.company_id;
+    const { data: order } = await supabase.from("orders").select("so_number, status, company_id").eq("id", id).single();
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.company_id !== company_id) return res.status(403).json({ error: "Not authorized" });
+    if (order.status === "Delivered") return res.status(400).json({ error: "Cannot delete a delivered order" });
+    // Delete matching sales_order first (cascade deletes legacy mirror)
+    if (order.so_number) {
+      const { data: so } = await supabase.from("sales_orders").select("id").eq("order_number", order.so_number).eq("company_id", company_id).maybeSingle();
+      if (so) {
+        await supabase.from("sales_orders").delete().eq("id", so.id);
+      }
+    }
+    // Also delete legacy order directly in case no sales_order match
+    await supabase.from("orders").delete().eq("id", id).eq("company_id", company_id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get("/services", requireAuth, async (req, res) => {
   const { company_id, salesman, status } = req.query;
   let query = supabase.from("orders").select("*").eq("type", "Service").order("created_at", { ascending: false });
