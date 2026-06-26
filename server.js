@@ -6541,28 +6541,77 @@ async function syncSalesOrderToDelivery(order, items) {
 }
 
 // GET /sales-orders — list; salesmen see only their own
+// GET /sales-orders — paginated lightweight list
 app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
     const { company_id, role, salesman_name } = req.user;
-    const { status, search } = req.query;
-    let query = supabase
-      .from("sales_orders")
-      .select("*, sales_order_items(*)")
-      .eq("company_id", company_id)
-      .order("created_at", { ascending: false });
-    if (status) query = query.eq("status", status);
-    if (search) query = query.or(`order_number.ilike.%${search}%,customer_name.ilike.%${search}%`);
-    let { data, error } = await query;
-    if (error) throw error;
+    const { status, search, salesman, date_from, date_to, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
+    const lim = Math.min(Number(limit) || 50, 100);
+    const pg = Math.max(Number(page) || 1, 1);
+    const ascending = sort_order === "asc";
+
+    // Lightweight columns — NO items, payment_proofs, customer_signature
+    const listCols = "id, company_id, order_number, customer_name, customer_contact, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark";
+
+    // Build count query + data query in parallel
+    let countQ = supabase.from("sales_orders").select("id", { count: "exact", head: true }).eq("company_id", company_id);
+    let dataQ = supabase.from("sales_orders").select(listCols).eq("company_id", company_id);
+
+    // Apply filters to both queries
+    if (status) { countQ = countQ.eq("status", status); dataQ = dataQ.eq("status", status); }
+    if (search) {
+      const filter = `order_number.ilike.%${search}%,customer_name.ilike.%${search}%,customer_contact.ilike.%${search}%`;
+      countQ = countQ.or(filter); dataQ = dataQ.or(filter);
+    }
+    if (salesman) { countQ = countQ.ilike("salesman_name", `%${salesman}%`); dataQ = dataQ.ilike("salesman_name", `%${salesman}%`); }
+    if (date_from) { countQ = countQ.gte("delivery_date", date_from); dataQ = dataQ.gte("delivery_date", date_from); }
+    if (date_to) { countQ = countQ.lte("delivery_date", date_to); dataQ = dataQ.lte("delivery_date", date_to); }
+
+    // Salesman role filter
+    if (role === "salesman" && salesman_name) {
+      countQ = countQ.ilike("salesman_name", `%${salesman_name}%`);
+      dataQ = dataQ.ilike("salesman_name", `%${salesman_name}%`);
+    }
+
+    // Sort + paginate data query
+    dataQ = dataQ.order(sort_by, { ascending }).range((pg - 1) * lim, pg * lim - 1);
+
+    const [{ count, error: cErr }, { data, error: dErr }] = await Promise.all([countQ, dataQ]);
+    if (cErr) throw cErr;
+    if (dErr) throw dErr;
+
+    // For salesman role, further filter by exact name match (handles shared orders with "/")
+    let finalData = data || [];
+    let finalCount = count || 0;
     if (role === "salesman" && salesman_name) {
       const name = salesman_name.toLowerCase().trim();
-      data = (data || []).filter(o => (o.salesman_name || "").toLowerCase().split("/").map(s => s.trim()).includes(name));
+      finalData = finalData.filter(o => (o.salesman_name || "").toLowerCase().split("/").map(s => s.trim()).includes(name));
+      // Count is approximate for salesmen — PostgREST ilike is broader than exact split match
     }
-    res.json({ orders: data || [] });
+
+    // Add item count per order (lightweight — just count, not full items)
+    const orderIds = finalData.map(o => o.id);
+    if (orderIds.length > 0) {
+      const { data: itemCounts } = await supabase.rpc("count_items_per_order", { order_ids: orderIds }).catch(() => ({ data: null }));
+      if (itemCounts) {
+        const countMap = {};
+        itemCounts.forEach(r => { countMap[r.order_id] = r.count; });
+        finalData = finalData.map(o => ({ ...o, _item_count: countMap[o.id] || 0 }));
+      } else {
+        // Fallback: batch count via separate query
+        const { data: items } = await supabase.from("sales_order_items").select("order_id").in("order_id", orderIds);
+        const countMap = {};
+        (items || []).forEach(i => { countMap[i.order_id] = (countMap[i.order_id] || 0) + 1; });
+        finalData = finalData.map(o => ({ ...o, _item_count: countMap[o.id] || 0 }));
+      }
+    }
+
+    const totalPages = Math.ceil(finalCount / lim);
+    res.json({ data: finalData, total: finalCount, page: pg, limit: lim, total_pages: totalPages });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /sales-orders/:id
+// GET /sales-orders/:id — full detail with items, proofs, signature
 app.get("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -6570,7 +6619,13 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
       .select("*, sales_order_items(*)")
       .eq("id", req.params.id).eq("company_id", req.user.company_id).single();
     if (error || !data) return res.status(404).json({ error: "Order not found" });
-    res.json({ order: data });
+    // Load legacy order for arrival data
+    let legacyOrder = null;
+    if (data.order_number) {
+      const { data: leg } = await supabase.from("orders").select("id, items").eq("so_number", data.order_number).maybeSingle();
+      legacyOrder = leg;
+    }
+    res.json({ order: data, legacy_order: legacyOrder });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
