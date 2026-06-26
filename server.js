@@ -6592,21 +6592,16 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
     // Add item count per order (lightweight — just count, not full items)
     const orderIds = finalData.map(o => o.id);
     if (orderIds.length > 0) {
-      const { data: itemCounts } = await supabase.rpc("count_items_per_order", { order_ids: orderIds }).catch(() => ({ data: null }));
-      if (itemCounts) {
-        const countMap = {};
-        itemCounts.forEach(r => { countMap[r.order_id] = r.count; });
-        finalData = finalData.map(o => ({ ...o, _item_count: countMap[o.id] || 0 }));
-      } else {
-        // Fallback: batch count via separate query
+      try {
         const { data: items } = await supabase.from("sales_order_items").select("order_id").in("order_id", orderIds);
         const countMap = {};
         (items || []).forEach(i => { countMap[i.order_id] = (countMap[i.order_id] || 0) + 1; });
         finalData = finalData.map(o => ({ ...o, _item_count: countMap[o.id] || 0 }));
-      }
+      } catch (e) { console.error("item count error:", e.message); }
     }
 
     const totalPages = Math.ceil(finalCount / lim);
+    console.log(`[sales-orders] pg=${pg} lim=${lim} total=${finalCount} data=${finalData.length} pages=${totalPages}`);
     res.json({ data: finalData, total: finalCount, page: pg, limit: lim, total_pages: totalPages });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
