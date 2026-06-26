@@ -4614,9 +4614,13 @@ app.post("/delivery-schedules", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { order_id, team_id, scheduled_date, area, slot, sort_order } = req.body;
     if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
-    // Check for duplicate
+    // If already scheduled for this date, update the team instead of blocking
     const { data: dup } = await supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date).maybeSingle();
-    if (dup) return res.status(400).json({ error: "Order already scheduled for this date" });
+    if (dup) {
+      const { data: updated, error: upErr } = await supabase.from("delivery_schedules").update({ team_id: team_id || null, area: area || null, slot: slot || null, sort_order: sort_order || 0 }).eq("id", dup.id).select().single();
+      if (upErr) throw upErr;
+      return res.json({ schedule: updated });
+    }
     const { data, error } = await supabase.from("delivery_schedules")
       .insert({ order_id, team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null, sort_order: sort_order || 0, status: "scheduled", is_ready: false })
       .select().single();
