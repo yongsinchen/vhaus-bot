@@ -4205,26 +4205,59 @@ const DRIVER_ROLES = ["master", "manager", "company_admin", "driver", "operation
 app.get("/driver/my-route", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
+    const companyId = req.user.company_id;
     const date = req.query.date || new Date().toISOString().slice(0, 10);
-    // Find teams where this user is driver or helper
-    const { data: myTeams } = await supabase.from("delivery_teams").select("*")
+
+    // Try 1: teams where user is driver or helper
+    let { data: myTeams } = await supabase.from("delivery_teams").select("*")
       .eq("team_date", date).or(`driver_id.eq.${userId},helper_id.eq.${userId}`);
+
+    // Try 2: if no teams found, show all company teams for the date
     if (!myTeams || myTeams.length === 0) {
-      // Fallback: find by vehicle assignment for drivers without user account
-      return res.json({ teams: [], schedules: [], date });
+      const { data: companyTeams } = await supabase.from("delivery_teams").select("*")
+        .eq("team_date", date).eq("company_id", companyId);
+      myTeams = companyTeams || [];
     }
+
+    // Try 3: if still no teams, check for orders directly (legacy - no delivery_schedules)
     const teamIds = myTeams.map(t => t.id);
-    const { data: schedules } = await supabase.from("delivery_schedules")
-      .select("*, orders(id, so_number, customer_name, address, contact, items, balance, status, type, remark, time_slot, photo_url)")
-      .in("team_id", teamIds).order("sort_order");
+    let schedules = [];
+    if (teamIds.length > 0) {
+      const { data: sched } = await supabase.from("delivery_schedules")
+        .select("*, orders(id, so_number, customer_name, address, contact, items, balance, status, type, remark, time_slot, photo_url)")
+        .in("team_id", teamIds).order("sort_order");
+      schedules = sched || [];
+    }
+
     // Enrich teams with vehicle info
     for (const team of myTeams) {
       if (team.vehicle_id) {
         const { data: v } = await supabase.from("delivery_vehicles").select("vehicle_plate, driver_name").eq("id", team.vehicle_id).maybeSingle();
         if (v) { team.vehicle_plate = v.vehicle_plate; team.driver_name = v.driver_name; }
       }
-      team.schedules = (schedules || []).filter(s => s.team_id === team.id);
+      team.schedules = schedules.filter(s => s.team_id === team.id);
     }
+
+    // Also get legacy orders for this date that aren't in delivery_schedules
+    const scheduledOrderIds = new Set(schedules.map(s => s.order_id));
+    const { data: legacyOrders } = await supabase.from("orders")
+      .select("id, so_number, customer_name, address, contact, items, balance, status, type, remark, time_slot, photo_url")
+      .eq("company_id", companyId).eq("delivery_date", date)
+      .in("status", ["Pending", "Confirmed", "In Progress", "Out for Delivery"]);
+    const unscheduled = (legacyOrders || []).filter(o => !scheduledOrderIds.has(o.id));
+    if (unscheduled.length > 0) {
+      // Create a virtual team for unscheduled legacy orders
+      myTeams.push({
+        id: "legacy", vehicle_plate: "Unassigned", driver_name: "",
+        team_date: date, _source: "legacy",
+        schedules: unscheduled.map((o, i) => ({
+          id: `legacy-${o.id}`, order_id: o.id, team_id: "legacy",
+          scheduled_date: date, sort_order: i, status: o.status === "Out for Delivery" ? "Out for Delivery" : "Confirmed",
+          slot: o.time_slot || "", is_ready: true, orders: o,
+        })),
+      });
+    }
+
     res.json({ teams: myTeams, date });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
