@@ -6656,6 +6656,20 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
       .select("*, sales_order_items(*)").single();
     if (error) throw error;
     await syncSalesOrderToDelivery(data, data.sales_order_items);
+    // Recalculate commission on status change (cancel claws back, confirm may enable)
+    if (["cancelled", "confirmed", "amended"].includes(status)) {
+      try {
+        const { data: legacyOrder } = await supabase.from("orders").select("id, company_id").eq("so_number", data.order_number).maybeSingle();
+        if (legacyOrder) {
+          if (status === "cancelled") {
+            // Clawback: set all commissions for this order to status "clawback"
+            await supabase.from("commissions").update({ status: "clawback", commission_amt: 0 }).eq("order_id", legacyOrder.id);
+          } else {
+            await calculateCommission(legacyOrder.id, req.user.company_id);
+          }
+        }
+      } catch (e) { console.error("commission recalc on status change:", e.message); }
+    }
     res.json({ order: { id: data.id, status: data.status } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
