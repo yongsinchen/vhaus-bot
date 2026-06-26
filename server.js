@@ -1808,13 +1808,21 @@ app.get("/delivery/routes", requireAuth, async (req, res) => {
 app.get("/delivery/unassigned", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
-  const { data: orders, error: ordErr } = await supabase.from("orders").select("*").eq("delivery_date", date);
+  const { company_id } = req.query;
+  let q = supabase.from("orders").select("*").eq("delivery_date", date).not("status", "in", '("Delivered","Cancelled")');
+  if (company_id) q = q.eq("company_id", company_id);
+  const { data: orders, error: ordErr } = await q;
   if (ordErr) return res.status(500).json({ error: ordErr.message });
-  const { data: assigned } = await supabase
+  // Exclude orders assigned via old delivery_route_orders
+  const { data: oldAssigned } = await supabase
     .from("delivery_route_orders")
     .select("order_id, delivery_routes!inner(delivery_date)")
     .eq("delivery_routes.delivery_date", date);
-  const assignedIds = new Set((assigned || []).map(a => a.order_id));
+  const assignedIds = new Set((oldAssigned || []).map(a => a.order_id));
+  // Also exclude orders assigned via new delivery_schedules
+  const { data: newAssigned } = await supabase
+    .from("delivery_schedules").select("order_id").eq("scheduled_date", date);
+  for (const s of (newAssigned || [])) assignedIds.add(s.order_id);
   res.json((orders || []).filter(o => !assignedIds.has(o.id)));
 }); 
 
