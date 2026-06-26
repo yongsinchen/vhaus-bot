@@ -4598,7 +4598,7 @@ app.delete("/delivery-teams/:id", requireRole(MANAGE_ROLES), async (req, res) =>
 app.get("/delivery-schedules", requireAuth, async (req, res) => {
   try {
     const { date, team_id, company_id } = req.query;
-    let q = supabase.from("delivery_schedules").select("*, orders(so_number, customer_name, address, contact, items, status, balance, type), delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate))").order("sort_order");
+    let q = supabase.from("delivery_schedules").select("*, orders(so_number, customer_name, address, contact, items, status, balance, type, salesman, time_slot, remark), delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate))").order("sort_order");
     if (date) q = q.eq("scheduled_date", date);
     if (team_id) q = q.eq("team_id", team_id);
     if (company_id) {
@@ -6382,6 +6382,26 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
       results,
     });
   } catch (err) { console.error("do-upload error:", err); res.status(500).json({ error: err.message }); }
+});
+
+// ── Order Item Arrival Date ──────────────────────────────────────
+app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { item_index, item_code, arrival_date } = req.body;
+    const { data: order } = await supabase.from("orders").select("items").eq("id", req.params.id).single();
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+    if (!Array.isArray(items)) return res.status(400).json({ error: "No items" });
+    // Find item by index or code
+    let updated = false;
+    items.forEach((it, i) => {
+      if (item_index !== undefined && i === item_index) { it.arrivalDate = arrival_date || ""; updated = true; }
+      else if (item_code && (it.itemCode === item_code || it.itemName === item_code)) { it.arrivalDate = arrival_date || ""; updated = true; }
+    });
+    if (!updated) return res.status(404).json({ error: "Item not found" });
+    await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", req.params.id);
+    res.json({ ok: true, items });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Sales Order Routes ────────────────────────────────────────────
