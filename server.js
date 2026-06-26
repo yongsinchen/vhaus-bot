@@ -3512,8 +3512,13 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     const { company_id, payout_month } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
     const month = payout_month || getPayoutMonth(25);
-    const { data: comms } = await supabase.from("commissions").select("*, orders(so_number, customer_name), users(name, salesman_name)")
+    // Get eligible commissions for payout month + all pending (any month)
+    const { data: eligibleComms } = await supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
+    const { data: pendingComms } = await supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
+      .eq("status", "pending");
+    // Filter by company
+    const comms = [...(eligibleComms || []), ...(pendingComms || [])].filter(c => !company_id || c.orders?.company_id === company_id);
     // Get adjustments
     const commIds = (comms || []).map(c => c.id);
     let adjustments = [];
