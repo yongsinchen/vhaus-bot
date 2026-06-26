@@ -7131,8 +7131,8 @@ app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
     if (!["master", "manager", "company_admin"].includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const company_id = req.user.company_id;
     const { data: existing } = await supabase.from("sales_orders").select("order_number, status").eq("id", req.params.id).eq("company_id", company_id).single();
-    if (existing && ["confirmed", "delivered"].includes(existing.status)) {
-      return res.status(400).json({ error: "Cannot delete a " + existing.status + " order. Cancel it first." });
+    if (existing && existing.status === "delivered") {
+      return res.status(400).json({ error: "Cannot delete a delivered order." });
     }
     const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", company_id);
     if (error) throw error;
