@@ -3186,6 +3186,179 @@ app.get("/payments", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Statement Reconciliation ────────────────────────────────────
+app.post("/statements/upload", requireRole(MANAGE_ROLES), upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file" });
+    const { type = "bank" } = req.body;
+    const ext = file.originalname.split(".").pop().toLowerCase();
+
+    // Upload to storage
+    const path = `statements/${req.user.company_id}/${Date.now()}-${file.originalname}`;
+    await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+    const { data: urlData } = supabase.storage.from("order-attachments").getPublicUrl(path);
+
+    // Create upload record
+    const { data: upload, error } = await supabase.from("statement_uploads").insert({
+      company_id: req.user.company_id, type, filename: file.originalname,
+      file_url: urlData?.publicUrl || null, status: "processing", uploaded_by: req.user.id,
+    }).select().single();
+    if (error) throw error;
+
+    // Extract transactions
+    let transactions = [];
+    if (["csv", "xlsx", "xls"].includes(ext)) {
+      const XLSX = require("xlsx");
+      const wb = XLSX.read(file.buffer, { type: "buffer" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      transactions = rows.map(r => {
+        const amount = Number(r.Amount || r.amount || r.AMOUNT || r.Credit || r.credit || r.Debit || r.debit || 0);
+        const dateRaw = r.Date || r.date || r.DATE || r["Transaction Date"] || r["Value Date"] || "";
+        const ref = String(r.Reference || r.reference || r.Ref || r.ref || r["Reference No"] || r.Description || "");
+        const desc = String(r.Description || r.description || r.Particulars || r.particulars || r.Narrative || "");
+        return { amount: Math.abs(amount), transaction_date: dateRaw ? new Date(dateRaw).toISOString().slice(0, 10) : null, reference: ref.trim(), description: desc.trim() };
+      }).filter(t => t.amount > 0);
+    } else {
+      // PDF/Image — use GPT-4o to extract
+      try {
+        const b64 = file.buffer.toString("base64");
+        const content = ext === "pdf"
+          ? [{ type: "file", file: { filename: file.originalname, file_data: `data:application/pdf;base64,${b64}` } }]
+          : [{ type: "image_url", image_url: { url: `data:${file.mimetype};base64,${b64}`, detail: "high" } }];
+        content.push({ type: "text", text: `Extract ALL transactions from this ${type} statement. Return a JSON array of objects with: { "date": "YYYY-MM-DD", "amount": number, "reference": "string", "description": "string" }. Only return the JSON array, no explanation.` });
+        const resp = await openai.chat.completions.create({ model: "gpt-4o", max_tokens: 8000, messages: [{ role: "user", content }] });
+        const text = resp.choices[0].message.content;
+        const jsonMatch = text.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          transactions = JSON.parse(jsonMatch[0]).map(t => ({
+            amount: Math.abs(Number(t.amount) || 0), transaction_date: t.date || null,
+            reference: String(t.reference || "").trim(), description: String(t.description || "").trim(),
+          })).filter(t => t.amount > 0);
+        }
+      } catch (ocrErr) { console.error("Statement OCR error:", ocrErr.message); }
+    }
+
+    // Insert transactions
+    if (transactions.length > 0) {
+      const rows = transactions.map(t => ({ upload_id: upload.id, ...t, match_status: "unmatched" }));
+      await supabase.from("statement_transactions").insert(rows);
+    }
+
+    // Auto-match
+    const matchCount = await autoMatchTransactions(upload.id, req.user.company_id);
+
+    // Update upload
+    await supabase.from("statement_uploads").update({
+      status: "review", total_transactions: transactions.length,
+      matched_count: matchCount, unmatched_count: transactions.length - matchCount,
+    }).eq("id", upload.id);
+
+    res.json({ upload_id: upload.id, total: transactions.length, matched: matchCount });
+  } catch (err) { console.error("statement upload error:", err); res.status(500).json({ error: err.message }); }
+});
+
+async function autoMatchTransactions(uploadId, companyId) {
+  const { data: txns } = await supabase.from("statement_transactions").select("*").eq("upload_id", uploadId).eq("match_status", "unmatched");
+  const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, balance, order_amount, contact, delivery_date, created_at")
+    .eq("company_id", companyId).gt("balance", 0);
+  let matched = 0;
+  for (const txn of (txns || [])) {
+    let bestMatch = null;
+    // Try 1: reference contains SO number
+    if (txn.reference || txn.description) {
+      const searchText = `${txn.reference} ${txn.description}`.toLowerCase();
+      bestMatch = (orders || []).find(o => o.so_number && searchText.includes(o.so_number.toLowerCase()));
+    }
+    // Try 2: exact amount match on balance
+    if (!bestMatch) {
+      const amountMatches = (orders || []).filter(o => Math.abs(Number(o.balance) - txn.amount) < 0.01);
+      if (amountMatches.length === 1) bestMatch = amountMatches[0];
+    }
+    // Try 3: amount matches deposit (30% of order_amount ± 1)
+    if (!bestMatch) {
+      const depositMatches = (orders || []).filter(o => {
+        const dep30 = Number(o.order_amount) * 0.3;
+        return Math.abs(dep30 - txn.amount) < 1;
+      });
+      if (depositMatches.length === 1) bestMatch = depositMatches[0];
+    }
+    if (bestMatch) {
+      await supabase.from("statement_transactions").update({ match_status: "auto_matched", matched_order_id: bestMatch.id }).eq("id", txn.id);
+      matched++;
+    }
+  }
+  return matched;
+}
+
+app.get("/statements", requireAuth, async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    const { data } = await supabase.from("statement_uploads").select("*").eq("company_id", company_id).order("created_at", { ascending: false });
+    res.json({ uploads: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/statements/:id", requireAuth, async (req, res) => {
+  try {
+    const { data: upload } = await supabase.from("statement_uploads").select("*").eq("id", req.params.id).single();
+    if (!upload) return res.status(404).json({ error: "Not found" });
+    const { data: txns } = await supabase.from("statement_transactions").select("*").eq("upload_id", upload.id).order("transaction_date");
+    // Enrich matched orders
+    for (const t of (txns || [])) {
+      if (t.matched_order_id) {
+        const { data: o } = await supabase.from("orders").select("so_number, customer_name, balance").eq("id", t.matched_order_id).single();
+        if (o) { t._order = o; }
+      }
+    }
+    res.json({ upload, transactions: txns || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Manual match / confirm / reject
+app.patch("/statement-transactions/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { match_status, matched_order_id } = req.body;
+    const updates = {};
+    if (match_status) updates.match_status = match_status;
+    if (matched_order_id !== undefined) updates.matched_order_id = matched_order_id;
+    const { data, error } = await supabase.from("statement_transactions").update(updates).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ transaction: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Confirm all matches and record payments
+app.post("/statements/:id/reconcile", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data: txns } = await supabase.from("statement_transactions").select("*")
+      .eq("upload_id", req.params.id).in("match_status", ["auto_matched", "confirmed"]);
+    let recorded = 0;
+    for (const txn of (txns || [])) {
+      if (!txn.matched_order_id) continue;
+      // Create payment
+      const { data: payment } = await supabase.from("payments").insert({
+        order_id: txn.matched_order_id, amount: txn.amount,
+        payment_method: "Bank Transfer", reference_no: txn.reference || null,
+        recorded_by: req.user.id, notes: `Statement reconciliation: ${txn.description || ""}`.trim(),
+      }).select().single();
+      if (payment) {
+        // Update order balance
+        const { data: order } = await supabase.from("orders").select("balance").eq("id", txn.matched_order_id).single();
+        const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - txn.amount);
+        await supabase.from("orders").update({ balance: newBal }).eq("id", txn.matched_order_id);
+        // Link payment
+        await supabase.from("statement_transactions").update({ match_status: "reconciled", matched_payment_id: payment.id }).eq("id", txn.id);
+        recorded++;
+      }
+    }
+    // Update upload status
+    await supabase.from("statement_uploads").update({ status: "reconciled", matched_count: recorded }).eq("id", req.params.id);
+    res.json({ reconciled: recorded });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Aging Report ────────────────────────────────────────────────
 app.get("/aging-report", requireAuth, async (req, res) => {
   try {
