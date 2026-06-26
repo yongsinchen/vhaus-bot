@@ -3252,12 +3252,13 @@ app.get("/commission-rules", requireAuth, async (req, res) => {
 
 app.post("/commission-rules", requireRole(["master", "manager"]), async (req, res) => {
   try {
-    const { role_name, tier_name, min_net, max_net, rate_pct, incentive_pct, payout_day, deposit_gate_pct } = req.body;
+    const { role_name, tier_name, min_net, max_net, rate_pct, incentive_pct, payout_day, deposit_gate_pct, channel, user_id } = req.body;
     if (!role_name || rate_pct == null) return res.status(400).json({ error: "role_name and rate_pct required" });
     const { data, error } = await supabase.from("commission_rules").insert({
       company_id: req.user.company_id, role_name, tier_name: tier_name || null,
       min_net: Number(min_net) || 0, max_net: max_net ? Number(max_net) : null,
       rate_pct: Number(rate_pct), incentive_pct: Number(incentive_pct) || 0,
+      channel: channel || "branch", user_id: user_id || null,
       payout_day: Number(payout_day) || 25, deposit_gate_pct: Number(deposit_gate_pct) || 30,
       is_active: true, updated_by: req.user.id,
     }).select().single();
@@ -3294,7 +3295,7 @@ app.delete("/commission-rules/:id", requireRole(["master", "manager"]), async (r
 
 // Calculate commission for an order
 async function calculateCommission(orderId, companyId) {
-  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, items")
+  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, items, sales_channel")
     .eq("id", orderId).single();
   if (!order) return;
 
@@ -3302,9 +3303,14 @@ async function calculateCommission(orderId, companyId) {
   const totalPaid = gross - (Number(order.balance) || 0);
   const depositPct = gross > 0 ? (totalPaid / gross) * 100 : 0;
   const net = gross;
+  const channel = order.sales_channel || "branch";
 
-  // Get all rules (company-wide + per-salesman overrides)
-  const { data: rules } = await supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true);
+  // Get rules matching this channel (fallback to 'branch' if no channel-specific rules)
+  let { data: rules } = await supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true).eq("channel", channel);
+  if (!rules || rules.length === 0) {
+    const { data: fallback } = await supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true).eq("channel", "branch");
+    rules = fallback || [];
+  }
   if (!rules || rules.length === 0) return;
 
   // Get active product incentives
@@ -6419,6 +6425,7 @@ async function syncSalesOrderToDelivery(order, items) {
       time_slot: order.delivery_time_slot || null,
       type: order.delivery_type || "Delivery",
       remark: order.remark || null,
+      sales_channel: order.sales_channel || "branch",
       status: deliveryStatusFromSO(order.status),
       items: JSON.stringify(deliveryItems),
     };
@@ -6484,7 +6491,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const { company_id, id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
-            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber } = req.body;
+            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
@@ -6510,7 +6517,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         delivery_type: delivery_type || "Delivery", remark: remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
         country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
-        subtotal, notes: notes || null, created_by,
+        subtotal, notes: notes || null, created_by, sales_channel: sales_channel || "branch",
       })
       .select().single();
     if (orderErr) throw orderErr;
@@ -6548,7 +6555,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
-            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived } = req.body;
+            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
@@ -6597,7 +6604,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
-      country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
+      country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false, sales_channel: sales_channel || "branch",
     };
     if (amendmentNote) {
       updateData.notes = [amendmentNote, notes || ""].filter(Boolean).join("\n");
