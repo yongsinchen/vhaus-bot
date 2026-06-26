@@ -3164,6 +3164,11 @@ app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
       const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
       await supabase.from("orders").update({ balance: newBal }).eq("id", order_id);
     }
+    // Auto-recalculate commissions for affected orders
+    const affectedOrderIds = Array.isArray(allocations) ? allocations.map(a => a.order_id) : order_id ? [order_id] : [];
+    for (const oid of affectedOrderIds) {
+      try { await calculateCommission(oid, req.user.company_id); } catch (e) { console.error("commission recalc error:", e.message); }
+    }
     res.json({ payment });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3183,6 +3188,280 @@ app.get("/payments", requireAuth, async (req, res) => {
       return res.json({ payments: d2 || [] });
     }
     res.json({ payments: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Commission System ───────────────────────────────────────────
+
+// Commission Rules CRUD
+app.get("/commission-rules", requireAuth, async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    const { data } = await supabase.from("commission_rules").select("*").eq("company_id", company_id).eq("is_active", true).order("role_name").order("min_net");
+    res.json({ rules: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/commission-rules", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const { role_name, tier_name, min_net, max_net, rate_pct, incentive_pct, payout_day, deposit_gate_pct } = req.body;
+    if (!role_name || rate_pct == null) return res.status(400).json({ error: "role_name and rate_pct required" });
+    const { data, error } = await supabase.from("commission_rules").insert({
+      company_id: req.user.company_id, role_name, tier_name: tier_name || null,
+      min_net: Number(min_net) || 0, max_net: max_net ? Number(max_net) : null,
+      rate_pct: Number(rate_pct), incentive_pct: Number(incentive_pct) || 0,
+      payout_day: Number(payout_day) || 25, deposit_gate_pct: Number(deposit_gate_pct) || 30,
+      is_active: true, updated_by: req.user.id,
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ rule: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/commission-rules/:id", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const { role_name, tier_name, min_net, max_net, rate_pct, incentive_pct, payout_day, deposit_gate_pct, is_active } = req.body;
+    const updates = { updated_by: req.user.id, updated_at: new Date().toISOString() };
+    if (role_name !== undefined) updates.role_name = role_name;
+    if (tier_name !== undefined) updates.tier_name = tier_name;
+    if (min_net !== undefined) updates.min_net = Number(min_net);
+    if (max_net !== undefined) updates.max_net = max_net ? Number(max_net) : null;
+    if (rate_pct !== undefined) updates.rate_pct = Number(rate_pct);
+    if (incentive_pct !== undefined) updates.incentive_pct = Number(incentive_pct);
+    if (payout_day !== undefined) updates.payout_day = Number(payout_day);
+    if (deposit_gate_pct !== undefined) updates.deposit_gate_pct = Number(deposit_gate_pct);
+    if (is_active !== undefined) updates.is_active = is_active;
+    const { data, error } = await supabase.from("commission_rules").update(updates).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ rule: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/commission-rules/:id", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    await supabase.from("commission_rules").update({ is_active: false }).eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Calculate commission for an order
+async function calculateCommission(orderId, companyId) {
+  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at")
+    .eq("id", orderId).single();
+  if (!order) return;
+
+  const gross = Number(order.order_amount) || 0;
+  const totalPaid = gross - (Number(order.balance) || 0);
+  const depositPct = gross > 0 ? (totalPaid / gross) * 100 : 0;
+
+  // Get rules for this company
+  const { data: rules } = await supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true);
+  if (!rules || rules.length === 0) return;
+
+  // Net amount = gross (simplified — adjust if you have cost tracking)
+  const net = gross;
+
+  // Find salesman user
+  const salesmanName = (order.salesman || "").split("/").map(s => s.trim()).filter(Boolean);
+
+  for (const name of salesmanName) {
+    const { data: salesUser } = await supabase.from("users").select("id, role")
+      .eq("company_id", companyId).ilike("salesman_name", name).maybeSingle();
+    if (!salesUser) continue;
+
+    // Find matching salesman rule (by tier)
+    const salesRules = (rules || []).filter(r => r.role_name === "salesman");
+    const matchRule = salesRules.find(r => net >= (r.min_net || 0) && (!r.max_net || net <= r.max_net)) || salesRules[0];
+    if (!matchRule) continue;
+
+    const depositMet = depositPct >= (matchRule.deposit_gate_pct || 30);
+    const commAmt = net * ((matchRule.rate_pct || 0) / 100) + net * ((matchRule.incentive_pct || 0) / 100);
+    // Split among salesmen
+    const splitAmt = commAmt / salesmanName.length;
+
+    // Check existing commission
+    const { data: existing } = await supabase.from("commissions").select("id").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
+    if (existing) {
+      await supabase.from("commissions").update({
+        net_amount: net, rate_pct: matchRule.rate_pct, incentive_pct: matchRule.incentive_pct,
+        commission_amt: splitAmt, deposit_met: depositMet,
+        status: depositMet ? "eligible" : "pending",
+        eligible_at: depositMet ? new Date().toISOString() : null,
+        payout_month: depositMet ? getPayoutMonth(matchRule.payout_day) : null,
+      }).eq("id", existing.id);
+    } else {
+      await supabase.from("commissions").insert({
+        order_id: orderId, user_id: salesUser.id, role_name: "salesman",
+        net_amount: net, rate_pct: matchRule.rate_pct, incentive_pct: matchRule.incentive_pct,
+        commission_amt: splitAmt, deposit_met: depositMet,
+        status: depositMet ? "eligible" : "pending",
+        eligible_at: depositMet ? new Date().toISOString() : null,
+        payout_month: depositMet ? getPayoutMonth(matchRule.payout_day) : null,
+      });
+    }
+  }
+
+  // Branch manager override
+  const mgrRules = (rules || []).filter(r => r.role_name === "branch_manager");
+  if (mgrRules.length > 0 && order.branch_id) {
+    const { data: mgr } = await supabase.from("users").select("id")
+      .eq("company_id", companyId).eq("branch_id", order.branch_id).eq("role", "manager").eq("is_active", true).limit(1).maybeSingle();
+    if (mgr) {
+      const mgrRule = mgrRules[0];
+      const depositMet = depositPct >= (mgrRule.deposit_gate_pct || 30);
+      const overrideAmt = net * ((mgrRule.rate_pct || 0) / 100);
+
+      const { data: existing } = await supabase.from("commissions").select("id").eq("order_id", orderId).eq("user_id", mgr.id).maybeSingle();
+      if (existing) {
+        await supabase.from("commissions").update({
+          net_amount: net, rate_pct: mgrRule.rate_pct, commission_amt: overrideAmt,
+          deposit_met: depositMet, status: depositMet ? "eligible" : "pending",
+          eligible_at: depositMet ? new Date().toISOString() : null,
+          payout_month: depositMet ? getPayoutMonth(mgrRule.payout_day) : null,
+        }).eq("id", existing.id);
+      } else {
+        await supabase.from("commissions").insert({
+          order_id: orderId, user_id: mgr.id, role_name: "branch_manager",
+          net_amount: net, rate_pct: mgrRule.rate_pct, incentive_pct: 0,
+          commission_amt: overrideAmt, deposit_met: depositMet,
+          status: depositMet ? "eligible" : "pending",
+          eligible_at: depositMet ? new Date().toISOString() : null,
+          payout_month: depositMet ? getPayoutMonth(mgrRule.payout_day) : null,
+        });
+      }
+    }
+  }
+}
+
+function getPayoutMonth(payoutDay) {
+  const now = new Date();
+  const day = now.getDate();
+  // If past payout day this month, next month
+  if (day > (payoutDay || 25)) now.setMonth(now.getMonth() + 1);
+  now.setDate(1);
+  return now.toISOString().slice(0, 10);
+}
+
+// GET commissions list
+app.get("/commissions", requireAuth, async (req, res) => {
+  try {
+    const { company_id, user_id, status, payout_month } = req.query;
+    let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance), users(name, salesman_name)").order("created_at", { ascending: false });
+    if (user_id) q = q.eq("user_id", user_id);
+    if (status) q = q.eq("status", status);
+    if (payout_month) q = q.eq("payout_month", payout_month);
+    const { data, error } = await q;
+    if (error) {
+      let q2 = supabase.from("commissions").select("*").order("created_at", { ascending: false });
+      if (user_id) q2 = q2.eq("user_id", user_id);
+      if (status) q2 = q2.eq("status", status);
+      const { data: d2 } = await q2;
+      return res.json({ commissions: d2 || [] });
+    }
+    res.json({ commissions: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Recalculate commission for an order (triggered after payment)
+app.post("/commissions/recalculate/:orderId", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data: order } = await supabase.from("orders").select("company_id").eq("id", req.params.orderId).single();
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    await calculateCommission(Number(req.params.orderId), order.company_id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Commission adjustments
+app.post("/commission-adjustments", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const { commission_id, adjustment_type, delta_amt, reason, applied_to_payout } = req.body;
+    if (!commission_id || !delta_amt) return res.status(400).json({ error: "commission_id and delta_amt required" });
+    const { data, error } = await supabase.from("commission_adjustments").insert({
+      commission_id, adjustment_type: adjustment_type || "manual",
+      delta_amt: Number(delta_amt), reason: reason || null,
+      applied_to_payout: applied_to_payout || null, created_by: req.user.id,
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ adjustment: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Wrong-item holds
+app.post("/wrong-item-holds", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { commission_id, hold_reason, held_amt } = req.body;
+    if (!commission_id) return res.status(400).json({ error: "commission_id required" });
+    // Get commission amount if held_amt not provided
+    let amt = held_amt;
+    if (!amt) {
+      const { data: comm } = await supabase.from("commissions").select("commission_amt").eq("id", commission_id).single();
+      amt = comm?.commission_amt || 0;
+    }
+    const { data, error } = await supabase.from("wrong_item_holds").insert({
+      commission_id, hold_reason: hold_reason || "wrong_item",
+      held_amt: Number(amt), status: "held", auto_release: true,
+    }).select().single();
+    if (error) throw error;
+    // Update commission status
+    await supabase.from("commissions").update({ status: "held" }).eq("id", commission_id);
+    res.status(201).json({ hold: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/wrong-item-holds/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { status, resale_order_id } = req.body;
+    const updates = {};
+    if (status) updates.status = status;
+    if (resale_order_id) updates.resale_order_id = resale_order_id;
+    if (status === "released") { updates.released_at = new Date().toISOString(); updates.override_by = req.user.id; }
+    const { data, error } = await supabase.from("wrong_item_holds").update(updates).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    // If released, update commission back to eligible
+    if (status === "released" && data.commission_id) {
+      await supabase.from("commissions").update({ status: "eligible" }).eq("id", data.commission_id);
+    }
+    res.json({ hold: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Payout summary
+app.get("/commission-payout", requireAuth, async (req, res) => {
+  try {
+    const { company_id, payout_month } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const month = payout_month || getPayoutMonth(25);
+    const { data: comms } = await supabase.from("commissions").select("*, orders(so_number, customer_name), users(name, salesman_name)")
+      .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
+    // Get adjustments
+    const commIds = (comms || []).map(c => c.id);
+    let adjustments = [];
+    if (commIds.length > 0) {
+      const { data: adjs } = await supabase.from("commission_adjustments").select("*").in("commission_id", commIds);
+      adjustments = adjs || [];
+    }
+    // Get holds
+    let holds = [];
+    if (commIds.length > 0) {
+      const { data: hs } = await supabase.from("wrong_item_holds").select("*").in("commission_id", commIds);
+      holds = hs || [];
+    }
+    // Group by user
+    const byUser = {};
+    for (const c of (comms || [])) {
+      const uid = c.user_id;
+      if (!byUser[uid]) byUser[uid] = { user_id: uid, name: c.users?.name || c.users?.salesman_name || "?", role: c.role_name, commissions: [], adjustments: [], holds: [], total: 0 };
+      const userAdjs = adjustments.filter(a => a.commission_id === c.id);
+      const userHolds = holds.filter(h => h.commission_id === c.id);
+      const adjTotal = userAdjs.reduce((s, a) => s + (Number(a.delta_amt) || 0), 0);
+      const holdTotal = userHolds.filter(h => h.status === "held").reduce((s, h) => s + (Number(h.held_amt) || 0), 0);
+      byUser[uid].commissions.push(c);
+      byUser[uid].adjustments.push(...userAdjs);
+      byUser[uid].holds.push(...userHolds);
+      byUser[uid].total += (Number(c.commission_amt) || 0) + adjTotal - holdTotal;
+    }
+    res.json({ payout_month: month, users: Object.values(byUser), total: Object.values(byUser).reduce((s, u) => s + u.total, 0) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4656,6 +4935,7 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
     const { data: order } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
     const newBalance = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
     await supabase.from("orders").update({ balance: newBalance }).eq("id", sched.order_id);
+    try { await calculateCommission(sched.order_id, req.user.company_id); } catch (e) { console.error("commission recalc:", e.message); }
     res.json({ ok: true, new_balance: newBalance });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
