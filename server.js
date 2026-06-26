@@ -3054,6 +3054,169 @@ app.get("/services", requireAuth, async (req, res) => {
   res.json(result);
 });
 
+// ── Customer Database ────────────────────────────────────────────
+app.get("/customers", requireAuth, async (req, res) => {
+  try {
+    const { company_id, search, limit = 50 } = req.query;
+    let q = supabase.from("customers").select("*", { count: "exact" }).order("name").limit(Number(limit));
+    if (company_id) q = q.eq("company_id", company_id);
+    if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
+    const { data, count, error } = await q;
+    if (error) throw error;
+    res.json({ customers: data || [], total: count || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/customers/:id", requireAuth, async (req, res) => {
+  try {
+    const { data: customer } = await supabase.from("customers").select("*").eq("id", req.params.id).single();
+    if (!customer) return res.status(404).json({ error: "Customer not found" });
+    // Load all orders for this customer
+    const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, created_at, type")
+      .eq("customer_id", customer.id).order("created_at", { ascending: false });
+    // Also find orders by phone match if customer_id not linked
+    const { data: phoneOrders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, created_at, type")
+      .eq("company_id", customer.company_id).ilike("contact", `%${customer.phone || "NOMATCH"}%`).is("customer_id", null);
+    const allOrders = [...(orders || []), ...(phoneOrders || [])];
+    // Load payments
+    const { data: payments } = await supabase.from("payments").select("*")
+      .or(`customer_id.eq.${customer.id}${allOrders.length > 0 ? `,order_id.in.(${allOrders.map(o => o.id).join(",")})` : ""}`)
+      .order("paid_at", { ascending: false });
+    // Calculate totals
+    const totalSpent = allOrders.reduce((s, o) => s + (Number(o.order_amount) || 0), 0);
+    const totalBalance = allOrders.reduce((s, o) => s + Math.max(0, Number(o.balance) || 0), 0);
+    const totalPaid = (payments || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    res.json({ customer, orders: allOrders, payments: payments || [], summary: { total_spent: totalSpent, total_balance: totalBalance, total_paid: totalPaid, order_count: allOrders.length } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/customers", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, phone, email, address, ic_number, company_name: custCompany, notes } = req.body;
+    if (!name) return res.status(400).json({ error: "Name required" });
+    // Check duplicate by phone
+    if (phone) {
+      const { data: dup } = await supabase.from("customers").select("id, name").eq("company_id", req.user.company_id).eq("phone", phone.trim()).maybeSingle();
+      if (dup) return res.status(400).json({ error: `Customer with phone ${phone} already exists: ${dup.name}`, existing: dup });
+    }
+    const { data, error } = await supabase.from("customers").insert({
+      company_id: req.user.company_id, name: name.trim(), phone: phone?.trim() || null,
+      email: email?.trim() || null, address: address || null,
+      ic_number: ic_number || null, company_name: custCompany || null, notes: notes || null,
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ customer: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/customers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { name, phone, email, address, ic_number, company_name: custCompany, notes } = req.body;
+    const { data, error } = await supabase.from("customers").update({
+      name: name?.trim(), phone: phone?.trim() || null, email: email?.trim() || null,
+      address: address || null, ic_number: ic_number || null,
+      company_name: custCompany || null, notes: notes || null,
+    }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ customer: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Search customer by phone (for order creation auto-detect)
+app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
+  try {
+    const phone = req.params.phone.trim();
+    const { data } = await supabase.from("customers").select("*")
+      .eq("company_id", req.user.company_id).ilike("phone", `%${phone}%`).limit(5);
+    res.json({ customers: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Cross-Order Payments ────────────────────────────────────────
+app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations } = req.body;
+    if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
+    // Create payment
+    const { data: payment, error } = await supabase.from("payments").insert({
+      order_id: order_id || (allocations?.[0]?.order_id) || null,
+      customer_id: customer_id || null,
+      amount: Number(amount), payment_method: payment_method || "cash",
+      reference_no: reference_no || null, recorded_by: req.user.id,
+      notes: proof_url ? `Proof: ${proof_url}` : null,
+    }).select().single();
+    if (error) throw error;
+    // Allocate to orders
+    if (Array.isArray(allocations) && allocations.length > 0) {
+      const rows = allocations.filter(a => a.order_id && Number(a.amount) > 0).map(a => ({
+        payment_id: payment.id, order_id: a.order_id, amount: Number(a.amount),
+      }));
+      if (rows.length > 0) await supabase.from("payment_allocations").insert(rows);
+      // Update each order's balance
+      for (const a of rows) {
+        const { data: order } = await supabase.from("orders").select("balance").eq("id", a.order_id).single();
+        const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - a.amount);
+        await supabase.from("orders").update({ balance: newBal }).eq("id", a.order_id);
+      }
+    } else if (order_id) {
+      // Single order payment
+      const { data: order } = await supabase.from("orders").select("balance").eq("id", order_id).single();
+      const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
+      await supabase.from("orders").update({ balance: newBal }).eq("id", order_id);
+    }
+    res.json({ payment });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/payments", requireAuth, async (req, res) => {
+  try {
+    const { company_id, customer_id, order_id, limit = 100 } = req.query;
+    let q = supabase.from("payments").select("*, payment_allocations(order_id, amount)").order("paid_at", { ascending: false }).limit(Number(limit));
+    if (customer_id) q = q.eq("customer_id", customer_id);
+    if (order_id) q = q.eq("order_id", order_id);
+    const { data, error } = await q;
+    if (error) {
+      let q2 = supabase.from("payments").select("*").order("paid_at", { ascending: false }).limit(Number(limit));
+      if (customer_id) q2 = q2.eq("customer_id", customer_id);
+      if (order_id) q2 = q2.eq("order_id", order_id);
+      const { data: d2 } = await q2;
+      return res.json({ payments: d2 || [] });
+    }
+    res.json({ payments: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Aging Report ────────────────────────────────────────────────
+app.get("/aging-report", requireAuth, async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, contact, order_amount, balance, status, created_at, delivery_date, customer_id")
+      .eq("company_id", company_id).gt("balance", 0)
+      .not("status", "in", '("Cancelled")');
+    const now = new Date();
+    const buckets = { current: [], "30_60": [], "60_90": [], "90_plus": [] };
+    for (const o of (orders || [])) {
+      const orderDate = new Date(o.delivery_date || o.created_at);
+      const days = Math.floor((now - orderDate) / 86400000);
+      const entry = { ...o, days_outstanding: days, balance: Number(o.balance) || 0 };
+      if (days <= 30) buckets.current.push(entry);
+      else if (days <= 60) buckets["30_60"].push(entry);
+      else if (days <= 90) buckets["60_90"].push(entry);
+      else buckets["90_plus"].push(entry);
+    }
+    const summary = {
+      current: buckets.current.reduce((s, o) => s + o.balance, 0),
+      "30_60": buckets["30_60"].reduce((s, o) => s + o.balance, 0),
+      "60_90": buckets["60_90"].reduce((s, o) => s + o.balance, 0),
+      "90_plus": buckets["90_plus"].reduce((s, o) => s + o.balance, 0),
+      total: (orders || []).reduce((s, o) => s + (Number(o.balance) || 0), 0),
+      order_count: (orders || []).length,
+    };
+    res.json({ buckets, summary });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Service Management (proper tables) ──────────────────────────
 
 // Service types: 1=warranty, 2=assembly, 3=exchange
