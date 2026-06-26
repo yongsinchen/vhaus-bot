@@ -5856,18 +5856,29 @@ const XLSX = require("xlsx");
 const pdfParse = require("pdf-parse");
 
 const normaliseImportRow = (raw) => {
-  const find = (...keys) => { for (const k of keys) { const v = raw[k] ?? raw[k?.toLowerCase()] ?? raw[k?.toUpperCase()]; if (v !== undefined && v !== null && v !== "") return String(v).trim(); } return ""; };
+  // Match headers loosely: ignore case, spaces, punctuation. So "Item No.",
+  // "item_no", and "ITEM NO" all resolve to the same field.
+  const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normMap = {};
+  for (const [k, v] of Object.entries(raw || {})) normMap[norm(k)] = v;
+  const find = (...keys) => {
+    for (const k of keys) {
+      const v = normMap[norm(k)];
+      if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+    }
+    return "";
+  };
   const toNum = (v) => { const n = parseFloat(String(v).replace(/[^0-9.]/g, "")); return isNaN(n) ? null : n; };
   return {
-    product_code: find("code","Code","item_code","Item Code","SKU","sku","Model","model").toUpperCase(),
-    product_name: find("name","Name","item_name","Item Name","Product","product","Description","description"),
-    color:        find("color","Color","Colour","colour","color_code","Color Code"),
-    size:         find("size","Size","dimension","Dimension","dimensions","Dimensions","variant","Variant","option","Option","spec","Spec"),
-    is_customizable: ["true","yes","1"].includes(find("customizable","Customizable","custom","Custom","is_customizable").toLowerCase()),
-    category_name: find("category","Category","type","Type","product_type","Product Type","group","Group"),
-    supplier_name: find("supplier","Supplier","company","Company","brand","Brand","manufacturer","Manufacturer"),
-    unit_cost:    toNum(find("cost","Cost","unit_cost","Unit Cost","Buy Price","buy_price","purchase_price")),
-    unit_price:   toNum(find("price","Price","unit_price","Unit Price","Sell Price","sell_price","selling_price")),
+    product_code: find("code","item_code","itemcode","item no","itemno","item number","sku","model","model no","art no","article","article no","ref","ref no","product code","prod code","stock code").toUpperCase(),
+    product_name: find("name","item_name","item name","item","product","product name","description","desc","details","title").trim(),
+    color:        find("color","colour","color code","colour code"),
+    size:         find("size","dimension","dimensions","dimensions mm","measurement","variant","option","spec","specification"),
+    is_customizable: ["true","yes","1"].includes(find("customizable","custom","is_customizable").toLowerCase()),
+    category_name: find("category","type","product type","product_type","group"),
+    supplier_name: find("supplier","company","brand","manufacturer","maker"),
+    unit_cost:    toNum(find("cost","unit_cost","unit cost","buy price","buyprice","purchase price","cost price","cost rm","nett","net cost","nett cost")),
+    unit_price:   toNum(find("price","unit_price","unit price","sell price","selling price","sale price","retail","retail price","list price","rrp","srp","price rm")),
   };
 };
 
@@ -6135,7 +6146,11 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
         await finaliseJob(job.id, company_id, parsedRows, costDivisor, colorMode);
         const { data: updatedJob } = await supabase.from("catalogue_import_jobs")
           .select("*, catalogue_import_rows(*)").eq("id", job.id).single();
-        return res.json({ job_id: job.id, status: "review", rows: updatedJob?.catalogue_import_rows || [] });
+        // Reflect the real outcome — finaliseJob marks the job "failed" when nothing was parsed
+        if (updatedJob?.status === "failed") {
+          return res.json({ job_id: job.id, status: "failed", error: updatedJob.error_message || "No products found in file", rows: [] });
+        }
+        return res.json({ job_id: job.id, status: updatedJob?.status || "review", rows: updatedJob?.catalogue_import_rows || [] });
       } catch (parseErr) {
         await supabase.from("catalogue_import_jobs").update({ status: "failed", error_message: parseErr.message }).eq("id", job.id);
         return res.status(422).json({ error: "Failed to parse file: " + parseErr.message });
