@@ -1856,8 +1856,14 @@ app.patch("/delivery/routes/:id", requireRole(MANAGE_ROLES), async (req, res) =>
     }
   }
 
+  const ROUTE_EDITABLE = ["status", "lorry_plate", "driver_name", "area", "notes", "vehicle_id", "delivery_date"];
+  const updateData = {};
+  for (const key of ROUTE_EDITABLE) {
+    if (req.body[key] !== undefined) updateData[key] = req.body[key];
+  }
+  if (Object.keys(updateData).length === 0) return res.status(400).json({ error: "No valid fields to update" });
   const { data, error } = await supabase
-    .from("delivery_routes").update(req.body).eq("id", id).select().single();
+    .from("delivery_routes").update(updateData).eq("id", id).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
   if (req.body.status === "Out for Delivery" || req.body.status === "Delivered") {
@@ -2976,14 +2982,23 @@ app.get("/admin/users/list", requireRole(["master", "manager"]), async (req, res
   res.json(data || []);
 });
 
-app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) => {
+app.post("/admin/users", requireRole(["master", "manager", "company_admin"]), async (req, res) => {
   const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
   if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
+  const ALLOWED_ROLES = ["master", "manager", "company_admin", "salesman", "warehouse", "driver", "finance"];
+  if (!ALLOWED_ROLES.includes(role)) return res.status(400).json({ error: `Invalid role. Allowed: ${ALLOWED_ROLES.join(", ")}` });
+  // Prevent escalation: cannot create a role at or above your own level
+  const ROLE_LEVEL = { master: 100, manager: 80, company_admin: 60, finance: 40, salesman: 30, warehouse: 20, driver: 10 };
+  const creatorLevel = ROLE_LEVEL[req.user.role] || 0;
+  const targetLevel = ROLE_LEVEL[role] || 0;
+  if (targetLevel >= creatorLevel) return res.status(403).json({ error: "Cannot create a user with equal or higher role than your own" });
+  // Enforce company_id from authenticated user (non-master users can only create within their own company)
+  const resolvedCompanyId = req.user.role === "master" ? (company_id || req.user.company_id) : req.user.company_id;
   const { data: authData, error: authErr } = await supabase.auth.admin.createUser({ email, password, email_confirm: true });
   if (authErr) return res.status(400).json({ success: false, error: authErr.message });
   const { error: profileErr } = await supabase.from("users").insert({
     id: authData.user.id, name, email, role,
-    company_id: company_id || null, telegram_id: telegram_id || null,
+    company_id: resolvedCompanyId || null, telegram_id: telegram_id || null,
     salesman_name: salesman_name || null, is_active: true,
   });
   if (profileErr) return res.status(500).json({ success: false, error: profileErr.message });
@@ -3020,10 +3035,14 @@ app.get("/services/unscheduled", requireAuth, async (req, res) => {
 app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { delivery_date } = req.body;
-  const { data, error } = await supabase.from("orders")
-    .update({ delivery_date: delivery_date || null })
-    .eq("id", id).select().single();
-  if (error) return res.status(500).json({ error: error.message });
+  // Update via sales_orders first, sync to legacy
+  const soNum = await getLegacySoNumber(id);
+  if (soNum) {
+    await updateSalesOrderField(soNum, null, { delivery_date: delivery_date || null });
+  } else {
+    await supabase.from("orders").update({ delivery_date: delivery_date || null }).eq("id", id);
+  }
+  const { data } = await supabase.from("orders").select("*").eq("id", id).single();
   res.json(data);
 });
 
@@ -3045,9 +3064,9 @@ app.get("/services", requireAuth, async (req, res) => {
 // ── Customer Database ────────────────────────────────────────────
 app.get("/customers", requireAuth, async (req, res) => {
   try {
-    const { company_id, search, limit = 50 } = req.query;
-    let q = supabase.from("customers").select("*", { count: "exact" }).order("name").limit(Number(limit));
-    if (company_id) q = q.eq("company_id", company_id);
+    const companyId = req.user.company_id;
+    const { search, limit = 50 } = req.query;
+    let q = supabase.from("customers").select("*", { count: "exact" }).eq("company_id", companyId).order("name").limit(Number(limit));
     if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
     const { data, count, error } = await q;
     if (error) throw error;
@@ -3057,7 +3076,7 @@ app.get("/customers", requireAuth, async (req, res) => {
 
 app.get("/customers/:id", requireAuth, async (req, res) => {
   try {
-    const { data: customer } = await supabase.from("customers").select("*").eq("id", req.params.id).single();
+    const { data: customer } = await supabase.from("customers").select("*").eq("id", req.params.id).eq("company_id", req.user.company_id).single();
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     // Load all orders for this customer
     const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, created_at, type")
@@ -3158,14 +3177,16 @@ app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.get("/payments", requireAuth, async (req, res) => {
   try {
-    const { company_id, customer_id, order_id, limit = 100 } = req.query;
-    let q = supabase.from("payments").select("*, payment_allocations(order_id, amount)").order("paid_at", { ascending: false }).limit(Number(limit));
+    const companyId = req.user.company_id;
+    const { customer_id, order_id, limit = 100 } = req.query;
+    // Scope to user's company via orders join
+    let q = supabase.from("payments").select("*, payment_allocations(order_id, amount), orders!inner(company_id)").eq("orders.company_id", companyId).order("paid_at", { ascending: false }).limit(Number(limit));
     if (customer_id) q = q.eq("customer_id", customer_id);
     if (order_id) q = q.eq("order_id", order_id);
     const { data, error } = await q;
     if (error) {
+      // Fallback without join
       let q2 = supabase.from("payments").select("*").order("paid_at", { ascending: false }).limit(Number(limit));
-      if (customer_id) q2 = q2.eq("customer_id", customer_id);
       if (order_id) q2 = q2.eq("order_id", order_id);
       const { data: d2 } = await q2;
       return res.json({ payments: d2 || [] });
@@ -3177,9 +3198,8 @@ app.get("/payments", requireAuth, async (req, res) => {
 // ── Product Incentives ──────────────────────────────────────────
 app.get("/product-incentives", requireAuth, async (req, res) => {
   try {
-    const { company_id, active_only } = req.query;
-    let q = supabase.from("product_incentives").select("*").order("product_name");
-    if (company_id) q = q.eq("company_id", company_id);
+    const { active_only } = req.query;
+    let q = supabase.from("product_incentives").select("*").eq("company_id", req.user.company_id).order("product_name");
     if (active_only === "true") q = q.eq("is_active", true);
     const { data } = await q;
     res.json({ incentives: data || [] });
@@ -3664,15 +3684,14 @@ async function autoMatchTransactions(uploadId, companyId) {
 
 app.get("/statements", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    const { data } = await supabase.from("statement_uploads").select("*").eq("company_id", company_id).order("created_at", { ascending: false });
+    const { data } = await supabase.from("statement_uploads").select("*").eq("company_id", req.user.company_id).order("created_at", { ascending: false });
     res.json({ uploads: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/statements/:id", requireAuth, async (req, res) => {
   try {
-    const { data: upload } = await supabase.from("statement_uploads").select("*").eq("id", req.params.id).single();
+    const { data: upload } = await supabase.from("statement_uploads").select("*").eq("id", req.params.id).eq("company_id", req.user.company_id).single();
     if (!upload) return res.status(404).json({ error: "Not found" });
     const { data: txns } = await supabase.from("statement_transactions").select("*").eq("upload_id", upload.id).order("transaction_date");
     // Enrich matched orders
