@@ -11,7 +11,7 @@ const app = express();
 // ── CORS — must be before all routes ─────────────────────────────
 app.use(cors({
   origin: ["https://vhaus-delivery.vercel.app", "https://pulseos.vercel.app", "https://pulseos-my.vercel.app", "http://localhost:3000"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Company-ID"],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
 app.options("*", cors());
@@ -22,6 +22,8 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+const { PermissionEngine } = require("./permission-engine");
+const permEngine = new PermissionEngine(supabase);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
@@ -68,6 +70,28 @@ const requireAuth = async (req, res, next) => {
     if (profErr) return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     req.user = profile;
+
+    // Resolve company context from X-Company-ID header (with legacy fallback)
+    const requestedCompanyId = req.headers["x-company-id"] || null;
+    const context = await permEngine.resolveCompanyContext(profile.id, requestedCompanyId);
+    if (context) {
+      req.activeCompanyId = context.companyId;
+      req.activeRoleId = context.roleId;
+      req.activeRoleKey = context.roleKey;
+      req.activeRoleName = context.roleName;
+      req.activeRoleLevel = context.roleLevel;
+      req.activeBranches = context.branches;
+      req.primaryBranchId = context.primaryBranchId;
+      req.activeDepartmentId = context.departmentId;
+      req.availableCompanies = context.allAccess;
+    } else {
+      // Legacy fallback
+      req.activeCompanyId = profile.company_id;
+      req.activeRoleKey = (profile.role || "").toUpperCase();
+      req.activeRoleLevel = 0;
+      req.activeBranches = profile.branch_id ? [profile.branch_id] : [];
+      req.primaryBranchId = profile.branch_id || null;
+    }
     next();
   } catch (err) { res.status(500).json({ error: err.message }); }
 };
@@ -2889,7 +2913,226 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
       const { data: companyData } = await supabase.from("companies").select("id, name, code").eq("id", user.company_id).single();
       company = companyData || null;
     }
-    res.json({ ...user, companies: company });
+    // Include multi-company context
+    const companies = await permEngine.getUserCompanies(req.user.id);
+    res.json({
+      ...user, companies: company,
+      availableCompanies: companies,
+      activeCompanyId: req.activeCompanyId,
+      activeRoleKey: req.activeRoleKey,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Company Access & Permission Endpoints ────────────────────────
+
+// GET /user-company-access — current user's accessible companies
+app.get("/user-company-access", requireAuth, async (req, res) => {
+  try {
+    const companies = await permEngine.getUserCompanies(req.user.id);
+    res.json({ companies, activeCompanyId: req.activeCompanyId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /auth/switch-company — switch active company
+app.post("/auth/switch-company", requireAuth, async (req, res) => {
+  try {
+    const { company_id } = req.body;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const context = await permEngine.resolveCompanyContext(req.user.id, company_id);
+    if (!context) return res.status(403).json({ error: "No access to this company" });
+    // Load effective permissions for the new company
+    const perms = await permEngine.computePermissions(req.user.id, company_id);
+    await permEngine.logEvent(company_id, req.user.id, "AUTH_COMPANY_SWITCH", "companies", company_id, { from: req.activeCompanyId, to: company_id }, req);
+    res.json({
+      activeCompanyId: context.companyId,
+      activeRoleKey: context.roleKey,
+      activeRoleName: context.roleName,
+      branches: context.branches,
+      primaryBranchId: context.primaryBranchId,
+      permissions: perms?.permissions || {},
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/modules — all modules + actions (for permission UI)
+app.get("/permissions/modules", requireAuth, async (req, res) => {
+  try {
+    const { data: modules } = await supabase.from("permission_modules")
+      .select("*, permission_actions(*)").eq("is_active", true).order("sort_order");
+    res.json({ modules: modules || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/effective — current user's permissions for active company
+app.get("/permissions/effective", requireAuth, async (req, res) => {
+  try {
+    const perms = await permEngine.computePermissions(req.user.id, req.activeCompanyId);
+    if (!perms) return res.json({ permissions: {}, roleKey: req.activeRoleKey });
+    res.json({
+      permissions: perms.permissions,
+      roleKey: perms.roleKey,
+      activeCompanyId: req.activeCompanyId,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/roles — roles available for active company
+app.get("/permissions/roles", requireAuth, async (req, res) => {
+  try {
+    if (req.activeRoleKey !== "MASTER" && req.activeRoleKey !== "MANAGER") {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+    const { data: roles } = await supabase.from("roles")
+      .select("*").or(`company_id.is.null,company_id.eq.${req.activeCompanyId}`)
+      .is("deleted_at", null).eq("is_active", true).order("level", { ascending: false });
+    res.json({ roles: roles || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/users — users in active company with permission summaries
+app.get("/permissions/users", requireAuth, async (req, res) => {
+  try {
+    if (req.activeRoleKey !== "MASTER") return res.status(403).json({ error: "Master only" });
+    const { data: access } = await supabase.from("user_company_access")
+      .select("user_id, role_id, is_active, roles(role_key, role_name, level), users(id, name, email, salesman_name, is_active)")
+      .eq("company_id", req.activeCompanyId).is("deleted_at", null);
+    const users = (access || []).map(a => ({
+      userId: a.user_id,
+      name: a.users?.name,
+      email: a.users?.email,
+      salesmanName: a.users?.salesman_name,
+      isActive: a.is_active && a.users?.is_active,
+      roleKey: a.roles?.role_key,
+      roleName: a.roles?.role_name,
+      roleLevel: a.roles?.level,
+    }));
+    res.json({ users });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/users/:userId — user permissions for active company
+app.get("/permissions/users/:userId", requireAuth, async (req, res) => {
+  try {
+    if (req.activeRoleKey !== "MASTER") return res.status(403).json({ error: "Master only" });
+    const { userId } = req.params;
+    // Verify user belongs to this company
+    const { data: access } = await supabase.from("user_company_access")
+      .select("role_id, roles(role_key, role_name)")
+      .eq("user_id", userId).eq("company_id", req.activeCompanyId).is("deleted_at", null).single();
+    if (!access) return res.status(404).json({ error: "User not found in this company" });
+    const perms = await permEngine.computePermissions(userId, req.activeCompanyId);
+    // Also get overrides to show which are custom
+    const { data: overrides } = await supabase.from("user_permission_overrides")
+      .select("action_id, allowed, scope, permission_actions(action_key)")
+      .eq("user_id", userId).eq("company_id", req.activeCompanyId).is("deleted_at", null);
+    const overrideKeys = new Set((overrides || []).map(o => o.permission_actions?.action_key).filter(Boolean));
+    res.json({
+      roleKey: access.roles?.role_key,
+      roleName: access.roles?.role_name,
+      permissions: perms?.permissions || {},
+      overrideKeys: [...overrideKeys],
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /permissions/users/:userId — set/remove overrides for a user
+app.put("/permissions/users/:userId", requireAuth, async (req, res) => {
+  try {
+    if (req.activeRoleKey !== "MASTER") return res.status(403).json({ error: "Master only" });
+    const { userId } = req.params;
+    if (userId === req.user.id) return res.status(400).json({ error: "Cannot edit your own permissions" });
+    const { overrides } = req.body; // [{ action_key, allowed, scope }]
+    if (!Array.isArray(overrides)) return res.status(400).json({ error: "overrides array required" });
+    // Verify user belongs to this company
+    const { data: access } = await supabase.from("user_company_access")
+      .select("id").eq("user_id", userId).eq("company_id", req.activeCompanyId).is("deleted_at", null).single();
+    if (!access) return res.status(404).json({ error: "User not found in this company" });
+    // Load action map
+    const { data: actions } = await supabase.from("permission_actions").select("id, action_key");
+    const actionMap = Object.fromEntries((actions || []).map(a => [a.action_key, a.id]));
+    // Apply overrides
+    for (const ov of overrides) {
+      const actionId = actionMap[ov.action_key];
+      if (!actionId) continue;
+      if (ov.allowed === null || ov.allowed === undefined) {
+        // Remove override (soft delete)
+        await supabase.from("user_permission_overrides")
+          .update({ deleted_at: new Date().toISOString(), deleted_by: req.user.id })
+          .eq("user_id", userId).eq("company_id", req.activeCompanyId).eq("action_id", actionId);
+        await permEngine.logPermissionChange(userId, req.activeCompanyId, actionId, req.user.id, "override_removed", null, null);
+      } else {
+        // Upsert override
+        await supabase.from("user_permission_overrides").upsert({
+          user_id: userId, company_id: req.activeCompanyId, action_id: actionId,
+          allowed: ov.allowed, scope: ov.scope || null,
+          created_by: req.user.id, updated_at: new Date().toISOString(), deleted_at: null, deleted_by: null,
+        }, { onConflict: "user_id,company_id,action_id" });
+        await permEngine.logPermissionChange(userId, req.activeCompanyId, actionId, req.user.id, "override_set", null, { allowed: ov.allowed, scope: ov.scope });
+      }
+    }
+    // Invalidate cache
+    permEngine.invalidate(userId, req.activeCompanyId);
+    const perms = await permEngine.computePermissions(userId, req.activeCompanyId);
+    res.json({ ok: true, permissions: perms?.permissions || {} });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /user-company-access/grant — master grants user access to a company
+app.post("/user-company-access/grant", requireAuth, async (req, res) => {
+  try {
+    if (req.activeRoleKey !== "MASTER") return res.status(403).json({ error: "Master only" });
+    const { user_id, company_id, role_id, department_id, branch_ids } = req.body;
+    if (!user_id || !company_id || !role_id) return res.status(400).json({ error: "user_id, company_id, role_id required" });
+    // Verify master has access to target company
+    const masterAccess = await permEngine.resolveCompanyContext(req.user.id, company_id);
+    if (!masterAccess) return res.status(403).json({ error: "You don't have access to this company" });
+    const { data, error } = await supabase.from("user_company_access").upsert({
+      user_id, company_id, role_id, department_id: department_id || null,
+      is_active: true, created_by: req.user.id, deleted_at: null, deleted_by: null,
+    }, { onConflict: "user_id,company_id" }).select().single();
+    if (error) throw error;
+    // Add branch access
+    if (Array.isArray(branch_ids)) {
+      for (let i = 0; i < branch_ids.length; i++) {
+        await supabase.from("user_branch_access").upsert({
+          user_id, company_id, branch_id: branch_ids[i],
+          is_primary: i === 0, is_active: true, deleted_at: null,
+        }, { onConflict: "user_id,company_id,branch_id" });
+      }
+    }
+    await permEngine.logEvent(company_id, req.user.id, "COMPANY_ACCESS_GRANTED", "user_company_access", data.id, { user_id, role_id }, req);
+    permEngine.invalidate(user_id, company_id);
+    res.json({ ok: true, access: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /user-company-access/:id — revoke company access
+app.delete("/user-company-access/:id", requireAuth, async (req, res) => {
+  try {
+    if (req.activeRoleKey !== "MASTER") return res.status(403).json({ error: "Master only" });
+    const { data: access } = await supabase.from("user_company_access")
+      .select("user_id, company_id").eq("id", req.params.id).single();
+    if (!access) return res.status(404).json({ error: "Not found" });
+    await supabase.from("user_company_access")
+      .update({ is_active: false, deleted_at: new Date().toISOString(), deleted_by: req.user.id })
+      .eq("id", req.params.id);
+    await permEngine.logEvent(access.company_id, req.user.id, "COMPANY_ACCESS_REVOKED", "user_company_access", req.params.id, { user_id: access.user_id }, req);
+    permEngine.invalidate(access.user_id, access.company_id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /features — features + company enablement
+app.get("/features", requireAuth, async (req, res) => {
+  try {
+    const { data: features } = await supabase.from("features").select("*").order("sort_order");
+    const { data: enabled } = await supabase.from("company_features")
+      .select("feature_id, enabled").eq("company_id", req.activeCompanyId).eq("enabled", true);
+    const enabledIds = new Set((enabled || []).map(e => e.feature_id));
+    res.json({
+      features: (features || []).map(f => ({ ...f, enabled: enabledIds.has(f.id) })),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
