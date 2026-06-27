@@ -33,6 +33,28 @@ const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse 
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
 // ── Auth middleware (used by all protected routes) ───────────────
+const resolveCompany = async (req) => {
+  const requestedCompanyId = req.headers["x-company-id"] || null;
+  const context = await permEngine.resolveCompanyContext(req.user.id, requestedCompanyId);
+  if (context) {
+    req.activeCompanyId = context.companyId;
+    req.activeRoleId = context.roleId;
+    req.activeRoleKey = context.roleKey;
+    req.activeRoleName = context.roleName;
+    req.activeRoleLevel = context.roleLevel;
+    req.activeBranches = context.branches;
+    req.primaryBranchId = context.primaryBranchId;
+    req.activeDepartmentId = context.departmentId;
+    req.availableCompanies = context.allAccess;
+  } else {
+    req.activeCompanyId = req.user.company_id;
+    req.activeRoleKey = (req.user.role || "").toUpperCase();
+    req.activeRoleLevel = 0;
+    req.activeBranches = req.user.branch_id ? [req.user.branch_id] : [];
+    req.primaryBranchId = req.user.branch_id || null;
+  }
+};
+
 const requireRole = (allowedRoles) => async (req, res, next) => {
   try {
     const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
@@ -41,12 +63,13 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
     if (authErr || !authUser) return res.status(401).json({ error: "Invalid token" });
     const { data: profile } = await supabase
       .from("users")
-      .select("id, role, company_id, branch_id, is_active")
+      .select("id, role, company_id, branch_id, name, salesman_name, is_active")
       .eq("id", authUser.id)
       .single();
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     if (!allowedRoles.includes(profile.role)) return res.status(403).json({ error: "Insufficient permissions" });
     req.user = profile;
+    await resolveCompany(req);
     next();
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -70,28 +93,7 @@ const requireAuth = async (req, res, next) => {
     if (profErr) return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     req.user = profile;
-
-    // Resolve company context from X-Company-ID header (with legacy fallback)
-    const requestedCompanyId = req.headers["x-company-id"] || null;
-    const context = await permEngine.resolveCompanyContext(profile.id, requestedCompanyId);
-    if (context) {
-      req.activeCompanyId = context.companyId;
-      req.activeRoleId = context.roleId;
-      req.activeRoleKey = context.roleKey;
-      req.activeRoleName = context.roleName;
-      req.activeRoleLevel = context.roleLevel;
-      req.activeBranches = context.branches;
-      req.primaryBranchId = context.primaryBranchId;
-      req.activeDepartmentId = context.departmentId;
-      req.availableCompanies = context.allAccess;
-    } else {
-      // Legacy fallback
-      req.activeCompanyId = profile.company_id;
-      req.activeRoleKey = (profile.role || "").toUpperCase();
-      req.activeRoleLevel = 0;
-      req.activeBranches = profile.branch_id ? [profile.branch_id] : [];
-      req.primaryBranchId = profile.branch_id || null;
-    }
+    await resolveCompany(req);
     next();
   } catch (err) { res.status(500).json({ error: err.message }); }
 };
