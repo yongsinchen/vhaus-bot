@@ -6559,7 +6559,7 @@ async function nextDONumber(company_id) {
 
 app.post("/sales-orders/:id/generate-do", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
   try {
-    const { company_id } = req.user;
+    const company_id = req.activeCompanyId;
     const { item_ids, warehouse_id } = req.body;
 
     const { data: order } = await supabase.from("sales_orders")
@@ -7103,7 +7103,9 @@ async function syncSalesOrderToDelivery(order, items) {
 // GET /sales-orders — paginated lightweight list
 app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
-    const { company_id, role, salesman_name } = req.user;
+    const company_id = req.activeCompanyId;
+    const role = req.activeRoleKey?.toLowerCase() || req.user.role;
+    const salesman_name = req.user.salesman_name;
     const { status, search, salesman, date_from, date_to, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
     const lim = Math.min(Number(limit) || 50, 100);
     const pg = Math.max(Number(page) || 1, 1);
@@ -7112,9 +7114,11 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
     // Lightweight columns — NO items, payment_proofs, customer_signature
     const listCols = "id, company_id, order_number, customer_name, customer_contact, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark";
 
-    // Build count query + data query in parallel
+    // Build count query + data query in parallel — ALWAYS filter by activeCompanyId
     let countQ = supabase.from("sales_orders").select("id", { count: "exact", head: true }).eq("company_id", company_id);
     let dataQ = supabase.from("sales_orders").select(listCols).eq("company_id", company_id);
+
+    console.log(`[sales-orders] user=${req.user.id} activeCompany=${company_id} header=${req.headers["x-company-id"] || "none"}`);
 
     // Apply filters to both queries
     if (status) { countQ = countQ.eq("status", status); dataQ = dataQ.eq("status", status); }
@@ -7160,7 +7164,11 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
     }
 
     const totalPages = Math.ceil(finalCount / lim);
-    console.log(`[sales-orders] pg=${pg} lim=${lim} total=${finalCount} data=${finalData.length} pages=${totalPages}`);
+    const distinctCompanies = [...new Set(finalData.map(o => o.company_id))];
+    if (distinctCompanies.length > 1 || (distinctCompanies.length === 1 && distinctCompanies[0] !== company_id)) {
+      console.error(`[ISOLATION VIOLATION] user=${req.user.id} activeCompany=${company_id} returned companies=${distinctCompanies.join(",")}`);
+    }
+    console.log(`[sales-orders] user=${req.user.id} company=${company_id} pg=${pg} total=${finalCount} returned=${finalData.length}`);
     res.json({ data: finalData, total: finalCount, page: pg, limit: lim, total_pages: totalPages });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -7171,7 +7179,7 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
     const { data, error } = await supabase
       .from("sales_orders")
       .select("*, sales_order_items(*)")
-      .eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+      .eq("id", req.params.id).eq("company_id", req.activeCompanyId).single();
     if (error || !data) return res.status(404).json({ error: "Order not found" });
     // Load legacy order for arrival data
     let legacyOrder = null;
@@ -7187,7 +7195,8 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
 app.post("/sales-orders", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { company_id, id: created_by, salesman_name, name } = req.user;
+    const company_id = req.activeCompanyId;
+    const { id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel } = req.body;
@@ -7249,7 +7258,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
 app.put("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { company_id } = req.user;
+    const company_id = req.activeCompanyId;
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
@@ -7347,7 +7356,7 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
     }
     const updatePayload = status === "cancelled" ? { status, notes: cancel_reason } : { status };
     const { error } = await supabase.from("sales_orders")
-      .update(updatePayload).eq("id", req.params.id).eq("company_id", req.user.company_id);
+      .update(updatePayload).eq("id", req.params.id).eq("company_id", req.activeCompanyId);
     if (error) throw error;
     const data = await fetchFullAndSync(req.params.id);
     // Recalculate commission on status change (cancel claws back, confirm may enable)
@@ -7372,14 +7381,15 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
 app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     if (!["master", "manager", "company_admin"].includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const company_id = req.user.company_id;
+    const company_id = req.activeCompanyId;
     const { data: existing } = await supabase.from("sales_orders").select("order_number, status").eq("id", req.params.id).eq("company_id", company_id).single();
-    if (existing && existing.status === "delivered") {
+    if (!existing) return res.status(404).json({ error: "Order not found in this company" });
+    if (existing.status === "delivered") {
       return res.status(400).json({ error: "Cannot delete a delivered order." });
     }
     const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", company_id);
     if (error) throw error;
-    if (existing?.order_number) {
+    if (existing.order_number) {
       await supabase.from("orders").delete().eq("company_id", company_id).eq("so_number", existing.order_number);
     }
     res.json({ ok: true });
@@ -7392,11 +7402,11 @@ app.post("/sales-orders/upload-attachment", requireAuth, upload.single("file"), 
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No file uploaded" });
     const ext = file.originalname.split(".").pop();
-    const path = `order-attachments/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const path = `order-attachments/${req.activeCompanyId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
     if (upErr) {
       // Fallback: try catalogue-imports bucket if order-attachments doesn't exist
-      const fallbackPath = `order-attachments/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const fallbackPath = `order-attachments/${req.activeCompanyId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const { error: upErr2 } = await supabase.storage.from("catalogue-imports").upload(fallbackPath, file.buffer, { contentType: file.mimetype, upsert: false });
       if (upErr2) return res.status(500).json({ error: "Upload failed: " + upErr.message + " / fallback: " + upErr2.message });
       const { data: d2 } = supabase.storage.from("catalogue-imports").getPublicUrl(fallbackPath);
@@ -7413,7 +7423,7 @@ app.patch("/sales-orders/:id/signature", requireAuth, async (req, res) => {
     const { signature } = req.body;
     const { data, error } = await supabase.from("sales_orders")
       .update({ customer_signature: signature || null })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .eq("id", req.params.id).eq("company_id", req.activeCompanyId)
       .select("id, customer_signature").single();
     if (error) throw error;
     res.json({ ok: true, signature: data.customer_signature });
@@ -7447,7 +7457,7 @@ async function updatePOStatus(poId) {
 app.post("/sales-orders/:id/submit-po", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { company_id } = req.user;
+    const company_id = req.activeCompanyId;
     const { item_ids } = req.body;
 
     const { data: order } = await supabase.from("sales_orders")
