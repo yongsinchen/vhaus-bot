@@ -2997,7 +2997,7 @@ app.get("/permissions/users", requireAuth, async (req, res) => {
   try {
     if (req.activeRoleKey !== "MASTER") return res.status(403).json({ error: "Master only" });
     const { data: access } = await supabase.from("user_company_access")
-      .select("user_id, role_id, is_active, roles(role_key, role_name, level), users(id, name, email, salesman_name, is_active)")
+      .select("user_id, role_id, is_active, roles(role_key, role_name, level), users!user_company_access_user_id_fkey(id, name, email, salesman_name, is_active)")
       .eq("company_id", req.activeCompanyId).is("deleted_at", null);
     const users = (access || []).map(a => ({
       userId: a.user_id,
