@@ -3045,66 +3045,125 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
     const { data: user, error } = await supabase.from("users").select("*").eq("id", req.user.id).single();
     if (error || !user) return res.status(404).json({ error: "User not found" });
 
-    // Get primary company
+    // Get primary company (backward compat: "companies" field)
     let company = null;
     if (user.company_id) {
       const { data: companyData } = await supabase.from("companies").select("id, name, code").eq("id", user.company_id).single();
       company = companyData || null;
     }
 
-    // For master/manager: get all available companies they can access
+    // Get available companies from PermissionEngine
     let availableCompanies = [];
-    if (["master", "manager"].includes(user.role)) {
-      // Check user_company_roles first
-      const { data: roles } = await supabase.from("user_company_roles").select("company_id, role, companies(id, name, code)").eq("user_id", user.id).eq("active", true);
-      if (roles && roles.length > 0) {
-        availableCompanies = roles.map(r => ({ companyId: r.company_id, companyName: r.companies?.name, companyCode: r.companies?.code, roleName: r.role }));
+    try {
+      const engineCompanies = await permEngine.getUserCompanies(user.id);
+      if (engineCompanies && engineCompanies.length > 0) {
+        availableCompanies = engineCompanies.map(c => ({
+          companyId: c.companyId, companyName: c.companyName, companyCode: c.companyCode,
+          roleName: c.roleKey || c.roleName,
+        }));
       }
-      // Always include their primary company
-      if (company && !availableCompanies.find(c => c.companyId === company.id)) {
-        availableCompanies.unshift({ companyId: company.id, companyName: company.name, companyCode: company.code, roleName: user.role });
-      }
-      // For master with no roles set, show all active companies
-      if (user.role === "master" && availableCompanies.length <= 1) {
-        const { data: allCompanies } = await supabase.from("companies").select("id, name, code").eq("is_active", true);
-        availableCompanies = (allCompanies || []).map(c => ({ companyId: c.id, companyName: c.name, companyCode: c.code, roleName: "master" }));
-      }
+    } catch (e) { console.error("[auth/profile] getUserCompanies failed:", e.message); }
+
+    // Always include primary company
+    if (company && !availableCompanies.find(c => c.companyId === company.id)) {
+      availableCompanies.unshift({ companyId: company.id, companyName: company.name, companyCode: company.code, roleName: user.role });
     }
 
-    // Check X-Company-ID header for active company override
-    const headerCompanyId = req.headers["x-company-id"];
-    let activeCompanyId = user.company_id;
-    if (headerCompanyId && availableCompanies.find(c => c.companyId === headerCompanyId)) {
-      activeCompanyId = headerCompanyId;
+    // Master: if still only 1 company, show all active companies
+    if (user.role === "master" && availableCompanies.length <= 1) {
+      const { data: allCompanies } = await supabase.from("companies").select("id, name, code").eq("is_active", true);
+      availableCompanies = (allCompanies || []).map(c => ({ companyId: c.id, companyName: c.name, companyCode: c.code, roleName: "master" }));
     }
 
-    res.json({ ...user, companies: company, availableCompanies, activeCompanyId });
+    // Active company from requireAuth (already validated)
+    const activeCompanyId = req.activeCompanyId || user.company_id;
+
+    // Effective role + permissions from requireAuth
+    const effectiveRole = req.activeRoleKey || req.effectiveRoleKey || (user.role || "").toUpperCase();
+    let effectivePermissions = [];
+    if (req.effectivePermissions) {
+      effectivePermissions = Object.entries(req.effectivePermissions)
+        .filter(([, v]) => v.allowed).map(([k]) => k);
+    }
+
+    res.json({
+      ...user,
+      companies: company,           // backward compat
+      availableCompanies,            // backward compat format
+      activeCompanyId,               // backward compat
+      effectiveRole,                 // NEW
+      effectivePermissions,          // NEW
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /auth/switch-company — switch active company context
+// POST /auth/switch-company — switch active company context via PermissionEngine
 app.post("/auth/switch-company", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.body;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
-    // Verify user has access to this company
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRe.test(company_id)) return res.status(403).json({ error: "Invalid company_id format" });
+
     const user = req.user;
-    if (user.role === "master") {
-      // Master can access any company
-      const { data: comp } = await supabase.from("companies").select("id, name").eq("id", company_id).eq("is_active", true).single();
-      if (!comp) return res.status(404).json({ error: "Company not found" });
-      return res.json({ activeCompanyId: company_id, activeRoleKey: "master", permissions: {} });
+
+    // Try PermissionEngine first
+    const ctx = await permEngine.resolveCompanyContext(user.id, company_id);
+    if (ctx) {
+      // Load permissions for the switched company
+      const perms = await permEngine.computePermissions(user.id, company_id);
+      const allowed = perms ? Object.entries(perms.permissions).filter(([, v]) => v.allowed).map(([k]) => k) : [];
+      return res.json({
+        activeCompanyId: ctx.companyId,
+        activeRoleKey: ctx.roleKey,
+        effectiveRole: ctx.roleKey,
+        effectivePermissions: allowed,
+        company: { id: ctx.companyId },
+      });
     }
-    // Check user_company_roles
-    const { data: role } = await supabase.from("user_company_roles").select("role").eq("user_id", user.id).eq("company_id", company_id).eq("active", true).maybeSingle();
-    if (!role && user.company_id !== company_id) return res.status(403).json({ error: "No access to this company" });
-    res.json({ activeCompanyId: company_id, activeRoleKey: role?.role || user.role, permissions: {} });
+
+    // Legacy master bypass
+    if (user.role === "master") {
+      const { data: comp } = await supabase.from("companies")
+        .select("id, name, code, organization_id, organizations(is_active)")
+        .eq("id", company_id).eq("is_active", true).maybeSingle();
+      if (!comp) return res.status(403).json({ error: "Company not found or inactive" });
+      if (comp.organizations && comp.organizations.is_active === false) return res.status(403).json({ error: "Organization inactive" });
+      const masterPerms = [...ALL_ACTION_KEYS];
+      return res.json({
+        activeCompanyId: company_id,
+        activeRoleKey: "MASTER",
+        effectiveRole: "MASTER",
+        effectivePermissions: masterPerms,
+        company: { id: comp.id, name: comp.name, code: comp.code },
+      });
+    }
+
+    // Own company fallback
+    if (company_id === user.company_id) {
+      const perms = await permEngine.computePermissions(user.id, company_id);
+      const allowed = perms ? Object.entries(perms.permissions).filter(([, v]) => v.allowed).map(([k]) => k) : [];
+      return res.json({
+        activeCompanyId: company_id,
+        activeRoleKey: perms?.roleKey || (user.role || "").toUpperCase(),
+        effectiveRole: perms?.roleKey || (user.role || "").toUpperCase(),
+        effectivePermissions: allowed,
+      });
+    }
+
+    return res.status(403).json({ error: "No access to this company" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // GET /permissions/effective — returns effective permissions for current context
 app.get("/permissions/effective", requireAuth, async (req, res) => {
-  res.json({ permissions: {}, activeCompanyId: req.user.company_id, roleKey: req.user.role });
+  const perms = req.effectivePermissions;
+  const allowed = perms ? Object.entries(perms).filter(([, v]) => v.allowed).map(([k]) => k) : [];
+  res.json({
+    permissions: allowed,
+    activeCompanyId: req.activeCompanyId || req.user.company_id,
+    roleKey: req.activeRoleKey || req.effectiveRoleKey || req.user.role,
+  });
 });
 
 // ── DO Review API ────────────────────────────────────────────────
