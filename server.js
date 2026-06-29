@@ -6,6 +6,9 @@ const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
 const multer = require("multer");
 
+const { PermissionEngine } = require("./permission-engine");
+const { MODULE_REGISTRY, ALL_ACTION_KEYS } = require("./module-registry");
+
 const app = express();
 
 // ── CORS — must be before all routes ─────────────────────────────
@@ -22,6 +25,7 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+const permEngine = new PermissionEngine(supabase);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
@@ -39,12 +43,37 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
     if (authErr || !authUser) return res.status(401).json({ error: "Invalid token" });
     const { data: profile } = await supabase
       .from("users")
-      .select("id, role, company_id, branch_id, is_active")
+      .select("id, role, company_id, branch_id, name, salesman_name, is_active")
       .eq("id", authUser.id)
       .single();
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     if (!allowedRoles.includes(profile.role)) return res.status(403).json({ error: "Insufficient permissions" });
     req.user = profile;
+    // Resolve company context via engine (same as requireAuth)
+    const headerCid = req.headers["x-company-id"] || null;
+    const requestedCid = headerCid || profile.company_id;
+    try {
+      const ctx = await permEngine.resolveCompanyContext(profile.id, requestedCid);
+      if (ctx) {
+        req.activeCompanyId = ctx.companyId;
+        req._validatedCompanyId = ctx.companyId;
+        req.activeRoleKey = ctx.roleKey;
+        req.activeRoleLevel = ctx.roleLevel;
+      } else if (profile.role === "master" && headerCid) {
+        req.activeCompanyId = headerCid;
+        req._validatedCompanyId = headerCid;
+        req.activeRoleKey = "MASTER";
+        req.activeRoleLevel = 100;
+      } else {
+        req.activeCompanyId = profile.company_id;
+        req._validatedCompanyId = profile.company_id;
+        req.activeRoleKey = (profile.role || "").toUpperCase();
+      }
+    } catch (e) {
+      req.activeCompanyId = profile.company_id;
+      req._validatedCompanyId = profile.company_id;
+      req.activeRoleKey = (profile.role || "").toUpperCase();
+    }
     next();
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -52,11 +81,9 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
 };
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
 
-// Derive active company_id — pre-validated by requireAuth middleware
-// No header → user's own company. Invalid/unauthorized header → blocked in middleware (403).
+// Derive active company_id — resolved by PermissionEngine in requireAuth
 function getActiveCompanyId(req) {
-  if (req._validatedCompanyId) return req._validatedCompanyId;
-  return req.user?.company_id || null;
+  return req.activeCompanyId || req._validatedCompanyId || req.user?.company_id || null;
 }
 const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
@@ -75,21 +102,61 @@ const requireAuth = async (req, res, next) => {
     if (profErr) return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     req.user = profile;
-    // Validate X-Company-ID header — 403 if invalid/unauthorized
-    const headerCid = req.headers["x-company-id"];
-    if (headerCid && headerCid !== profile.company_id) {
-      const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      if (!uuidRe.test(headerCid)) return res.status(403).json({ error: "Invalid X-Company-ID format" });
-      if (profile.role === "master") {
-        const { data: comp } = await supabase.from("companies").select("id").eq("id", headerCid).eq("is_active", true).maybeSingle();
-        if (!comp) return res.status(403).json({ error: "Company not found or inactive" });
-        req._validatedCompanyId = headerCid;
+
+    // Resolve company context via PermissionEngine
+    const headerCid = req.headers["x-company-id"] || null;
+    const requestedCid = headerCid || profile.company_id;
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (headerCid && !uuidRe.test(headerCid)) return res.status(403).json({ error: "Invalid X-Company-ID format" });
+
+    try {
+      const ctx = await permEngine.resolveCompanyContext(profile.id, requestedCid);
+      if (ctx) {
+        req.activeCompanyId = ctx.companyId;
+        req._validatedCompanyId = ctx.companyId;
+        req.activeRoleKey = ctx.roleKey;
+        req.activeRoleLevel = ctx.roleLevel;
+        req.activeBranches = ctx.branches;
+        req.primaryBranchId = ctx.primaryBranchId;
+        req.availableCompanies = ctx.allAccess;
+      } else if (headerCid && headerCid !== profile.company_id) {
+        // Engine found no access — check legacy master bypass
+        if (profile.role === "master") {
+          const { data: comp } = await supabase.from("companies").select("id").eq("id", headerCid).eq("is_active", true).maybeSingle();
+          if (!comp) return res.status(403).json({ error: "Company not found or inactive" });
+          req.activeCompanyId = headerCid;
+          req._validatedCompanyId = headerCid;
+          req.activeRoleKey = "MASTER";
+          req.activeRoleLevel = 100;
+        } else {
+          return res.status(403).json({ error: "No access to selected company" });
+        }
       } else {
-        const { data: role } = await supabase.from("user_company_roles").select("id").eq("user_id", profile.id).eq("company_id", headerCid).eq("active", true).maybeSingle();
-        if (!role) return res.status(403).json({ error: "No access to selected company" });
-        req._validatedCompanyId = headerCid;
+        // No engine context, no header switch — legacy fallback
+        req.activeCompanyId = profile.company_id;
+        req._validatedCompanyId = profile.company_id;
+        req.activeRoleKey = (profile.role || "").toUpperCase();
+        req.activeRoleLevel = 0;
       }
+    } catch (engineErr) {
+      // Engine failure must NOT silently bypass — fail closed
+      console.error("[PermissionEngine] resolveCompanyContext failed:", engineErr.message);
+      return res.status(500).json({ error: "Permission resolution failed" });
     }
+
+    // Load effective permissions (non-blocking for now — cached)
+    try {
+      const perms = await permEngine.computePermissions(profile.id, req.activeCompanyId);
+      if (perms) {
+        req.effectivePermissions = perms.permissions;
+        req.effectiveRoleKey = perms.roleKey;
+      }
+    } catch (permErr) {
+      // Permission load failure — log but don't block (requireRole still works as guard)
+      console.error("[PermissionEngine] computePermissions failed:", permErr.message);
+      req.effectivePermissions = null;
+    }
+
     next();
   } catch (err) { res.status(500).json({ error: err.message }); }
 };
