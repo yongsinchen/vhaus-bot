@@ -53,6 +53,12 @@ async function migrate() {
     .eq("type", "Service").order("created_at");
   console.log(`Legacy service orders: ${(legacyServices || []).length}`);
 
+  // Get a fallback user (master/manager) for created_by when legacy order has none
+  const { data: fallbackUser } = await supabase.from("users").select("id").in("role", ["master", "manager"]).eq("is_active", true).limit(1).single();
+  const fallbackUserId = fallbackUser?.id || null;
+  console.log(`Fallback user: ${fallbackUserId || "NONE"}`);
+
+
   // Load existing services to check duplicates
   const { data: existingServices } = await supabase.from("services").select("id, legacy_order_id");
   const migratedIds = new Set((existingServices || []).filter(s => s.legacy_order_id).map(s => s.legacy_order_id));
@@ -94,7 +100,7 @@ async function migrate() {
       customer_address: order.address || null,
       priority: "normal",
       due_date: scheduledDate,
-      created_by: order.created_by_user_id || null,
+      created_by: order.created_by_user_id || order.main_salesman_user_id || fallbackUserId,
       created_at: order.created_at || new Date().toISOString(),
     };
 
