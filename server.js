@@ -124,7 +124,9 @@ const requireAuth = async (req, res, next) => {
         req.primaryBranchId = ctx.primaryBranchId;
         req.availableCompanies = ctx.allAccess;
       } else if (headerCid && headerCid !== profile.company_id) {
-        // Engine found no access — check legacy master bypass
+        // Engine found no access for header company.
+        // Master: try legacy bypass. Non-master: fallback to own company (stale localStorage).
+        // Hard 403 only comes from explicit POST /auth/switch-company.
         if (profile.role === "master") {
           const { data: comp } = await supabase.from("companies")
             .select("id, organization_id, organizations(is_active)")
@@ -143,7 +145,24 @@ const requireAuth = async (req, res, next) => {
           req.effectivePermissions = masterPerms;
           req.effectiveRoleKey = "MASTER";
         } else {
-          return res.status(403).json({ error: "No access to selected company" });
+          // Non-master with stale/unauthorized header: fallback to own company
+          // (Don't 403 on passive auth — user may have stale localStorage from another account)
+          console.warn(`[requireAuth] User ${profile.id} has no access to ${headerCid}, falling back to ${profile.company_id}`);
+          const fallbackCtx = await permEngine.resolveCompanyContext(profile.id, profile.company_id);
+          if (fallbackCtx) {
+            req.activeCompanyId = fallbackCtx.companyId;
+            req._validatedCompanyId = fallbackCtx.companyId;
+            req.activeRoleKey = fallbackCtx.roleKey;
+            req.activeRoleLevel = fallbackCtx.roleLevel;
+            req.activeBranches = fallbackCtx.branches;
+            req.primaryBranchId = fallbackCtx.primaryBranchId;
+            req.availableCompanies = fallbackCtx.allAccess;
+          } else {
+            req.activeCompanyId = profile.company_id;
+            req._validatedCompanyId = profile.company_id;
+            req.activeRoleKey = (profile.role || "").toUpperCase();
+            req.activeRoleLevel = 0;
+          }
         }
       } else {
         // No engine context, no header switch — legacy fallback

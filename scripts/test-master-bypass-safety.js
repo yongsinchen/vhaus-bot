@@ -38,10 +38,10 @@ async function run() {
   console.log("── 1. Only master role triggers bypass ──");
   assert("Bypass checks profile.role === 'master'",
     serverCode.includes('profile.role === "master"'));
-  // Verify non-master path returns 403
-  assert("Non-master path returns 403",
-    serverCode.includes('"No access to selected company"'));
-  // Verify the else branch is 403, not a fallback
+  // Verify non-master path falls back to own company (not 403 — stale localStorage recovery)
+  assert("Non-master with stale header falls back to own company",
+    serverCode.includes("falling back to") && serverCode.includes("profile.company_id"));
+  // Verify the else branch handles fallback safely
   const bypassBlock = serverCode.match(/Engine found no access.*?else \{[^}]*\}/s);
   assert("Non-master else clause contains 403 status",
     bypassBlock && bypassBlock[0].includes("res.status(403)"));
@@ -136,9 +136,9 @@ async function run() {
 
     if (!access) {
       assert(`Non-master '${nonMaster.name}' has no access to '${otherComp.name}'`, true);
-      // Code path: engine returns null → not master → 403
-      assert("Code path: engine null + not master → 403 (verified via code)",
-        serverCode.includes('"No access to selected company"'));
+      // Code path: engine returns null → not master → fallback to own company
+      assert("Code path: engine null + not master → fallback to own company",
+        serverCode.includes("falling back to"));
     } else {
       console.log(`  ℹ️  ${nonMaster.name} has access to ${otherComp.name} via user_company_access — bypass not needed`);
       assert("Non-master with access uses engine path (not bypass)", true);
@@ -147,9 +147,12 @@ async function run() {
     skipped("Non-master test", "No suitable test users");
   }
 
-  // Verify the code structure: the else clause ONLY has 403
-  const elseBlock = serverCode.match(/} else \{\s*return res\.status\(403\)\.json\(\{ error: "No access to selected company" \}\);/);
-  assert("Else clause is strictly 403 — no fallback, no bypass", !!elseBlock);
+  // Verify the else clause falls back to own company with engine resolution
+  assert("Else clause resolves fallback via permEngine",
+    serverCode.includes("permEngine.resolveCompanyContext(profile.id, profile.company_id)"));
+  // Hard 403 only in POST /auth/switch-company (explicit switch)
+  assert("POST /switch-company still returns 403 for unauthorized",
+    /switch-company[\s\S]*?"No access to this company"/.test(serverCode));
 
   // Summary
   console.log(`\n${"═".repeat(60)}`);
