@@ -2943,13 +2943,67 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
   try {
     const { data: user, error } = await supabase.from("users").select("*").eq("id", req.user.id).single();
     if (error || !user) return res.status(404).json({ error: "User not found" });
+
+    // Get primary company
     let company = null;
     if (user.company_id) {
       const { data: companyData } = await supabase.from("companies").select("id, name, code").eq("id", user.company_id).single();
       company = companyData || null;
     }
-    res.json({ ...user, companies: company });
+
+    // For master/manager: get all available companies they can access
+    let availableCompanies = [];
+    if (["master", "manager"].includes(user.role)) {
+      // Check user_company_roles first
+      const { data: roles } = await supabase.from("user_company_roles").select("company_id, role, companies(id, name, code)").eq("user_id", user.id).eq("active", true);
+      if (roles && roles.length > 0) {
+        availableCompanies = roles.map(r => ({ id: r.company_id, name: r.companies?.name, code: r.companies?.code, role: r.role }));
+      }
+      // Always include their primary company
+      if (company && !availableCompanies.find(c => c.id === company.id)) {
+        availableCompanies.unshift({ id: company.id, name: company.name, code: company.code, role: user.role });
+      }
+      // For master with no roles set, show all active companies
+      if (user.role === "master" && availableCompanies.length <= 1) {
+        const { data: allCompanies } = await supabase.from("companies").select("id, name, code").eq("is_active", true);
+        availableCompanies = (allCompanies || []).map(c => ({ ...c, role: "master" }));
+      }
+    }
+
+    // Check X-Company-ID header for active company override
+    const headerCompanyId = req.headers["x-company-id"];
+    let activeCompanyId = user.company_id;
+    if (headerCompanyId && availableCompanies.find(c => c.id === headerCompanyId)) {
+      activeCompanyId = headerCompanyId;
+    }
+
+    res.json({ ...user, companies: company, availableCompanies, activeCompanyId });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /auth/switch-company — switch active company context
+app.post("/auth/switch-company", requireAuth, async (req, res) => {
+  try {
+    const { company_id } = req.body;
+    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    // Verify user has access to this company
+    const user = req.user;
+    if (user.role === "master") {
+      // Master can access any company
+      const { data: comp } = await supabase.from("companies").select("id, name").eq("id", company_id).eq("is_active", true).single();
+      if (!comp) return res.status(404).json({ error: "Company not found" });
+      return res.json({ activeCompanyId: company_id, activeRoleKey: "master", permissions: {} });
+    }
+    // Check user_company_roles
+    const { data: role } = await supabase.from("user_company_roles").select("role").eq("user_id", user.id).eq("company_id", company_id).eq("active", true).maybeSingle();
+    if (!role && user.company_id !== company_id) return res.status(403).json({ error: "No access to this company" });
+    res.json({ activeCompanyId: company_id, activeRoleKey: role?.role || user.role, permissions: {} });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/effective — returns effective permissions for current context
+app.get("/permissions/effective", requireAuth, async (req, res) => {
+  res.json({ permissions: {}, activeCompanyId: req.user.company_id, roleKey: req.user.role });
 });
 
 // ── DO Review API ────────────────────────────────────────────────
