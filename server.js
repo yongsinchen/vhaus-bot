@@ -7623,6 +7623,10 @@ app.patch("/user-roles/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     const { data, error } = await supabase.from("user_company_access").update(updates)
       .eq("id", req.params.id).select("*, roles(role_key, role_name), companies(name, code)").single();
     if (error) throw error;
+    // Sync legacy users.role field when role changes
+    if (role_id && data?.roles?.role_key) {
+      await supabase.from("users").update({ role: data.roles.role_key.toLowerCase() }).eq("id", existing.user_id);
+    }
     permEngine.invalidate(existing.user_id, existing.company_id);
     permEngine.logEvent(existing.company_id, req.user.id, "user_role.updated", "user_company_access", req.params.id, updates, req);
     res.json({ access: data });
