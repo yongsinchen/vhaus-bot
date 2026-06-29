@@ -3330,9 +3330,10 @@ app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) =>
 });
 
 app.get("/services", requireAuth, async (req, res) => {
-  const { company_id, salesman, status } = req.query;
+  const { salesman, status } = req.query;
+  const cid = getActiveCompanyId(req);
   let query = supabase.from("orders").select("*").eq("type", "Service").order("created_at", { ascending: false });
-  if (company_id) query = query.eq("company_id", company_id);
+  if (cid) query = query.eq("company_id", cid);
   if (status) query = query.eq("status", status);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
@@ -3347,7 +3348,8 @@ app.get("/services", requireAuth, async (req, res) => {
 // ── Customer Database ────────────────────────────────────────────
 app.get("/customers", requireAuth, async (req, res) => {
   try {
-    const { company_id, search, limit = 50 } = req.query;
+    const { search, limit = 50 } = req.query;
+    const cid = getActiveCompanyId(req);
     // Salesman: only show customers from their orders
     if (req.user.role === "salesman" && req.user.salesman_name) {
       const name = req.user.salesman_name;
@@ -3361,7 +3363,7 @@ app.get("/customers", requireAuth, async (req, res) => {
       return res.json({ customers: data || [], total: count || 0 });
     }
     let q = supabase.from("customers").select("*", { count: "exact" }).order("name").limit(Number(limit));
-    if (company_id) q = q.eq("company_id", company_id);
+    if (cid) q = q.eq("company_id", cid);
     if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
     const { data, count, error } = await q;
     if (error) throw error;
@@ -3501,9 +3503,10 @@ app.get("/payments", requireAuth, async (req, res) => {
 // ── Product Incentives ──────────────────────────────────────────
 app.get("/product-incentives", requireAuth, async (req, res) => {
   try {
-    const { company_id, active_only } = req.query;
+    const { active_only } = req.query;
+    const cid = getActiveCompanyId(req);
     let q = supabase.from("product_incentives").select("*").order("product_name");
-    if (company_id) q = q.eq("company_id", company_id);
+    if (cid) q = q.eq("company_id", cid);
     if (active_only === "true") q = q.eq("is_active", true);
     const { data } = await q;
     res.json({ incentives: data || [] });
@@ -3551,8 +3554,10 @@ app.delete("/product-incentives/:id", requireRole(["master", "manager"]), async 
 // Commission Rules CRUD
 app.get("/commission-rules", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    const { data } = await supabase.from("commission_rules").select("*").eq("company_id", company_id).eq("is_active", true).order("role_name").order("min_net");
+    const cid = getActiveCompanyId(req);
+    let q = supabase.from("commission_rules").select("*").eq("is_active", true).order("role_name").order("min_net");
+    if (cid) q = q.eq("company_id", cid);
+    const { data } = await q;
     res.json({ rules: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3994,8 +3999,10 @@ async function autoMatchTransactions(uploadId, companyId) {
 
 app.get("/statements", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    const { data } = await supabase.from("statement_uploads").select("*").eq("company_id", company_id).order("created_at", { ascending: false });
+    const cid = getActiveCompanyId(req);
+    let q = supabase.from("statement_uploads").select("*").order("created_at", { ascending: false });
+    if (cid) q = q.eq("company_id", cid);
+    const { data } = await q;
     res.json({ uploads: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4062,10 +4069,10 @@ app.post("/statements/:id/reconcile", requireRole(MANAGE_ROLES), async (req, res
 // ── Aging Report ────────────────────────────────────────────────
 app.get("/aging-report", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     let ordQ = supabase.from("orders").select("id, so_number, customer_name, contact, order_amount, balance, status, created_at, delivery_date, customer_id, salesman")
-      .eq("company_id", company_id).gt("balance", 0)
+      .eq("company_id", cid).gt("balance", 0)
       .not("status", "in", '("Cancelled")');
     // Salesman: only their orders
     if (req.user.role === "salesman" && req.user.salesman_name) {
@@ -4107,9 +4114,10 @@ const SERVICE_TYPES = { 1: "Warranty Repair", 2: "Assembly/Installation", 3: "Ex
 
 app.get("/service-cases", requireAuth, async (req, res) => {
   try {
-    const { company_id, status } = req.query;
+    const { status } = req.query;
+    const cid = getActiveCompanyId(req);
     let q = supabase.from("services").select("*").order("created_at", { ascending: false });
-    if (company_id) q = q.eq("company_id", company_id);
+    if (cid) q = q.eq("company_id", cid);
     if (status) q = q.eq("status", status);
     const { data, error } = await q;
     if (error) throw error;
@@ -4486,9 +4494,9 @@ Please contact your manager to set up your account.`);
 // ── Company Settings ─────────────────────────────────────────────
 app.get("/company-settings", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
-    const { data } = await supabase.from("company_settings").select("*").eq("company_id", company_id).maybeSingle();
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
+    const { data } = await supabase.from("company_settings").select("*").eq("company_id", cid).maybeSingle();
     res.json({ settings: data || {} });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4516,9 +4524,9 @@ app.post("/company-settings", requireRole(MANAGE_ROLES), async (req, res) => {
 // ── Warehouses CRUD ──────────────────────────────────────────────
 app.get("/warehouses", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
-    const { data, error } = await supabase.from("warehouses").select("*").eq("company_id", company_id).eq("is_active", true).order("name");
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
+    const { data, error } = await supabase.from("warehouses").select("*").eq("company_id", cid).eq("is_active", true).order("name");
     if (error) throw error;
     res.json({ warehouses: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4908,15 +4916,16 @@ app.patch("/packings/:id/load", ...requirePerm(PERMS.WAREHOUSE_LOAD), async (req
 // ── Delivery Teams ──────────────────────────────────────────────
 app.get("/delivery-teams", requireAuth, async (req, res) => {
   try {
-    const { company_id, date } = req.query;
+    const { date } = req.query;
+    const cid = getActiveCompanyId(req);
     let q = supabase.from("delivery_teams").select("*, delivery_vehicles(vehicle_plate, vehicle_type), driver:users!delivery_teams_driver_id_fkey(name), helper:users!delivery_teams_helper_id_fkey(name)").order("created_at");
-    if (company_id) q = q.eq("company_id", company_id);
+    if (cid) q = q.eq("company_id", cid);
     if (date) q = q.eq("team_date", date);
     const { data, error } = await q;
     if (error) {
       // Fallback without joins if FK not detected
       let q2 = supabase.from("delivery_teams").select("*").order("created_at");
-      if (company_id) q2 = q2.eq("company_id", company_id);
+      if (cid) q2 = q2.eq("company_id", cid);
       if (date) q2 = q2.eq("team_date", date);
       const { data: d2 } = await q2;
       return res.json({ teams: d2 || [] });
@@ -5037,8 +5046,9 @@ app.delete("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async
 // ── Unified Pick List ───────────────────────────────────────────
 app.get("/unified-pick-list", requireAuth, async (req, res) => {
   try {
-    const { company_id, date, days = 3 } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { date, days = 3 } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     const startDate = date || new Date().toISOString().slice(0, 10);
     const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
     const seenSO = new Set();
@@ -5055,11 +5065,11 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
     }
 
     // Source 2: orders with delivery_date in range (text column, string compare works for YYYY-MM-DD)
-    console.log(`[pick-list] company=${company_id} range=${startDate} to ${endDate}`);
+    console.log(`[pick-list] company=${cid} range=${startDate} to ${endDate}`);
     // Fetch ALL upcoming orders for this company, filter delivery_date in JS to avoid text/date issues
     const { data: allOrders, error: ordErr } = await supabase.from("orders")
       .select("id, so_number, customer_name, delivery_date, status, items")
-      .eq("company_id", company_id)
+      .eq("company_id", cid)
       .in("status", ["Pending", "Confirmed", "In Progress"]);
     if (ordErr) console.error("[pick-list] orders query error:", ordErr.message);
     const orders = (allOrders || []).filter(o => {
@@ -5235,17 +5245,18 @@ app.patch("/package-labels/:id/store", ...requirePerm(PERMS.WAREHOUSE_RECEIVE), 
 // ── Pick List: items needed for upcoming deliveries ─────────────
 app.get("/pick-list", requireAuth, async (req, res) => {
   try {
-    const { company_id, date, days = 3 } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { date, days = 3 } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     const startDate = date || new Date().toISOString().slice(0, 10);
     const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
     // Get orders scheduled for delivery in date range
     const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, delivery_date, status, items")
-      .eq("company_id", company_id).gte("delivery_date", startDate).lte("delivery_date", endDate)
+      .eq("company_id", cid).gte("delivery_date", startDate).lte("delivery_date", endDate)
       .in("status", ["Pending", "Confirmed", "In Progress"]);
     // Get package labels that are stored (ready to pick)
     const { data: allLabels } = await supabase.from("package_labels").select("*")
-      .eq("company_id", company_id).eq("status", "stored");
+      .eq("company_id", cid).eq("status", "stored");
     const labelMap = new Map();
     for (const l of (allLabels || [])) {
       const key = l.so_number?.toLowerCase();
@@ -5278,7 +5289,8 @@ app.patch("/package-labels/:id/pick", ...requirePerm(PERMS.WAREHOUSE_PICK), asyn
 // ── Loading List: packages for a specific delivery route ────────
 app.get("/loading-list", requireAuth, async (req, res) => {
   try {
-    const { company_id, route_id, date } = req.query;
+    const { route_id, date } = req.query;
+    const cid = getActiveCompanyId(req);
     if (!route_id && !date) return res.status(400).json({ error: "route_id or date required" });
     // Get orders on this route
     let orderIds = [];
@@ -5293,7 +5305,7 @@ app.get("/loading-list", requireAuth, async (req, res) => {
       soNumbers = (orders || []).map(o => ({ so: o.so_number, customer: o.customer_name }));
     } else if (date) {
       const { data: orders } = await supabase.from("orders").select("so_number, customer_name")
-        .eq("company_id", company_id).eq("delivery_date", date).in("status", ["Confirmed", "Out for Delivery"]);
+        .eq("company_id", cid).eq("delivery_date", date).in("status", ["Confirmed", "Out for Delivery"]);
       soNumbers = (orders || []).map(o => ({ so: o.so_number, customer: o.customer_name }));
     }
     // Get picked packages for these SOs
@@ -5459,15 +5471,16 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
 // ── Auto-Ready Check + Missing Item Alerts ──────────────────────
 app.get("/delivery-readiness", requireAuth, async (req, res) => {
   try {
-    const { company_id, date, days = 3 } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { date, days = 3 } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     const startDate = date || new Date().toISOString().slice(0, 10);
     const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
 
     // Get all orders with delivery_date in range
     const { data: allOrders } = await supabase.from("orders")
       .select("id, so_number, customer_name, delivery_date, status, items, balance")
-      .eq("company_id", company_id).in("status", ["Pending", "Confirmed", "In Progress"]);
+      .eq("company_id", cid).in("status", ["Pending", "Confirmed", "In Progress"]);
     const orders = (allOrders || []).filter(o => {
       const dd = (o.delivery_date || "").trim();
       return dd >= startDate && dd <= endDate;
@@ -5537,13 +5550,14 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
 // ── Smart Scheduling: area grouping + suggestions ───────────────
 app.get("/scheduling-suggest", requireAuth, async (req, res) => {
   try {
-    const { company_id, date } = req.query;
-    if (!company_id || !date) return res.status(400).json({ error: "company_id and date required" });
+    const { date } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid || !date) return res.status(400).json({ error: "company_id and date required" });
 
     // Get unassigned orders for this date
     const { data: allOrders } = await supabase.from("orders")
       .select("id, so_number, customer_name, address, delivery_date, status, items, balance, time_slot, order_area")
-      .eq("company_id", company_id).in("status", ["Pending", "Confirmed", "In Progress"]);
+      .eq("company_id", cid).in("status", ["Pending", "Confirmed", "In Progress"]);
     const orders = (allOrders || []).filter(o => (o.delivery_date || "").trim() === date);
 
     // Check which are already scheduled
@@ -5596,7 +5610,7 @@ app.get("/scheduling-suggest", requireAuth, async (req, res) => {
     }
 
     // Get vehicles for capacity reference
-    const { data: vehicles } = await supabase.from("delivery_vehicles").select("*").eq("company_id", company_id).eq("status", "Active");
+    const { data: vehicles } = await supabase.from("delivery_vehicles").select("*").eq("company_id", cid).eq("status", "Active");
 
     // Build suggestions: one team per area group
     const suggestions = Object.entries(areaGroups).map(([area, orders]) => ({
@@ -5641,11 +5655,12 @@ async function recordLeadTime(company_id, supplier_id, product_id, po_created_at
 
 app.get("/inventory", requireAuth, async (req, res) => {
   try {
-    const { company_id, warehouse_id, low_stock } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { warehouse_id, low_stock } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     let query = supabase.from("inventory")
       .select("*, products(id, code, name, color, size, unit_cost, reorder_point, suppliers(id, name)), warehouses(id, name, type)")
-      .eq("company_id", company_id);
+      .eq("company_id", cid);
     if (warehouse_id) query = query.eq("warehouse_id", warehouse_id);
     const { data, error } = await query;
     if (error) throw error;
@@ -5659,11 +5674,11 @@ app.get("/inventory", requireAuth, async (req, res) => {
 
 app.get("/inventory/summary", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     const { data, error } = await supabase.from("inventory")
       .select("product_id, quantity, reserved_qty, products(id, code, name, color, size, reorder_point)")
-      .eq("company_id", company_id);
+      .eq("company_id", cid);
     if (error) throw error;
     const grouped = {};
     (data || []).forEach(r => {
@@ -5704,11 +5719,12 @@ app.post("/inventory/transfer", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.get("/stock-movements", requireAuth, async (req, res) => {
   try {
-    const { company_id, warehouse_id, type, limit: lim } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { warehouse_id, type, limit: lim } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     let query = supabase.from("stock_movements")
       .select("*, products(code, name), warehouses(name)")
-      .eq("company_id", company_id)
+      .eq("company_id", cid)
       .order("created_at", { ascending: false })
       .limit(Number(lim) || 100);
     if (warehouse_id) query = query.eq("warehouse_id", warehouse_id);
@@ -5759,9 +5775,10 @@ app.post("/inventory/import", requireRole(MANAGE_ROLES), upload.single("file"), 
 // ── Spec Options Library ─────────────────────────────────────────
 app.get("/spec-options", requireAuth, async (req, res) => {
   try {
-    const { company_id, label } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
-    let query = supabase.from("spec_options").select("*").eq("company_id", company_id).order("label").order("value");
+    const { label } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
+    let query = supabase.from("spec_options").select("*").eq("company_id", cid).order("label").order("value");
     if (label) query = query.eq("label", label);
     const { data, error } = await query;
     if (error) throw error;
@@ -5771,10 +5788,10 @@ app.get("/spec-options", requireAuth, async (req, res) => {
 
 app.get("/spec-options/pending", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     const { data, error } = await supabase.from("spec_options").select("*")
-      .eq("company_id", company_id).eq("is_approved", false).order("created_at", { ascending: false });
+      .eq("company_id", cid).eq("is_approved", false).order("created_at", { ascending: false });
     if (error) throw error;
     res.json({ options: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5824,9 +5841,9 @@ app.patch("/spec-options/:id/approve", ...requirePerm(PERMS.PRODUCTS_EDIT), asyn
 // ── Branches CRUD ────────────────────────────────────────────────
 app.get("/branches", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
+    const cid = getActiveCompanyId(req);
     let query = supabase.from("branches").select("id, name, company_id").order("name");
-    if (company_id) query = query.eq("company_id", company_id);
+    if (cid) query = query.eq("company_id", cid);
     const { data, error } = await query;
     if (error) throw error;
     res.json({ branches: data || [] });
@@ -5864,9 +5881,9 @@ app.delete("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async
 // ── GET /suppliers ───────────────────────────────────────────────
 app.get("/suppliers", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
+    const cid = getActiveCompanyId(req);
     let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at").order("name");
-    if (company_id) query = query.eq("company_id", company_id);
+    if (cid) query = query.eq("company_id", cid);
     const { data, error } = await query;
     if (error) throw error;
     res.json({ suppliers: data || [] });
@@ -5944,9 +5961,9 @@ app.delete("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, r
 // ── GET /categories ──────────────────────────────────────────────
 app.get("/categories", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.query;
+    const cid = getActiveCompanyId(req);
     let query = supabase.from("product_categories").select("id, name, parent_id, spec_labels, created_at").order("name");
-    if (company_id) query = query.eq("company_id", company_id);
+    if (cid) query = query.eq("company_id", cid);
     const { data, error } = await query;
     if (error) throw error;
     res.json({ categories: data || [] });
@@ -5990,13 +6007,14 @@ app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, r
 // ── GET /products ────────────────────────────────────────────────
 app.get("/products", requireAuth, async (req, res) => {
   try {
-    const { company_id, search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
+    const { search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
+    const cid = getActiveCompanyId(req);
     let query = supabase
       .from("products")
       .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
-    if (company_id) query = query.eq("company_id", company_id);
+    if (cid) query = query.eq("company_id", cid);
     if (search) query = query.or(`name.ilike.%${search}%,code.ilike.%${search}%`);
     if (supplier_id) query = query.eq("supplier_id", supplier_id);
     if (category_id) query = query.eq("category_id", category_id);
