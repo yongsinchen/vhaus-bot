@@ -7155,12 +7155,14 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
       color: it.color || null,
       is_custom: it.is_custom === true,
       custom_dimensions: it.custom_dimensions || null,
+      custom_specs: it.custom_specs || null,
       quantity: Number(it.quantity) || 1,
       unit_price: it.unit_price ?? null,
       unit_cost: it.unit_cost ?? null,
       line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
       attachment_url: it.attachment_url || null,
       notes: it.notes || null,
+      requires_product_review: !it.product_id ? true : false,
     }));
     const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
     if (itemsErr) throw itemsErr;
@@ -7242,9 +7244,11 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         order_id: id, product_id: it.product_id || null, product_code: it.product_code || null,
         product_name: it.product_name || null, size: it.size || null, color: it.color || null,
         is_custom: it.is_custom === true, custom_dimensions: it.custom_dimensions || null,
+        custom_specs: it.custom_specs || null,
         quantity: Number(it.quantity) || 1, unit_price: it.unit_price ?? null, unit_cost: it.unit_cost ?? null,
         line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
         attachment_url: it.attachment_url || null, notes: it.notes || null,
+        requires_product_review: !it.product_id ? true : false,
       }));
       const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
       if (itemsErr) throw itemsErr;
