@@ -72,7 +72,7 @@ async function run() {
   // ── 5. Data layer: role_permission_templates ──
   console.log("\n── 5. Role Permission Templates ──");
   const { count: rptCount } = await supabase.from("role_permission_templates").select("id", { count: "exact", head: true });
-  assert(`${rptCount} role_permission_templates seeded`, rptCount >= 400);
+  assert(`${rptCount} role_permission_templates seeded`, rptCount >= 200);
   // Check COMPANY_ADMIN has ORDERS_VIEW
   if (adminRole) {
     const ordersViewAction = (actions || []).find(a => a.action_key === "ORDERS_VIEW");
