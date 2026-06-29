@@ -4509,9 +4509,9 @@ app.get("/company-settings", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/company-settings", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/company-settings", ...requirePerm(PERMS.COMPANY_EDIT_SETTINGS), async (req, res) => {
   try {
-    const { company_id } = req.user;
+    const company_id = getActiveCompanyId(req);
     const { company_name, registration_no, address, hotline, bank_account, branches_display, work_start, work_end, base_address, countries, sales_channels } = req.body;
     const row = { company_id, company_name, registration_no, address, hotline, bank_account, branches_display, work_start: work_start || "09:00", work_end: work_end || "18:00", base_address, countries: countries || null, sales_channels: sales_channels || null, updated_at: new Date().toISOString() };
     const { data: existing } = await supabase.from("company_settings").select("id").eq("company_id", company_id).maybeSingle();
