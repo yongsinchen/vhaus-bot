@@ -4542,10 +4542,11 @@ app.get("/warehouses", requireAuth, async (req, res) => {
 
 app.post("/warehouses", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { name, type, address, pic, contact } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
     const { data, error } = await supabase.from("warehouses")
-      .insert({ company_id: req.user.company_id, name: name.trim(), type: type || "warehouse", address: address || null, pic: pic || null, contact: contact || null, is_active: true })
+      .insert({ company_id: cid, name: name.trim(), type: type || "warehouse", address: address || null, pic: pic || null, contact: contact || null, is_active: true })
       .select().single();
     if (error) throw error;
     res.status(201).json({ warehouse: data });
@@ -4554,9 +4555,10 @@ app.post("/warehouses", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) =
 
 app.put("/warehouses/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { name, type, address, pic, contact } = req.body;
     const { data, error } = await supabase.from("warehouses")
-      .update({ name: name?.trim(), type, address, pic: pic || null, contact: contact || null }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+      .update({ name: name?.trim(), type, address, pic: pic || null, contact: contact || null }).eq("id", req.params.id).eq("company_id", cid).select().single();
     if (error) throw error;
     res.json({ warehouse: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4564,7 +4566,8 @@ app.put("/warehouses/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res
 
 app.delete("/warehouses/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
-    await supabase.from("warehouses").update({ is_active: false }).eq("id", req.params.id).eq("company_id", req.user.company_id);
+    const cid = getActiveCompanyId(req);
+    await supabase.from("warehouses").update({ is_active: false }).eq("id", req.params.id).eq("company_id", cid);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4585,9 +4588,10 @@ app.get("/warehouses/:id/zones", requireAuth, async (req, res) => {
 
 app.post("/warehouses/:id/zones", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { name, description } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
-    const { data, error } = await supabase.from("warehouse_zones").insert({ warehouse_id: req.params.id, company_id: req.user.company_id, name: name.trim(), code: name.trim().substring(0, 10).toUpperCase().replace(/\s+/g, "-") }).select().single();
+    const { data, error } = await supabase.from("warehouse_zones").insert({ warehouse_id: req.params.id, company_id: cid, name: name.trim(), code: name.trim().substring(0, 10).toUpperCase().replace(/\s+/g, "-") }).select().single();
     if (error) throw error;
     res.status(201).json({ zone: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4637,6 +4641,7 @@ function generateQRCode() {
 
 app.post("/package-labels/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { supplier_delivery_id, items } = req.body;
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
     // Prevent duplicate label generation
@@ -4649,7 +4654,7 @@ app.post("/package-labels/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LAB
       const cartons = Number(item.carton_count) || 1;
       for (let c = 1; c <= cartons; c++) {
         labels.push({
-          company_id: req.user.company_id,
+          company_id: cid,
           supplier_delivery_id: supplier_delivery_id || null,
           product_id: item.product_id || null,
           product_code: item.product_code || null,
@@ -4723,6 +4728,7 @@ app.patch("/package-labels/:id/scan", ...requirePerm(PERMS.WAREHOUSE_SCAN), asyn
 
 app.post("/package-labels/confirm-all", ...requirePerm(PERMS.WAREHOUSE_SCAN), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { supplier_delivery_id, warehouse_id } = req.body;
     if (!supplier_delivery_id) return res.status(400).json({ error: "supplier_delivery_id required" });
     const { data: labels } = await supabase.from("package_labels")
@@ -4736,7 +4742,7 @@ app.post("/package-labels/confirm-all", ...requirePerm(PERMS.WAREHOUSE_SCAN), as
         const wh = warehouse_id || label.warehouse_id;
         if (wh) {
           const totalQty = (labels || []).filter(l => l.product_id === label.product_id).length;
-          await adjustStock(req.user.company_id, wh, label.product_id, totalQty, "in", "do", supplier_delivery_id, `DO received — ${label.product_name}`, req.user.id);
+          await adjustStock(cid, wh, label.product_id, totalQty, "in", "do", supplier_delivery_id, `DO received — ${label.product_name}`, req.user.id);
           stocked++;
         }
       }
@@ -4807,10 +4813,11 @@ app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), 
     const { data, error } = await supabase.from("order_item_packings").insert(packings).select();
     if (error) throw error;
     // Also create package_labels for backward compat (print uses them)
+    const cid = getActiveCompanyId(req);
     const labels = (data || []).map((p, i) => {
       const item = items[Math.min(Math.floor(i / (Number(items[0]?.carton_count) || 1)), items.length - 1)];
       return {
-        company_id: req.user.company_id,
+        company_id: cid,
         supplier_delivery_id: supplier_delivery_id || null,
         product_code: item.product_code || item.item_code || null,
         product_name: item.product_name || item.item_name || null,
@@ -4944,10 +4951,11 @@ app.get("/delivery-teams", requireAuth, async (req, res) => {
 
 app.post("/delivery-teams", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { vehicle_id, driver_id, helper_id, team_date } = req.body;
     if (!driver_id || !team_date) return res.status(400).json({ error: "driver_id and team_date required" });
     const { data, error } = await supabase.from("delivery_teams")
-      .insert({ company_id: req.user.company_id, vehicle_id, driver_id, helper_id: helper_id || null, team_date })
+      .insert({ company_id: cid, vehicle_id, driver_id, helper_id: helper_id || null, team_date })
       .select().single();
     if (error) throw error;
     res.status(201).json({ team: data });
@@ -5807,11 +5815,12 @@ app.get("/spec-options/pending", requireAuth, async (req, res) => {
 
 app.post("/spec-options", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { label, value, is_approved } = req.body;
     if (!label || !value) return res.status(400).json({ error: "label and value required" });
     const isAdmin = ["master", "manager", "company_admin"].includes(req.user.role);
     const { data, error } = await supabase.from("spec_options")
-      .upsert({ company_id: req.user.company_id, label: label.trim(), value: value.trim(), is_approved: is_approved !== undefined ? is_approved : isAdmin, added_by: req.user.id },
+      .upsert({ company_id: cid, label: label.trim(), value: value.trim(), is_approved: is_approved !== undefined ? is_approved : isAdmin, added_by: req.user.id },
         { onConflict: "company_id,label,value", ignoreDuplicates: true })
       .select().single();
     if (error && error.code !== "23505") throw error;
@@ -5821,9 +5830,10 @@ app.post("/spec-options", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) 
 
 app.put("/spec-options/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { value } = req.body;
     const { data, error } = await supabase.from("spec_options").update({ value: value.trim() })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+      .eq("id", req.params.id).eq("company_id", cid).select().single();
     if (error) throw error;
     res.json({ option: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5831,7 +5841,8 @@ app.put("/spec-options/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, re
 
 app.delete("/spec-options/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const { error } = await supabase.from("spec_options").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    const cid = getActiveCompanyId(req);
+    const { error } = await supabase.from("spec_options").delete().eq("id", req.params.id).eq("company_id", cid);
     if (error) throw error;
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5839,8 +5850,9 @@ app.delete("/spec-options/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req,
 
 app.patch("/spec-options/:id/approve", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { data, error } = await supabase.from("spec_options").update({ is_approved: true })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+      .eq("id", req.params.id).eq("company_id", cid).select().single();
     if (error) throw error;
     res.json({ option: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5862,8 +5874,9 @@ app.post("/branches", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (req,
   try {
     const { name, code } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
+    const cid = getActiveCompanyId(req);
     const branchCode = code || name.trim().toUpperCase().replace(/\s+/g, "_").slice(0, 20);
-    const { data, error } = await supabase.from("branches").insert({ company_id: req.user.company_id, name: name.trim(), code: branchCode }).select().single();
+    const { data, error } = await supabase.from("branches").insert({ company_id: cid, name: name.trim(), code: branchCode }).select().single();
     if (error) throw error;
     res.status(201).json({ branch: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5871,8 +5884,9 @@ app.post("/branches", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (req,
 
 app.put("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { name } = req.body;
-    const { data, error } = await supabase.from("branches").update({ name: name.trim() }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    const { data, error } = await supabase.from("branches").update({ name: name.trim() }).eq("id", req.params.id).eq("company_id", cid).select().single();
     if (error) throw error;
     res.json({ branch: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5880,7 +5894,8 @@ app.put("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (r
 
 app.delete("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (req, res) => {
   try {
-    const { error } = await supabase.from("branches").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    const cid = getActiveCompanyId(req);
+    const { error } = await supabase.from("branches").delete().eq("id", req.params.id).eq("company_id", cid);
     if (error) throw error;
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5911,11 +5926,12 @@ const parseColorMode = (v) => (v === "split" ? "split" : "combined");
 
 app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { name, code, contact, cost_divisor, color_mode } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
     const { data, error } = await supabase
       .from("suppliers")
-      .insert({ company_id: req.user.company_id, name: name.trim(), code: code?.trim() || null, contact: contact || null, cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode) })
+      .insert({ company_id: cid, name: name.trim(), code: code?.trim() || null, contact: contact || null, cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode) })
       .select().single();
     if (error) throw error;
     res.status(201).json({ supplier: data });
@@ -5924,6 +5940,7 @@ app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) 
 
 app.put("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { name, code, contact, cost_divisor, color_mode, is_active } = req.body;
     const patch = {};
     if (name !== undefined) patch.name = name.trim();
@@ -5935,7 +5952,7 @@ app.put("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res)
     const { data, error } = await supabase
       .from("suppliers")
       .update(patch)
-      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .eq("id", req.params.id).eq("company_id", cid)
       .select().single();
     if (error) throw error;
     if (!data) return res.status(404).json({ error: "Supplier not found" });
@@ -5947,7 +5964,7 @@ app.put("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res)
 // in which case those products are unassigned (supplier_id set to null) first.
 app.delete("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res) => {
   try {
-    const company_id = req.user.company_id;
+    const company_id = getActiveCompanyId(req);
     const id = req.params.id;
     const force = req.query.force === "true";
     const { count } = await supabase.from("products")
@@ -5980,11 +5997,12 @@ app.get("/categories", requireAuth, async (req, res) => {
 
 app.post("/categories", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { name, parent_id } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
     const { data, error } = await supabase
       .from("product_categories")
-      .insert({ company_id: req.user.company_id, name: name.trim(), parent_id: parent_id || null })
+      .insert({ company_id: cid, name: name.trim(), parent_id: parent_id || null })
       .select().single();
     if (error) throw error;
     res.status(201).json({ category: data });
@@ -5997,7 +6015,8 @@ app.put("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res)
     const { spec_labels } = req.body;
     const update = { name: name.trim(), parent_id: parent_id || null };
     if (spec_labels !== undefined) update.spec_labels = spec_labels;
-    const { data, error } = await supabase.from("product_categories").update(update).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+    const cid = getActiveCompanyId(req);
+    const { data, error } = await supabase.from("product_categories").update(update).eq("id", req.params.id).eq("company_id", cid).select().single();
     if (error) throw error;
     res.json({ category: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -6005,8 +6024,9 @@ app.put("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res)
 
 app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    await supabase.from("products").update({ category_id: null }).eq("category_id", req.params.id).eq("company_id", req.user.company_id);
-    const { error } = await supabase.from("product_categories").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
+    const cid = getActiveCompanyId(req);
+    await supabase.from("products").update({ category_id: null }).eq("category_id", req.params.id).eq("company_id", cid);
+    const { error } = await supabase.from("product_categories").delete().eq("id", req.params.id).eq("company_id", cid);
     if (error) throw error;
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -6036,10 +6056,11 @@ app.get("/products", requireAuth, async (req, res) => {
 
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: req.user.company_id, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true })
+      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -6051,10 +6072,11 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
 
 app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
     const { data, error } = await supabase.from("products")
       .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .eq("id", req.params.id).eq("company_id", cid)
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -6067,7 +6089,8 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
 
 app.patch("/products/:id/toggle", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const { data: existing } = await supabase.from("products").select("is_active").eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+    const cid = getActiveCompanyId(req);
+    const { data: existing } = await supabase.from("products").select("is_active").eq("id", req.params.id).eq("company_id", cid).single();
     if (!existing) return res.status(404).json({ error: "Product not found" });
     const { data, error } = await supabase.from("products").update({ is_active: !existing.is_active }).eq("id", req.params.id).select("id, is_active").single();
     if (error) throw error;
@@ -6078,7 +6101,7 @@ app.patch("/products/:id/toggle", ...requirePerm(PERMS.PRODUCTS_EDIT), async (re
 // DELETE /products/:id — remove a product (unlinks any catalogue import rows first)
 app.delete("/products/:id", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, res) => {
   try {
-    const company_id = req.user.company_id;
+    const company_id = getActiveCompanyId(req);
     const id = req.params.id;
     await supabase.from("catalogue_import_rows").update({ product_id: null }).eq("product_id", id);
     const { error } = await supabase.from("products").delete().eq("id", id).eq("company_id", company_id);
@@ -6093,7 +6116,7 @@ app.delete("/products/:id", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, r
 // POST /products/bulk-delete — remove many products at once. body: { ids: [] }
 app.post("/products/bulk-delete", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, res) => {
   try {
-    const company_id = req.user.company_id;
+    const company_id = getActiveCompanyId(req);
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "ids must be a non-empty array" });
     await supabase.from("catalogue_import_rows").update({ product_id: null }).in("product_id", ids);
@@ -6112,7 +6135,7 @@ app.post("/products/bulk-delete", ...requirePerm(PERMS.PRODUCTS_DELETE), async (
 // recomputes each product's unit_cost from its own unit_price.
 app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const company_id = req.user.company_id;
+    const company_id = getActiveCompanyId(req);
     const { ids, set = {}, cost_divisor } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "ids must be a non-empty array" });
 
@@ -6204,10 +6227,11 @@ app.post("/product-review-queue/link", ...requirePerm(PERMS.PRODUCTS_EDIT), asyn
 // POST create product from review queue then link
 app.post("/product-review-queue/create-and-link", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { item_ids, product_code, product_name, size, color, supplier_id, category_id, unit_cost, unit_price } = req.body;
     if (!item_ids || !product_name) return res.status(400).json({ error: "item_ids and product_name required" });
     const { data: product, error: pErr } = await supabase.from("products").insert({
-      company_id: req.user.company_id,
+      company_id: cid,
       code: (product_code || product_name.substring(0, 20)).toUpperCase().replace(/\s+/g, "-"),
       name: product_name, size: size || null, color: color || null,
       supplier_id: supplier_id || null, category_id: category_id || null,
