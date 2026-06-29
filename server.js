@@ -6145,9 +6145,12 @@ app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res
 // GET unmatched items grouped by product_name+product_code
 app.get("/product-review-queue", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const { data: items } = await supabase.from("sales_order_items")
-      .select("id, order_id, product_id, product_code, product_name, size, color, supplier_name, quantity, unit_price, requires_product_review, legacy_item_json")
+    const cid = getActiveCompanyId(req);
+    let rqQ = supabase.from("sales_order_items")
+      .select("id, order_id, product_id, product_code, product_name, size, color, supplier_name, quantity, unit_price, requires_product_review, legacy_item_json, sales_orders!inner(company_id)")
       .eq("requires_product_review", true).is("product_id", null);
+    if (cid) rqQ = rqQ.eq("sales_orders.company_id", cid);
+    const { data: items } = await rqQ;
     // Group by product_name + product_code
     const groups = {};
     for (const item of (items || [])) {
