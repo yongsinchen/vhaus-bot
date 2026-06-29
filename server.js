@@ -4215,6 +4215,18 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.delete("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { data: svc } = await supabase.from("services").select("id").eq("id", req.params.id).eq("company_id", cid).single();
+    if (!svc) return res.status(404).json({ error: "Service case not found" });
+    await supabase.from("service_part_claims").delete().eq("service_id", req.params.id);
+    await supabase.from("service_legs").delete().eq("service_id", req.params.id);
+    await supabase.from("services").delete().eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Service Legs
 app.patch("/service-legs/:id", requireRole([...MANAGE_ROLES, "driver", "operation"]), async (req, res) => {
   try {
