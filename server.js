@@ -51,6 +51,16 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
   }
 };
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
+
+// Derive active company_id from token or header — never trust query params blindly
+function getActiveCompanyId(req) {
+  const headerCid = req.headers["x-company-id"];
+  const userCid = req.user?.company_id;
+  // If header is set and user is master (can switch companies), use header
+  if (headerCid && req.user?.role === "master") return headerCid;
+  // Otherwise always use user's own company_id
+  return userCid || null;
+}
 const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
 
@@ -1633,7 +1643,8 @@ const handleDeliveryTemplate = async (chatId, text) => {
 
     await supabase.from("service_pending").insert({
       so_number: soNumber, driver, helper: helper || null,
-      date: date || null, note: note || null, status: "Pending"
+      date: date || null, note: note || null, status: "Pending",
+      company_id: order.company_id || null, branch_id: order.branch_id || null,
     });
 
     await sendMessage(chatId,
@@ -1734,10 +1745,10 @@ app.post("/order-trips/so/:soNumber/cancel-remaining", requireRole(MANAGE_ROLES)
 
 // GET /delivery/vehicles
 app.get("/delivery/vehicles", requireAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from("delivery_vehicles")
-    .select("*")
-    .order("created_at");
+  const cid = getActiveCompanyId(req);
+  let q = supabase.from("delivery_vehicles").select("*").order("created_at");
+  if (cid) q = q.eq("company_id", cid);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -1789,8 +1800,10 @@ app.delete("/delivery/vehicles/:id", requireRole(MANAGE_ROLES), async (req, res)
 app.get("/delivery/routes", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
-  const { data: routes, error: routeErr } = await supabase
-    .from("delivery_routes").select("*").eq("delivery_date", date).order("created_at");
+  const cid = getActiveCompanyId(req);
+  let rq = supabase.from("delivery_routes").select("*").eq("delivery_date", date).order("created_at");
+  if (cid) rq = rq.eq("company_id", cid);
+  const { data: routes, error: routeErr } = await rq;
   if (routeErr) return res.status(500).json({ error: routeErr.message });
   const routesWithOrders = await Promise.all(routes.map(async (route) => {
     const { data: routeOrders } = await supabase
@@ -1808,9 +1821,9 @@ app.get("/delivery/routes", requireAuth, async (req, res) => {
 app.get("/delivery/unassigned", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
-  const { company_id } = req.query;
+  const cid = getActiveCompanyId(req);
   let q = supabase.from("orders").select("*").eq("delivery_date", date).not("status", "in", '("Delivered","Cancelled")');
-  if (company_id) q = q.eq("company_id", company_id);
+  if (cid) q = q.eq("company_id", cid);
   const { data: orders, error: ordErr } = await q;
   if (ordErr) return res.status(500).json({ error: ordErr.message });
   // Exclude orders assigned via old delivery_route_orders
@@ -2571,11 +2584,10 @@ const handleDOPhoto = async (chatId, base64Image) => {
 
 // GET /service-pending
 app.get("/service-pending", requireAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from("service_pending")
-    .select("*")
-    .eq("status", "Pending")
-    .order("created_at", { ascending: false });
+  const cid = getActiveCompanyId(req);
+  let q = supabase.from("service_pending").select("*").eq("status", "Pending").order("created_at", { ascending: false });
+  if (cid) q = q.eq("company_id", cid);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -3010,11 +3022,10 @@ app.get("/permissions/effective", requireAuth, async (req, res) => {
 
 // GET /do-review — list all pending DO review items
 app.get("/do-review", requireAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from("do_review")
-    .select("*")
-    .eq("status", "Pending")
-    .order("created_at", { ascending: false });
+  const cid = getActiveCompanyId(req);
+  let q = supabase.from("do_review").select("*").eq("status", "Pending").order("created_at", { ascending: false });
+  if (cid) q = q.eq("company_id", cid);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
@@ -3948,7 +3959,10 @@ app.get("/service-cases", requireAuth, async (req, res) => {
 
 app.get("/service-cases/:id", requireAuth, async (req, res) => {
   try {
-    const { data: svc } = await supabase.from("services").select("*").eq("id", req.params.id).single();
+    const cid = getActiveCompanyId(req);
+    let sq = supabase.from("services").select("*").eq("id", req.params.id);
+    if (cid) sq = sq.eq("company_id", cid);
+    const { data: svc } = await sq.single();
     if (!svc) return res.status(404).json({ error: "Service not found" });
     // Load related data
     const [legsRes, tripsRes, claimsRes, orderRes] = await Promise.all([
@@ -4064,9 +4078,10 @@ app.patch("/service-part-claims/:id", requireRole(MANAGE_ROLES), async (req, res
 
 // ── Supplier Deliveries API ───────────────────────────────────────
 app.get("/supplier-deliveries", requireAuth, async (req, res) => {
-  const { company_id, supplier, from_date, to_date, status, limit = 100 } = req.query;
+  const { supplier, from_date, to_date, status, limit = 100 } = req.query;
+  const cid = getActiveCompanyId(req);
   let query = supabase.from("supplier_deliveries").select("*").order("created_at", { ascending: false }).limit(parseInt(limit));
-  if (company_id) query = query.eq("company_id", company_id);
+  if (cid) query = query.eq("company_id", cid);
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
   if (to_date) query = query.lte("do_date", to_date);
@@ -4464,9 +4479,10 @@ app.post("/package-labels/generate", requireRole(MANAGE_ROLES), async (req, res)
 
 app.get("/package-labels", requireAuth, async (req, res) => {
   try {
-    const { company_id, supplier_delivery_id, so_number, status } = req.query;
+    const { supplier_delivery_id, so_number, status } = req.query;
+    const cid = getActiveCompanyId(req);
     let query = supabase.from("package_labels").select("*").order("created_at", { ascending: false });
-    if (company_id) query = query.eq("company_id", company_id);
+    if (cid) query = query.eq("company_id", cid);
     if (supplier_delivery_id) query = query.eq("supplier_delivery_id", supplier_delivery_id);
     if (so_number) query = query.eq("so_number", so_number);
     if (status) query = query.eq("status", status);
