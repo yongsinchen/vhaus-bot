@@ -7,7 +7,7 @@ const OpenAI = require("openai");
 const multer = require("multer");
 
 const { PermissionEngine } = require("./permission-engine");
-const { MODULE_REGISTRY, ALL_ACTION_KEYS } = require("./module-registry");
+const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry");
 
 const app = express();
 
@@ -26,6 +26,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 const permEngine = new PermissionEngine(supabase);
+const requirePerm = (key) => [requireAuth, permEngine.requirePermission(key)];
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
@@ -1866,7 +1867,7 @@ app.get("/delivery/vehicles", requireAuth, async (req, res) => {
 });
 
 // POST /delivery/vehicles
-app.post("/delivery/vehicles", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/delivery/vehicles", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   const { driver_name, vehicle_plate, vehicle_type, status } = req.body;
   if (!driver_name && !vehicle_plate) return res.status(400).json({ error: "driver_name or vehicle_plate is required" });
   const { data, error } = await supabase
@@ -1879,7 +1880,7 @@ app.post("/delivery/vehicles", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // PATCH /delivery/vehicles/:id
-app.patch("/delivery/vehicles/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/delivery/vehicles/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   const { id } = req.params;
   const { driver_name, vehicle_plate, vehicle_type, status } = req.body;
   const updates = {};
@@ -1898,7 +1899,7 @@ app.patch("/delivery/vehicles/:id", requireRole(MANAGE_ROLES), async (req, res) 
 });
 
 // DELETE /delivery/vehicles/:id
-app.delete("/delivery/vehicles/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/delivery/vehicles/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   const { id } = req.params;
   const { error } = await supabase.from("delivery_vehicles").delete().eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
@@ -4523,7 +4524,7 @@ app.get("/warehouses", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/warehouses", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/warehouses", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     const { name, type, address, pic, contact } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
@@ -4535,7 +4536,7 @@ app.post("/warehouses", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/warehouses/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     const { name, type, address, pic, contact } = req.body;
     const { data, error } = await supabase.from("warehouses")
@@ -4545,7 +4546,7 @@ app.put("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/warehouses/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/warehouses/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     await supabase.from("warehouses").update({ is_active: false }).eq("id", req.params.id).eq("company_id", req.user.company_id);
     res.json({ ok: true });
@@ -4566,7 +4567,7 @@ app.get("/warehouses/:id/zones", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/warehouses/:id/zones", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/warehouses/:id/zones", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     const { name, description } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
@@ -4576,7 +4577,7 @@ app.post("/warehouses/:id/zones", requireRole(MANAGE_ROLES), async (req, res) =>
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/warehouse-zones/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/warehouse-zones/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     const { name, description } = req.body;
     const { data, error } = await supabase.from("warehouse_zones").update({ name: name?.trim(), description }).eq("id", req.params.id).select().single();
@@ -4585,7 +4586,7 @@ app.put("/warehouse-zones/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/warehouse-zones/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/warehouse-zones/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     await supabase.from("warehouse_racks").delete().eq("zone_id", req.params.id);
     await supabase.from("warehouse_zones").delete().eq("id", req.params.id);
@@ -4593,7 +4594,7 @@ app.delete("/warehouse-zones/:id", requireRole(MANAGE_ROLES), async (req, res) =
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/warehouse-zones/:id/racks", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/warehouse-zones/:id/racks", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     const { code, description } = req.body;
     if (!code) return res.status(400).json({ error: "code required" });
@@ -4604,7 +4605,7 @@ app.post("/warehouse-zones/:id/racks", requireRole(MANAGE_ROLES), async (req, re
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/warehouse-racks/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/warehouse-racks/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, res) => {
   try {
     await supabase.from("warehouse_racks").delete().eq("id", req.params.id);
     res.json({ ok: true });
@@ -4618,7 +4619,7 @@ function generateQRCode() {
   return `PKG-${d}-${r}`;
 }
 
-app.post("/package-labels/generate", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/package-labels/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), async (req, res) => {
   try {
     const { supplier_delivery_id, items } = req.body;
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
@@ -4682,7 +4683,7 @@ app.get("/package-labels/validate/:qr_code", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch("/package-labels/:id/assign-location", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/package-labels/:id/assign-location", ...requirePerm(PERMS.WAREHOUSE_SCAN), async (req, res) => {
   try {
     const { zone_id, rack_id, location_code } = req.body;
     const { data, error } = await supabase.from("package_labels")
@@ -4693,7 +4694,7 @@ app.patch("/package-labels/:id/assign-location", requireRole(MANAGE_ROLES), asyn
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch("/package-labels/:id/scan", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
+app.patch("/package-labels/:id/scan", ...requirePerm(PERMS.WAREHOUSE_SCAN), async (req, res) => {
   try {
     const { status } = req.body;
     const update = { status };
@@ -4704,7 +4705,7 @@ app.patch("/package-labels/:id/scan", requireRole(["master", "manager", "company
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/package-labels/confirm-all", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/package-labels/confirm-all", ...requirePerm(PERMS.WAREHOUSE_SCAN), async (req, res) => {
   try {
     const { supplier_delivery_id, warehouse_id } = req.body;
     if (!supplier_delivery_id) return res.status(400).json({ error: "supplier_delivery_id required" });
@@ -4747,7 +4748,7 @@ function generatePackingQR() {
 }
 
 // Generate packings from a supplier delivery's items
-app.post("/packings/generate", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), async (req, res) => {
   try {
     const { supplier_delivery_id, items } = req.body;
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
@@ -4845,7 +4846,7 @@ app.get("/packings/validate/:qr_code", requireAuth, async (req, res) => {
 });
 
 // Put away: scan item QR + rack QR → link to location
-app.patch("/packings/:id/put-away", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/packings/:id/put-away", ...requirePerm(PERMS.WAREHOUSE_RECEIVE), async (req, res) => {
   try {
     const { rack_qr_code, rack_id } = req.body;
     let finalRackId = rack_id, finalZoneId = null, locationCode = null, rackLevel = null;
@@ -4869,7 +4870,7 @@ app.patch("/packings/:id/put-away", requireRole(MANAGE_ROLES), async (req, res) 
 });
 
 // Pick
-app.patch("/packings/:id/pick", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/packings/:id/pick", ...requirePerm(PERMS.WAREHOUSE_PICK), async (req, res) => {
   try {
     const { data, error } = await supabase.from("order_item_packings")
       .update({ status: "picked", picked_at: new Date().toISOString() })
@@ -4882,7 +4883,7 @@ app.patch("/packings/:id/pick", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // Load + validate
-app.patch("/packings/:id/load", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/packings/:id/load", ...requirePerm(PERMS.WAREHOUSE_LOAD), async (req, res) => {
   try {
     const { team_id } = req.body;
     const { data: packing } = await supabase.from("order_item_packings").select("*, order_items(order_id, product_name, orders(so_number))").eq("id", req.params.id).single();
@@ -4924,7 +4925,7 @@ app.get("/delivery-teams", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/delivery-teams", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/delivery-teams", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   try {
     const { vehicle_id, driver_id, helper_id, team_date } = req.body;
     if (!driver_id || !team_date) return res.status(400).json({ error: "driver_id and team_date required" });
@@ -4936,7 +4937,7 @@ app.post("/delivery-teams", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/delivery-teams/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/delivery-teams/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   try {
     const { vehicle_id, driver_id, helper_id } = req.body;
     const { data, error } = await supabase.from("delivery_teams")
@@ -4947,7 +4948,7 @@ app.put("/delivery-teams/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/delivery-teams/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/delivery-teams/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   try {
     await supabase.from("delivery_schedules").delete().eq("team_id", req.params.id);
     await supabase.from("delivery_teams").delete().eq("id", req.params.id);
@@ -4977,7 +4978,7 @@ app.get("/delivery-schedules", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/delivery-schedules", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (req, res) => {
   try {
     const { order_id, team_id, scheduled_date, area, slot, sort_order } = req.body;
     if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
@@ -4999,7 +5000,7 @@ app.post("/delivery-schedules", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     // Validate record belongs to active company
@@ -5023,7 +5024,7 @@ app.patch("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res)
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     let dq = supabase.from("delivery_schedules").delete().eq("id", req.params.id);
@@ -5212,7 +5213,7 @@ app.get("/warehouses/:id/rack-qrs", requireAuth, async (req, res) => {
 });
 
 // ── Store: two-scan (item QR → rack QR) ─────────────────────────
-app.patch("/package-labels/:id/store", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/package-labels/:id/store", ...requirePerm(PERMS.WAREHOUSE_RECEIVE), async (req, res) => {
   try {
     const { rack_id, rack_qr_code, location_code } = req.body;
     let finalRackId = rack_id;
@@ -5264,7 +5265,7 @@ app.get("/pick-list", requireAuth, async (req, res) => {
 });
 
 // ── Pick: mark item as picked ───────────────────────────────────
-app.patch("/package-labels/:id/pick", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/package-labels/:id/pick", ...requirePerm(PERMS.WAREHOUSE_PICK), async (req, res) => {
   try {
     const { data, error } = await supabase.from("package_labels")
       .update({ status: "picked", picked_at: new Date().toISOString(), picked_by: req.user.id })
@@ -5307,7 +5308,7 @@ app.get("/loading-list", requireAuth, async (req, res) => {
 });
 
 // ── Load: scan item onto truck + validate route ─────────────────
-app.patch("/package-labels/:id/load", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/package-labels/:id/load", ...requirePerm(PERMS.WAREHOUSE_LOAD), async (req, res) => {
   try {
     const { route_id } = req.body;
     const { data: label } = await supabase.from("package_labels").select("*").eq("id", req.params.id).single();
@@ -5779,7 +5780,7 @@ app.get("/spec-options/pending", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/spec-options", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
+app.post("/spec-options", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { label, value, is_approved } = req.body;
     if (!label || !value) return res.status(400).json({ error: "label and value required" });
@@ -5793,7 +5794,7 @@ app.post("/spec-options", requireRole(["master", "manager", "company_admin", "sa
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/spec-options/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/spec-options/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { value } = req.body;
     const { data, error } = await supabase.from("spec_options").update({ value: value.trim() })
@@ -5803,7 +5804,7 @@ app.put("/spec-options/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/spec-options/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/spec-options/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { error } = await supabase.from("spec_options").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
     if (error) throw error;
@@ -5811,7 +5812,7 @@ app.delete("/spec-options/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch("/spec-options/:id/approve", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/spec-options/:id/approve", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { data, error } = await supabase.from("spec_options").update({ is_approved: true })
       .eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
@@ -5832,7 +5833,7 @@ app.get("/branches", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/branches", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/branches", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (req, res) => {
   try {
     const { name, code } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
@@ -5843,7 +5844,7 @@ app.post("/branches", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/branches/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (req, res) => {
   try {
     const { name } = req.body;
     const { data, error } = await supabase.from("branches").update({ name: name.trim() }).eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
@@ -5852,7 +5853,7 @@ app.put("/branches/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/branches/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async (req, res) => {
   try {
     const { error } = await supabase.from("branches").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
     if (error) throw error;
@@ -5883,7 +5884,7 @@ const parseCostDivisor = (v) => {
 // "combined" (default) → "A/B" is one two-tone colour kept as-is.
 const parseColorMode = (v) => (v === "split" ? "split" : "combined");
 
-app.post("/suppliers", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) => {
   try {
     const { name, code, contact, cost_divisor, color_mode } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
@@ -5896,7 +5897,7 @@ app.post("/suppliers", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res) => {
   try {
     const { name, code, contact, cost_divisor, color_mode, is_active } = req.body;
     const patch = {};
@@ -5919,7 +5920,7 @@ app.put("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 
 // DELETE /suppliers/:id — blocked when products reference it unless ?force=true,
 // in which case those products are unassigned (supplier_id set to null) first.
-app.delete("/suppliers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res) => {
   try {
     const company_id = req.user.company_id;
     const id = req.params.id;
@@ -5952,7 +5953,7 @@ app.get("/categories", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/categories", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/categories", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { name, parent_id } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
@@ -5965,7 +5966,7 @@ app.post("/categories", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/categories/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { name, parent_id } = req.body;
     const { spec_labels } = req.body;
@@ -5977,7 +5978,7 @@ app.put("/categories/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/categories/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     await supabase.from("products").update({ category_id: null }).eq("category_id", req.params.id).eq("company_id", req.user.company_id);
     const { error } = await supabase.from("product_categories").delete().eq("id", req.params.id).eq("company_id", req.user.company_id);
@@ -6007,7 +6008,7 @@ app.get("/products", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/products", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
@@ -6022,7 +6023,7 @@ app.post("/products", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
     const { data, error } = await supabase.from("products")
@@ -6038,7 +6039,7 @@ app.put("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch("/products/:id/toggle", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/products/:id/toggle", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { data: existing } = await supabase.from("products").select("is_active").eq("id", req.params.id).eq("company_id", req.user.company_id).single();
     if (!existing) return res.status(404).json({ error: "Product not found" });
@@ -6049,7 +6050,7 @@ app.patch("/products/:id/toggle", requireRole(MANAGE_ROLES), async (req, res) =>
 });
 
 // DELETE /products/:id — remove a product (unlinks any catalogue import rows first)
-app.delete("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+app.delete("/products/:id", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, res) => {
   try {
     const company_id = req.user.company_id;
     const id = req.params.id;
@@ -6064,7 +6065,7 @@ app.delete("/products/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 });
 
 // POST /products/bulk-delete — remove many products at once. body: { ids: [] }
-app.post("/products/bulk-delete", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/products/bulk-delete", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, res) => {
   try {
     const company_id = req.user.company_id;
     const { ids } = req.body;
@@ -6083,7 +6084,7 @@ app.post("/products/bulk-delete", requireRole(MANAGE_ROLES), async (req, res) =>
 // body: { ids: [], set: { supplier_id?, category_id?, is_active?, is_standard?, reorder_point? }, cost_divisor? }
 // Provided keys in `set` are written to every product; cost_divisor (when > 0)
 // recomputes each product's unit_cost from its own unit_price.
-app.patch("/products/bulk", requireRole(MANAGE_ROLES), async (req, res) => {
+app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const company_id = req.user.company_id;
     const { ids, set = {}, cost_divisor } = req.body;
@@ -6124,7 +6125,7 @@ app.patch("/products/bulk", requireRole(MANAGE_ROLES), async (req, res) => {
 // ── Product Review Queue ─────────────────────────────────────────
 
 // GET unmatched items grouped by product_name+product_code
-app.get("/product-review-queue", requireRole(MANAGE_ROLES), async (req, res) => {
+app.get("/product-review-queue", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { data: items } = await supabase.from("sales_order_items")
       .select("id, order_id, product_id, product_code, product_name, size, color, supplier_name, quantity, unit_price, requires_product_review, legacy_item_json")
@@ -6159,7 +6160,7 @@ app.get("/product-review-queue", requireRole(MANAGE_ROLES), async (req, res) => 
 });
 
 // POST link items to existing product
-app.post("/product-review-queue/link", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/product-review-queue/link", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { item_ids, product_id } = req.body;
     if (!Array.isArray(item_ids) || !product_id) return res.status(400).json({ error: "item_ids and product_id required" });
@@ -6172,7 +6173,7 @@ app.post("/product-review-queue/link", requireRole(MANAGE_ROLES), async (req, re
 });
 
 // POST create product from review queue then link
-app.post("/product-review-queue/create-and-link", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/product-review-queue/create-and-link", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const { item_ids, product_code, product_name, size, color, supplier_id, category_id, unit_cost, unit_price } = req.body;
     if (!item_ids || !product_name) return res.status(400).json({ error: "item_ids and product_name required" });
@@ -6194,7 +6195,7 @@ app.post("/product-review-queue/create-and-link", requireRole(MANAGE_ROLES), asy
 });
 
 // POST dismiss — mark as custom (keep as-is)
-app.post("/product-review-queue/dismiss", requireRole(MANAGE_ROLES), async (req, res) => {
+app.post("/product-review-queue/dismiss", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const { item_ids } = req.body;
     if (!Array.isArray(item_ids)) return res.status(400).json({ error: "item_ids required" });

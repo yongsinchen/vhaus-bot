@@ -167,9 +167,15 @@ const ALL_ACTION_KEYS = new Set(
   Object.values(MODULE_REGISTRY).flatMap(m => m.permissions)
 );
 
+// Permission constants — use these instead of raw strings
+// e.g. PERMS.PRODUCTS_CREATE instead of "PRODUCTS_CREATE"
+const PERMS = {};
+for (const key of ALL_ACTION_KEYS) PERMS[key] = key;
+Object.freeze(PERMS);
+
 // Navigation items ordered
 const NAV_ITEMS = Object.values(MODULE_REGISTRY)
   .filter(m => m.nav)
   .map(m => ({ ...m.nav, moduleKey: m.key, feature: m.feature }));
 
-module.exports = { MODULE_REGISTRY, ALL_ACTION_KEYS, NAV_ITEMS };
+module.exports = { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS, NAV_ITEMS };
