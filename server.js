@@ -3846,19 +3846,27 @@ app.get("/service-cases", requireAuth, async (req, res) => {
     // Enrich with order info where available
     for (const svc of (data || [])) {
       if (svc.order_id) {
-        const { data: o } = await supabase.from("orders").select("so_number, customer_name, address, contact").eq("id", svc.order_id).maybeSingle();
+        const { data: o } = await supabase.from("orders").select("so_number, customer_name, address, contact, salesman").eq("id", svc.order_id).maybeSingle();
         if (o) svc._order = o;
       }
-      // Use customer fields from service itself (for legacy/pending-sourced)
       if (!svc._order && svc.customer_name) {
-        svc._order = { so_number: null, customer_name: svc.customer_name, address: svc.customer_address, contact: svc.customer_phone };
+        svc._order = { so_number: null, customer_name: svc.customer_name, address: svc.customer_address, contact: svc.customer_phone, salesman: null };
       }
       if (svc.assigned_to) {
         const { data: u } = await supabase.from("users").select("name").eq("id", svc.assigned_to).maybeSingle();
         if (u) svc._assigned = u;
       }
     }
-    res.json({ services: data || [] });
+    // Salesman role: only show services linked to their orders
+    let result = data || [];
+    if (req.user.role === "salesman" && req.user.salesman_name) {
+      const name = req.user.salesman_name.toLowerCase().trim();
+      result = result.filter(svc => {
+        const salesman = (svc._order?.salesman || "").toLowerCase();
+        return salesman.split("/").map(s => s.trim()).includes(name);
+      });
+    }
+    res.json({ services: result });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
