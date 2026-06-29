@@ -2957,16 +2957,16 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
       // Check user_company_roles first
       const { data: roles } = await supabase.from("user_company_roles").select("company_id, role, companies(id, name, code)").eq("user_id", user.id).eq("active", true);
       if (roles && roles.length > 0) {
-        availableCompanies = roles.map(r => ({ id: r.company_id, name: r.companies?.name, code: r.companies?.code, role: r.role }));
+        availableCompanies = roles.map(r => ({ companyId: r.company_id, companyName: r.companies?.name, companyCode: r.companies?.code, roleName: r.role }));
       }
       // Always include their primary company
-      if (company && !availableCompanies.find(c => c.id === company.id)) {
-        availableCompanies.unshift({ id: company.id, name: company.name, code: company.code, role: user.role });
+      if (company && !availableCompanies.find(c => c.companyId === company.id)) {
+        availableCompanies.unshift({ companyId: company.id, companyName: company.name, companyCode: company.code, roleName: user.role });
       }
       // For master with no roles set, show all active companies
       if (user.role === "master" && availableCompanies.length <= 1) {
         const { data: allCompanies } = await supabase.from("companies").select("id, name, code").eq("is_active", true);
-        availableCompanies = (allCompanies || []).map(c => ({ ...c, role: "master" }));
+        availableCompanies = (allCompanies || []).map(c => ({ companyId: c.id, companyName: c.name, companyCode: c.code, roleName: "master" }));
       }
     }
 
