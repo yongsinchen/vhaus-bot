@@ -2580,34 +2580,76 @@ app.get("/service-pending", requireAuth, async (req, res) => {
   res.json(data);
 });
 
-// POST /service-pending/:id/convert — Option B: new service order linked to original
+// POST /service-pending/:id/convert — creates services record + legacy order for delivery compat
 app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
-  const { remark: adminRemark, delivery_date } = req.body || {};
+  const { remark: adminRemark, delivery_date, service_type } = req.body || {};
 
   const { data: sp, error: spErr } = await supabase
     .from("service_pending").select("*").eq("id", id).single();
   if (spErr || !sp) return res.status(404).json({ error: "Service pending not found" });
 
+  // Prevent double conversion
+  if (sp.status === "Converted") return res.status(400).json({ error: "Already converted" });
+
   // Get original delivery order for customer info
   const { data: origOrder } = await supabase
     .from("orders").select("*").eq("so_number", sp.so_number).eq("type", "Delivery").maybeSingle();
 
-  // Get next SV number
-  const svNumber = await getNextSvNumber();
+  const companyId = origOrder?.company_id || sp.company_id || req.user.company_id;
 
-  const serviceNote = [
-    `Linked to SO: ${sp.so_number}`,
+  // Infer service type from note if not provided
+  let svcType = Number(service_type) || 0;
+  if (!svcType) {
+    const text = `${sp.note || ""} ${adminRemark || ""}`.toLowerCase();
+    if (/assembl|install|setup|pasang/.test(text)) svcType = 2;
+    else if (/exchang|change|replac|swap|tukar/.test(text)) svcType = 3;
+    else svcType = 1;
+  }
+
+  const description = [
     sp.note ? `Issue: ${sp.note}` : null,
     `Driver: ${sp.driver}${sp.helper ? ` | Helper: ${sp.helper}` : ""}`,
-    adminRemark ? `Admin note: ${adminRemark}` : null,
+    adminRemark ? `Admin: ${adminRemark}` : null,
   ].filter(Boolean).join(" | ");
 
-  // CREATE NEW service order (original delivery stays intact)
+  // 1. Create services record (new system — source of truth)
+  const { data: svc, error: svcErr } = await supabase.from("services").insert({
+    company_id: companyId,
+    order_id: origOrder?.id || null,
+    service_type: svcType,
+    status: delivery_date ? "scheduled" : "open",
+    description: description,
+    issue_description: sp.note || null,
+    source: "service_pending",
+    source_pending_id: sp.id,
+    original_order_id: origOrder?.id || null,
+    customer_name: origOrder?.customer_name || null,
+    customer_phone: origOrder?.contact || null,
+    customer_address: origOrder?.address || null,
+    priority: "normal",
+    due_date: delivery_date || null,
+    created_by: req.user.id,
+  }).select().single();
+  if (svcErr) return res.status(500).json({ error: "Service create failed: " + svcErr.message });
+
+  // 2. Auto-create service legs
+  const legs = [];
+  if (svcType === 1 || svcType === 3) {
+    legs.push({ service_id: svc.id, leg_order: 1, leg_type: "pickup", from_location: "Customer", to_location: "Warehouse", status: "pending", scheduled_date: delivery_date || null });
+    legs.push({ service_id: svc.id, leg_order: 2, leg_type: "delivery", from_location: "Warehouse", to_location: "Customer", status: "pending" });
+  } else {
+    legs.push({ service_id: svc.id, leg_order: 1, leg_type: "visit", from_location: "Warehouse", to_location: "Customer", status: "pending", scheduled_date: delivery_date || null });
+  }
+  if (legs.length > 0) await supabase.from("service_legs").insert(legs);
+
+  // 3. Create legacy orders row for delivery scheduling compatibility
+  const svNumber = await getNextSvNumber();
+  const serviceNote = `Linked to SO: ${sp.so_number} | ${description}`;
+
   const { data: newOrder, error: insertErr } = await supabase
     .from("orders").insert({
-      so_number: sp.so_number,
-      sv_number: svNumber,
+      so_number: sp.so_number, sv_number: svNumber,
       customer_name: origOrder?.customer_name || null,
       address: origOrder?.address || null,
       contact: origOrder?.contact || null,
@@ -2615,21 +2657,24 @@ app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, 
       order_amount: origOrder?.order_amount || null,
       balance: origOrder?.balance || null,
       delivery_date: delivery_date || null,
-      type: "Service",
-      service_note: serviceNote,
-      remark: serviceNote,
+      type: "Service", service_note: serviceNote, remark: serviceNote,
       status: "Pending",
       items: origOrder?.items || JSON.stringify([]),
       linked_so: sp.so_number,
-      company_id: origOrder?.company_id || null,
+      company_id: companyId,
       photo_url: origOrder?.photo_url || null,
     }).select().single();
-  if (insertErr) return res.status(500).json({ error: insertErr.message });
 
-  // Mark service_pending as Converted
-  await supabase.from("service_pending").update({ status: "Converted" }).eq("id", id);
+  // 4. Link everything together
+  const updateSp = { status: "Converted", converted_at: new Date().toISOString(), converted_service_id: svc.id };
+  if (newOrder) {
+    updateSp.converted_order_id = newOrder.id;
+    // Link service to legacy order
+    await supabase.from("services").update({ legacy_order_id: newOrder.id }).eq("id", svc.id);
+  }
+  await supabase.from("service_pending").update(updateSp).eq("id", id);
 
-  res.json({ success: true, svNumber, order: newOrder });
+  res.json({ success: true, svNumber, service: svc, order: newOrder, service_id: svc.id });
 });
 
 // DELETE /service-pending/:id — remove (not applicable)
@@ -3793,17 +3838,25 @@ const SERVICE_TYPES = { 1: "Warranty Repair", 2: "Assembly/Installation", 3: "Ex
 app.get("/service-cases", requireAuth, async (req, res) => {
   try {
     const { company_id, status } = req.query;
-    let q = supabase.from("services").select("*, orders(so_number, customer_name, address, contact), assigned:users!services_assigned_to_fkey(name)").order("created_at", { ascending: false });
+    let q = supabase.from("services").select("*").order("created_at", { ascending: false });
     if (company_id) q = q.eq("company_id", company_id);
     if (status) q = q.eq("status", status);
     const { data, error } = await q;
-    if (error) {
-      // Fallback without joins
-      let q2 = supabase.from("services").select("*").order("created_at", { ascending: false });
-      if (company_id) q2 = q2.eq("company_id", company_id);
-      if (status) q2 = q2.eq("status", status);
-      const { data: d2 } = await q2;
-      return res.json({ services: d2 || [] });
+    if (error) throw error;
+    // Enrich with order info where available
+    for (const svc of (data || [])) {
+      if (svc.order_id) {
+        const { data: o } = await supabase.from("orders").select("so_number, customer_name, address, contact").eq("id", svc.order_id).maybeSingle();
+        if (o) svc._order = o;
+      }
+      // Use customer fields from service itself (for legacy/pending-sourced)
+      if (!svc._order && svc.customer_name) {
+        svc._order = { so_number: null, customer_name: svc.customer_name, address: svc.customer_address, contact: svc.customer_phone };
+      }
+      if (svc.assigned_to) {
+        const { data: u } = await supabase.from("users").select("name").eq("id", svc.assigned_to).maybeSingle();
+        if (u) svc._assigned = u;
+      }
     }
     res.json({ services: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3826,13 +3879,22 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
 
 app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { order_id, service_type, description, assigned_to } = req.body;
+    const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date } = req.body;
     if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange)" });
+    // Auto-fill customer info from order if linked
+    let custName = customer_name, custPhone = customer_phone, custAddr = customer_address;
+    if (order_id && !custName) {
+      const { data: o } = await supabase.from("orders").select("customer_name, contact, address").eq("id", order_id).maybeSingle();
+      if (o) { custName = o.customer_name; custPhone = o.contact; custAddr = o.address; }
+    }
     const { data, error } = await supabase.from("services").insert({
       company_id: req.user.company_id, order_id: order_id || null,
       service_type: Number(service_type), status: "open",
-      description: description || null, assigned_to: assigned_to || null,
-      created_by: req.user.id,
+      description: description || null, issue_description: description || null,
+      assigned_to: assigned_to || null, source: "manual",
+      customer_name: custName || null, customer_phone: custPhone || null,
+      customer_address: custAddr || null, priority: priority || "normal",
+      due_date: due_date || null, created_by: req.user.id,
     }).select().single();
     if (error) throw error;
     // Auto-create legs based on type
