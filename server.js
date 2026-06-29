@@ -3270,9 +3270,9 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
 
 // GET /admin/users/list — list all users (service role bypasses RLS)
 app.get("/admin/users/list", requireRole(["master", "manager"]), async (req, res) => {
-  const { company_id } = req.query;
+  const cid = getActiveCompanyId(req);
   let query = supabase.from("users").select("*, companies(name, code)").order("name");
-  if (company_id) query = query.eq("company_id", company_id);
+  if (cid) query = query.eq("company_id", cid);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
