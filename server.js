@@ -85,6 +85,10 @@ const MANAGE_ROLES = ["master", "manager", "company_admin"];
 function getActiveCompanyId(req) {
   return req.activeCompanyId || req._validatedCompanyId || req.user?.company_id || null;
 }
+
+// Normalize role keys to lowercase for API responses
+// DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
+function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
 const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
 
@@ -3059,7 +3063,7 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
       if (engineCompanies && engineCompanies.length > 0) {
         availableCompanies = engineCompanies.map(c => ({
           companyId: c.companyId, companyName: c.companyName, companyCode: c.companyCode,
-          roleName: c.roleKey || c.roleName,
+          roleName: normalizeRoleKey(c.roleKey || c.roleName),
         }));
       }
     } catch (e) { console.error("[auth/profile] getUserCompanies failed:", e.message); }
@@ -3079,7 +3083,7 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
     const activeCompanyId = req.activeCompanyId || user.company_id;
 
     // Effective role + permissions from requireAuth
-    const effectiveRole = req.activeRoleKey || req.effectiveRoleKey || (user.role || "").toUpperCase();
+    const effectiveRole = normalizeRoleKey(req.activeRoleKey || req.effectiveRoleKey || user.role);
     let effectivePermissions = [];
     if (req.effectivePermissions) {
       effectivePermissions = Object.entries(req.effectivePermissions)
@@ -3115,8 +3119,8 @@ app.post("/auth/switch-company", requireAuth, async (req, res) => {
       const allowed = perms ? Object.entries(perms.permissions).filter(([, v]) => v.allowed).map(([k]) => k) : [];
       return res.json({
         activeCompanyId: ctx.companyId,
-        activeRoleKey: ctx.roleKey,
-        effectiveRole: ctx.roleKey,
+        activeRoleKey: normalizeRoleKey(ctx.roleKey),
+        effectiveRole: normalizeRoleKey(ctx.roleKey),
         effectivePermissions: allowed,
         company: { id: ctx.companyId },
       });
@@ -3132,8 +3136,8 @@ app.post("/auth/switch-company", requireAuth, async (req, res) => {
       const masterPerms = [...ALL_ACTION_KEYS];
       return res.json({
         activeCompanyId: company_id,
-        activeRoleKey: "MASTER",
-        effectiveRole: "MASTER",
+        activeRoleKey: "master",
+        effectiveRole: "master",
         effectivePermissions: masterPerms,
         company: { id: comp.id, name: comp.name, code: comp.code },
       });
@@ -3145,8 +3149,8 @@ app.post("/auth/switch-company", requireAuth, async (req, res) => {
       const allowed = perms ? Object.entries(perms.permissions).filter(([, v]) => v.allowed).map(([k]) => k) : [];
       return res.json({
         activeCompanyId: company_id,
-        activeRoleKey: perms?.roleKey || (user.role || "").toUpperCase(),
-        effectiveRole: perms?.roleKey || (user.role || "").toUpperCase(),
+        activeRoleKey: normalizeRoleKey(perms?.roleKey || user.role),
+        effectiveRole: normalizeRoleKey(perms?.roleKey || user.role),
         effectivePermissions: allowed,
       });
     }
@@ -3162,7 +3166,7 @@ app.get("/permissions/effective", requireAuth, async (req, res) => {
   res.json({
     permissions: allowed,
     activeCompanyId: req.activeCompanyId || req.user.company_id,
-    roleKey: req.activeRoleKey || req.effectiveRoleKey || req.user.role,
+    roleKey: normalizeRoleKey(req.activeRoleKey || req.effectiveRoleKey || req.user.role),
   });
 });
 
@@ -7599,7 +7603,7 @@ app.get("/auth/effective-permissions", requireAuth, async (req, res) => {
     const allowed = perms ? Object.entries(perms).filter(([, v]) => v.allowed).map(([k]) => k) : [];
     res.json({
       activeCompanyId: req.activeCompanyId,
-      effectiveRole: req.activeRoleKey || req.effectiveRoleKey,
+      effectiveRole: normalizeRoleKey(req.activeRoleKey || req.effectiveRoleKey),
       permissions: allowed,
       total: allowed.length,
     });

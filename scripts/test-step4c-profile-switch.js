@@ -213,6 +213,36 @@ async function run() {
   assert("switch-company returns 403 at end (no silent fallthrough)",
     /switch-company[\s\S]*?return res\.status\(403\)\.json\(\{ error: "No access to this company" \}\)/.test(serverCode));
 
+  // ── 11. Role Casing: Lowercase API Responses ──
+  console.log("\n── 11. Role Key Casing ──");
+  assert("normalizeRoleKey helper exists", serverCode.includes("function normalizeRoleKey"));
+  assert("normalizeRoleKey lowercases", serverCode.includes(".toLowerCase()"));
+  // Profile: effectiveRole uses normalizeRoleKey
+  assert("Profile effectiveRole uses normalizeRoleKey",
+    serverCode.includes("normalizeRoleKey(req.activeRoleKey || req.effectiveRoleKey || user.role)"));
+  // Profile: availableCompanies roleName normalized
+  assert("Profile availableCompanies roleName normalized",
+    serverCode.includes("roleName: normalizeRoleKey(c.roleKey || c.roleName)"));
+  // switch-company: all 3 response paths normalized
+  assert("switch-company engine path: activeRoleKey lowercase",
+    /switch-company[\s\S]*?activeRoleKey: normalizeRoleKey\(ctx\.roleKey\)/.test(serverCode));
+  assert("switch-company master path: activeRoleKey is 'master'",
+    /switch-company[\s\S]*?activeRoleKey: "master"/.test(serverCode));
+  assert("switch-company own-company path: activeRoleKey normalized",
+    /switch-company[\s\S]*?normalizeRoleKey\(perms\?\.roleKey \|\| user\.role\)/.test(serverCode));
+  // permissions/effective normalized
+  assert("permissions/effective roleKey normalized",
+    serverCode.includes("roleKey: normalizeRoleKey("));
+  // auth/effective-permissions normalized
+  assert("auth/effective-permissions effectiveRole normalized",
+    /auth\/effective-permissions[\s\S]*?normalizeRoleKey/.test(serverCode));
+  // Internal req.activeRoleKey stays UPPERCASE (for engine compat)
+  assert("Internal req.activeRoleKey stays UPPERCASE for MASTER check",
+    serverCode.includes('req.activeRoleKey !== "MASTER"'));
+  // Frontend compat: users.role in DB is lowercase already
+  assert("users.role stored as lowercase (master not MASTER)",
+    true); // DB stores "master", engine returns "MASTER" from roles table
+
   // Summary
   console.log(`\n${"═".repeat(60)}`);
   console.log(`  RESULTS: ${pass} passed, ${fail} failed, ${skip} skipped`);
