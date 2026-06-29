@@ -7548,6 +7548,92 @@ app.get("/permissions", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /permissions/modules — permission modules with nested actions
+app.get("/permissions/modules", ...requirePerm(PERMS.SYSTEM_MANAGE_PERMISSIONS), async (req, res) => {
+  try {
+    const { data: modules } = await supabase.from("permission_modules").select("id, module_key, module_name, category, feature_key, sort_order").eq("is_active", true).order("sort_order");
+    const { data: actions } = await supabase.from("permission_actions").select("id, module_id, action_key, action_name, description, supports_scope, sort_order").eq("is_active", true).order("sort_order");
+    const grouped = (modules || []).map(m => ({ ...m, permission_actions: (actions || []).filter(a => a.module_id === m.id) }));
+    res.json({ modules: grouped });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/roles — roles list
+app.get("/permissions/roles", ...requirePerm(PERMS.SYSTEM_MANAGE_PERMISSIONS), async (req, res) => {
+  try {
+    const { data } = await supabase.from("roles").select("id, role_key, role_name, level, is_system").is("deleted_at", null).is("company_id", null).order("level", { ascending: false });
+    res.json({ roles: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/users — users in active company with role info
+app.get("/permissions/users", ...requirePerm(PERMS.SYSTEM_MANAGE_PERMISSIONS), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { data: accessRows } = await supabase.from("user_company_access")
+      .select("user_id, roles(role_key, role_name), users(id, name, email, is_active)")
+      .eq("company_id", cid).eq("is_active", true).is("deleted_at", null);
+    const users = (accessRows || []).filter(a => a.users?.is_active).map(a => ({
+      userId: a.user_id, name: a.users.name, email: a.users.email,
+      roleKey: a.roles?.role_key, roleName: a.roles?.role_name,
+    }));
+    res.json({ users });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /permissions/users/:userId — user's effective permissions in active company
+app.get("/permissions/users/:userId", ...requirePerm(PERMS.SYSTEM_MANAGE_PERMISSIONS), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const perms = await permEngine.computePermissions(req.params.userId, cid);
+    if (!perms) return res.status(404).json({ error: "No access found for this user in active company" });
+    // Get override keys
+    const { data: overrides } = await supabase.from("user_permission_overrides")
+      .select("permission_actions(action_key)")
+      .eq("user_id", req.params.userId).eq("company_id", cid).is("deleted_at", null);
+    const overrideKeys = (overrides || []).map(o => o.permission_actions?.action_key).filter(Boolean);
+    res.json({ permissions: perms.permissions, roleKey: perms.roleKey, overrideKeys });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /permissions/users/:userId — save permission overrides
+app.put("/permissions/users/:userId", ...requirePerm(PERMS.SYSTEM_MANAGE_PERMISSIONS), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { overrides } = req.body;
+    if (!Array.isArray(overrides)) return res.status(400).json({ error: "overrides array required" });
+    for (const o of overrides) {
+      const { data: action } = await supabase.from("permission_actions").select("id").eq("action_key", o.action_key).single();
+      if (!action) continue;
+      if (o.allowed === null) {
+        // Remove override (reset to role default)
+        await supabase.from("user_permission_overrides").update({ deleted_at: new Date().toISOString(), deleted_by: req.user.id })
+          .eq("user_id", req.params.userId).eq("company_id", cid).eq("action_id", action.id).is("deleted_at", null);
+      } else {
+        // Upsert override
+        const { data: existing } = await supabase.from("user_permission_overrides").select("id")
+          .eq("user_id", req.params.userId).eq("company_id", cid).eq("action_id", action.id).is("deleted_at", null).maybeSingle();
+        if (existing) {
+          await supabase.from("user_permission_overrides").update({ allowed: o.allowed, updated_at: new Date().toISOString() }).eq("id", existing.id);
+        } else {
+          await supabase.from("user_permission_overrides").insert({
+            user_id: req.params.userId, company_id: cid, action_id: action.id,
+            allowed: o.allowed, created_by: req.user.id,
+          });
+        }
+      }
+    }
+    // Invalidate cache and return updated perms
+    permEngine.invalidate(req.params.userId, cid);
+    const perms = await permEngine.computePermissions(req.params.userId, cid);
+    const { data: newOverrides } = await supabase.from("user_permission_overrides")
+      .select("permission_actions(action_key)")
+      .eq("user_id", req.params.userId).eq("company_id", cid).is("deleted_at", null);
+    const overrideKeys = (newOverrides || []).map(o => o.permission_actions?.action_key).filter(Boolean);
+    res.json({ permissions: perms?.permissions || {}, overrideKeys });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /roles — list all system + company roles
 app.get("/roles", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
