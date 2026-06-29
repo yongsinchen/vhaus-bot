@@ -3271,17 +3271,9 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
 // GET /admin/users/list — list all users (service role bypasses RLS)
 app.get("/admin/users/list", requireRole(["master", "manager"]), async (req, res) => {
   const cid = getActiveCompanyId(req);
-  if (!cid) {
-    const { data, error } = await supabase.from("users").select("*, companies(name, code)").order("name");
-    if (error) return res.status(500).json({ error: error.message });
-    return res.json(data || []);
-  }
-  // Users with primary company OR user_company_access for this company
-  const { data: primaryUsers } = await supabase.from("users").select("id").eq("company_id", cid);
-  const { data: accessUsers } = await supabase.from("user_company_access").select("user_id").eq("company_id", cid).eq("is_active", true).is("deleted_at", null);
-  const userIds = [...new Set([...(primaryUsers || []).map(u => u.id), ...(accessUsers || []).map(a => a.user_id)])];
-  if (userIds.length === 0) return res.json([]);
-  const { data, error } = await supabase.from("users").select("*, companies(name, code)").in("id", userIds).order("name");
+  let query = supabase.from("users").select("*, companies(name, code)").order("name");
+  if (cid) query = query.eq("company_id", cid);
+  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
