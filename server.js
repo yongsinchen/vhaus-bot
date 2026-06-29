@@ -7571,10 +7571,15 @@ app.get("/permissions/users", ...requirePerm(PERMS.SYSTEM_MANAGE_PERMISSIONS), a
   try {
     const cid = getActiveCompanyId(req);
     const { data: accessRows } = await supabase.from("user_company_access")
-      .select("user_id, roles(role_key, role_name), users(id, name, email, is_active)")
+      .select("user_id, roles(role_key, role_name)")
       .eq("company_id", cid).eq("is_active", true).is("deleted_at", null);
-    const users = (accessRows || []).filter(a => a.users?.is_active).map(a => ({
-      userId: a.user_id, name: a.users.name, email: a.users.email,
+    const userIds = (accessRows || []).map(a => a.user_id);
+    const { data: userRows } = userIds.length > 0
+      ? await supabase.from("users").select("id, name, email, is_active").in("id", userIds)
+      : { data: [] };
+    const userMap = Object.fromEntries((userRows || []).map(u => [u.id, u]));
+    const users = (accessRows || []).filter(a => userMap[a.user_id]?.is_active).map(a => ({
+      userId: a.user_id, name: userMap[a.user_id]?.name, email: userMap[a.user_id]?.email,
       roleKey: a.roles?.role_key, roleName: a.roles?.role_name,
     }));
     res.json({ users });
