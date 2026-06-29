@@ -3111,6 +3111,18 @@ app.get("/services", requireAuth, async (req, res) => {
 app.get("/customers", requireAuth, async (req, res) => {
   try {
     const { company_id, search, limit = 50 } = req.query;
+    // Salesman: only show customers from their orders
+    if (req.user.role === "salesman" && req.user.salesman_name) {
+      const name = req.user.salesman_name;
+      const { data: myOrders } = await supabase.from("orders").select("customer_id")
+        .eq("company_id", req.user.company_id).ilike("salesman", `%${name}%`).not("customer_id", "is", null);
+      const custIds = [...new Set((myOrders || []).map(o => o.customer_id).filter(Boolean))];
+      if (custIds.length === 0) return res.json({ customers: [], total: 0 });
+      let q = supabase.from("customers").select("*", { count: "exact" }).in("id", custIds).order("name").limit(Number(limit));
+      if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
+      const { data, count } = await q;
+      return res.json({ customers: data || [], total: count || 0 });
+    }
     let q = supabase.from("customers").select("*", { count: "exact" }).order("name").limit(Number(limit));
     if (company_id) q = q.eq("company_id", company_id);
     if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
@@ -3804,9 +3816,19 @@ app.get("/aging-report", requireAuth, async (req, res) => {
   try {
     const { company_id } = req.query;
     if (!company_id) return res.status(400).json({ error: "company_id required" });
-    const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, contact, order_amount, balance, status, created_at, delivery_date, customer_id")
+    let ordQ = supabase.from("orders").select("id, so_number, customer_name, contact, order_amount, balance, status, created_at, delivery_date, customer_id, salesman")
       .eq("company_id", company_id).gt("balance", 0)
       .not("status", "in", '("Cancelled")');
+    // Salesman: only their orders
+    if (req.user.role === "salesman" && req.user.salesman_name) {
+      ordQ = ordQ.ilike("salesman", `%${req.user.salesman_name}%`);
+    }
+    let { data: orders } = await ordQ;
+    // Exact salesman filter for shared orders
+    if (req.user.role === "salesman" && req.user.salesman_name) {
+      const name = req.user.salesman_name.toLowerCase().trim();
+      orders = (orders || []).filter(o => (o.salesman || "").toLowerCase().split("/").map(s => s.trim()).includes(name));
+    }
     const now = new Date();
     const buckets = { current: [], "30_60": [], "60_90": [], "90_plus": [] };
     for (const o of (orders || [])) {
