@@ -122,12 +122,22 @@ const requireAuth = async (req, res, next) => {
       } else if (headerCid && headerCid !== profile.company_id) {
         // Engine found no access — check legacy master bypass
         if (profile.role === "master") {
-          const { data: comp } = await supabase.from("companies").select("id").eq("id", headerCid).eq("is_active", true).maybeSingle();
+          const { data: comp } = await supabase.from("companies")
+            .select("id, organization_id, organizations(is_active)")
+            .eq("id", headerCid).eq("is_active", true).maybeSingle();
           if (!comp) return res.status(403).json({ error: "Company not found or inactive" });
+          if (comp.organizations && comp.organizations.is_active === false) return res.status(403).json({ error: "Organization inactive" });
           req.activeCompanyId = headerCid;
           req._validatedCompanyId = headerCid;
           req.activeRoleKey = "MASTER";
           req.activeRoleLevel = 100;
+          // Set wildcard permissions for master bypass
+          const masterPerms = {};
+          for (const key of ALL_ACTION_KEYS) {
+            masterPerms[key] = { allowed: true, scope: "ALL", source: "master_bypass" };
+          }
+          req.effectivePermissions = masterPerms;
+          req.effectiveRoleKey = "MASTER";
         } else {
           return res.status(403).json({ error: "No access to selected company" });
         }
@@ -7384,6 +7394,156 @@ app.patch("/purchase-order-items/:id/receive", requireRole(MANAGE_ROLES), async 
     }
 
     res.json({ item: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Permission & Role Management API ────────────────────────────
+
+// GET /permissions — list all registered permissions grouped by module
+app.get("/permissions", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data: modules } = await supabase.from("permission_modules").select("id, module_key, module_name, category, feature_key, sort_order").eq("is_active", true).order("sort_order");
+    const { data: actions } = await supabase.from("permission_actions").select("id, module_id, action_key, action_name, description, supports_scope, sort_order").eq("is_active", true).order("sort_order");
+    const grouped = (modules || []).map(m => ({
+      ...m,
+      actions: (actions || []).filter(a => a.module_id === m.id),
+    }));
+    res.json({ modules: grouped, total_actions: (actions || []).length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /roles — list all system + company roles
+app.get("/roles", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    let q = supabase.from("roles").select("*").is("deleted_at", null).order("level", { ascending: false });
+    // System roles (company_id null) + company-specific roles
+    const { data, error } = await q;
+    if (error) throw error;
+    const filtered = (data || []).filter(r => !r.company_id || r.company_id === cid);
+    res.json({ roles: filtered });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /roles/:id/permissions — get permission template for a role
+app.get("/roles/:id/permissions", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    // Global templates (company_id null) + company overrides
+    const { data, error } = await supabase.from("role_permission_templates")
+      .select("id, action_id, allowed, scope, company_id, permission_actions(action_key, action_name)")
+      .eq("role_id", req.params.id);
+    if (error) throw error;
+    const filtered = (data || []).filter(t => !t.company_id || t.company_id === cid);
+    res.json({ permissions: filtered });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /user-roles/:userId — list all company + org roles for a user
+app.get("/user-roles/:userId", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { data: companyRoles } = await supabase.from("user_company_access")
+      .select("id, user_id, company_id, role_id, department_id, is_default, is_active, created_at, roles(role_key, role_name, level), companies(name, code)")
+      .eq("user_id", req.params.userId).is("deleted_at", null);
+    const { data: branchAccess } = await supabase.from("user_branch_access")
+      .select("id, company_id, branch_id, is_primary, is_active, branches(name, code)")
+      .eq("user_id", req.params.userId).is("deleted_at", null);
+    res.json({ companyRoles: companyRoles || [], branchAccess: branchAccess || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /user-roles — assign company role to user
+app.post("/user-roles", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { user_id, company_id, role_id, department_id, is_default } = req.body;
+    if (!user_id || !company_id || !role_id) return res.status(400).json({ error: "user_id, company_id, role_id required" });
+    // Validate role exists
+    const { data: role } = await supabase.from("roles").select("id, role_key, level").eq("id", role_id).is("deleted_at", null).single();
+    if (!role) return res.status(404).json({ error: "Role not found" });
+    // Prevent assigning role higher than your own
+    if (role.level > (req.activeRoleLevel || 0) && req.activeRoleKey !== "MASTER") {
+      return res.status(403).json({ error: "Cannot assign role higher than your own" });
+    }
+    // Validate company exists and is in an accessible org
+    const { data: comp } = await supabase.from("companies").select("id, organization_id").eq("id", company_id).eq("is_active", true).single();
+    if (!comp) return res.status(404).json({ error: "Company not found or inactive" });
+    // Insert
+    const { data, error } = await supabase.from("user_company_access").insert({
+      user_id, company_id, role_id,
+      department_id: department_id || null,
+      is_default: is_default || false,
+      is_active: true,
+      created_by: req.user.id,
+    }).select("*, roles(role_key, role_name), companies(name, code)").single();
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ error: "User already has access to this company" });
+      throw error;
+    }
+    // Invalidate permission cache
+    permEngine.invalidate(user_id, company_id);
+    // Audit log
+    permEngine.logEvent(company_id, req.user.id, "user_role.assigned", "user_company_access", data.id, { user_id, role_key: role.role_key }, req);
+    res.status(201).json({ access: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /user-roles/:id — update company role assignment
+app.patch("/user-roles/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const { role_id, department_id, is_default, is_active } = req.body;
+    // Load existing
+    const { data: existing } = await supabase.from("user_company_access").select("user_id, company_id, role_id")
+      .eq("id", req.params.id).is("deleted_at", null).single();
+    if (!existing) return res.status(404).json({ error: "Access record not found" });
+    // If changing role, validate level
+    if (role_id && role_id !== existing.role_id) {
+      const { data: newRole } = await supabase.from("roles").select("id, level").eq("id", role_id).single();
+      if (!newRole) return res.status(404).json({ error: "Role not found" });
+      if (newRole.level > (req.activeRoleLevel || 0) && req.activeRoleKey !== "MASTER") {
+        return res.status(403).json({ error: "Cannot assign role higher than your own" });
+      }
+    }
+    const updates = {};
+    if (role_id !== undefined) updates.role_id = role_id;
+    if (department_id !== undefined) updates.department_id = department_id;
+    if (is_default !== undefined) updates.is_default = is_default;
+    if (is_active !== undefined) updates.is_active = is_active;
+    const { data, error } = await supabase.from("user_company_access").update(updates)
+      .eq("id", req.params.id).select("*, roles(role_key, role_name), companies(name, code)").single();
+    if (error) throw error;
+    permEngine.invalidate(existing.user_id, existing.company_id);
+    permEngine.logEvent(existing.company_id, req.user.id, "user_role.updated", "user_company_access", req.params.id, updates, req);
+    res.json({ access: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /user-roles/:id — soft-delete (revoke access)
+app.delete("/user-roles/:id", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const { data: existing } = await supabase.from("user_company_access").select("user_id, company_id")
+      .eq("id", req.params.id).is("deleted_at", null).single();
+    if (!existing) return res.status(404).json({ error: "Access record not found" });
+    const { error } = await supabase.from("user_company_access").update({
+      deleted_at: new Date().toISOString(), deleted_by: req.user.id, is_active: false,
+    }).eq("id", req.params.id);
+    if (error) throw error;
+    permEngine.invalidate(existing.user_id, existing.company_id);
+    permEngine.logEvent(existing.company_id, req.user.id, "user_role.revoked", "user_company_access", req.params.id, {}, req);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /auth/effective-permissions — current user's effective permissions
+app.get("/auth/effective-permissions", requireAuth, async (req, res) => {
+  try {
+    const perms = req.effectivePermissions;
+    const allowed = perms ? Object.entries(perms).filter(([, v]) => v.allowed).map(([k]) => k) : [];
+    res.json({
+      activeCompanyId: req.activeCompanyId,
+      effectiveRole: req.activeRoleKey || req.effectiveRoleKey,
+      permissions: allowed,
+      total: allowed.length,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
