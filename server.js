@@ -2721,7 +2721,7 @@ app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, 
   const { data: origOrder } = await supabase
     .from("orders").select("*").eq("so_number", sp.so_number).eq("type", "Delivery").maybeSingle();
 
-  const companyId = origOrder?.company_id || sp.company_id || req.user.company_id;
+  const companyId = origOrder?.company_id || sp.company_id || getActiveCompanyId(req);
 
   // Infer service type from note if not provided
   let svcType = Number(service_type) || 0;
@@ -3185,7 +3185,7 @@ app.get("/permissions/effective", requireAuth, async (req, res) => {
   const allowed = perms ? Object.entries(perms).filter(([, v]) => v.allowed).map(([k]) => k) : [];
   res.json({
     permissions: allowed,
-    activeCompanyId: req.activeCompanyId || req.user.company_id,
+    activeCompanyId: req.activeCompanyId || getActiveCompanyId(req),
     roleKey: normalizeRoleKey(req.activeRoleKey || req.effectiveRoleKey || req.user.role),
   });
 });
@@ -3259,7 +3259,7 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
     const { data: review } = await supabase.from("do_review").select("*").eq("id", req.params.id).single();
     if (!review) return res.status(404).json({ error: "Review item not found" });
     const qty = Number(quantity) || 1;
-    await adjustStock(req.user.company_id, warehouse_id, product_id, qty, "in", "do", review.supplier_delivery_id, `DO #${review.do_number} — ${review.item_name}`, req.user.id);
+    await adjustStock(getActiveCompanyId(req), warehouse_id, product_id, qty, "in", "do", review.supplier_delivery_id, `DO #${review.do_number} — ${review.item_name}`, req.user.id);
     await supabase.from("do_review").update({ status: "Resolved" }).eq("id", req.params.id);
     await autoAdvanceDOStatus(req.params.id);
     res.json({ success: true });
@@ -3354,7 +3354,7 @@ app.get("/customers", requireAuth, async (req, res) => {
     if (req.user.role === "salesman" && req.user.salesman_name) {
       const name = req.user.salesman_name;
       const { data: myOrders } = await supabase.from("orders").select("customer_id")
-        .eq("company_id", req.user.company_id).ilike("salesman", `%${name}%`).not("customer_id", "is", null);
+        .eq("company_id", getActiveCompanyId(req)).ilike("salesman", `%${name}%`).not("customer_id", "is", null);
       const custIds = [...new Set((myOrders || []).map(o => o.customer_id).filter(Boolean))];
       if (custIds.length === 0) return res.json({ customers: [], total: 0 });
       let q = supabase.from("customers").select("*", { count: "exact" }).in("id", custIds).order("name").limit(Number(limit));
@@ -3400,11 +3400,11 @@ app.post("/customers", requireRole(MANAGE_ROLES), async (req, res) => {
     if (!name) return res.status(400).json({ error: "Name required" });
     // Check duplicate by phone
     if (phone) {
-      const { data: dup } = await supabase.from("customers").select("id, name").eq("company_id", req.user.company_id).eq("phone", phone.trim()).maybeSingle();
+      const { data: dup } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("phone", phone.trim()).maybeSingle();
       if (dup) return res.status(400).json({ error: `Customer with phone ${phone} already exists: ${dup.name}`, existing: dup });
     }
     const { data, error } = await supabase.from("customers").insert({
-      company_id: req.user.company_id, name: name.trim(), phone: phone?.trim() || null,
+      company_id: getActiveCompanyId(req), name: name.trim(), phone: phone?.trim() || null,
       email: email?.trim() || null, address: address || null,
       ic_number: ic_number || null, company_name: custCompany || null, notes: notes || null,
     }).select().single();
@@ -3431,7 +3431,7 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
   try {
     const phone = req.params.phone.trim();
     const { data } = await supabase.from("customers").select("*")
-      .eq("company_id", req.user.company_id).ilike("phone", `%${phone}%`).limit(5);
+      .eq("company_id", getActiveCompanyId(req)).ilike("phone", `%${phone}%`).limit(5);
     res.json({ customers: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3473,7 +3473,7 @@ app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
     // Auto-recalculate commissions for affected orders
     const affectedOrderIds = Array.isArray(allocations) ? allocations.map(a => a.order_id) : order_id ? [order_id] : [];
     for (const oid of affectedOrderIds) {
-      try { await calculateCommission(oid, req.user.company_id); } catch (e) { console.error("commission recalc error:", e.message); }
+      try { await calculateCommission(oid, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc error:", e.message); }
     }
     res.json({ payment });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3518,7 +3518,7 @@ app.post("/product-incentives", requireRole(["master", "manager"]), async (req, 
     const { product_id, product_code, product_name, incentive_amount, start_date, end_date } = req.body;
     if (!incentive_amount || Number(incentive_amount) <= 0) return res.status(400).json({ error: "incentive_amount required" });
     const { data, error } = await supabase.from("product_incentives").insert({
-      company_id: req.user.company_id, product_id: product_id || null,
+      company_id: getActiveCompanyId(req), product_id: product_id || null,
       product_code: product_code || null, product_name: product_name || null,
       incentive_amount: Number(incentive_amount), start_date: start_date || null,
       end_date: end_date || null, is_active: true, created_by: req.user.id,
@@ -3567,7 +3567,7 @@ app.post("/commission-rules", requireRole(["master", "manager"]), async (req, re
     const { role_name, tier_name, min_net, max_net, rate_pct, incentive_pct, payout_day, deposit_gate_pct, channel, user_id } = req.body;
     if (!role_name || rate_pct == null) return res.status(400).json({ error: "role_name and rate_pct required" });
     const { data, error } = await supabase.from("commission_rules").insert({
-      company_id: req.user.company_id, role_name, tier_name: tier_name || null,
+      company_id: getActiveCompanyId(req), role_name, tier_name: tier_name || null,
       min_net: Number(min_net) || 0, max_net: max_net ? Number(max_net) : null,
       rate_pct: Number(rate_pct), incentive_pct: Number(incentive_pct) || 0,
       channel: channel || "branch", user_id: user_id || null,
@@ -3777,13 +3777,13 @@ app.post("/commissions/recalculate-all", requireRole(["master", "manager"]), asy
   try {
     // Prime the cache once before processing all orders
     _commCache.ts = 0; // invalidate
-    await getCommCache(req.user.company_id);
+    await getCommCache(getActiveCompanyId(req));
     const { data: orders } = await supabase.from("orders").select("id")
-      .eq("company_id", req.user.company_id).gt("order_amount", 0)
+      .eq("company_id", getActiveCompanyId(req)).gt("order_amount", 0)
       .not("status", "in", '("Cancelled")').limit(500);
     let calculated = 0;
     for (const o of (orders || [])) {
-      try { await calculateCommission(o.id, req.user.company_id); calculated++; } catch {}
+      try { await calculateCommission(o.id, getActiveCompanyId(req)); calculated++; } catch {}
     }
     res.json({ calculated, total: (orders || []).length });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3900,13 +3900,13 @@ app.post("/statements/upload", requireRole(MANAGE_ROLES), upload.single("file"),
     const ext = file.originalname.split(".").pop().toLowerCase();
 
     // Upload to storage
-    const path = `statements/${req.user.company_id}/${Date.now()}-${file.originalname}`;
+    const path = `statements/${getActiveCompanyId(req)}/${Date.now()}-${file.originalname}`;
     await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
     const { data: urlData } = supabase.storage.from("order-attachments").getPublicUrl(path);
 
     // Create upload record
     const { data: upload, error } = await supabase.from("statement_uploads").insert({
-      company_id: req.user.company_id, type, filename: file.originalname,
+      company_id: getActiveCompanyId(req), type, filename: file.originalname,
       file_url: urlData?.publicUrl || null, status: "processing", uploaded_by: req.user.id,
     }).select().single();
     if (error) throw error;
@@ -3952,7 +3952,7 @@ app.post("/statements/upload", requireRole(MANAGE_ROLES), upload.single("file"),
     }
 
     // Auto-match
-    const matchCount = await autoMatchTransactions(upload.id, req.user.company_id);
+    const matchCount = await autoMatchTransactions(upload.id, getActiveCompanyId(req));
 
     // Update upload
     await supabase.from("statement_uploads").update({
@@ -4177,7 +4177,7 @@ app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
       if (o) { custName = o.customer_name; custPhone = o.contact; custAddr = o.address; }
     }
     const { data, error } = await supabase.from("services").insert({
-      company_id: req.user.company_id, order_id: order_id || null,
+      company_id: getActiveCompanyId(req), order_id: order_id || null,
       service_type: Number(service_type), status: "open",
       description: description || null, issue_description: description || null,
       assigned_to: assigned_to || null, source: "manual",
@@ -4310,7 +4310,7 @@ app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, re
       .eq("reference_type", "do").eq("reference_id", req.params.id);
     for (const m of (movements || [])) {
       if (m.quantity > 0) {
-        await adjustStock(req.user.company_id, m.warehouse_id, m.product_id, -m.quantity, "adjustment", "do_reversal", req.params.id, "DO deleted — stock reversed", req.user.id);
+        await adjustStock(getActiveCompanyId(req), m.warehouse_id, m.product_id, -m.quantity, "adjustment", "do_reversal", req.params.id, "DO deleted — stock reversed", req.user.id);
       }
     }
     await supabase.from("do_review").delete().eq("supplier_delivery_id", req.params.id);
@@ -5356,7 +5356,7 @@ const DRIVER_ROLES = ["master", "manager", "company_admin", "driver", "operation
 app.get("/driver/my-route", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const companyId = req.user.company_id;
+    const companyId = getActiveCompanyId(req);
     const date = req.query.date || new Date().toISOString().slice(0, 10);
 
     // Try 1: teams where user is driver or helper
@@ -5439,7 +5439,7 @@ app.post("/driver/schedule/:id/photo", requireRole(DRIVER_ROLES), upload.single(
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No photo" });
     const ext = file.originalname.split(".").pop();
-    const path = `delivery-photos/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+    const path = `delivery-photos/${getActiveCompanyId(req)}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
     const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
     if (upErr) return res.status(500).json({ error: "Upload failed: " + upErr.message });
     const { data: urlData } = supabase.storage.from("order-attachments").getPublicUrl(path);
@@ -5471,7 +5471,7 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
     const { data: order } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
     const newBalance = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
     await supabase.from("orders").update({ balance: newBalance }).eq("id", sched.order_id);
-    try { await calculateCommission(sched.order_id, req.user.company_id); } catch (e) { console.error("commission recalc:", e.message); }
+    try { await calculateCommission(sched.order_id, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc:", e.message); }
     res.json({ ok: true, new_balance: newBalance });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5705,7 +5705,7 @@ app.post("/inventory/adjust", requireRole(MANAGE_ROLES), async (req, res) => {
     const { data: current } = await supabase.from("inventory")
       .select("quantity").eq("warehouse_id", warehouse_id).eq("product_id", product_id).maybeSingle();
     const delta = Number(quantity) - (current?.quantity || 0);
-    const newQty = await adjustStock(req.user.company_id, warehouse_id, product_id, delta, "adjustment", "adjustment", null, notes || "Manual adjustment", req.user.id);
+    const newQty = await adjustStock(getActiveCompanyId(req), warehouse_id, product_id, delta, "adjustment", "adjustment", null, notes || "Manual adjustment", req.user.id);
     res.json({ ok: true, new_quantity: newQty });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5719,8 +5719,8 @@ app.post("/inventory/transfer", requireRole(MANAGE_ROLES), async (req, res) => {
     const { data: fromStock } = await supabase.from("inventory")
       .select("quantity").eq("warehouse_id", from_warehouse_id).eq("product_id", product_id).maybeSingle();
     if ((fromStock?.quantity || 0) < qty) return res.status(400).json({ error: `Insufficient stock (have ${fromStock?.quantity || 0})` });
-    await adjustStock(req.user.company_id, from_warehouse_id, product_id, -qty, "transfer", "transfer", to_warehouse_id, `Transfer to ${to_warehouse_id}`, req.user.id);
-    await adjustStock(req.user.company_id, to_warehouse_id, product_id, qty, "transfer", "transfer", from_warehouse_id, `Transfer from ${from_warehouse_id}`, req.user.id);
+    await adjustStock(getActiveCompanyId(req), from_warehouse_id, product_id, -qty, "transfer", "transfer", to_warehouse_id, `Transfer to ${to_warehouse_id}`, req.user.id);
+    await adjustStock(getActiveCompanyId(req), to_warehouse_id, product_id, qty, "transfer", "transfer", from_warehouse_id, `Transfer from ${from_warehouse_id}`, req.user.id);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5754,7 +5754,7 @@ app.post("/inventory/import", requireRole(MANAGE_ROLES), upload.single("file"), 
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
 
-    const company_id = req.user.company_id;
+    const company_id = getActiveCompanyId(req);
     let imported = 0, skipped = 0, errors = [];
 
     for (const row of rows) {
@@ -6555,7 +6555,7 @@ app.get("/catalogue-import/:job_id", requireRole(MANAGE_ROLES), async (req, res)
   try {
     const { data: job, error } = await supabase.from("catalogue_import_jobs")
       .select("*, catalogue_import_rows(*)")
-      .eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
+      .eq("id", req.params.job_id).eq("company_id", getActiveCompanyId(req)).single();
     if (error || !job) return res.status(404).json({ error: "Job not found" });
 
     // Timeout guard: if processing for more than 15 minutes, mark as failed
@@ -6578,7 +6578,7 @@ app.put("/catalogue-import/:job_id/rows", requireRole(MANAGE_ROLES), async (req,
   try {
     const { rows } = req.body;
     if (!Array.isArray(rows)) return res.status(400).json({ error: "rows must be an array" });
-    const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", req.params.job_id).eq("company_id", req.user.company_id).single();
+    const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", req.params.job_id).eq("company_id", getActiveCompanyId(req)).single();
     if (!job) return res.status(404).json({ error: "Job not found" });
     await Promise.all(rows.map(r => supabase.from("catalogue_import_rows").update({ product_code: r.product_code?.toUpperCase(), product_name: r.product_name, color: r.color || null, size: r.size || null, is_customizable: r.is_customizable || false, category_name: r.category_name || null, supplier_name: r.supplier_name || null, unit_cost: r.unit_cost, unit_price: r.unit_price, action: r.action }).eq("id", r.id).eq("job_id", req.params.job_id)));
     res.json({ ok: true });
@@ -6590,7 +6590,7 @@ app.put("/catalogue-import/:job_id/rows", requireRole(MANAGE_ROLES), async (req,
 app.post("/catalogue-import/:job_id/rows/:row_id/split", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { job_id, row_id } = req.params;
-    const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", job_id).eq("company_id", req.user.company_id).single();
+    const { data: job } = await supabase.from("catalogue_import_jobs").select("id").eq("id", job_id).eq("company_id", getActiveCompanyId(req)).single();
     if (!job) return res.status(404).json({ error: "Job not found" });
     const { data: row } = await supabase.from("catalogue_import_rows").select("*").eq("id", row_id).eq("job_id", job_id).single();
     if (!row) return res.status(404).json({ error: "Row not found" });
@@ -6728,7 +6728,7 @@ app.get("/delivery-notes", requireRole(["master", "manager", "company_admin", "s
     const { status } = req.query;
     let query = supabase.from("delivery_notes")
       .select("*, delivery_note_items(*)")
-      .eq("company_id", req.user.company_id)
+      .eq("company_id", getActiveCompanyId(req))
       .order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
     const { data, error } = await query;
@@ -6741,7 +6741,7 @@ app.patch("/delivery-notes/:id/status", requireRole(["master", "manager", "compa
   try {
     const { status } = req.body;
     const { data, error } = await supabase.from("delivery_notes")
-      .update({ status }).eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .update({ status }).eq("id", req.params.id).eq("company_id", getActiveCompanyId(req))
       .select("id, status").single();
     if (error) throw error;
     res.json({ note: data });
@@ -6794,7 +6794,7 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
       supplier_reference: doData.supplierReference || null,
       photo_url: doPhotoUrl,
       status: "Processed",
-      company_id: req.user.company_id,
+      company_id: getActiveCompanyId(req),
     }).select().single();
     const supplierDeliveryId = supplierDelivery?.id || null;
 
@@ -6871,7 +6871,7 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
 
           // Check if item exists in product master (fuzzy match)
           try {
-            const cid = req.user.company_id;
+            const cid = getActiveCompanyId(req);
             const code = (item.itemCode || "").toUpperCase().trim();
             const name = (item.itemName || "").trim();
             // Extract keywords from DO item name (skip short words, dimensions, abbreviations)
@@ -7028,7 +7028,8 @@ async function syncSalesOrderToDelivery(order, items) {
 // GET /sales-orders — paginated lightweight list
 app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
-    const { company_id, role, salesman_name } = req.user;
+    const company_id = getActiveCompanyId(req);
+    const { role, salesman_name } = req.user;
     const { status, search, salesman, date_from, date_to, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
     const lim = Math.min(Number(limit) || 50, 100);
     const pg = Math.max(Number(page) || 1, 1);
@@ -7096,7 +7097,7 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
     const { data, error } = await supabase
       .from("sales_orders")
       .select("*, sales_order_items(*)")
-      .eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+      .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).single();
     if (error || !data) return res.status(404).json({ error: "Order not found" });
     // Load legacy order for arrival data
     let legacyOrder = null;
@@ -7280,7 +7281,7 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
     if (status === "cancelled" && cancel_reason) updateData.notes = supabase.raw ? cancel_reason : cancel_reason;
     const { data, error } = await supabase.from("sales_orders")
       .update(status === "cancelled" ? { status, notes: cancel_reason } : { status })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req))
       .select("*, sales_order_items(*)").single();
     if (error) throw error;
     await syncSalesOrderToDelivery(data, data.sales_order_items);
@@ -7293,7 +7294,7 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
             // Clawback: set all commissions for this order to status "clawback"
             await supabase.from("commissions").update({ status: "clawback", commission_amt: 0 }).eq("order_id", legacyOrder.id);
           } else {
-            await calculateCommission(legacyOrder.id, req.user.company_id);
+            await calculateCommission(legacyOrder.id, getActiveCompanyId(req));
           }
         }
       } catch (e) { console.error("commission recalc on status change:", e.message); }
@@ -7306,7 +7307,7 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
 app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     if (!["master", "manager", "company_admin"].includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const company_id = req.user.company_id;
+    const company_id = getActiveCompanyId(req);
     const { data: existing } = await supabase.from("sales_orders").select("order_number, status").eq("id", req.params.id).eq("company_id", company_id).single();
     if (existing && ["confirmed", "delivered"].includes(existing.status)) {
       return res.status(400).json({ error: "Cannot delete a " + existing.status + " order. Cancel it first." });
@@ -7326,11 +7327,11 @@ app.post("/sales-orders/upload-attachment", requireAuth, upload.single("file"), 
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No file uploaded" });
     const ext = file.originalname.split(".").pop();
-    const path = `order-attachments/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const path = `order-attachments/${getActiveCompanyId(req)}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
     if (upErr) {
       // Fallback: try catalogue-imports bucket if order-attachments doesn't exist
-      const fallbackPath = `order-attachments/${req.user.company_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const fallbackPath = `order-attachments/${getActiveCompanyId(req)}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const { error: upErr2 } = await supabase.storage.from("catalogue-imports").upload(fallbackPath, file.buffer, { contentType: file.mimetype, upsert: false });
       if (upErr2) return res.status(500).json({ error: "Upload failed: " + upErr.message + " / fallback: " + upErr2.message });
       const { data: d2 } = supabase.storage.from("catalogue-imports").getPublicUrl(fallbackPath);
@@ -7347,7 +7348,7 @@ app.patch("/sales-orders/:id/signature", requireAuth, async (req, res) => {
     const { signature } = req.body;
     const { data, error } = await supabase.from("sales_orders")
       .update({ customer_signature: signature || null })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req))
       .select("id, customer_signature").single();
     if (error) throw error;
     res.json({ ok: true, signature: data.customer_signature });
@@ -7458,7 +7459,7 @@ app.get("/purchase-orders/:id", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase.from("purchase_orders")
       .select("*, purchase_order_items(*), suppliers(id, name)")
-      .eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+      .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).single();
     if (error || !data) return res.status(404).json({ error: "PO not found" });
     res.json({ order: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -7470,7 +7471,7 @@ app.put("/purchase-orders/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     const { expected_date, notes } = req.body;
     const { data, error } = await supabase.from("purchase_orders")
       .update({ expected_date: expected_date || null, notes: notes || null, updated_at: new Date().toISOString() })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id).select().single();
+      .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).select().single();
     if (error) throw error;
     res.json({ order: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -7482,7 +7483,7 @@ app.patch("/purchase-orders/:id/status", requireRole(MANAGE_ROLES), async (req, 
     const { status } = req.body;
     const { data, error } = await supabase.from("purchase_orders")
       .update({ status, updated_at: new Date().toISOString() })
-      .eq("id", req.params.id).eq("company_id", req.user.company_id)
+      .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req))
       .select("id, status").single();
     if (error) throw error;
     res.json({ order: data });
@@ -7492,7 +7493,7 @@ app.patch("/purchase-orders/:id/status", requireRole(MANAGE_ROLES), async (req, 
 // DELETE /purchase-orders/:id — draft only
 app.delete("/purchase-orders/:id", requireAuth, async (req, res) => {
   try {
-    const { data: po } = await supabase.from("purchase_orders").select("status").eq("id", req.params.id).eq("company_id", req.user.company_id).single();
+    const { data: po } = await supabase.from("purchase_orders").select("status").eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).single();
     if (!po) return res.status(404).json({ error: "PO not found" });
     if (po.status !== "draft") return res.status(400).json({ error: "Only draft POs can be deleted" });
     await supabase.from("purchase_order_items").delete().eq("po_id", req.params.id);
@@ -7521,7 +7522,7 @@ app.patch("/purchase-order-items/:id/receive", requireRole(MANAGE_ROLES), async 
     // Stock in if warehouse specified (uses "po_receive" type to avoid double-count with DO confirm-all)
     if (warehouse_id && data.product_id) {
       try {
-        await adjustStock(req.user.company_id, warehouse_id, data.product_id, Number(received_qty) || data.quantity, "in", "po_receive", data.po_id, `PO receive`, req.user.id);
+        await adjustStock(getActiveCompanyId(req), warehouse_id, data.product_id, Number(received_qty) || data.quantity, "in", "po_receive", data.po_id, `PO receive`, req.user.id);
       } catch {}
     }
 
