@@ -52,14 +52,34 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
 };
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
 
-// Derive active company_id from token or header — never trust query params blindly
+// Derive active company_id — validates access for all roles
+// Approach: invalid header → fallback to user's own company (safe, no 403 on bad header)
 function getActiveCompanyId(req) {
   const headerCid = req.headers["x-company-id"];
   const userCid = req.user?.company_id;
-  // If header is set and user is master (can switch companies), use header
-  if (headerCid && req.user?.role === "master") return headerCid;
-  // Otherwise always use user's own company_id
+  if (!headerCid || headerCid === userCid) return userCid || null;
+  // Header differs from user's company — validate access
+  // Cache validated companies on req to avoid re-querying within same request
+  if (req._validatedCompanyId !== undefined) return req._validatedCompanyId;
+  // Validation happens async in middleware; for sync helper, trust if pre-validated
+  if (req._allowedCompanies && req._allowedCompanies.has(headerCid)) return headerCid;
+  // Fallback: if not pre-validated, use user's own company (safe default)
   return userCid || null;
+}
+
+// Async version — use in endpoints that need guaranteed validation
+async function getActiveCompanyIdAsync(req) {
+  const headerCid = req.headers["x-company-id"];
+  const userCid = req.user?.company_id;
+  if (!headerCid || headerCid === userCid) return userCid || null;
+  // Validate: master can access any active company
+  if (req.user?.role === "master") {
+    const { data: comp } = await supabase.from("companies").select("id").eq("id", headerCid).eq("is_active", true).maybeSingle();
+    return comp ? headerCid : userCid;
+  }
+  // Non-master: check user_company_roles
+  const { data: role } = await supabase.from("user_company_roles").select("id").eq("user_id", req.user?.id).eq("company_id", headerCid).eq("active", true).maybeSingle();
+  return role ? headerCid : userCid;
 }
 const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
@@ -78,6 +98,27 @@ const requireAuth = async (req, res, next) => {
     if (profErr) return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     req.user = profile;
+    // Pre-validate X-Company-ID so sync getActiveCompanyId works
+    const headerCid = req.headers["x-company-id"];
+    if (headerCid && headerCid !== profile.company_id) {
+      if (profile.role === "master") {
+        const { data: comp } = await supabase.from("companies").select("id").eq("id", headerCid).eq("is_active", true).maybeSingle();
+        if (comp) {
+          req._allowedCompanies = new Set([profile.company_id, headerCid].filter(Boolean));
+          req._validatedCompanyId = headerCid;
+        } else {
+          req._validatedCompanyId = profile.company_id;
+        }
+      } else {
+        const { data: role } = await supabase.from("user_company_roles").select("id").eq("user_id", profile.id).eq("company_id", headerCid).eq("active", true).maybeSingle();
+        if (role) {
+          req._allowedCompanies = new Set([profile.company_id, headerCid].filter(Boolean));
+          req._validatedCompanyId = headerCid;
+        } else {
+          req._validatedCompanyId = profile.company_id;
+        }
+      }
+    }
     next();
   } catch (err) { res.status(500).json({ error: err.message }); }
 };
@@ -2985,7 +3026,7 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
     // Check X-Company-ID header for active company override
     const headerCompanyId = req.headers["x-company-id"];
     let activeCompanyId = user.company_id;
-    if (headerCompanyId && availableCompanies.find(c => c.id === headerCompanyId)) {
+    if (headerCompanyId && availableCompanies.find(c => c.companyId === headerCompanyId)) {
       activeCompanyId = headerCompanyId;
     }
 
