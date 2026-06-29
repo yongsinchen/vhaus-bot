@@ -52,34 +52,11 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
 };
 const MANAGE_ROLES = ["master", "manager", "company_admin"];
 
-// Derive active company_id — validates access for all roles
-// Approach: invalid header → fallback to user's own company (safe, no 403 on bad header)
+// Derive active company_id — pre-validated by requireAuth middleware
+// No header → user's own company. Invalid/unauthorized header → blocked in middleware (403).
 function getActiveCompanyId(req) {
-  const headerCid = req.headers["x-company-id"];
-  const userCid = req.user?.company_id;
-  if (!headerCid || headerCid === userCid) return userCid || null;
-  // Header differs from user's company — validate access
-  // Cache validated companies on req to avoid re-querying within same request
-  if (req._validatedCompanyId !== undefined) return req._validatedCompanyId;
-  // Validation happens async in middleware; for sync helper, trust if pre-validated
-  if (req._allowedCompanies && req._allowedCompanies.has(headerCid)) return headerCid;
-  // Fallback: if not pre-validated, use user's own company (safe default)
-  return userCid || null;
-}
-
-// Async version — use in endpoints that need guaranteed validation
-async function getActiveCompanyIdAsync(req) {
-  const headerCid = req.headers["x-company-id"];
-  const userCid = req.user?.company_id;
-  if (!headerCid || headerCid === userCid) return userCid || null;
-  // Validate: master can access any active company
-  if (req.user?.role === "master") {
-    const { data: comp } = await supabase.from("companies").select("id").eq("id", headerCid).eq("is_active", true).maybeSingle();
-    return comp ? headerCid : userCid;
-  }
-  // Non-master: check user_company_roles
-  const { data: role } = await supabase.from("user_company_roles").select("id").eq("user_id", req.user?.id).eq("company_id", headerCid).eq("active", true).maybeSingle();
-  return role ? headerCid : userCid;
+  if (req._validatedCompanyId) return req._validatedCompanyId;
+  return req.user?.company_id || null;
 }
 const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
@@ -98,25 +75,19 @@ const requireAuth = async (req, res, next) => {
     if (profErr) return res.status(500).json({ error: "Profile lookup failed: " + profErr.message });
     if (!profile || !profile.is_active) return res.status(403).json({ error: "Account inactive" });
     req.user = profile;
-    // Pre-validate X-Company-ID so sync getActiveCompanyId works
+    // Validate X-Company-ID header — 403 if invalid/unauthorized
     const headerCid = req.headers["x-company-id"];
     if (headerCid && headerCid !== profile.company_id) {
+      const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!uuidRe.test(headerCid)) return res.status(403).json({ error: "Invalid X-Company-ID format" });
       if (profile.role === "master") {
         const { data: comp } = await supabase.from("companies").select("id").eq("id", headerCid).eq("is_active", true).maybeSingle();
-        if (comp) {
-          req._allowedCompanies = new Set([profile.company_id, headerCid].filter(Boolean));
-          req._validatedCompanyId = headerCid;
-        } else {
-          req._validatedCompanyId = profile.company_id;
-        }
+        if (!comp) return res.status(403).json({ error: "Company not found or inactive" });
+        req._validatedCompanyId = headerCid;
       } else {
         const { data: role } = await supabase.from("user_company_roles").select("id").eq("user_id", profile.id).eq("company_id", headerCid).eq("active", true).maybeSingle();
-        if (role) {
-          req._allowedCompanies = new Set([profile.company_id, headerCid].filter(Boolean));
-          req._validatedCompanyId = headerCid;
-        } else {
-          req._validatedCompanyId = profile.company_id;
-        }
+        if (!role) return res.status(403).json({ error: "No access to selected company" });
+        req._validatedCompanyId = headerCid;
       }
     }
     next();

@@ -53,13 +53,13 @@ async function run() {
   const { data: validComp } = await supabase.from("companies").select("id").eq("id", compB.id).eq("is_active", true).maybeSingle();
   assert("Master: valid company exists in DB → switching allowed", !!validComp);
 
-  // Simulate: master + invalid UUID → fallback
+  // Simulate: master + invalid UUID → 403 (company not found)
   const fakeId = "00000000-0000-0000-0000-000000000000";
   const { data: fakeComp } = await supabase.from("companies").select("id").eq("id", fakeId).eq("is_active", true).maybeSingle();
-  assert("Master: invalid company UUID → not found, fallback to own", !fakeComp);
+  assert("Master: invalid company UUID → not found → 403 (not fallback)", !fakeComp);
 
-  // Simulate: malformed ID
-  assert("Malformed ID 'not-a-uuid' → would fail UUID parse", !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test("not-a-uuid"));
+  // Simulate: malformed ID → 403 (fails UUID regex)
+  assert("Malformed ID 'not-a-uuid' → fails UUID regex → 403", !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test("not-a-uuid"));
 
   // ── 2. Non-master user_company_roles validation ──
   console.log("\n── 2. Non-Master Company Roles Validation ──");
@@ -77,7 +77,7 @@ async function run() {
     if (!(roles || []).find(r => r.company_id === compB.id)) {
       const { data: noAccess } = await supabase.from("user_company_roles").select("id")
         .eq("user_id", nonMaster.id).eq("company_id", compB.id).eq("active", true).maybeSingle();
-      assert("Non-master without role: cannot access Company B", !noAccess);
+      assert("Non-master without role: Company B access → 403 (not fallback)", !noAccess);
     }
 
     // Non-master with own company → always accessible
@@ -99,13 +99,17 @@ async function run() {
   // ── 4. getActiveCompanyId implementation tests ──
   console.log("\n── 4. getActiveCompanyId Implementation ──");
 
-  assert("getActiveCompanyId checks _validatedCompanyId",
-    serverCode.includes("req._validatedCompanyId !== undefined"));
-  assert("getActiveCompanyId checks _allowedCompanies set",
-    serverCode.includes("req._allowedCompanies"));
-  assert("requireAuth pre-validates X-Company-ID for master",
+  assert("getActiveCompanyId reads _validatedCompanyId",
+    serverCode.includes("req._validatedCompanyId"));
+  assert("requireAuth returns 403 on invalid UUID format",
+    serverCode.includes("Invalid X-Company-ID format"));
+  assert("requireAuth returns 403 when company not found/inactive",
+    serverCode.includes("Company not found or inactive"));
+  assert("requireAuth returns 403 when no access to company",
+    serverCode.includes("No access to selected company"));
+  assert("requireAuth validates master via companies table",
     serverCode.includes('profile.role === "master"') && serverCode.includes("_validatedCompanyId"));
-  assert("requireAuth pre-validates X-Company-ID for non-master via user_company_roles",
+  assert("requireAuth validates non-master via user_company_roles",
     serverCode.includes("user_company_roles") && serverCode.includes("_validatedCompanyId"));
 
   // ── 5. Frontend: All 13 pages send X-Company-ID ──
@@ -136,8 +140,8 @@ async function run() {
   // A user with company_id but no X-Company-ID header should still work
   assert("Single-company user has company_id", !!master.company_id);
   // getActiveCompanyId with no header returns user's own company
-  assert("getActiveCompanyId with no header returns userCid (code check)",
-    serverCode.includes("return userCid || null"));
+  assert("getActiveCompanyId with no header returns user.company_id (code check)",
+    serverCode.includes('req.user?.company_id || null'));
 
   // ── 7. Previously fixed pages still include X-Company-ID ──
   console.log("\n── 7. Previously Compliant Pages Regression ──");
