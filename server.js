@@ -3271,11 +3271,22 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
 // GET /admin/users/list — list all users (service role bypasses RLS)
 app.get("/admin/users/list", requireRole(["master", "manager"]), async (req, res) => {
   const cid = getActiveCompanyId(req);
-  let query = supabase.from("users").select("*, companies(name, code)").order("name");
-  if (cid) query = query.eq("company_id", cid);
-  const { data, error } = await query;
+  if (!cid) {
+    const { data, error } = await supabase.from("users").select("*, companies(name, code)").order("name");
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json(data || []);
+  }
+  // Include users who have user_company_access for this company (multi-company users)
+  const { data: primaryUsers, error } = await supabase.from("users").select("*, companies(name, code)").eq("company_id", cid).order("name");
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  const { data: accessRows } = await supabase.from("user_company_access").select("user_id").eq("company_id", cid).eq("is_active", true).is("deleted_at", null);
+  const primaryIds = new Set((primaryUsers || []).map(u => u.id));
+  const extraIds = (accessRows || []).map(a => a.user_id).filter(id => !primaryIds.has(id));
+  if (extraIds.length > 0) {
+    const { data: extraUsers } = await supabase.from("users").select("*, companies(name, code)").in("id", extraIds).eq("is_active", true).order("name");
+    return res.json([...(primaryUsers || []), ...(extraUsers || [])]);
+  }
+  res.json(primaryUsers || []);
 });
 
 app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) => {
