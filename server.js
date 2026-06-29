@@ -3267,6 +3267,7 @@ app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations } = req.body;
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
+    const cid = getActiveCompanyId(req);
     // Create payment
     const { data: payment, error } = await supabase.from("payments").insert({
       order_id: order_id || (allocations?.[0]?.order_id) || null,
@@ -3274,6 +3275,7 @@ app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
       amount: Number(amount), payment_method: payment_method || "cash",
       reference_no: reference_no || null, recorded_by: req.user.id,
       notes: proof_url ? `Proof: ${proof_url}` : null,
+      company_id: cid,
     }).select().single();
     if (error) throw error;
     // Allocate to orders
@@ -3305,13 +3307,16 @@ app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.get("/payments", requireAuth, async (req, res) => {
   try {
-    const { company_id, customer_id, order_id, limit = 100 } = req.query;
+    const { customer_id, order_id, limit = 100 } = req.query;
+    const cid = getActiveCompanyId(req);
     let q = supabase.from("payments").select("*, payment_allocations(order_id, amount)").order("paid_at", { ascending: false }).limit(Number(limit));
+    if (cid) q = q.eq("company_id", cid);
     if (customer_id) q = q.eq("customer_id", customer_id);
     if (order_id) q = q.eq("order_id", order_id);
     const { data, error } = await q;
     if (error) {
       let q2 = supabase.from("payments").select("*").order("paid_at", { ascending: false }).limit(Number(limit));
+      if (cid) q2 = q2.eq("company_id", cid);
       if (customer_id) q2 = q2.eq("customer_id", customer_id);
       if (order_id) q2 = q2.eq("order_id", order_id);
       const { data: d2 } = await q2;
@@ -3521,7 +3526,7 @@ async function calculateCommission(orderId, companyId) {
       payout_month: depositMet ? getPayoutMonth(matchRule.payout_day) : null,
     };
     if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
-    else await supabase.from("commissions").insert({ order_id: orderId, user_id: salesUser.id, role_name: "salesman", ...commData });
+    else await supabase.from("commissions").insert({ order_id: orderId, user_id: salesUser.id, role_name: "salesman", company_id: companyId, ...commData });
   }
 
   // Branch manager override — 1% on all branch sales
@@ -3543,7 +3548,7 @@ async function calculateCommission(orderId, companyId) {
         payout_month: depositMet ? getPayoutMonth(mgrRule.payout_day) : null,
       };
       if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
-      else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", ...commData });
+      else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", company_id: companyId, ...commData });
     }
   }
 }
@@ -3560,15 +3565,17 @@ function getPayoutMonth(payoutDay) {
 // GET commissions list
 app.get("/commissions", requireAuth, async (req, res) => {
   try {
-    const { company_id, user_id, status, payout_month } = req.query;
+    const { user_id, status, payout_month } = req.query;
+    const cid = getActiveCompanyId(req);
     let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, company_id), users(name, salesman_name)").order("created_at", { ascending: false });
-    if (company_id) q = q.eq("orders.company_id", company_id);
+    if (cid) q = q.eq("company_id", cid);
     if (user_id) q = q.eq("user_id", user_id);
     if (status) q = q.eq("status", status);
     if (payout_month) q = q.eq("payout_month", payout_month);
     const { data, error } = await q;
     if (error) {
       let q2 = supabase.from("commissions").select("*").order("created_at", { ascending: false });
+      if (cid) q2 = q2.eq("company_id", cid);
       if (user_id) q2 = q2.eq("user_id", user_id);
       if (status) q2 = q2.eq("status", status);
       const { data: d2 } = await q2;
@@ -3662,16 +3669,20 @@ app.patch("/wrong-item-holds/:id", requireRole(MANAGE_ROLES), async (req, res) =
 // Payout summary
 app.get("/commission-payout", requireAuth, async (req, res) => {
   try {
-    const { company_id, payout_month } = req.query;
-    if (!company_id) return res.status(400).json({ error: "company_id required" });
+    const { payout_month } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company context required" });
     const month = payout_month || getPayoutMonth(25);
     // Get eligible commissions for payout month + all pending (any month)
-    const { data: eligibleComms } = await supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
+    let eq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
-    const { data: pendingComms } = await supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
+    if (cid) eq = eq.eq("company_id", cid);
+    const { data: eligibleComms } = await eq;
+    let pq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
       .eq("status", "pending");
-    // Filter by company
-    const comms = [...(eligibleComms || []), ...(pendingComms || [])].filter(c => !company_id || c.orders?.company_id === company_id);
+    if (cid) pq = pq.eq("company_id", cid);
+    const { data: pendingComms } = await pq;
+    const comms = [...(eligibleComms || []), ...(pendingComms || [])];
     // Get adjustments
     const commIds = (comms || []).map(c => c.id);
     let adjustments = [];
@@ -4776,20 +4787,18 @@ app.delete("/delivery-teams/:id", requireRole(MANAGE_ROLES), async (req, res) =>
 // ── Delivery Schedules ──────────────────────────────────────────
 app.get("/delivery-schedules", requireAuth, async (req, res) => {
   try {
-    const { date, team_id, company_id } = req.query;
+    const { date, team_id } = req.query;
+    const cid = getActiveCompanyId(req);
     let q = supabase.from("delivery_schedules").select("*, orders(so_number, customer_name, address, contact, items, status, balance, type, salesman, time_slot, remark), delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate))").order("sort_order");
     if (date) q = q.eq("scheduled_date", date);
     if (team_id) q = q.eq("team_id", team_id);
-    if (company_id) {
-      const { data: teamIds } = await supabase.from("delivery_teams").select("id").eq("company_id", company_id);
-      if (teamIds?.length) q = q.in("team_id", teamIds.map(t => t.id));
-    }
+    if (cid) q = q.eq("company_id", cid);
     const { data, error } = await q;
     if (error) {
-      // Fallback without joins
       let q2 = supabase.from("delivery_schedules").select("*").order("sort_order");
       if (date) q2 = q2.eq("scheduled_date", date);
       if (team_id) q2 = q2.eq("team_id", team_id);
+      if (cid) q2 = q2.eq("company_id", cid);
       const { data: d2 } = await q2;
       return res.json({ schedules: d2 || [] });
     }
@@ -4801,15 +4810,18 @@ app.post("/delivery-schedules", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { order_id, team_id, scheduled_date, area, slot, sort_order } = req.body;
     if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
+    const cid = getActiveCompanyId(req);
     // If already scheduled for this date, update the team instead of blocking
-    const { data: dup } = await supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date).maybeSingle();
+    let dupQ = supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date);
+    if (cid) dupQ = dupQ.eq("company_id", cid);
+    const { data: dup } = await dupQ.maybeSingle();
     if (dup) {
       const { data: updated, error: upErr } = await supabase.from("delivery_schedules").update({ team_id: team_id || null, area: area || null, slot: slot || null, sort_order: sort_order || 0 }).eq("id", dup.id).select().single();
       if (upErr) throw upErr;
       return res.json({ schedule: updated });
     }
     const { data, error } = await supabase.from("delivery_schedules")
-      .insert({ order_id, team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null, sort_order: sort_order || 0, status: "scheduled", is_ready: false })
+      .insert({ order_id, team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null, sort_order: sort_order || 0, status: "scheduled", is_ready: false, company_id: cid })
       .select().single();
     if (error) throw error;
     res.status(201).json({ schedule: data });
@@ -4818,6 +4830,12 @@ app.post("/delivery-schedules", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.patch("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
+    // Validate record belongs to active company
+    if (cid) {
+      const { data: check } = await supabase.from("delivery_schedules").select("id").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
+      if (!check) return res.status(404).json({ error: "Schedule not found" });
+    }
     const { team_id, sort_order, status, slot, area, is_ready, notes } = req.body;
     const updates = {};
     if (team_id !== undefined) updates.team_id = team_id;
@@ -4836,7 +4854,10 @@ app.patch("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res)
 
 app.delete("/delivery-schedules/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    await supabase.from("delivery_schedules").delete().eq("id", req.params.id);
+    const cid = getActiveCompanyId(req);
+    let dq = supabase.from("delivery_schedules").delete().eq("id", req.params.id);
+    if (cid) dq = dq.eq("company_id", cid);
+    await dq;
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
