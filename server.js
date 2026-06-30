@@ -3870,7 +3870,7 @@ app.get("/commissions", requireAuth, async (req, res) => {
     // filter to a specific person via user_id, defaulting to everyone if omitted.
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
-    let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, company_id), users(name, salesman_name)").order("created_at", { ascending: false });
+    let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, status, company_id), users(name, salesman_name), wrong_item_holds(hold_reason, status)").order("created_at", { ascending: false });
     if (cid) q = q.eq("company_id", cid);
     if (user_id) q = q.eq("user_id", user_id);
     if (status) q = q.eq("status", status);
@@ -3982,12 +3982,12 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
     // Get eligible commissions for payout month + all pending (any month)
-    let eq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
+    let eq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, status, company_id), users(name, salesman_name)")
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
     if (cid) eq = eq.eq("company_id", cid);
     if (user_id) eq = eq.eq("user_id", user_id);
     const { data: eligibleComms } = await eq;
-    let pq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
+    let pq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, status, company_id), users(name, salesman_name)")
       .eq("status", "pending");
     if (user_id) pq = pq.eq("user_id", user_id);
     if (cid) pq = pq.eq("company_id", cid);
