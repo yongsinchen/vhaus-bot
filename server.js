@@ -3317,6 +3317,23 @@ app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) =>
   res.json({ success: true, userId: authData.user.id });
 });
 
+app.patch("/admin/users/:id", requireRole(["master", "manager"]), async (req, res) => {
+  const { id } = req.params;
+  const { name, role, company_id, telegram_id, salesman_name, is_active } = req.body;
+  const updates = {};
+  if (name !== undefined) updates.name = name;
+  if (role !== undefined) updates.role = role;
+  if (company_id !== undefined) updates.company_id = company_id || null;
+  if (telegram_id !== undefined) updates.telegram_id = telegram_id || null;
+  if (salesman_name !== undefined) updates.salesman_name = salesman_name || null;
+  if (is_active !== undefined) updates.is_active = is_active;
+  if (Object.keys(updates).length === 0) return res.status(400).json({ success: false, error: "No fields to update." });
+  const { data, error } = await supabase.from("users").update(updates).eq("id", id).select().single();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "User not found." });
+  res.json({ success: true, user: data });
+});
+
 app.patch("/admin/users/:id/password", requireRole(["master", "manager"]), async (req, res) => {
   const { id } = req.params;
   const { password } = req.body;
@@ -5677,6 +5694,7 @@ app.get("/scheduling-suggest", requireAuth, async (req, res) => {
 // ── Inventory Routes ─────────────────────────────────────────────
 // NOTE: `inventory` holds company-wide on_hand/reserved_qty (no warehouse_id —
 // per-location tracking lives in order_item_packings/package_labels via zone/rack).
+// `branch_id` is set to null — requires migrations/006_inventory_branch_id_nullable.sql.
 // `warehouse_id` here is passed through only to tag the stock_movements audit log.
 async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type, reference_type, reference_id, notes, created_by) {
   const { data: existing } = await supabase.from("inventory")
@@ -5685,7 +5703,7 @@ async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type
   if (existing) {
     await supabase.from("inventory").update({ on_hand: newQty, updated_at: new Date().toISOString() }).eq("id", existing.id);
   } else {
-    await supabase.from("inventory").insert({ company_id, product_id, on_hand: newQty, reserved_qty: 0 });
+    await supabase.from("inventory").insert({ company_id, product_id, branch_id: null, on_hand: newQty, reserved_qty: 0 });
   }
   await supabase.from("stock_movements").insert({
     company_id, warehouse_id: warehouse_id || null, product_id, type, quantity: qty_delta,
@@ -5758,8 +5776,10 @@ app.get("/stock-movements", requireAuth, async (req, res) => {
     const { warehouse_id, type, limit: lim } = req.query;
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company_id required" });
+    // stock_movements.product_id/warehouse_id have no FK constraints in the live DB,
+    // so PostgREST can't embed products()/warehouses() — look them up manually instead.
     let query = supabase.from("stock_movements")
-      .select("*, products(code, name), warehouses(name)")
+      .select("*")
       .eq("company_id", cid)
       .order("created_at", { ascending: false })
       .limit(Number(lim) || 100);
@@ -5767,7 +5787,16 @@ app.get("/stock-movements", requireAuth, async (req, res) => {
     if (type) query = query.eq("type", type);
     const { data, error } = await query;
     if (error) throw error;
-    res.json({ movements: data || [] });
+    const movements = data || [];
+    const productIds = [...new Set(movements.map(m => m.product_id).filter(Boolean))];
+    const warehouseIds = [...new Set(movements.map(m => m.warehouse_id).filter(Boolean))];
+    const [{ data: prods }, { data: whs }] = await Promise.all([
+      productIds.length ? supabase.from("products").select("id, code, name").in("id", productIds) : Promise.resolve({ data: [] }),
+      warehouseIds.length ? supabase.from("warehouses").select("id, name").in("id", warehouseIds) : Promise.resolve({ data: [] }),
+    ]);
+    const prodMap = Object.fromEntries((prods || []).map(p => [p.id, p]));
+    const whMap = Object.fromEntries((whs || []).map(w => [w.id, w]));
+    res.json({ movements: movements.map(m => ({ ...m, products: prodMap[m.product_id] || null, warehouses: whMap[m.warehouse_id] || null })) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
