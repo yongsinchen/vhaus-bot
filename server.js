@@ -5934,7 +5934,7 @@ app.delete("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async
 app.get("/suppliers", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at, organization_supplier_id").order("name");
+    let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at, organization_supplier_id, organization_suppliers(id, name)").order("name");
     if (cid) query = query.eq("company_id", cid);
     const { data, error } = await query;
     if (error) throw error;

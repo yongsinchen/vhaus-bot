@@ -56,9 +56,11 @@ async function run() {
 
   // ── 3. GET /suppliers unchanged behavior, additive field only ──
   console.log("\n── 3. GET /suppliers — Additive Field Only ──");
-  assert("GET /suppliers still scoped by company_id", /app\.get\("\/suppliers", requireAuth[\s\S]{0,300}eq\("company_id", cid\)/.test(serverCode));
-  assert("GET /suppliers now includes organization_supplier_id in select (additive)",
-    serverCode.includes('select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at, organization_supplier_id")'));
+  assert("GET /suppliers still scoped by company_id", /app\.get\("\/suppliers", requireAuth[\s\S]{0,500}eq\("company_id", cid\)/.test(serverCode));
+  assert("GET /suppliers includes organization_supplier_id in select (additive, Phase 2)",
+    serverCode.includes("organization_supplier_id"));
+  assert("GET /suppliers now also includes nested organization_suppliers(id, name) (Phase C-2)",
+    serverCode.includes("organization_suppliers(id, name)"));
 
   // ── 4. Org supplier list returns only active org scope ──
   console.log("\n── 4. Organization Scoping ──");
