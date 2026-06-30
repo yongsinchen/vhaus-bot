@@ -3339,6 +3339,22 @@ app.get("/salesman-names", requireRole(ORDER_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /drivers — minimal-exposure list of active driver users for the active
+// company: { id, name } only. delivery_vehicles only stores a free-text
+// driver_name, not a user reference, so POST /delivery-teams (which requires
+// a real driver_id FK to users) had no way for the UI to supply one — every
+// team creation 400'd with "driver_id and team_date required". This backs
+// the Add Team picker so a real driver user can be selected.
+app.get("/drivers", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ drivers: [] });
+    const { data } = await supabase.from("users")
+      .select("id, name").eq("company_id", cid).eq("is_active", true).eq("role", "driver").order("name");
+    res.json({ drivers: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) => {
   const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
   if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
