@@ -76,22 +76,24 @@ async function run() {
   assert("processJobAsync reads company_id back from the job row (not from req — there is no req in a background job)",
     serverCode.includes("await finaliseJob(jobId, job.company_id, parsedRows, job.cost_divisor, job.color_mode);"));
 
-  // ── 4. Other req.user.company_id call sites — confirmed out of scope, untouched ──
-  console.log("\n── 4. Out-of-Scope Call Sites Untouched (Per D4 Scope) ──");
+  // ── 4. Other req.user.company_id call sites — out of scope when this test was
+  //      written, fixed in the approved follow-up Phase D4b. See
+  //      test-phase-d4b-remaining-scoping.js for full coverage of that fix.
+  console.log("\n── 4. Remaining Call Sites (Fixed in Phase D4b) ──");
   const remaining = [...serverCode.matchAll(/(?:const \{[^}]*company_id[^}]*\} = req\.user;)/g)].map(m => m[0]);
-  assert("Exactly 4 req.user.company_id call sites remain (all confirmed out of D4 scope)", remaining.length === 4, `found ${remaining.length}`);
+  assert("Zero req.user.company_id call sites remain anywhere (Phase D4b completed the cleanup)", remaining.length === 0, `found ${remaining.length}`);
   const generateDo = extractHandler(serverCode, 'app.post("/sales-orders/:id/generate-do"');
-  assert("POST /sales-orders/:id/generate-do still uses req.user.company_id (out of scope, untouched)",
-    generateDo && generateDo.includes("const { company_id } = req.user;"));
+  assert("POST /sales-orders/:id/generate-do now uses getActiveCompanyId(req) (D4b)",
+    generateDo && generateDo.includes("const company_id = getActiveCompanyId(req);"));
   const putSalesOrder = extractHandler(serverCode, 'app.put("/sales-orders/:id"');
-  assert("PUT /sales-orders/:id still uses req.user.company_id (out of scope, untouched)",
-    putSalesOrder && putSalesOrder.includes("const { company_id } = req.user;"));
+  assert("PUT /sales-orders/:id now uses getActiveCompanyId(req) (D4b)",
+    putSalesOrder && putSalesOrder.includes("const company_id = getActiveCompanyId(req);"));
   const getPOs = extractHandler(serverCode, 'app.get("/purchase-orders"');
-  assert("GET /purchase-orders still uses req.user.company_id (out of scope, untouched)",
-    getPOs && getPOs.includes("const { company_id } = req.user;"));
+  assert("GET /purchase-orders now uses getActiveCompanyId(req) (D4b)",
+    getPOs && getPOs.includes("const company_id = getActiveCompanyId(req);"));
   const postSalesOrder = extractHandler(serverCode, 'app.post("/sales-orders"');
-  assert("POST /sales-orders still uses req.user.company_id (out of scope, untouched)",
-    postSalesOrder && postSalesOrder.includes("const { company_id, id: created_by, salesman_name, name } = req.user;"));
+  assert("POST /sales-orders now uses getActiveCompanyId(req) (D4b)",
+    postSalesOrder && postSalesOrder.includes("const company_id = getActiveCompanyId(req);"));
 
   // ── 5. Explicitly deferred: no organization-identity write logic added ──
   console.log("\n── 5. No Organization-Identity Write Logic Added (Per D4 Scope) ──");

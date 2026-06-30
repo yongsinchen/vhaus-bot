@@ -6993,7 +6993,7 @@ async function nextDONumber(company_id) {
 
 app.post("/sales-orders/:id/generate-do", requireRole(["master", "manager", "company_admin", "salesman"]), async (req, res) => {
   try {
-    const { company_id } = req.user;
+    const company_id = getActiveCompanyId(req);
     const { item_ids, warehouse_id } = req.body;
 
     const { data: order } = await supabase.from("sales_orders")
@@ -7417,7 +7417,8 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
 app.post("/sales-orders", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { company_id, id: created_by, salesman_name, name } = req.user;
+    const company_id = getActiveCompanyId(req);
+    const { id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel } = req.body;
@@ -7482,7 +7483,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
 app.put("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { company_id } = req.user;
+    const company_id = getActiveCompanyId(req);
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
@@ -7743,7 +7744,7 @@ app.post("/sales-orders/:id/submit-po", requireAuth, async (req, res) => {
 // GET /purchase-orders
 app.get("/purchase-orders", requireAuth, async (req, res) => {
   try {
-    const { company_id } = req.user;
+    const company_id = getActiveCompanyId(req);
     const { status, supplier_id, search } = req.query;
     let query = supabase.from("purchase_orders")
       .select("*, purchase_order_items(*), suppliers(id, name)")
