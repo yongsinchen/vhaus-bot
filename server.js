@@ -123,6 +123,16 @@ async function isOrgSharingEnabledForCompany(req) {
   return comp?.org_sharing_enabled !== false;
 }
 
+// The active company's catalogue_group_id, or null if it isn't in one
+// (migration 007 — the product/supplier/category sharing boundary, distinct
+// from organization_id). Null for UGL/Fontera/Test Company today.
+async function getActiveCatalogueGroupId(req) {
+  const cid = getActiveCompanyId(req);
+  if (!cid) return null;
+  const { data: comp } = await supabase.from("companies").select("catalogue_group_id").eq("id", cid).maybeSingle();
+  return comp?.catalogue_group_id || null;
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -6375,9 +6385,25 @@ app.patch("/organization-products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), asy
 });
 
 // ── GET /categories ──────────────────────────────────────────────
+// Categories collapse to org-level for companies in a catalogue_group (migration
+// 008): no more per-company product_categories row — the category IS the
+// organization_categories row, returned with isOrgLevel:true so the frontend
+// knows to write organization_category_id on products instead of category_id.
+// Companies without a catalogue_group_id (UGL, Fontera, Test Company) keep the
+// legacy per-company product_categories behavior, unchanged.
 app.get("/categories", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+
+    if (catalogueGroupId) {
+      const { data, error } = await supabase.from("organization_categories")
+        .select("id, name, parent_id, spec_labels, created_at")
+        .eq("catalogue_group_id", catalogueGroupId).eq("is_active", true).order("name");
+      if (error) throw error;
+      return res.json({ categories: (data || []).map(c => ({ ...c, isOrgLevel: true })) });
+    }
+
     let query = supabase.from("product_categories")
       .select("id, name, parent_id, spec_labels, created_at, organization_category_id, organization_categories(id, name)")
       .order("name");
@@ -6457,6 +6483,18 @@ app.post("/categories", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =>
     const { name, parent_id } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
 
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    if (catalogueGroupId) {
+      try {
+        const orgId = await getActiveOrganizationIdOrThrow(req);
+        const orgCategory = await orgIdentity.findOrCreateCategory({ organizationId: orgId, catalogueGroupId, name, parentId: parent_id || null });
+        return res.status(201).json({ category: { id: orgCategory.id, name: orgCategory.name, parent_id: orgCategory.parent_id, isOrgLevel: true } });
+      } catch (orgErr) {
+        console.error("[POST /categories] organization identity resolution failed:", orgErr.message);
+        return res.status(500).json({ error: "Could not resolve organization identity for this category: " + orgErr.message });
+      }
+    }
+
     let orgCategoryId = null;
     if (await isOrgSharingEnabledForCompany(req)) {
       try {
@@ -6478,12 +6516,26 @@ app.post("/categories", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =>
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Org-level categories (catalogue_group companies) are identified by an
+// organization_categories.id, not a product_categories.id — try that table
+// first (scoped to the company's catalogue group, so one company can't edit
+// another catalogue group's category), fall back to the legacy per-company
+// table for everyone else.
 app.put("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const { name, parent_id } = req.body;
-    const { spec_labels } = req.body;
+    const { name, parent_id, spec_labels } = req.body;
     const update = { name: name.trim(), parent_id: parent_id || null };
     if (spec_labels !== undefined) update.spec_labels = spec_labels;
+
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    if (catalogueGroupId) {
+      const { data, error } = await supabase.from("organization_categories")
+        .update(update).eq("id", req.params.id).eq("catalogue_group_id", catalogueGroupId).select().single();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: "Category not found" });
+      return res.json({ category: { ...data, isOrgLevel: true } });
+    }
+
     const cid = getActiveCompanyId(req);
     const { data, error } = await supabase.from("product_categories").update(update).eq("id", req.params.id).eq("company_id", cid).select().single();
     if (error) throw error;
@@ -6493,6 +6545,19 @@ app.put("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res)
 
 app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    if (catalogueGroupId) {
+      // Deactivate, don't delete — this category may be referenced by products
+      // in any of the catalogue group's companies, not just the active one.
+      const { data: orgCategory } = await supabase.from("organization_categories")
+        .select("id").eq("id", req.params.id).eq("catalogue_group_id", catalogueGroupId).maybeSingle();
+      if (!orgCategory) return res.status(404).json({ error: "Category not found" });
+      await supabase.from("products").update({ organization_category_id: null }).eq("organization_category_id", req.params.id);
+      const { error } = await supabase.from("organization_categories").update({ is_active: false }).eq("id", req.params.id);
+      if (error) throw error;
+      return res.json({ ok: true });
+    }
+
     const cid = getActiveCompanyId(req);
     await supabase.from("products").update({ category_id: null }).eq("category_id", req.params.id).eq("company_id", cid);
     const { error } = await supabase.from("product_categories").delete().eq("id", req.params.id).eq("company_id", cid);
@@ -6508,13 +6573,16 @@ app.get("/products", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     let query = supabase
       .from("products")
-      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name), organization_product_id, organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_product_id, organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
     if (search) query = query.or(`name.ilike.%${search}%,code.ilike.%${search}%`);
     if (supplier_id) query = query.eq("supplier_id", supplier_id);
-    if (category_id) query = query.eq("category_id", category_id);
+    // category_id filter accepts either a legacy product_categories.id or, for
+    // catalogue-group companies, an organization_categories.id — try both
+    // columns since the caller doesn't know which kind of id it's passing.
+    if (category_id) query = query.or(`category_id.eq.${category_id},organization_category_id.eq.${category_id}`);
     if (is_active === "true") query = query.eq("is_active", true);
     if (is_active === "false") query = query.eq("is_active", false);
     const { data, error, count } = await query;
@@ -6529,7 +6597,7 @@ app.get("/products", requireAuth, async (req, res) => {
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
+    const { code, name, description, color, size, supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
 
     let orgProductId = null;
@@ -6544,8 +6612,11 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
       }
     }
 
+    // category_id and organization_category_id are mutually exclusive — a
+    // product picks one kind of category depending on whether the active
+    // company is in a catalogue group (see GET/POST /categories).
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProductId })
+      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProductId })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -6558,9 +6629,9 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
 app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
+    const { code, name, description, color, size, supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
     const { data, error } = await supabase.from("products")
-      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
+      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
       .eq("id", req.params.id).eq("company_id", cid)
       .select().single();
     if (error) {
@@ -6626,7 +6697,8 @@ app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res
 
     const patch = {};
     if (set.supplier_id !== undefined) patch.supplier_id = set.supplier_id || null;
-    if (set.category_id !== undefined) patch.category_id = set.category_id || null;
+    if (set.organization_category_id !== undefined) { patch.organization_category_id = set.organization_category_id || null; patch.category_id = null; }
+    else if (set.category_id !== undefined) patch.category_id = set.category_id || null;
     if (set.is_active !== undefined) patch.is_active = set.is_active;
     if (set.is_standard !== undefined) patch.is_standard = set.is_standard;
     if (set.reorder_point !== undefined) patch.reorder_point = Number(set.reorder_point) || 0;
@@ -7127,6 +7199,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     // commit must resolve to an organization identity. If we can't even
     // determine the organization, nothing in the batch can succeed — abort
     // before processing any row, same contract as POST /suppliers / POST /products.
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
     let orgId;
     try {
       orgId = await getActiveOrganizationIdOrThrow(req);
@@ -7151,39 +7224,60 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
     const supplierMap = new Map((allSuppliers || []).map(s => [s.name.toLowerCase(), s.id]));
 
-    // Build category name → id lookup; auto-create missing categories. A newly
-    // created category must also resolve an organization_categories link
-    // (mandatory on create, Phase E2) — row-level skip-and-continue: if either
-    // the company-level insert or the organization link fails for a specific
-    // category, that category is unusable and every row referencing it is
-    // skipped below with a clear error, rather than silently falling through
-    // with a wrong/null category. Existing (reused) categories are untouched
-    // here — they were already linked when created, or are caught by the
-    // periodic backfill; this phase only covers auto-create.
-    const { data: allCategories } = await supabase.from("product_categories").select("id, name").eq("company_id", company_id);
-    const categoryMap = new Map((allCategories || []).map(c => [c.name.toLowerCase(), c.id]));
+    // Build category name → id lookup; auto-create missing categories.
+    //
+    // Catalogue-group companies (categories collapse to org-level, see
+    // server.js GET/POST /categories and migration 008): categoryMap holds
+    // organization_categories.id directly, no product_categories row is
+    // created at all — matches/creates straight against the org master,
+    // scoped by catalogue_group_id.
+    //
+    // Non-grouped companies: legacy behavior unchanged — a newly created
+    // category must also resolve an organization_categories link (mandatory
+    // on create, Phase E2), row-level skip-and-continue if either the
+    // company-level insert or the organization link fails.
     const failedCategoryNames = new Map(); // normalized name -> error message
     const uniqueCatNames = [...new Set(toImport.map(r => r.category_name?.trim()).filter(Boolean))];
-    for (const catName of uniqueCatNames) {
-      if (categoryMap.has(catName.toLowerCase())) continue;
-      const { data: newCat, error: catErr } = await supabase.from("product_categories")
-        .insert({ company_id, name: catName }).select("id, name").single();
-      if (catErr || !newCat) {
-        console.error("[catalogue-import/commit] category creation failed:", catName, catErr?.message);
-        failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" could not be created: ${catErr?.message || "unknown error"}`);
-        continue;
+    let categoryMap;
+
+    if (catalogueGroupId) {
+      const { data: existingOrgCats } = await supabase.from("organization_categories")
+        .select("id, name").eq("catalogue_group_id", catalogueGroupId).eq("is_active", true);
+      categoryMap = new Map((existingOrgCats || []).map(c => [c.name.toLowerCase(), c.id]));
+      for (const catName of uniqueCatNames) {
+        if (categoryMap.has(catName.toLowerCase())) continue;
+        try {
+          const orgCategory = await orgIdentity.findOrCreateCategory({ organizationId: orgId, catalogueGroupId, name: catName });
+          categoryMap.set(catName.toLowerCase(), orgCategory.id);
+        } catch (orgCatErr) {
+          console.error("[catalogue-import/commit] category organization-linking failed:", catName, orgCatErr.message);
+          failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" organization-linking failed: ${orgCatErr.message}`);
+        }
       }
-      try {
-        const orgCategory = await orgIdentity.findOrCreateCategory({ organizationId: orgId, name: catName });
-        await supabase.from("product_categories").update({ organization_category_id: orgCategory.id }).eq("id", newCat.id);
-        categoryMap.set(newCat.name.toLowerCase(), newCat.id);
-      } catch (orgCatErr) {
-        console.error("[catalogue-import/commit] category organization-linking failed:", catName, orgCatErr.message);
-        failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" organization-linking failed: ${orgCatErr.message}`);
-        // The company-level product_categories row was created (newCat.id exists)
-        // but is left without organization_category_id — caught by the periodic
-        // link-organization-categories.js run. Rows referencing it this commit
-        // are still skipped below, since linking must be immediate on create.
+    } else {
+      const { data: allCategories } = await supabase.from("product_categories").select("id, name").eq("company_id", company_id);
+      categoryMap = new Map((allCategories || []).map(c => [c.name.toLowerCase(), c.id]));
+      for (const catName of uniqueCatNames) {
+        if (categoryMap.has(catName.toLowerCase())) continue;
+        const { data: newCat, error: catErr } = await supabase.from("product_categories")
+          .insert({ company_id, name: catName }).select("id, name").single();
+        if (catErr || !newCat) {
+          console.error("[catalogue-import/commit] category creation failed:", catName, catErr?.message);
+          failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" could not be created: ${catErr?.message || "unknown error"}`);
+          continue;
+        }
+        try {
+          const orgCategory = await orgIdentity.findOrCreateCategory({ organizationId: orgId, name: catName });
+          await supabase.from("product_categories").update({ organization_category_id: orgCategory.id }).eq("id", newCat.id);
+          categoryMap.set(newCat.name.toLowerCase(), newCat.id);
+        } catch (orgCatErr) {
+          console.error("[catalogue-import/commit] category organization-linking failed:", catName, orgCatErr.message);
+          failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" organization-linking failed: ${orgCatErr.message}`);
+          // The company-level product_categories row was created (newCat.id exists)
+          // but is left without organization_category_id — caught by the periodic
+          // link-organization-categories.js run. Rows referencing it this commit
+          // are still skipped below, since linking must be immediate on create.
+        }
       }
     }
 
@@ -7229,7 +7323,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         if (matched) categoryId = matched;
       }
       const { data: product, error: insertErr } = await supabase.from("products")
-        .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true, organization_product_id: orgProduct.id })
+        .insert({ company_id, supplier_id: supplierId, category_id: catalogueGroupId ? null : categoryId, organization_category_id: catalogueGroupId ? categoryId : null, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true, organization_product_id: orgProduct.id })
         .select("id").single();
       if (insertErr) { console.error("Product insert error:", insertErr.code, insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: insertErr.message, product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
@@ -7257,6 +7351,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
 app.get("/catalogue-import/:job_id/commit-preview", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const company_id = getActiveCompanyId(req);
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
 
     let orgId;
     try {
@@ -7281,7 +7376,9 @@ app.get("/catalogue-import/:job_id/commit-preview", requireRole(MANAGE_ROLES), a
     const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
     const supplierMap = new Map((allSuppliers || []).map(s => [s.name.toLowerCase(), s.id]));
 
-    const { data: allCategories } = await supabase.from("product_categories").select("id, name").eq("company_id", company_id);
+    const { data: allCategories } = catalogueGroupId
+      ? await supabase.from("organization_categories").select("id, name").eq("catalogue_group_id", catalogueGroupId).eq("is_active", true)
+      : await supabase.from("product_categories").select("id, name").eq("company_id", company_id);
     const categoryMap = new Map((allCategories || []).map(c => [c.name.toLowerCase(), c.id]));
     const uniqueCatNames = [...new Set(toImport.map(r => r.category_name?.trim()).filter(Boolean))];
 
@@ -7293,7 +7390,7 @@ app.get("/catalogue-import/:job_id/commit-preview", requireRole(MANAGE_ROLES), a
         continue;
       }
       try {
-        const dryRunCat = await orgIdentity.findOrCreateCategory({ organizationId: orgId, name: catName, dryRun: true });
+        const dryRunCat = await orgIdentity.findOrCreateCategory({ organizationId: orgId, catalogueGroupId, name: catName, dryRun: true });
         if (dryRunCat.wouldCreate) categoriesPreview.created.push(catName);
         else categoriesPreview.reused.push(catName);
       } catch (orgCatErr) {

@@ -89,38 +89,48 @@ class OrganizationIdentityService {
   }
 
   /**
-   * Find an existing organization_categories row by normalized name within the
-   * given organization, or create one (unless dryRun). Throws on any database error.
-   * Returns { id, name, created, wouldCreate }.
+   * Find an existing organization_categories row by normalized name, or create
+   * one (unless dryRun). Throws on any database error. Returns
+   * { id, name, created, wouldCreate }.
+   *
+   * Scope: when catalogueGroupId is provided, matching and creation are scoped
+   * to that catalogue group (the product/supplier/category sharing boundary —
+   * see migrations 007/008), not organizationId. catalogueGroupId is optional
+   * and organizationId-only matching is kept as a fallback for companies that
+   * aren't in a catalogue group yet (UGL, Fontera, Test Company) — those
+   * companies still get per-organization category identity, just not shared
+   * across a catalogue group since they don't have one.
    */
-  async findOrCreateCategory({ organizationId, name, dryRun = false }) {
+  async findOrCreateCategory({ organizationId, catalogueGroupId = null, name, parentId = null, dryRun = false }) {
     if (!organizationId) throw new Error("organizationId is required");
     const trimmedName = (name || "").trim();
     if (!trimmedName) throw new Error("name is required");
     const key = normalizeName(trimmedName);
+    const scopeColumn = catalogueGroupId ? "catalogue_group_id" : "organization_id";
+    const scopeValue = catalogueGroupId || organizationId;
 
     const { data: candidates, error: selErr } = await this.supabase
       .from("organization_categories")
-      .select("id, name")
-      .eq("organization_id", organizationId)
+      .select("id, name, parent_id")
+      .eq(scopeColumn, scopeValue)
       .ilike("name", trimmedName);
     if (selErr) throw new Error(`organization_categories lookup failed: ${selErr.message}`);
 
     const match = (candidates || []).find(o => normalizeName(o.name) === key);
-    if (match) return { id: match.id, name: match.name, created: false, wouldCreate: false };
+    if (match) return { id: match.id, name: match.name, parent_id: match.parent_id, created: false, wouldCreate: false };
     if (dryRun) return { id: null, name: trimmedName, created: false, wouldCreate: true };
 
     const { data: created, error: insErr } = await this.supabase
       .from("organization_categories")
-      .insert({ organization_id: organizationId, name: trimmedName })
-      .select("id, name")
+      .insert({ organization_id: organizationId, catalogue_group_id: catalogueGroupId, name: trimmedName, parent_id: parentId || null })
+      .select("id, name, parent_id")
       .single();
     if (insErr) {
       if (insErr.code === "23505") {
         const { data: refetched, error: refErr } = await this.supabase
           .from("organization_categories")
           .select("id, name")
-          .eq("organization_id", organizationId)
+          .eq(scopeColumn, scopeValue)
           .ilike("name", trimmedName);
         if (refErr) throw new Error(`organization_categories re-fetch after create race failed: ${refErr.message}`);
         const won = (refetched || []).find(o => normalizeName(o.name) === key);
@@ -128,7 +138,7 @@ class OrganizationIdentityService {
       }
       throw new Error(`organization_categories create failed: ${insErr.message}`);
     }
-    return { id: created.id, name: created.name, created: true, wouldCreate: false };
+    return { id: created.id, name: created.name, parent_id: created.parent_id, created: true, wouldCreate: false };
   }
 
   /**
