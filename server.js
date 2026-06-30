@@ -87,6 +87,16 @@ function getActiveCompanyId(req) {
   return req.activeCompanyId || req._validatedCompanyId || req.user?.company_id || null;
 }
 
+// Organization of the active company — the scope at which the product
+// catalogue is shared across sibling companies (e.g. PG / KL entities).
+async function getActiveOrganizationId(req) {
+  if (req.activeOrganizationId !== undefined) return req.activeOrganizationId;
+  const cid = getActiveCompanyId(req);
+  if (!cid) return (req.activeOrganizationId = null);
+  const { data } = await supabase.from("companies").select("organization_id").eq("id", cid).single();
+  return (req.activeOrganizationId = data?.organization_id || null);
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -5778,6 +5788,7 @@ app.post("/inventory/import", requireRole(MANAGE_ROLES), upload.single("file"), 
     const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
 
     const company_id = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
     let imported = 0, skipped = 0, errors = [];
 
     for (const row of rows) {
@@ -5787,8 +5798,9 @@ app.post("/inventory/import", requireRole(MANAGE_ROLES), upload.single("file"), 
       if (!code && !name) { skipped++; continue; }
       if (qty <= 0) { skipped++; continue; }
 
-      // Find product by code (and optionally name/size/color)
-      let query = supabase.from("products").select("id").eq("company_id", company_id);
+      // Find product by code (and optionally name/size/color) — shared catalogue, so match across the organization
+      let query = supabase.from("products").select("id");
+      query = orgId ? query.eq("organization_id", orgId) : query.eq("company_id", company_id);
       if (code) query = query.eq("code", code);
       else query = query.ilike("name", `%${name}%`);
       const { data: prods } = await query.limit(1);
@@ -6048,16 +6060,19 @@ app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, r
 });
 
 // ── GET /products ────────────────────────────────────────────────
+// Products are scoped by organization, not company: sibling companies under
+// the same org (e.g. PG / KL entities) share one catalogue.
 app.get("/products", requireAuth, async (req, res) => {
   try {
     const { search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
-    const cid = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
     let query = supabase
       .from("products")
-      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, company_id, suppliers(id,name), product_categories(id,name), companies(id,name)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
-    if (cid) query = query.eq("company_id", cid);
+    if (orgId) query = query.eq("organization_id", orgId);
+    else query = query.eq("company_id", getActiveCompanyId(req));
     if (search) query = query.or(`name.ilike.%${search}%,code.ilike.%${search}%`);
     if (supplier_id) query = query.eq("supplier_id", supplier_id);
     if (category_id) query = query.eq("category_id", category_id);
@@ -6072,10 +6087,11 @@ app.get("/products", requireAuth, async (req, res) => {
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true })
+      .insert({ company_id: cid, organization_id: orgId, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -6087,12 +6103,13 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
 
 app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const cid = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
-    const { data, error } = await supabase.from("products")
+    let query = supabase.from("products")
       .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
-      .eq("id", req.params.id).eq("company_id", cid)
-      .select().single();
+      .eq("id", req.params.id);
+    query = orgId ? query.eq("organization_id", orgId) : query.eq("company_id", getActiveCompanyId(req));
+    const { data, error } = await query.select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
       throw error;
@@ -6104,8 +6121,10 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
 
 app.patch("/products/:id/toggle", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const cid = getActiveCompanyId(req);
-    const { data: existing } = await supabase.from("products").select("is_active").eq("id", req.params.id).eq("company_id", cid).single();
+    const orgId = await getActiveOrganizationId(req);
+    let existingQuery = supabase.from("products").select("is_active").eq("id", req.params.id);
+    existingQuery = orgId ? existingQuery.eq("organization_id", orgId) : existingQuery.eq("company_id", getActiveCompanyId(req));
+    const { data: existing } = await existingQuery.single();
     if (!existing) return res.status(404).json({ error: "Product not found" });
     const { data, error } = await supabase.from("products").update({ is_active: !existing.is_active }).eq("id", req.params.id).select("id, is_active").single();
     if (error) throw error;
@@ -6116,10 +6135,12 @@ app.patch("/products/:id/toggle", ...requirePerm(PERMS.PRODUCTS_EDIT), async (re
 // DELETE /products/:id — remove a product (unlinks any catalogue import rows first)
 app.delete("/products/:id", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, res) => {
   try {
-    const company_id = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
     const id = req.params.id;
     await supabase.from("catalogue_import_rows").update({ product_id: null }).eq("product_id", id);
-    const { error } = await supabase.from("products").delete().eq("id", id).eq("company_id", company_id);
+    let query = supabase.from("products").delete().eq("id", id);
+    query = orgId ? query.eq("organization_id", orgId) : query.eq("company_id", getActiveCompanyId(req));
+    const { error } = await query;
     if (error) {
       if (error.code === "23503") return res.status(409).json({ error: "Product is referenced elsewhere and can't be deleted" });
       throw error;
@@ -6131,11 +6152,13 @@ app.delete("/products/:id", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, r
 // POST /products/bulk-delete — remove many products at once. body: { ids: [] }
 app.post("/products/bulk-delete", ...requirePerm(PERMS.PRODUCTS_DELETE), async (req, res) => {
   try {
-    const company_id = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "ids must be a non-empty array" });
     await supabase.from("catalogue_import_rows").update({ product_id: null }).in("product_id", ids);
-    const { data, error } = await supabase.from("products").delete().eq("company_id", company_id).in("id", ids).select("id");
+    let query = supabase.from("products").delete().in("id", ids);
+    query = orgId ? query.eq("organization_id", orgId) : query.eq("company_id", getActiveCompanyId(req));
+    const { data, error } = await query.select("id");
     if (error) {
       if (error.code === "23503") return res.status(409).json({ error: "Some products are referenced elsewhere and can't be deleted" });
       throw error;
@@ -6150,7 +6173,8 @@ app.post("/products/bulk-delete", ...requirePerm(PERMS.PRODUCTS_DELETE), async (
 // recomputes each product's unit_cost from its own unit_price.
 app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const company_id = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
+    const scope = (q) => orgId ? q.eq("organization_id", orgId) : q.eq("company_id", getActiveCompanyId(req));
     const { ids, set = {}, cost_divisor } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "ids must be a non-empty array" });
 
@@ -6166,17 +6190,17 @@ app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res
 
     let updated = 0;
     if (Object.keys(patch).length > 0) {
-      const { data, error } = await supabase.from("products").update(patch).eq("company_id", company_id).in("id", ids).select("id");
+      const { data, error } = await scope(supabase.from("products").update(patch).in("id", ids)).select("id");
       if (error) throw error;
       updated = data?.length || 0;
     }
 
     const divisor = parseCostDivisor(cost_divisor);
     if (divisor) {
-      const { data: prods } = await supabase.from("products").select("id, unit_price").eq("company_id", company_id).in("id", ids);
+      const { data: prods } = await scope(supabase.from("products").select("id, unit_price").in("id", ids));
       const withPrice = (prods || []).filter(p => p.unit_price != null);
       await Promise.all(withPrice.map(p =>
-        supabase.from("products").update({ unit_cost: Math.round((p.unit_price / divisor) * 100) / 100 }).eq("id", p.id).eq("company_id", company_id)
+        supabase.from("products").update({ unit_cost: Math.round((p.unit_price / divisor) * 100) / 100 }).eq("id", p.id)
       ));
       updated = Math.max(updated, withPrice.length);
     }
@@ -6243,10 +6267,12 @@ app.post("/product-review-queue/link", ...requirePerm(PERMS.PRODUCTS_EDIT), asyn
 app.post("/product-review-queue/create-and-link", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
+    const orgId = await getActiveOrganizationId(req);
     const { item_ids, product_code, product_name, size, color, supplier_id, category_id, unit_cost, unit_price } = req.body;
     if (!item_ids || !product_name) return res.status(400).json({ error: "item_ids and product_name required" });
     const { data: product, error: pErr } = await supabase.from("products").insert({
       company_id: cid,
+      organization_id: orgId,
       code: (product_code || product_name.substring(0, 20)).toUpperCase().replace(/\s+/g, "-"),
       name: product_name, size: size || null, color: color || null,
       supplier_id: supplier_id || null, category_id: category_id || null,
@@ -6326,7 +6352,7 @@ const applyCostDivisor = (row, costDivisor) => {
 // Split a colour string like "Natural / Walnut" into its individual colours.
 const splitColours = (color) => String(color || "").split("/").map(c => c.trim()).filter(Boolean);
 
-// Variant identity: a product is unique per company on code + size + colour.
+// Variant identity: a product is unique per organization (shared catalogue) on code + size + colour.
 const variantKey = (code, name, size, color) =>
   `${(code || "").toUpperCase()}||${(name || "").trim().toLowerCase()}||${(size || "").trim().toLowerCase()}||${(color || "").trim().toLowerCase()}`;
 
@@ -6353,7 +6379,12 @@ async function finaliseJob(jobId, companyId, parsedRows, costDivisor = null, col
   const codes = rows.map(r => r.product_code).filter(Boolean);
   let existingKeys = new Set();
   if (codes.length > 0) {
-    const { data: existing } = await supabase.from("products").select("code, name, size, color").eq("company_id", companyId).in("code", codes);
+    // No req in this background context — resolve the sharing scope (organization) directly from the company.
+    const { data: companyRow } = await supabase.from("companies").select("organization_id").eq("id", companyId).single();
+    const orgId = companyRow?.organization_id || null;
+    let existingQuery = supabase.from("products").select("code, name, size, color").in("code", codes);
+    existingQuery = orgId ? existingQuery.eq("organization_id", orgId) : existingQuery.eq("company_id", companyId);
+    const { data: existing } = await existingQuery;
     existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.name, p.size, p.color)));
   }
   const stagingRows = rows.map(r => applyCostDivisor(r, costDivisor)).map(r => ({
@@ -6635,6 +6666,7 @@ app.post("/catalogue-import/:job_id/rows/:row_id/split", requireRole(MANAGE_ROLE
 app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { company_id } = req.user;
+    const orgId = await getActiveOrganizationId(req);
     const { data: job, error } = await supabase.from("catalogue_import_jobs").select("*, catalogue_import_rows(*)").eq("id", req.params.job_id).eq("company_id", company_id).single();
     if (error || !job) return res.status(404).json({ error: "Job not found" });
     if (job.status === "done") return res.status(409).json({ error: "Job already committed" });
@@ -6642,9 +6674,11 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const toImport = (job.catalogue_import_rows || []).filter(r => r.action === "import");
     const skippedCount = (job.catalogue_import_rows || []).filter(r => r.action !== "import").length;
 
-    // Re-check duplicates at commit time, keyed by code + size + colour
+    // Re-check duplicates at commit time, keyed by code + size + colour — across the shared organization catalogue
     const codes = toImport.map(r => r.product_code).filter(Boolean);
-    const { data: existing } = await supabase.from("products").select("code, name, size, color").eq("company_id", company_id).in("code", codes);
+    let existingProductsQuery = supabase.from("products").select("code, name, size, color").in("code", codes);
+    existingProductsQuery = orgId ? existingProductsQuery.eq("organization_id", orgId) : existingProductsQuery.eq("company_id", company_id);
+    const { data: existing } = await existingProductsQuery;
     const existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.name, p.size, p.color)));
 
     // Build supplier name → id lookup for per-row supplier assignment
@@ -6682,7 +6716,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         if (matched) categoryId = matched;
       }
       const { data: product, error: insertErr } = await supabase.from("products")
-        .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
+        .insert({ company_id, organization_id: orgId, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
         .select("id").single();
       if (insertErr) { console.error("Product insert error:", insertErr.code, insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: insertErr.message, product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
@@ -6895,6 +6929,7 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
           // Check if item exists in product master (fuzzy match)
           try {
             const cid = getActiveCompanyId(req);
+            const orgId = await getActiveOrganizationId(req);
             const code = (item.itemCode || "").toUpperCase().trim();
             const name = (item.itemName || "").trim();
             // Extract keywords from DO item name (skip short words, dimensions, abbreviations)
@@ -6902,19 +6937,25 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
             let found = false;
             // 1. Exact code match
             if (code) {
-              const { data: m1 } = await supabase.from("products").select("id").eq("company_id", cid).eq("code", code).limit(1);
+              let m1Query = supabase.from("products").select("id").eq("code", code);
+              m1Query = orgId ? m1Query.eq("organization_id", orgId) : m1Query.eq("company_id", cid);
+              const { data: m1 } = await m1Query.limit(1);
               if (m1?.length) found = true;
             }
             // 2. Partial code match (code contained in product code or vice versa)
             if (!found && code.length >= 3) {
-              const { data: m2 } = await supabase.from("products").select("id").eq("company_id", cid).ilike("code", `%${code}%`).limit(1);
+              let m2Query = supabase.from("products").select("id").ilike("code", `%${code}%`);
+              m2Query = orgId ? m2Query.eq("organization_id", orgId) : m2Query.eq("company_id", cid);
+              const { data: m2 } = await m2Query.limit(1);
               if (m2?.length) found = true;
             }
             // 3. Keyword search in product name (try longest keywords first)
             if (!found && keywords.length > 0) {
               const sorted = [...keywords].sort((a, b) => b.length - a.length);
               for (const kw of sorted.slice(0, 3)) {
-                const { data: m3 } = await supabase.from("products").select("id").eq("company_id", cid).ilike("name", `%${kw}%`).limit(1);
+                let m3Query = supabase.from("products").select("id").ilike("name", `%${kw}%`);
+                m3Query = orgId ? m3Query.eq("organization_id", orgId) : m3Query.eq("company_id", cid);
+                const { data: m3 } = await m3Query.limit(1);
                 if (m3?.length) { found = true; break; }
               }
             }
