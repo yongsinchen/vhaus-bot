@@ -821,9 +821,15 @@ const saveOrderToSupabase = async (draft) => {
   const normalized = normalizeDeliveryDate(draft.deliveryDate, draft.orderDate);
   const deliveryDate = normalized.deliveryDate;
 
+  // order_date is a DATE column — only accept valid YYYY-MM-DD, otherwise null + note in remark
+  const isValidOrderDate = draft.orderDate && /^\d{4}-\d{2}-\d{2}$/.test(draft.orderDate);
+  const orderDate = isValidOrderDate ? draft.orderDate : null;
+  const orderDateNote = draft.orderDate && !isValidOrderDate ? `Order date: ${draft.orderDate}` : "";
+
   const baseRemark = draft.remark || "";
-  const finalRemark = normalized.remarkNote
-    ? (baseRemark ? `${baseRemark} | ${normalized.remarkNote}` : normalized.remarkNote)
+  const remarkNotes = [normalized.remarkNote, orderDateNote].filter(Boolean).join(" | ");
+  const finalRemark = remarkNotes
+    ? (baseRemark ? `${baseRemark} | ${remarkNotes}` : remarkNotes)
     : baseRemark || null;
 
   // ✅ Duplicate SO check — company-scoped to match UNIQUE(company_id, so_number)
@@ -858,7 +864,7 @@ const saveOrderToSupabase = async (draft) => {
     customer_name: draft.customerName || null,
     address: draft.address || null,
     contact: draft.contact || null,
-    order_date: draft.orderDate || null,
+    order_date: orderDate,
     salesman: draft.salesman || null,
     order_amount: draft.orderAmount || null,
     balance: draft.balance || null,
