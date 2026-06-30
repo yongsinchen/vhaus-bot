@@ -34,7 +34,9 @@ where p.company_id = c.id and p.organization_id is null;
 --    kept as canonical; every other row's references are repointed to it
 --    and the row itself is then removed.
 do $$
-declare dupe_groups int;
+declare
+  dupe_groups int;
+  r record;
 begin
   create temporary table product_merge_map as
   select p.id as old_id,
@@ -50,40 +52,22 @@ begin
   select count(distinct canonical_id) into dupe_groups from product_merge_map;
   raise notice 'Merging % duplicate product row(s) across % group(s).', (select count(*) from product_merge_map), dupe_groups;
 
-  -- Repoint every table that references products(id), skipping any that
-  -- don't exist in this database.
-  if to_regclass('public.inventory') is not null then
-    update inventory i set product_id = m.canonical_id
-    from product_merge_map m where i.product_id = m.old_id;
-  end if;
-  if to_regclass('public.stock_movements') is not null then
-    update stock_movements s set product_id = m.canonical_id
-    from product_merge_map m where s.product_id = m.old_id;
-  end if;
-  if to_regclass('public.sales_order_items') is not null then
-    update sales_order_items s set product_id = m.canonical_id
-    from product_merge_map m where s.product_id = m.old_id;
-  end if;
-  if to_regclass('public.purchase_order_items') is not null then
-    update purchase_order_items po set product_id = m.canonical_id
-    from product_merge_map m where po.product_id = m.old_id;
-  end if;
-  if to_regclass('public.package_labels') is not null then
-    update package_labels pl set product_id = m.canonical_id
-    from product_merge_map m where pl.product_id = m.old_id;
-  end if;
-  if to_regclass('public.product_incentives') is not null then
-    update product_incentives pi set product_id = m.canonical_id
-    from product_merge_map m where pi.product_id = m.old_id;
-  end if;
-  if to_regclass('public.supplier_lead_times') is not null then
-    update supplier_lead_times slt set product_id = m.canonical_id
-    from product_merge_map m where slt.product_id = m.old_id;
-  end if;
-  if to_regclass('public.catalogue_import_rows') is not null then
-    update catalogue_import_rows cir set product_id = m.canonical_id
-    from product_merge_map m where cir.product_id = m.old_id;
-  end if;
+  -- Repoint every foreign key in the database that references products(id),
+  -- discovered from the catalog so no referencing table needs to be named
+  -- here by hand (and none can be missed).
+  for r in
+    select c.conrelid::regclass::text as tbl, a.attname as col
+    from pg_constraint c
+    join pg_attribute a on a.attrelid = c.conrelid and a.attnum = c.conkey[1]
+    where c.confrelid = 'products'::regclass
+      and c.contype = 'f'
+      and array_length(c.conkey, 1) = 1
+  loop
+    execute format(
+      'update %s set %I = m.canonical_id from product_merge_map m where %s.%I = m.old_id',
+      r.tbl, r.col, r.tbl, r.col
+    );
+  end loop;
 
   -- Remove the now-redundant duplicate product rows.
   delete from products p using product_merge_map m where p.id = m.old_id;
