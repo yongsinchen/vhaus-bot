@@ -3830,8 +3830,13 @@ function getPayoutMonth(orderDate) {
 // GET commissions list
 app.get("/commissions", requireAuth, async (req, res) => {
   try {
-    const { user_id, status, payout_month } = req.query;
+    const { status, payout_month } = req.query;
     const cid = getActiveCompanyId(req);
+    // A salesman can only ever see their own commission records — never trust a
+    // client-supplied user_id for this; managers/admins/finance may optionally
+    // filter to a specific person via user_id, defaulting to everyone if omitted.
+    const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
+    const user_id = isSalesman ? req.user.id : req.query.user_id;
     let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, company_id), users(name, salesman_name)").order("created_at", { ascending: false });
     if (cid) q = q.eq("company_id", cid);
     if (user_id) q = q.eq("user_id", user_id);
@@ -3938,13 +3943,20 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company context required" });
     const month = payout_month || `${new Date().toISOString().slice(0, 7)}-01`;
+    // A salesman can only ever see their own payout — never trust a client-supplied
+    // user_id; managers/admins/finance may optionally filter via user_id, defaulting
+    // to everyone in the company if omitted.
+    const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
+    const user_id = isSalesman ? req.user.id : req.query.user_id;
     // Get eligible commissions for payout month + all pending (any month)
     let eq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
     if (cid) eq = eq.eq("company_id", cid);
+    if (user_id) eq = eq.eq("user_id", user_id);
     const { data: eligibleComms } = await eq;
     let pq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
       .eq("status", "pending");
+    if (user_id) pq = pq.eq("user_id", user_id);
     if (cid) pq = pq.eq("company_id", cid);
     const { data: pendingComms } = await pq;
     const comms = [...(eligibleComms || []), ...(pendingComms || [])];
