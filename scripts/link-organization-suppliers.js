@@ -31,14 +31,13 @@ try { require("dotenv").config(); } catch {}
 const fs = require("fs");
 const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
+const { normalizeName: normalize } = require("../organization-identity-service");
 
 const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() !== "false";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPABASE_KEY) { console.error("SUPABASE_SERVICE_ROLE_KEY required"); process.exit(1); }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-const normalize = (name) => (name || "").trim().toLowerCase();
 
 async function fetchAll(table, filters, cols) {
   let all = [], from = 0, pageSize = 1000;

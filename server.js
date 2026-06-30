@@ -8,6 +8,7 @@ const multer = require("multer");
 
 const { PermissionEngine } = require("./permission-engine");
 const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry");
+const { OrganizationIdentityService } = require("./organization-identity-service");
 
 const app = express();
 
@@ -27,6 +28,7 @@ const supabase = createClient(
 );
 const permEngine = new PermissionEngine(supabase);
 const requirePerm = (key) => [requireAuth, permEngine.requirePermission(key)];
+const orgIdentity = new OrganizationIdentityService(supabase);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
@@ -93,6 +95,21 @@ async function getActiveOrganizationId(req) {
   if (!cid) return null;
   const { data: comp } = await supabase.from("companies").select("organization_id").eq("id", cid).maybeSingle();
   return comp?.organization_id || null;
+}
+
+// Strict variant for write paths where organization linking is mandatory (Phase D).
+// Unlike getActiveOrganizationId (used by read endpoints, which treat "no org" as
+// an empty-result fallback), this throws on any database error AND on a missing
+// organization_id — a supplier/product can't be created without organization
+// identity, so both failure modes must stop the request, not be silently treated
+// the same as "nothing to show."
+async function getActiveOrganizationIdOrThrow(req) {
+  const cid = getActiveCompanyId(req);
+  if (!cid) throw new Error("No active company context");
+  const { data: comp, error } = await supabase.from("companies").select("organization_id").eq("id", cid).maybeSingle();
+  if (error) throw new Error(`Failed to resolve organization for active company: ${error.message}`);
+  if (!comp?.organization_id) throw new Error("Active company has no organization assigned");
+  return comp.organization_id;
 }
 
 // Normalize role keys to lowercase for API responses
@@ -6044,14 +6061,32 @@ const parseCostDivisor = (v) => {
 // "combined" (default) → "A/B" is one two-tone colour kept as-is.
 const parseColorMode = (v) => (v === "split" ? "split" : "combined");
 
+// Organization linking is mandatory on create (Phase D) — a supplier is never
+// created without resolving (or creating) its organization_suppliers identity
+// first. If that resolution hits a database error, the whole request fails;
+// we do not insert an unlinked row and rely on the periodic backfill to catch it.
 app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     const { name, code, contact, cost_divisor, color_mode } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
+
+    let orgId, orgSupplier;
+    try {
+      orgId = await getActiveOrganizationIdOrThrow(req);
+      orgSupplier = await orgIdentity.findOrCreateSupplier({ organizationId: orgId, name });
+    } catch (orgErr) {
+      console.error("[POST /suppliers] organization identity resolution failed:", orgErr.message);
+      return res.status(500).json({ error: "Could not resolve organization identity for this supplier: " + orgErr.message });
+    }
+
     const { data, error } = await supabase
       .from("suppliers")
-      .insert({ company_id: cid, name: name.trim(), code: code?.trim() || null, contact: contact || null, cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode) })
+      .insert({
+        company_id: cid, name: name.trim(), code: code?.trim() || null, contact: contact || null,
+        cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode),
+        organization_id: orgId, organization_supplier_id: orgSupplier.id,
+      })
       .select().single();
     if (error) throw error;
     res.status(201).json({ supplier: data });
@@ -6301,13 +6336,26 @@ app.get("/products", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Organization linking is mandatory on create (Phase D) — same contract as
+// POST /suppliers: resolve or create the organization_products identity first,
+// fail the whole request on a database error, never insert an unlinked row.
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
+
+    let orgProduct;
+    try {
+      const orgId = await getActiveOrganizationIdOrThrow(req);
+      orgProduct = await orgIdentity.findOrCreateProduct({ organizationId: orgId, code, name, size, color, baseCost: unit_cost, basePrice: unit_price });
+    } catch (orgErr) {
+      console.error("[POST /products] organization identity resolution failed:", orgErr.message);
+      return res.status(500).json({ error: "Could not resolve organization identity for this product: " + orgErr.message });
+    }
+
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true })
+      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProduct.id })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });

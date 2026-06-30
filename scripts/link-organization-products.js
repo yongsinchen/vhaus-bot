@@ -26,15 +26,13 @@ try { require("dotenv").config(); } catch {}
 const fs = require("fs");
 const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
+const { productKey } = require("../organization-identity-service");
 
 const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() !== "false";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPABASE_KEY) { console.error("SUPABASE_SERVICE_ROLE_KEY required"); process.exit(1); }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-const normCode = (s) => (s || "").trim().toUpperCase();
-const norm = (s) => (s || "").trim().toLowerCase();
 
 async function fetchAll(table, filters, cols) {
   let all = [], from = 0, pageSize = 1000;
@@ -77,7 +75,7 @@ async function run() {
     // Group by exact code+size+color within the organization
     const groups = new Map();
     for (const p of allProducts) {
-      const key = [normCode(p.code), norm(p.size), norm(p.color)].join("|");
+      const key = productKey(p.code, p.size, p.color);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(p);
     }

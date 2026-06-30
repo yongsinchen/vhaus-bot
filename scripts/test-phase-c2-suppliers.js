@@ -97,7 +97,15 @@ async function run() {
   assert("POST /suppliers guard unchanged", serverCode.includes('app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE)'));
   assert("PUT /suppliers/:id guard unchanged", serverCode.includes('app.put("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT)'));
   assert("DELETE /suppliers/:id guard unchanged", serverCode.includes('app.delete("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT)'));
-  assert("POST /suppliers body/insert unchanged", serverCode.includes('insert({ company_id: cid, name: name.trim(), code: code?.trim() || null, contact: contact || null, cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode) })'));
+  // POST /suppliers' insert body intentionally changed in Phase D (approved,
+  // post-dates this Phase C-2 test): organization linking is now mandatory on
+  // create, so the insert also sets organization_id + organization_supplier_id.
+  // All the original company-scoped fields are still there unchanged — that's
+  // what this assertion now checks, rather than pinning the exact old literal.
+  assert("POST /suppliers still inserts all original company-scoped fields (org linking added on top, Phase D)",
+    serverCode.includes("company_id: cid, name: name.trim(), code: code?.trim() || null, contact: contact || null,") &&
+    serverCode.includes("cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode),") &&
+    serverCode.includes("organization_id: orgId, organization_supplier_id: orgSupplier.id,"));
 
   // ── 7. No catalogue import changes ──
   console.log("\n── 7. No Catalogue Import Changes ──");
