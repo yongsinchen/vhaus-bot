@@ -3303,6 +3303,42 @@ app.get("/admin/users/list", requireRole(["master", "manager"]), async (req, res
   res.json(primaryUsers || []);
 });
 
+// GET /salesman-names — minimal-exposure list of active sales assistants for
+// the active company: { id, name, salesman_name } only — no email, telegram_id,
+// or role. Used by the order form's "Sales Assistant(s)" picker and the
+// Commission page's per-salesman rule picker. Unlike /admin/users/list
+// (master/manager only, full user records), this is accessible to anyone who
+// can create an order (ORDER_ROLES); the actual write actions that use this
+// list (creating orders, creating commission rules) each enforce their own
+// stricter guard independently of this read.
+app.get("/salesman-names", requireRole(ORDER_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ salesmen: [] });
+
+    const { data: primaryUsers } = await supabase.from("users")
+      .select("id, name, salesman_name").eq("company_id", cid).eq("is_active", true).not("salesman_name", "is", null);
+    const { data: accessRows } = await supabase.from("user_company_access")
+      .select("user_id").eq("company_id", cid).eq("is_active", true).is("deleted_at", null);
+    const accessUserIds = (accessRows || []).map(a => a.user_id);
+    let accessUsers = [];
+    if (accessUserIds.length > 0) {
+      const { data } = await supabase.from("users")
+        .select("id, name, salesman_name").in("id", accessUserIds).eq("is_active", true).not("salesman_name", "is", null);
+      accessUsers = data || [];
+    }
+    const seen = new Set();
+    const salesmen = [];
+    for (const u of [...(primaryUsers || []), ...accessUsers]) {
+      if (seen.has(u.id)) continue;
+      seen.add(u.id);
+      salesmen.push(u);
+    }
+    salesmen.sort((a, b) => (a.salesman_name || "").localeCompare(b.salesman_name || ""));
+    res.json({ salesmen });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) => {
   const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
   if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
