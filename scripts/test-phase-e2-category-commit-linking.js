@@ -147,8 +147,10 @@ async function run() {
   // ── 5. Scope discipline: only category auto-create touched ──
   console.log("\n── 5. Scope Discipline (Per E2 Approval) ──");
   if (commitHandler) {
-    assert("Product insert still does NOT set organization_product_id (product org-linking not wired yet — E3)",
-      !commitHandler.includes("organization_product_id"));
+    // Product org-linking shipped in the approved follow-up Phase E3, after
+    // this test was written — see test-phase-e3-product-commit-linking.js.
+    assert("Product insert now sets organization_product_id (Phase E3, shipped)",
+      commitHandler.includes("organization_product_id: orgProduct.id"));
     assert("Supplier matching unchanged (still exact name lookup, no orgIdentity call for suppliers)",
       commitHandler.includes("supplierMap.get(row.supplier_name.toLowerCase())") && !/findOrCreateSupplier/.test(commitHandler));
     assert("No dry-run query param/flag added to the live commit endpoint yet (E4, not this phase)",

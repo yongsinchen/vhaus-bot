@@ -6992,6 +6992,24 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         rowUpdates.push({ id: row.id, action: "skip", error_message: failedCategoryNames.get(row.category_name.trim().toLowerCase()), product_id: null });
         continue;
       }
+      // Resolve product organization identity (mandatory on create, Phase E3),
+      // keyed by code + size + color via OrganizationIdentityService — separate
+      // from and unrelated to the variantKey duplicate check above, which also
+      // considers name and is purely a company-level concern. Row-level skip-
+      // and-continue: if this fails, the row is skipped entirely rather than
+      // inserting a product with no organization link.
+      let orgProduct;
+      try {
+        orgProduct = await orgIdentity.findOrCreateProduct({
+          organizationId: orgId, code: row.product_code, name: row.product_name,
+          size: row.size, color: row.color, baseCost: row.unit_cost, basePrice: row.unit_price,
+        });
+      } catch (orgProdErr) {
+        console.error("[catalogue-import/commit] product organization-linking failed:", row.product_code, orgProdErr.message);
+        skipped++;
+        rowUpdates.push({ id: row.id, action: "skip", error_message: `Product "${row.product_code}" organization-linking failed: ${orgProdErr.message}`, product_id: null });
+        continue;
+      }
       // Resolve supplier: per-row supplier_name > job-level supplier_id
       let supplierId = job.supplier_id || null;
       if (row.supplier_name) {
@@ -7005,7 +7023,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         if (matched) categoryId = matched;
       }
       const { data: product, error: insertErr } = await supabase.from("products")
-        .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true })
+        .insert({ company_id, supplier_id: supplierId, category_id: categoryId, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true, organization_product_id: orgProduct.id })
         .select("id").single();
       if (insertErr) { console.error("Product insert error:", insertErr.code, insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: insertErr.message, product_id: null }); }
       else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }

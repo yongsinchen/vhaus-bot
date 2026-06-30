@@ -197,8 +197,11 @@ async function run() {
     commitHandler && commitHandler.includes("orgIdentity.findOrCreateCategory"));
   assert("Commit handler's category auto-create insert line is unchanged (org-linking added on top, not replacing it)",
     commitHandler && commitHandler.includes('insert({ company_id, name: catName })'));
-  assert("Commit handler's product insert is unchanged (still no organization_product_id)",
-    commitHandler && !commitHandler.includes("organization_product_id"));
+  // Product org-linking shipped in the approved follow-up Phase E3, after this
+  // test was written — see test-phase-e3-product-commit-linking.js for full
+  // coverage.
+  assert("Commit handler's product insert now sets organization_product_id (Phase E3, shipped)",
+    commitHandler && commitHandler.includes("organization_product_id: orgProduct.id"));
 
   // ── 5. POST /suppliers and POST /products unaffected (dryRun is optional/additive) ──
   console.log("\n── 5. Normal POST /suppliers and POST /products Unaffected ──");

@@ -106,13 +106,18 @@ async function run() {
   assert("submit-po does NOT call orgIdentity (no product/supplier creation happens here)",
     submitPo && !submitPo.includes("orgIdentity"));
 
-  // ── 6. Category/product auto-create and supplier matching unchanged ──
-  console.log("\n── 6. Catalogue Import Auto-Create / Supplier Matching Unchanged ──");
-  assert("Category auto-create logic unchanged (still plain company-scoped insert, no org lookup)",
+  // ── 6. Category/product auto-create and supplier matching ──
+  // Category and product org-linking shipped in the approved Phases E2/E3,
+  // after this D4 test was written — see test-phase-e2-category-commit-linking.js
+  // and test-phase-e3-product-commit-linking.js for full coverage. The
+  // underlying company-level insert lines this D4 test checks are unchanged
+  // (org-linking was added on top, not replacing them).
+  console.log("\n── 6. Catalogue Import Auto-Create / Supplier Matching ──");
+  assert("Category auto-create's company-level insert line is unchanged (org-linking added on top, Phase E2)",
     commit && commit.includes('insert({ company_id, name: catName })'));
-  assert("Product insert in commit unchanged (still plain company-scoped insert, no organization_product_id)",
+  assert("Product insert's company-level fields are unchanged, organization_product_id now also set (Phase E3)",
     commit && /insert\(\{ company_id, supplier_id: supplierId, category_id: categoryId, code: row\.product_code/.test(commit) &&
-    !/organization_product_id/.test(commit));
+    /organization_product_id: orgProduct\.id/.test(commit));
   assert("Supplier matching unchanged (still exact name lookup against existing company suppliers only, no auto-create)",
     commit && commit.includes('supplierMap.get(row.supplier_name.toLowerCase())') && !commit.includes('suppliers").insert'));
 
