@@ -7449,6 +7449,30 @@ function deliveryStatusFromSO(s) {
 
 // Mirror a sales order into the legacy `orders` table so the dashboard,
 // calendar, and delivery routes pick it up. Keyed by so_number + company_id.
+// Find an existing customer by phone (within company), or create one from order details.
+async function findOrCreateCustomerForOrder(order) {
+  try {
+    const company_id = order.company_id;
+    const name = (order.customer_name || "").trim();
+    const phone = (order.customer_contact || "").trim();
+    if (!name && !phone) return null;
+    if (phone) {
+      const { data: existing } = await supabase.from("customers")
+        .select("id").eq("company_id", company_id).eq("phone", phone).maybeSingle();
+      if (existing) return existing.id;
+    }
+    const { data: created, error } = await supabase.from("customers").insert({
+      company_id, name: name || phone, phone: phone || null,
+      address: order.customer_address || null,
+    }).select("id").single();
+    if (error) throw error;
+    return created?.id || null;
+  } catch (e) {
+    console.error("findOrCreateCustomerForOrder error:", e.message);
+    return null;
+  }
+}
+
 async function syncSalesOrderToDelivery(order, items) {
   try {
     const deliveryItems = (items || []).map(it => ({
@@ -7458,10 +7482,14 @@ async function syncSalesOrderToDelivery(order, items) {
       supplier: it.supplier_name || "",
       itemOrderDate: "", supplierSentDate: "", arrivalDate: "",
     }));
+    const { data: existing } = await supabase.from("orders")
+      .select("id, customer_id").eq("company_id", order.company_id).eq("so_number", order.order_number).maybeSingle();
+    const customer_id = existing?.customer_id || await findOrCreateCustomerForOrder(order);
     const row = {
       company_id: order.company_id,
       so_number: order.order_number,
       customer_name: order.customer_name,
+      customer_id,
       address: order.customer_address || null,
       contact: order.customer_contact || null,
       order_date: (order.created_at || new Date().toISOString()).slice(0, 10),
@@ -7476,8 +7504,6 @@ async function syncSalesOrderToDelivery(order, items) {
       status: deliveryStatusFromSO(order.status),
       items: JSON.stringify(deliveryItems),
     };
-    const { data: existing } = await supabase.from("orders")
-      .select("id").eq("company_id", order.company_id).eq("so_number", order.order_number).maybeSingle();
     let orderId;
     if (existing) { await supabase.from("orders").update(row).eq("id", existing.id); orderId = existing.id; }
     else { const { data: ins } = await supabase.from("orders").insert(row).select("id").single(); orderId = ins?.id; }
