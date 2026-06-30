@@ -170,8 +170,11 @@ async function run() {
   assert("Catalogue import commit handler found", !!commitHandler);
   if (commitHandler) {
     assert("Catalogue import commit does NOT call orgIdentity (deferred to a later phase)", !commitHandler.includes("orgIdentity"));
-    assert("Catalogue import still uses req.user.company_id (fix deferred until immediately before that phase, per approval)",
-      commitHandler.includes("const { company_id } = req.user"));
+    // req.user.company_id was fixed to getActiveCompanyId(req) in the approved Phase D4
+    // (active-company scoping), which shipped after this Phase D1-D3 test was written —
+    // see test-phase-d4-active-company-scoping.js for full coverage of that fix.
+    assert("Catalogue import now uses getActiveCompanyId(req) (Phase D4, shipped)",
+      commitHandler.includes("const company_id = getActiveCompanyId(req);"));
   }
 
   // Summary

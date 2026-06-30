@@ -6756,7 +6756,8 @@ async function processJobAsync(jobId, fileBuffer) {
 
 app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("file"), async (req, res) => {
   try {
-    const { company_id, id: created_by } = req.user;
+    const company_id = getActiveCompanyId(req);
+    const { id: created_by } = req.user;
     const { supplier_id, category_id } = req.body;
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No file uploaded" });
@@ -6914,7 +6915,7 @@ app.post("/catalogue-import/:job_id/rows/:row_id/split", requireRole(MANAGE_ROLE
 
 app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { company_id } = req.user;
+    const company_id = getActiveCompanyId(req);
     const { data: job, error } = await supabase.from("catalogue_import_jobs").select("*, catalogue_import_rows(*)").eq("id", req.params.job_id).eq("company_id", company_id).single();
     if (error || !job) return res.status(404).json({ error: "Job not found" });
     if (job.status === "done") return res.status(409).json({ error: "Job already committed" });
@@ -7685,7 +7686,7 @@ async function updatePOStatus(poId) {
 app.post("/sales-orders/:id/submit-po", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
-    const { company_id } = req.user;
+    const company_id = getActiveCompanyId(req);
     const { item_ids } = req.body;
 
     const { data: order } = await supabase.from("sales_orders")
