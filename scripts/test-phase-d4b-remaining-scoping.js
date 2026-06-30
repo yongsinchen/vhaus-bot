@@ -79,9 +79,12 @@ async function run() {
   console.log("\n── 5. Out-of-Scope Areas Untouched ──");
   assert("None of the four fixed handlers call orgIdentity (no org-write logic added)",
     [postSO, putSO, generateDo, getPOs].every(h => h && !h.includes("orgIdentity")));
+  // Category org-linking (orgIdentity.findOrCreateCategory) shipped in the
+  // approved Phase E2, after this D4b test was written — its active-company
+  // scoping (getActiveCompanyId) is unaffected and still correct.
   const commitHandler = extractHandler(serverCode, 'app.post("/catalogue-import/:job_id/commit"');
-  assert("Catalogue import commit unchanged since D4 (still getActiveCompanyId, still no orgIdentity)",
-    commitHandler && commitHandler.includes("const company_id = getActiveCompanyId(req);") && !commitHandler.includes("orgIdentity"));
+  assert("Catalogue import commit still uses getActiveCompanyId (D4 fix holds) and now calls orgIdentity (Phase E2, shipped)",
+    commitHandler && commitHandler.includes("const company_id = getActiveCompanyId(req);") && commitHandler.includes("orgIdentity.findOrCreateCategory"));
   assert("Telegram webhook handler unchanged", serverCode.includes('app.post("/telegram/webhook", async (req, res) => {'));
 
   // ── 6. submit-po (fixed in D4) still uses the same grouping logic ──

@@ -169,7 +169,15 @@ async function run() {
   const commitHandler = extractHandler(serverCode, 'app.post("/catalogue-import/:job_id/commit"');
   assert("Catalogue import commit handler found", !!commitHandler);
   if (commitHandler) {
-    assert("Catalogue import commit does NOT call orgIdentity (deferred to a later phase)", !commitHandler.includes("orgIdentity"));
+    // orgIdentity.findOrCreateCategory is now called for newly-created categories,
+    // shipped in the approved Phase E2 (category org-linking), which post-dates
+    // this Phase D1-D3 test — see test-phase-e2-category-commit-linking.js for
+    // full coverage of that fix. Product org-linking (findOrCreateProduct) is
+    // still NOT called in commit — that's E3, not yet built.
+    assert("Catalogue import commit now calls orgIdentity.findOrCreateCategory (Phase E2, shipped)",
+      commitHandler.includes("orgIdentity.findOrCreateCategory"));
+    assert("Catalogue import commit still does NOT call findOrCreateProduct (E3, not yet built)",
+      !commitHandler.includes("orgIdentity.findOrCreateProduct"));
     // req.user.company_id was fixed to getActiveCompanyId(req) in the approved Phase D4
     // (active-company scoping), which shipped after this Phase D1-D3 test was written —
     // see test-phase-d4-active-company-scoping.js for full coverage of that fix.

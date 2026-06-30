@@ -186,12 +186,16 @@ async function run() {
     categoryMatchRatio >= 0.95, `${(categoryMatchRatio * 100).toFixed(2)}%`);
 
   // ── 4. Commit endpoint untouched this phase ──
-  console.log("\n── 4. Catalogue Import Commit Untouched (Per E1 Scope) ──");
+  // Category org-linking shipped in the approved follow-up Phase E2, after this
+  // test was written — see test-phase-e2-category-commit-linking.js for full
+  // coverage. Product org-linking (findOrCreateProduct in commit) is still E3,
+  // not yet built, which the assertion below still correctly verifies.
+  console.log("\n── 4. Catalogue Import Commit (Category Linking Shipped in E2) ──");
   const commitHandler = extractHandler(serverCode, 'app.post("/catalogue-import/:job_id/commit"');
   assert("Commit handler found", !!commitHandler);
-  assert("Commit handler does NOT call orgIdentity yet (no live write changes this phase)",
-    commitHandler && !commitHandler.includes("orgIdentity"));
-  assert("Commit handler's category auto-create is unchanged (still plain company-scoped insert)",
+  assert("Commit handler now calls orgIdentity.findOrCreateCategory (Phase E2, shipped)",
+    commitHandler && commitHandler.includes("orgIdentity.findOrCreateCategory"));
+  assert("Commit handler's category auto-create insert line is unchanged (org-linking added on top, not replacing it)",
     commitHandler && commitHandler.includes('insert({ company_id, name: catName })'));
   assert("Commit handler's product insert is unchanged (still no organization_product_id)",
     commitHandler && !commitHandler.includes("organization_product_id"));

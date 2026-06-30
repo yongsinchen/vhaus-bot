@@ -96,10 +96,13 @@ async function run() {
     postSalesOrder && postSalesOrder.includes("const company_id = getActiveCompanyId(req);"));
 
   // ── 5. Explicitly deferred: no organization-identity write logic added ──
+  // Catalogue import commit's category org-linking shipped in the approved
+  // Phase E2, after this D4 test was written — see
+  // test-phase-e2-category-commit-linking.js for full coverage.
   console.log("\n── 5. No Organization-Identity Write Logic Added (Per D4 Scope) ──");
-  assert("Catalogue import commit still does NOT call orgIdentity (deferred to a later phase)",
-    commit && !commit.includes("orgIdentity"));
-  assert("Catalogue import upload does NOT call orgIdentity", upload && !upload.includes("orgIdentity"));
+  assert("Catalogue import commit now calls orgIdentity.findOrCreateCategory (Phase E2, shipped)",
+    commit && commit.includes("orgIdentity.findOrCreateCategory"));
+  assert("Catalogue import upload does NOT call orgIdentity (upload itself never creates categories/products)", upload && !upload.includes("orgIdentity"));
   assert("submit-po does NOT call orgIdentity (no product/supplier creation happens here)",
     submitPo && !submitPo.includes("orgIdentity"));
 

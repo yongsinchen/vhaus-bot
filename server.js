@@ -6916,6 +6916,19 @@ app.post("/catalogue-import/:job_id/rows/:row_id/split", requireRole(MANAGE_ROLE
 app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const company_id = getActiveCompanyId(req);
+
+    // Request-level fail-fast (Phase E2): every category newly created in this
+    // commit must resolve to an organization identity. If we can't even
+    // determine the organization, nothing in the batch can succeed — abort
+    // before processing any row, same contract as POST /suppliers / POST /products.
+    let orgId;
+    try {
+      orgId = await getActiveOrganizationIdOrThrow(req);
+    } catch (orgCtxErr) {
+      console.error("[catalogue-import/commit] organization resolution failed:", orgCtxErr.message);
+      return res.status(500).json({ error: "Could not resolve organization for active company: " + orgCtxErr.message });
+    }
+
     const { data: job, error } = await supabase.from("catalogue_import_jobs").select("*, catalogue_import_rows(*)").eq("id", req.params.job_id).eq("company_id", company_id).single();
     if (error || !job) return res.status(404).json({ error: "Job not found" });
     if (job.status === "done") return res.status(409).json({ error: "Job already committed" });
@@ -6932,15 +6945,39 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
     const supplierMap = new Map((allSuppliers || []).map(s => [s.name.toLowerCase(), s.id]));
 
-    // Build category name → id lookup; auto-create missing categories
+    // Build category name → id lookup; auto-create missing categories. A newly
+    // created category must also resolve an organization_categories link
+    // (mandatory on create, Phase E2) — row-level skip-and-continue: if either
+    // the company-level insert or the organization link fails for a specific
+    // category, that category is unusable and every row referencing it is
+    // skipped below with a clear error, rather than silently falling through
+    // with a wrong/null category. Existing (reused) categories are untouched
+    // here — they were already linked when created, or are caught by the
+    // periodic backfill; this phase only covers auto-create.
     const { data: allCategories } = await supabase.from("product_categories").select("id, name").eq("company_id", company_id);
     const categoryMap = new Map((allCategories || []).map(c => [c.name.toLowerCase(), c.id]));
+    const failedCategoryNames = new Map(); // normalized name -> error message
     const uniqueCatNames = [...new Set(toImport.map(r => r.category_name?.trim()).filter(Boolean))];
     for (const catName of uniqueCatNames) {
-      if (!categoryMap.has(catName.toLowerCase())) {
-        const { data: newCat } = await supabase.from("product_categories")
-          .insert({ company_id, name: catName }).select("id, name").single();
-        if (newCat) categoryMap.set(newCat.name.toLowerCase(), newCat.id);
+      if (categoryMap.has(catName.toLowerCase())) continue;
+      const { data: newCat, error: catErr } = await supabase.from("product_categories")
+        .insert({ company_id, name: catName }).select("id, name").single();
+      if (catErr || !newCat) {
+        console.error("[catalogue-import/commit] category creation failed:", catName, catErr?.message);
+        failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" could not be created: ${catErr?.message || "unknown error"}`);
+        continue;
+      }
+      try {
+        const orgCategory = await orgIdentity.findOrCreateCategory({ organizationId: orgId, name: catName });
+        await supabase.from("product_categories").update({ organization_category_id: orgCategory.id }).eq("id", newCat.id);
+        categoryMap.set(newCat.name.toLowerCase(), newCat.id);
+      } catch (orgCatErr) {
+        console.error("[catalogue-import/commit] category organization-linking failed:", catName, orgCatErr.message);
+        failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" organization-linking failed: ${orgCatErr.message}`);
+        // The company-level product_categories row was created (newCat.id exists)
+        // but is left without organization_category_id — caught by the periodic
+        // link-organization-categories.js run. Rows referencing it this commit
+        // are still skipped below, since linking must be immediate on create.
       }
     }
 
@@ -6950,6 +6987,11 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     for (const row of toImport) {
       if (!row.product_code || !row.product_name) { skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: "Missing code or name", product_id: null }); continue; }
       if (existingKeys.has(variantKey(row.product_code, row.product_name, row.size, row.color))) { console.log("Duplicate skip:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "duplicate", product_id: null }); continue; }
+      if (row.category_name && failedCategoryNames.has(row.category_name.trim().toLowerCase())) {
+        skipped++;
+        rowUpdates.push({ id: row.id, action: "skip", error_message: failedCategoryNames.get(row.category_name.trim().toLowerCase()), product_id: null });
+        continue;
+      }
       // Resolve supplier: per-row supplier_name > job-level supplier_id
       let supplierId = job.supplier_id || null;
       if (row.supplier_name) {
