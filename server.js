@@ -6445,14 +6445,33 @@ app.get("/organization-categories/:id/companies", requireAuth, async (req, res) 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// M0: organization linking is now mandatory on create here too — this endpoint
+// previously inserted categories with no organization_category_id at all (only
+// the catalogue-import commit path called findOrCreateCategory). Same contract
+// as POST /suppliers / POST /products: resolve-or-create the org identity first,
+// skip it only if the company has opted out of org sharing, fail the whole
+// request on a database error rather than insert an unlinked row.
 app.post("/categories", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     const { name, parent_id } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
+
+    let orgCategoryId = null;
+    if (await isOrgSharingEnabledForCompany(req)) {
+      try {
+        const orgId = await getActiveOrganizationIdOrThrow(req);
+        const orgCategory = await orgIdentity.findOrCreateCategory({ organizationId: orgId, name });
+        orgCategoryId = orgCategory.id;
+      } catch (orgErr) {
+        console.error("[POST /categories] organization identity resolution failed:", orgErr.message);
+        return res.status(500).json({ error: "Could not resolve organization identity for this category: " + orgErr.message });
+      }
+    }
+
     const { data, error } = await supabase
       .from("product_categories")
-      .insert({ company_id: cid, name: name.trim(), parent_id: parent_id || null })
+      .insert({ company_id: cid, name: name.trim(), parent_id: parent_id || null, organization_category_id: orgCategoryId })
       .select().single();
     if (error) throw error;
     res.status(201).json({ category: data });
@@ -6691,18 +6710,34 @@ app.post("/product-review-queue/link", ...requirePerm(PERMS.PRODUCTS_EDIT), asyn
 });
 
 // POST create product from review queue then link
+// M0: this path previously inserted a product with no organization_product_id
+// at all — products created from the Telegram-order-review flow were invisible
+// to organization sharing. Same mandatory-on-create contract as POST /products.
 app.post("/product-review-queue/create-and-link", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     const { item_ids, product_code, product_name, size, color, supplier_id, category_id, unit_cost, unit_price } = req.body;
     if (!item_ids || !product_name) return res.status(400).json({ error: "item_ids and product_name required" });
+    const code = (product_code || product_name.substring(0, 20)).toUpperCase().replace(/\s+/g, "-");
+
+    let orgProductId = null;
+    if (await isOrgSharingEnabledForCompany(req)) {
+      try {
+        const orgId = await getActiveOrganizationIdOrThrow(req);
+        const orgProduct = await orgIdentity.findOrCreateProduct({ organizationId: orgId, code, name: product_name, size, color, baseCost: unit_cost, basePrice: unit_price });
+        orgProductId = orgProduct.id;
+      } catch (orgErr) {
+        console.error("[POST /product-review-queue/create-and-link] organization identity resolution failed:", orgErr.message);
+        return res.status(500).json({ error: "Could not resolve organization identity for this product: " + orgErr.message });
+      }
+    }
+
     const { data: product, error: pErr } = await supabase.from("products").insert({
-      company_id: cid,
-      code: (product_code || product_name.substring(0, 20)).toUpperCase().replace(/\s+/g, "-"),
+      company_id: cid, code,
       name: product_name, size: size || null, color: color || null,
       supplier_id: supplier_id || null, category_id: category_id || null,
       unit_cost: unit_cost || null, unit_price: unit_price || null,
-      is_standard: true, is_active: true,
+      is_standard: true, is_active: true, organization_product_id: orgProductId,
     }).select("id").single();
     if (pErr) throw pErr;
     // Link all items
