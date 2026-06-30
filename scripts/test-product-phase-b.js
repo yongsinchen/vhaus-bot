@@ -84,12 +84,14 @@ async function run() {
   const { error: cpcErr } = await supabase.from("company_product_config").select("id").limit(1);
   assert("company_product_config table does NOT exist (explicitly deferred)", !!cpcErr);
 
-  // ── 8. organization_categories explicitly NOT implemented ──
-  console.log("\n── 8. organization_categories Not Implemented (Design Only) ──");
+  // ── 8. organization_categories — built in the later-approved Phase Cat-A ──
+  // (Phase B itself only required this NOT exist yet; Phase Cat-A has since
+  // shipped and is covered by its own test-phase-cat-a.js suite.)
+  console.log("\n── 8. organization_categories (now built in Phase Cat-A) ──");
   const { error: ocErr } = await supabase.from("organization_categories").select("id").limit(1);
-  assert("organization_categories table does NOT exist (design only this phase)", !!ocErr);
+  assert("organization_categories table exists (Phase Cat-A)", !ocErr, ocErr?.message);
   const { error: pcColErr } = await supabase.from("product_categories").select("organization_category_id").limit(1);
-  assert("product_categories.organization_category_id does NOT exist yet", !!pcColErr);
+  assert("product_categories.organization_category_id exists (Phase Cat-A)", !pcColErr, pcColErr?.message);
 
   // ── 9. No premature API surface ──
   console.log("\n── 9. No Premature API Surface ──");
