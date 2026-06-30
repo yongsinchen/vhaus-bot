@@ -7038,6 +7038,115 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /catalogue-import/:job_id/commit-preview — read-only dry-run preview of
+// what POST .../commit would do, without writing anything (Phase E4). Mirrors
+// commit's exact sequence (duplicate detection via variantKey, category
+// resolution, product resolution) using OrganizationIdentityService's dryRun
+// mode for every org-linking call, so the preview can never silently diverge
+// from the real commit's matching logic. Never inserts/updates products,
+// suppliers, categories, organization_products, organization_categories, or
+// catalogue_import_rows/jobs — purely a read. Safe to call on a job in any
+// status, including an already-committed one (useful for testing/auditing
+// historical jobs without risk).
+app.get("/catalogue-import/:job_id/commit-preview", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const company_id = getActiveCompanyId(req);
+
+    let orgId;
+    try {
+      orgId = await getActiveOrganizationIdOrThrow(req);
+    } catch (orgCtxErr) {
+      console.error("[catalogue-import/commit-preview] organization resolution failed:", orgCtxErr.message);
+      return res.status(500).json({ error: "Could not resolve organization for active company: " + orgCtxErr.message });
+    }
+
+    const { data: job, error } = await supabase.from("catalogue_import_jobs").select("*, catalogue_import_rows(*)").eq("id", req.params.job_id).eq("company_id", company_id).single();
+    if (error || !job) return res.status(404).json({ error: "Job not found" });
+
+    const toImport = (job.catalogue_import_rows || []).filter(r => r.action === "import");
+
+    // Duplicate detection — identical query and key to commit; read-only either way.
+    const codes = toImport.map(r => r.product_code).filter(Boolean);
+    const { data: existing } = await supabase.from("products").select("code, name, size, color").eq("company_id", company_id).in("code", codes);
+    const existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.name, p.size, p.color)));
+
+    // Supplier matching — identical to commit; lookup-only, nothing to preview
+    // as "would create" since this path never creates suppliers.
+    const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
+    const supplierMap = new Map((allSuppliers || []).map(s => [s.name.toLowerCase(), s.id]));
+
+    const { data: allCategories } = await supabase.from("product_categories").select("id, name").eq("company_id", company_id);
+    const categoryMap = new Map((allCategories || []).map(c => [c.name.toLowerCase(), c.id]));
+    const uniqueCatNames = [...new Set(toImport.map(r => r.category_name?.trim()).filter(Boolean))];
+
+    const categoriesPreview = { reused: [], created: [], failed: [] };
+    const failedCategoryNames = new Map();
+    for (const catName of uniqueCatNames) {
+      if (categoryMap.has(catName.toLowerCase())) {
+        categoriesPreview.reused.push(catName);
+        continue;
+      }
+      try {
+        const dryRunCat = await orgIdentity.findOrCreateCategory({ organizationId: orgId, name: catName, dryRun: true });
+        if (dryRunCat.wouldCreate) categoriesPreview.created.push(catName);
+        else categoriesPreview.reused.push(catName);
+      } catch (orgCatErr) {
+        categoriesPreview.failed.push({ name: catName, error: orgCatErr.message });
+        failedCategoryNames.set(catName.toLowerCase(), `Category "${catName}" organization-linking would fail: ${orgCatErr.message}`);
+      }
+    }
+
+    const productsPreview = { duplicates: [], reused: [], created: [], failed: [] };
+    const rowsPreview = [];
+
+    for (const row of toImport) {
+      if (!row.product_code || !row.product_name) {
+        rowsPreview.push({ id: row.id, product_code: row.product_code, action: "skip", reason: "Missing code or name" });
+        continue;
+      }
+      if (existingKeys.has(variantKey(row.product_code, row.product_name, row.size, row.color))) {
+        productsPreview.duplicates.push({ code: row.product_code, size: row.size, color: row.color });
+        rowsPreview.push({ id: row.id, product_code: row.product_code, action: "duplicate", reason: "Already exists in this company" });
+        continue;
+      }
+      if (row.category_name && failedCategoryNames.has(row.category_name.trim().toLowerCase())) {
+        const reason = failedCategoryNames.get(row.category_name.trim().toLowerCase());
+        rowsPreview.push({ id: row.id, product_code: row.product_code, action: "skip", reason });
+        continue;
+      }
+      try {
+        const dryRunProd = await orgIdentity.findOrCreateProduct({
+          organizationId: orgId, code: row.product_code, name: row.product_name, size: row.size, color: row.color,
+          baseCost: row.unit_cost, basePrice: row.unit_price, dryRun: true,
+        });
+        if (dryRunProd.wouldCreate) {
+          productsPreview.created.push({ code: row.product_code, size: row.size, color: row.color });
+          rowsPreview.push({ id: row.id, product_code: row.product_code, action: "would_import", organization_product: "new" });
+        } else {
+          productsPreview.reused.push({ code: row.product_code, size: row.size, color: row.color, organization_product_id: dryRunProd.id });
+          rowsPreview.push({ id: row.id, product_code: row.product_code, action: "would_import", organization_product: "existing", organization_product_id: dryRunProd.id });
+        }
+      } catch (orgProdErr) {
+        productsPreview.failed.push({ code: row.product_code, error: orgProdErr.message });
+        rowsPreview.push({ id: row.id, product_code: row.product_code, action: "skip", reason: `Product "${row.product_code}" organization-linking would fail: ${orgProdErr.message}` });
+      }
+    }
+
+    res.json({
+      job_id: job.id,
+      dry_run: true,
+      categories: categoriesPreview,
+      products: productsPreview,
+      rows: rowsPreview,
+      summary: {
+        would_import: rowsPreview.filter(r => r.action === "would_import").length,
+        would_skip: rowsPreview.filter(r => r.action === "skip").length,
+        would_duplicate: rowsPreview.filter(r => r.action === "duplicate").length,
+      },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Generate Outbound DO ─────────────────────────────────────────
 async function nextDONumber(company_id) {
   const now = new Date();

@@ -153,8 +153,15 @@ async function run() {
       commitHandler.includes("organization_product_id: orgProduct.id"));
     assert("Supplier matching unchanged (still exact name lookup, no orgIdentity call for suppliers)",
       commitHandler.includes("supplierMap.get(row.supplier_name.toLowerCase())") && !/findOrCreateSupplier/.test(commitHandler));
-    assert("No dry-run query param/flag added to the live commit endpoint yet (E4, not this phase)",
-      !commitHandler.includes("dry_run") && !commitHandler.includes("dryRun"));
+    // The live dry-run preview shipped as a SEPARATE endpoint in the approved
+    // follow-up Phase E4 (GET .../commit-preview), not as a flag on commit
+    // itself — see test-phase-e4-commit-preview-dryrun.js. commitHandler's
+    // extracted text runs up to that new route's doc comment (which
+    // legitimately mentions "dryRun" in prose), so this checks actual commit
+    // CODE syntax, not a bare substring, to avoid a false positive against
+    // that documentation.
+    assert("Commit's own code does not call findOrCreateCategory/findOrCreateProduct with dryRun: true (no dry-run mode in the real commit itself)",
+      !/findOrCreateCategory\([^)]*dryRun: true/.test(commitHandler) && !/findOrCreateProduct\([^)]*dryRun: true/.test(commitHandler));
   }
   assert("Telegram webhook handler unchanged", serverCode.includes('app.post("/telegram/webhook", async (req, res) => {'));
   const postSuppliers = extractHandler(serverCode, 'app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE)');
