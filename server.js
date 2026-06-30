@@ -6084,11 +6084,70 @@ app.get("/organization-suppliers/:id/companies", requireAuth, async (req, res) =
 app.get("/categories", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    let query = supabase.from("product_categories").select("id, name, parent_id, spec_labels, created_at").order("name");
+    let query = supabase.from("product_categories")
+      .select("id, name, parent_id, spec_labels, created_at, organization_category_id, organization_categories(id, name)")
+      .order("name");
     if (cid) query = query.eq("company_id", cid);
     const { data, error } = await query;
     if (error) throw error;
     res.json({ categories: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /organization-categories — read-only org category visibility (Phase C-1)
+app.get("/organization-categories", requireAuth, async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.json({ organizationCategories: [] });
+
+    const { data: orgCategories, error } = await supabase.from("organization_categories")
+      .select("id, name, parent_id, spec_labels, is_active, created_at")
+      .eq("organization_id", orgId).eq("is_active", true).order("name");
+    if (error) throw error;
+
+    const orgCategoryIds = (orgCategories || []).map(o => o.id);
+    let countMap = {};
+    if (orgCategoryIds.length > 0) {
+      const { data: links } = await supabase.from("product_categories")
+        .select("organization_category_id")
+        .in("organization_category_id", orgCategoryIds);
+      for (const l of (links || [])) {
+        countMap[l.organization_category_id] = (countMap[l.organization_category_id] || 0) + 1;
+      }
+    }
+
+    const result = (orgCategories || []).map(o => ({
+      ...o,
+      companyCount: countMap[o.id] || 0,
+      isShared: (countMap[o.id] || 0) > 1,
+    }));
+    res.json({ organizationCategories: result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /organization-categories/:id/companies — drill-down: which company category
+// rows are linked to this organization category, with company name.
+app.get("/organization-categories/:id/companies", requireAuth, async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
+
+    const { data: orgCategory } = await supabase.from("organization_categories")
+      .select("id, name, organization_id").eq("id", req.params.id).maybeSingle();
+    if (!orgCategory || orgCategory.organization_id !== orgId) {
+      return res.status(404).json({ error: "Organization category not found" });
+    }
+
+    const { data: rows, error } = await supabase.from("product_categories")
+      .select("id, company_id, name, companies(id, name)")
+      .eq("organization_category_id", req.params.id)
+      .order("created_at");
+    if (error) throw error;
+
+    const companies = (rows || []).map(r => ({
+      categoryId: r.id, companyId: r.company_id, companyName: r.companies?.name || null, name: r.name,
+    }));
+    res.json({ organizationCategory: { id: orgCategory.id, name: orgCategory.name }, companies });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

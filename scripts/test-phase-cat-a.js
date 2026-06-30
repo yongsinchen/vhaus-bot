@@ -80,12 +80,15 @@ async function run() {
     .select("id, name, category_id, product_categories(name)").not("category_id", "is", null).limit(1).single();
   assert("Product with category_id still resolves its category via existing FK", !productErr && !!productSample, productErr?.message);
 
-  // ── 9. No premature API surface ──
-  console.log("\n── 9. No Premature API Surface ──");
+  // ── 9. API surface — write logic still unchanged (read endpoints added in Phase C-1) ──
+  console.log("\n── 9. API Surface (Write Logic Unchanged) ──");
   const serverCode = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert("server.js does not yet reference organization_categories (read migration is a later phase)", !serverCode.includes("organization_categories"));
-  assert("GET /categories endpoint unchanged", serverCode.includes('app.get("/categories", requireAuth'));
+  assert("GET /categories endpoint exists (now enriched in Phase C-1)", serverCode.includes('app.get("/categories", requireAuth'));
   assert("GET /products endpoint unchanged", serverCode.includes('app.get("/products", requireAuth'));
+  assert("POST/PUT/DELETE /categories write guards unchanged since Phase Cat-A",
+    serverCode.includes('app.post("/categories", ...requirePerm(PERMS.PRODUCTS_EDIT)') &&
+    serverCode.includes('app.put("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT)') &&
+    serverCode.includes('app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT)'));
 
   // Summary
   console.log(`\n${"═".repeat(60)}`);
