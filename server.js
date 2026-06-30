@@ -112,6 +112,17 @@ async function getActiveOrganizationIdOrThrow(req) {
   return comp.organization_id;
 }
 
+// Whether the active company has opted in to organization-level sharing.
+// When false, new suppliers/products created by this company are never linked
+// to an organization master, regardless of name/code match — they stay private
+// to this company.
+async function isOrgSharingEnabledForCompany(req) {
+  const cid = getActiveCompanyId(req);
+  if (!cid) return false;
+  const { data: comp } = await supabase.from("companies").select("org_sharing_enabled").eq("id", cid).maybeSingle();
+  return comp?.org_sharing_enabled !== false;
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -6071,13 +6082,16 @@ app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) 
     const { name, code, contact, cost_divisor, color_mode } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
 
-    let orgId, orgSupplier;
-    try {
-      orgId = await getActiveOrganizationIdOrThrow(req);
-      orgSupplier = await orgIdentity.findOrCreateSupplier({ organizationId: orgId, name });
-    } catch (orgErr) {
-      console.error("[POST /suppliers] organization identity resolution failed:", orgErr.message);
-      return res.status(500).json({ error: "Could not resolve organization identity for this supplier: " + orgErr.message });
+    let orgId = null, orgSupplierId = null;
+    if (await isOrgSharingEnabledForCompany(req)) {
+      try {
+        orgId = await getActiveOrganizationIdOrThrow(req);
+        const orgSupplier = await orgIdentity.findOrCreateSupplier({ organizationId: orgId, name });
+        orgSupplierId = orgSupplier.id;
+      } catch (orgErr) {
+        console.error("[POST /suppliers] organization identity resolution failed:", orgErr.message);
+        return res.status(500).json({ error: "Could not resolve organization identity for this supplier: " + orgErr.message });
+      }
     }
 
     const { data, error } = await supabase
@@ -6085,7 +6099,7 @@ app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) 
       .insert({
         company_id: cid, name: name.trim(), code: code?.trim() || null, contact: contact || null,
         cost_divisor: parseCostDivisor(cost_divisor), color_mode: parseColorMode(color_mode),
-        organization_id: orgId, organization_supplier_id: orgSupplier.id,
+        organization_id: orgId, organization_supplier_id: orgSupplierId,
       })
       .select().single();
     if (error) throw error;
@@ -6148,7 +6162,7 @@ app.get("/organization-suppliers", requireAuth, async (req, res) => {
     if (!orgId) return res.json({ organizationSuppliers: [] });
 
     const { data: orgSuppliers, error } = await supabase.from("organization_suppliers")
-      .select("id, name, code, notes, is_active, created_at")
+      .select("id, name, code, notes, is_active, share_enabled, created_at")
       .eq("organization_id", orgId).eq("is_active", true).order("name");
     if (error) throw error;
 
@@ -6206,6 +6220,29 @@ app.get("/organization-suppliers/:id/companies", requireAuth, async (req, res) =
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// PATCH /organization-suppliers/:id — toggle whether this organization supplier
+// master is open for other companies to auto-link into. Does not affect
+// already-linked company supplier rows; it only controls future matching.
+app.patch("/organization-suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
+    const { share_enabled } = req.body;
+    if (typeof share_enabled !== "boolean") return res.status(400).json({ error: "share_enabled (boolean) is required" });
+
+    const { data: orgSupplier } = await supabase.from("organization_suppliers")
+      .select("id, organization_id").eq("id", req.params.id).maybeSingle();
+    if (!orgSupplier || orgSupplier.organization_id !== orgId) {
+      return res.status(404).json({ error: "Organization supplier not found" });
+    }
+
+    const { data, error } = await supabase.from("organization_suppliers")
+      .update({ share_enabled }).eq("id", req.params.id).select("id, name, share_enabled").single();
+    if (error) throw error;
+    res.json({ organizationSupplier: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── GET /organization-companies — list companies in the active company's organization ──
 app.get("/organization-companies", requireAuth, async (req, res) => {
   try {
@@ -6213,12 +6250,35 @@ app.get("/organization-companies", requireAuth, async (req, res) => {
     if (!orgId) return res.json({ companies: [] });
 
     const { data: companies, error } = await supabase.from("companies")
-      .select("id, name, code, is_active, created_at")
+      .select("id, name, code, is_active, org_sharing_enabled, created_at")
       .eq("organization_id", orgId)
       .order("name");
     if (error) throw error;
 
     res.json({ companies: companies || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /organization-companies/:id — toggle whether this company participates
+// in organization sharing at all. Master-only: this affects every supplier/
+// product the company creates from now on, not a single item.
+app.patch("/organization-companies/:id", requireRole(["master"]), async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
+    const { org_sharing_enabled } = req.body;
+    if (typeof org_sharing_enabled !== "boolean") return res.status(400).json({ error: "org_sharing_enabled (boolean) is required" });
+
+    const { data: company } = await supabase.from("companies")
+      .select("id, organization_id").eq("id", req.params.id).maybeSingle();
+    if (!company || company.organization_id !== orgId) {
+      return res.status(404).json({ error: "Company not found in your organization" });
+    }
+
+    const { data, error } = await supabase.from("companies")
+      .update({ org_sharing_enabled }).eq("id", req.params.id).select("id, name, org_sharing_enabled").single();
+    if (error) throw error;
+    res.json({ company: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6232,7 +6292,7 @@ app.get("/organization-products", requireAuth, async (req, res) => {
     if (!orgId) return res.json({ organizationProducts: [] });
 
     const { data: orgProducts, error } = await supabase.from("organization_products")
-      .select("id, code, name, brand, dimensions, specification, image_url, barcode, is_active, created_at")
+      .select("id, code, name, brand, dimensions, specification, image_url, barcode, is_active, share_enabled, created_at")
       .eq("organization_id", orgId).eq("is_active", true).order("name");
     if (error) throw error;
 
@@ -6288,6 +6348,29 @@ app.get("/organization-products/:id/companies", requireAuth, async (req, res) =>
       isActive: r.is_active,
     }));
     res.json({ organizationProduct: { id: orgProduct.id, name: orgProduct.name }, companies });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /organization-products/:id — toggle whether this organization product
+// master is open for other companies to auto-link into. Does not affect
+// already-linked company product rows; it only controls future matching.
+app.patch("/organization-products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
+    const { share_enabled } = req.body;
+    if (typeof share_enabled !== "boolean") return res.status(400).json({ error: "share_enabled (boolean) is required" });
+
+    const { data: orgProduct } = await supabase.from("organization_products")
+      .select("id, organization_id").eq("id", req.params.id).maybeSingle();
+    if (!orgProduct || orgProduct.organization_id !== orgId) {
+      return res.status(404).json({ error: "Organization product not found" });
+    }
+
+    const { data, error } = await supabase.from("organization_products")
+      .update({ share_enabled }).eq("id", req.params.id).select("id, name, share_enabled").single();
+    if (error) throw error;
+    res.json({ organizationProduct: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6430,17 +6513,20 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
     const { code, name, description, color, size, supplier_id, category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
 
-    let orgProduct;
-    try {
-      const orgId = await getActiveOrganizationIdOrThrow(req);
-      orgProduct = await orgIdentity.findOrCreateProduct({ organizationId: orgId, code, name, size, color, baseCost: unit_cost, basePrice: unit_price });
-    } catch (orgErr) {
-      console.error("[POST /products] organization identity resolution failed:", orgErr.message);
-      return res.status(500).json({ error: "Could not resolve organization identity for this product: " + orgErr.message });
+    let orgProductId = null;
+    if (await isOrgSharingEnabledForCompany(req)) {
+      try {
+        const orgId = await getActiveOrganizationIdOrThrow(req);
+        const orgProduct = await orgIdentity.findOrCreateProduct({ organizationId: orgId, code, name, size, color, baseCost: unit_cost, basePrice: unit_price });
+        orgProductId = orgProduct.id;
+      } catch (orgErr) {
+        console.error("[POST /products] organization identity resolution failed:", orgErr.message);
+        return res.status(500).json({ error: "Could not resolve organization identity for this product: " + orgErr.message });
+      }
     }
 
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProduct.id })
+      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProductId })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });

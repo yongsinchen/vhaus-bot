@@ -59,6 +59,7 @@ class OrganizationIdentityService {
       .from("organization_suppliers")
       .select("id, name")
       .eq("organization_id", organizationId)
+      .eq("share_enabled", true)
       .ilike("name", trimmedName);
     if (selErr) throw new Error(`organization_suppliers lookup failed: ${selErr.message}`);
 
@@ -146,6 +147,7 @@ class OrganizationIdentityService {
       .from("organization_products")
       .select("id, code, size, color")
       .eq("organization_id", organizationId)
+      .eq("share_enabled", true)
       .ilike("code", trimmedCode);
     if (selErr) throw new Error(`organization_products lookup failed: ${selErr.message}`);
 
