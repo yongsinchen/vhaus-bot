@@ -89,12 +89,19 @@ async function run() {
   assert("organization_products.category_id is NOT populated yet (product_categories not org-scoped)", orgProductsWithCategory === 0, `got ${orgProductsWithCategory}`);
 
   // ── 8. No write-logic / endpoint changes yet ──
-  console.log("\n── 8. No Premature API Surface ──");
+  console.log("\n── 8. API Surface (Write Logic Unchanged) ──");
   const fs = require("fs");
   const path = require("path");
   const serverCode = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert("server.js does not yet reference organization_products (read/write migration is a later phase)", !serverCode.includes("organization_products"));
-  assert("GET /products endpoint unchanged (still company_id scoped)", serverCode.includes('app.get("/products", requireAuth'));
+  // organization_products is now referenced by GET /products (Phase C-3 read enrichment,
+  // approved and shipped after this Phase A test was originally written). Flipped to
+  // confirm the now-correct state, same pattern as prior phase test updates.
+  assert("server.js references organization_products (Phase C-3 read enrichment)", serverCode.includes("organization_products"));
+  assert("GET /products endpoint still company_id scoped (write logic unchanged)", serverCode.includes('app.get("/products", requireAuth'));
+  assert("POST/PUT/DELETE /products write guards unchanged since Phase A",
+    serverCode.includes('app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE)') &&
+    serverCode.includes('app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT)') &&
+    serverCode.includes('app.delete("/products/:id", ...requirePerm(PERMS.PRODUCTS_DELETE)'));
 
   // Summary
   console.log(`\n${"═".repeat(60)}`);

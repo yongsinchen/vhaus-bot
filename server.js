@@ -5704,7 +5704,7 @@ app.get("/inventory", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company_id required" });
     let query = supabase.from("inventory")
-      .select("*, products(id, code, name, color, size, unit_cost, reorder_point, suppliers(id, name)), warehouses(id, name, type)")
+      .select("*, products(id, code, name, color, size, unit_cost, reorder_point, organization_product_id, organization_products(brand, dimensions, specification, image_url, barcode), suppliers(id, name)), warehouses(id, name, type)")
       .eq("company_id", cid);
     if (warehouse_id) query = query.eq("warehouse_id", warehouse_id);
     const { data, error } = await query;
@@ -6195,7 +6195,7 @@ app.get("/products", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     let query = supabase
       .from("products")
-      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name), organization_product_id, organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
@@ -7622,7 +7622,7 @@ app.get("/purchase-orders", requireAuth, async (req, res) => {
 app.get("/purchase-orders/:id", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase.from("purchase_orders")
-      .select("*, purchase_order_items(*), suppliers(id, name)")
+      .select("*, purchase_order_items(*), suppliers(id, name, organization_supplier_id, organization_suppliers(name))")
       .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).single();
     if (error || !data) return res.status(404).json({ error: "PO not found" });
     res.json({ order: data });
