@@ -3715,10 +3715,17 @@ async function calculateCommission(orderId, companyId) {
     let monthlySales = cache.monthlySales[monthKey];
     if (monthlySales === undefined) {
       const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
-      const { data: monthOrders } = await supabase.from("orders").select("order_amount")
+      const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman")
         .eq("company_id", companyId).ilike("salesman", `%${name}%`)
         .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
-      monthlySales = (monthOrders || []).reduce((s, o) => s + (Number(o.order_amount) || 0), 0);
+      // Orders shared between multiple sales assistants count only this salesman's
+      // fractional share toward their own monthly cumulative sales (and therefore
+      // tier matching) — not the full order amount for every assistant on it.
+      monthlySales = (monthOrders || []).reduce((s, o) => {
+        const namesOnOrder = (o.salesman || "").split("/").map(n => n.trim()).filter(Boolean);
+        const share = namesOnOrder.length > 0 ? (Number(o.order_amount) || 0) / namesOnOrder.length : (Number(o.order_amount) || 0);
+        return s + share;
+      }, 0);
       cache.monthlySales[monthKey] = monthlySales;
     }
 
