@@ -3725,7 +3725,7 @@ async function calculateCommission(orderId, companyId) {
       commission_amt: totalComm, deposit_met: depositMet,
       status: depositMet ? "eligible" : "pending",
       eligible_at: depositMet ? new Date().toISOString() : null,
-      payout_month: depositMet ? getPayoutMonth(matchRule.payout_day) : null,
+      payout_month: depositMet ? getPayoutMonth(order.created_at) : null,
     };
     if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
     else await supabase.from("commissions").insert({ order_id: orderId, user_id: salesUser.id, role_name: "salesman", company_id: companyId, ...commData });
@@ -3747,7 +3747,7 @@ async function calculateCommission(orderId, companyId) {
         commission_amt: overrideAmt, deposit_met: depositMet,
         status: depositMet ? "eligible" : "pending",
         eligible_at: depositMet ? new Date().toISOString() : null,
-        payout_month: depositMet ? getPayoutMonth(mgrRule.payout_day) : null,
+        payout_month: depositMet ? getPayoutMonth(order.created_at) : null,
       };
       if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
       else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", company_id: companyId, ...commData });
@@ -3755,13 +3755,16 @@ async function calculateCommission(orderId, companyId) {
   }
 }
 
-function getPayoutMonth(payoutDay) {
-  const now = new Date();
-  const day = now.getDate();
-  // If past payout day this month, next month
-  if (day > (payoutDay || 25)) now.setMonth(now.getMonth() + 1);
-  now.setDate(1);
-  return now.toISOString().slice(0, 10);
+// Commissions are bucketed by the month AFTER the order's own month — e.g. an order
+// placed any time in June is paid out in July (on the rule's payout_day), regardless
+// of which day in June the order falls on, and regardless of when the commission is
+// actually calculated (so historical/backfilled orders bucket correctly by their own
+// date, not by today's date).
+function getPayoutMonth(orderDate) {
+  const d = orderDate ? new Date(orderDate) : new Date();
+  d.setMonth(d.getMonth() + 1);
+  d.setDate(1);
+  return d.toISOString().slice(0, 10);
 }
 
 // GET commissions list
@@ -3874,7 +3877,7 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     const { payout_month } = req.query;
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company context required" });
-    const month = payout_month || getPayoutMonth(25);
+    const month = payout_month || `${new Date().toISOString().slice(0, 7)}-01`;
     // Get eligible commissions for payout month + all pending (any month)
     let eq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, company_id), users(name, salesman_name)")
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
@@ -5672,17 +5675,20 @@ app.get("/scheduling-suggest", requireAuth, async (req, res) => {
 });
 
 // ── Inventory Routes ─────────────────────────────────────────────
+// NOTE: `inventory` holds company-wide on_hand/reserved_qty (no warehouse_id —
+// per-location tracking lives in order_item_packings/package_labels via zone/rack).
+// `warehouse_id` here is passed through only to tag the stock_movements audit log.
 async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type, reference_type, reference_id, notes, created_by) {
   const { data: existing } = await supabase.from("inventory")
-    .select("id, quantity").eq("warehouse_id", warehouse_id).eq("product_id", product_id).maybeSingle();
-  const newQty = (existing?.quantity || 0) + qty_delta;
+    .select("id, on_hand").eq("company_id", company_id).eq("product_id", product_id).maybeSingle();
+  const newQty = (existing?.on_hand || 0) + qty_delta;
   if (existing) {
-    await supabase.from("inventory").update({ quantity: newQty, updated_at: new Date().toISOString() }).eq("id", existing.id);
+    await supabase.from("inventory").update({ on_hand: newQty, updated_at: new Date().toISOString() }).eq("id", existing.id);
   } else {
-    await supabase.from("inventory").insert({ company_id, warehouse_id, product_id, quantity: newQty, reserved_qty: 0 });
+    await supabase.from("inventory").insert({ company_id, product_id, on_hand: newQty, reserved_qty: 0 });
   }
   await supabase.from("stock_movements").insert({
-    company_id, warehouse_id, product_id, type, quantity: qty_delta,
+    company_id, warehouse_id: warehouse_id || null, product_id, type, quantity: qty_delta,
     reference_type, reference_id, notes, created_by,
   });
   return newQty;
@@ -5700,18 +5706,16 @@ async function recordLeadTime(company_id, supplier_id, product_id, po_created_at
 
 app.get("/inventory", requireAuth, async (req, res) => {
   try {
-    const { warehouse_id, low_stock } = req.query;
+    const { low_stock } = req.query;
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company_id required" });
-    let query = supabase.from("inventory")
-      .select("*, products(id, code, name, color, size, unit_cost, reorder_point, organization_product_id, organization_products(brand, dimensions, specification, image_url, barcode), suppliers(id, name)), warehouses(id, name, type)")
+    const { data, error } = await supabase.from("inventory")
+      .select("*, products(id, code, name, color, size, unit_cost, reorder_point, organization_product_id, organization_products(brand, dimensions, specification, image_url, barcode), suppliers(id, name))")
       .eq("company_id", cid);
-    if (warehouse_id) query = query.eq("warehouse_id", warehouse_id);
-    const { data, error } = await query;
     if (error) throw error;
     let items = data || [];
     if (low_stock === "true") {
-      items = items.filter(i => i.products && i.quantity <= (i.products.reorder_point || 0));
+      items = items.filter(i => i.products && i.on_hand <= (i.products.reorder_point || 0));
     }
     res.json({ inventory: items });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5722,13 +5726,13 @@ app.get("/inventory/summary", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company_id required" });
     const { data, error } = await supabase.from("inventory")
-      .select("product_id, quantity, reserved_qty, products(id, code, name, color, size, reorder_point)")
+      .select("product_id, on_hand, reserved_qty, products(id, code, name, color, size, reorder_point)")
       .eq("company_id", cid);
     if (error) throw error;
     const grouped = {};
     (data || []).forEach(r => {
       if (!grouped[r.product_id]) grouped[r.product_id] = { product: r.products, total_qty: 0, total_reserved: 0 };
-      grouped[r.product_id].total_qty += r.quantity || 0;
+      grouped[r.product_id].total_qty += r.on_hand || 0;
       grouped[r.product_id].total_reserved += r.reserved_qty || 0;
     });
     res.json({ summary: Object.values(grouped) });
@@ -5738,27 +5742,14 @@ app.get("/inventory/summary", requireAuth, async (req, res) => {
 app.post("/inventory/adjust", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { warehouse_id, product_id, quantity, notes } = req.body;
-    if (!warehouse_id || !product_id || quantity == null) return res.status(400).json({ error: "warehouse_id, product_id, quantity required" });
+    if (!product_id || quantity == null) return res.status(400).json({ error: "product_id, quantity required" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
     const { data: current } = await supabase.from("inventory")
-      .select("quantity").eq("warehouse_id", warehouse_id).eq("product_id", product_id).maybeSingle();
-    const delta = Number(quantity) - (current?.quantity || 0);
-    const newQty = await adjustStock(getActiveCompanyId(req), warehouse_id, product_id, delta, "adjustment", "adjustment", null, notes || "Manual adjustment", req.user.id);
+      .select("on_hand").eq("company_id", cid).eq("product_id", product_id).maybeSingle();
+    const delta = Number(quantity) - (current?.on_hand || 0);
+    const newQty = await adjustStock(cid, warehouse_id || null, product_id, delta, "adjustment", "adjustment", null, notes || "Manual adjustment", req.user.id);
     res.json({ ok: true, new_quantity: newQty });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/inventory/transfer", requireRole(MANAGE_ROLES), async (req, res) => {
-  try {
-    const { from_warehouse_id, to_warehouse_id, product_id, quantity, notes } = req.body;
-    if (!from_warehouse_id || !to_warehouse_id || !product_id || !quantity) return res.status(400).json({ error: "Missing fields" });
-    const qty = Number(quantity);
-    if (qty <= 0) return res.status(400).json({ error: "Quantity must be positive" });
-    const { data: fromStock } = await supabase.from("inventory")
-      .select("quantity").eq("warehouse_id", from_warehouse_id).eq("product_id", product_id).maybeSingle();
-    if ((fromStock?.quantity || 0) < qty) return res.status(400).json({ error: `Insufficient stock (have ${fromStock?.quantity || 0})` });
-    await adjustStock(getActiveCompanyId(req), from_warehouse_id, product_id, -qty, "transfer", "transfer", to_warehouse_id, `Transfer to ${to_warehouse_id}`, req.user.id);
-    await adjustStock(getActiveCompanyId(req), to_warehouse_id, product_id, qty, "transfer", "transfer", from_warehouse_id, `Transfer from ${from_warehouse_id}`, req.user.id);
-    res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5785,7 +5776,7 @@ app.post("/inventory/import", requireRole(MANAGE_ROLES), upload.single("file"), 
   try {
     const file = req.file;
     const { warehouse_id } = req.body;
-    if (!file || !warehouse_id) return res.status(400).json({ error: "file and warehouse_id required" });
+    if (!file) return res.status(400).json({ error: "file required" });
     const XLSX = require("xlsx");
     const wb = XLSX.read(file.buffer, { type: "buffer" });
     const ws = wb.Sheets[wb.SheetNames[0]];
