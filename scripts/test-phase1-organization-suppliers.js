@@ -79,9 +79,21 @@ async function run() {
   assert("MODA is_active still true (not deactivated)", moda[0].is_active === true && moda[1].is_active === true);
 
   // ── 7. FK regression — products/POs untouched ──
+  // Live tolerance note: absolute row counts (POs, products) grow/shrink with normal
+  // business activity (new POs, manual cleanups) and are not a meaningful regression
+  // signal on their own. The real thing this migration could break is referential
+  // integrity — supplier_id still resolving to a real row — so we verify that directly
+  // for every PO with a supplier_id, rather than pinning a point-in-time count.
   console.log("\n── 7. FK Regression ──");
-  const { count: poWithSupplier } = await supabase.from("purchase_orders").select("id", { count: "exact", head: true }).not("supplier_id", "is", null);
-  assert("Purchase orders still have supplier_id populated (14)", poWithSupplier === 14, `got ${poWithSupplier}`);
+  const { data: posWithSupplier } = await supabase.from("purchase_orders").select("id, supplier_id").not("supplier_id", "is", null);
+  assert("Purchase orders have supplier_id populated", (posWithSupplier || []).length > 0, `got ${(posWithSupplier || []).length}`);
+  const poSupplierIds = [...new Set((posWithSupplier || []).map(p => p.supplier_id))];
+  const { data: resolvedPoSuppliers } = poSupplierIds.length > 0
+    ? await supabase.from("suppliers").select("id").in("id", poSupplierIds)
+    : { data: [] };
+  assert("Every PO supplier_id still resolves to an existing suppliers row",
+    (resolvedPoSuppliers || []).length === poSupplierIds.length,
+    `${(resolvedPoSuppliers || []).length}/${poSupplierIds.length} resolved`);
   const { count: productsWithSupplier } = await supabase.from("products").select("id", { count: "exact", head: true }).not("supplier_id", "is", null);
   assert("Products still have supplier_id populated", productsWithSupplier > 0, `got ${productsWithSupplier}`);
 

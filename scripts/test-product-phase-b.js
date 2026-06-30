@@ -75,11 +75,20 @@ async function run() {
   assert("organization_products.organization_supplier_id NOT populated (superseded by many-to-many table)", oldColPopulated === 0, `got ${oldColPopulated}`);
 
   // ── 6. FK regression — products.supplier_id, purchase_order_items untouched ──
+  // Live tolerance note: absolute PO item counts grow with normal business activity and
+  // aren't a meaningful regression signal — what matters is that product_id still
+  // resolves to a real row (the linking script never touches this FK).
   console.log("\n── 6. FK Regression ──");
-  const { count: poiCount } = await supabase.from("purchase_order_items").select("id", { count: "exact", head: true }).not("product_id", "is", null);
-  assert("purchase_order_items still have product_id populated (14)", poiCount === 14, `got ${poiCount}`);
-  const { count: productsSupplierCount } = await supabase.from("products").select("id", { count: "exact", head: true }).not("supplier_id", "is", null);
-  assert(`products.supplier_id still populated (${productsSupplierCount}, untouched)`, productsSupplierCount === productsWithSupplier);
+  const { data: poiRows } = await supabase.from("purchase_order_items").select("id, product_id").not("product_id", "is", null);
+  assert("purchase_order_items have product_id populated", (poiRows || []).length > 0, `got ${(poiRows || []).length}`);
+  const poiProductIds = [...new Set((poiRows || []).map(r => r.product_id))];
+  const { data: resolvedPoiProducts } = poiProductIds.length > 0
+    ? await supabase.from("products").select("id").in("id", poiProductIds)
+    : { data: [] };
+  assert("Every purchase_order_items.product_id still resolves to an existing products row",
+    (resolvedPoiProducts || []).length === poiProductIds.length, `${(resolvedPoiProducts || []).length}/${poiProductIds.length} resolved`);
+  const { count: productsSupplierCountAfter } = await supabase.from("products").select("id", { count: "exact", head: true }).not("supplier_id", "is", null);
+  assert(`products.supplier_id still populated (${productsSupplierCountAfter}, untouched)`, productsSupplierCountAfter === productsWithSupplier);
 
   // ── 7. company_product_config explicitly NOT created ──
   console.log("\n── 7. company_product_config Deferred (Not Built) ──");
