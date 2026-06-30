@@ -6206,6 +6206,91 @@ app.get("/organization-suppliers/:id/companies", requireAuth, async (req, res) =
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── GET /organization-companies — list companies in the active company's organization ──
+app.get("/organization-companies", requireAuth, async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.json({ companies: [] });
+
+    const { data: companies, error } = await supabase.from("companies")
+      .select("id, name, code, is_active, created_at")
+      .eq("organization_id", orgId)
+      .order("name");
+    if (error) throw error;
+
+    res.json({ companies: companies || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /organization-products — read-only org product visibility ──
+// Lists organization-level product masters for the active company's organization,
+// with a count of how many company-level product rows are linked to each.
+// Does not affect product create/edit/delete behavior or any FK.
+app.get("/organization-products", requireAuth, async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.json({ organizationProducts: [] });
+
+    const { data: orgProducts, error } = await supabase.from("organization_products")
+      .select("id, code, name, brand, dimensions, specification, image_url, barcode, is_active, created_at")
+      .eq("organization_id", orgId).eq("is_active", true).order("name");
+    if (error) throw error;
+
+    const orgProductIds = (orgProducts || []).map(o => o.id);
+    let countMap = {};
+    if (orgProductIds.length > 0) {
+      const { data: links } = await supabase.from("products")
+        .select("organization_product_id")
+        .in("organization_product_id", orgProductIds).eq("is_active", true);
+      for (const l of (links || [])) {
+        countMap[l.organization_product_id] = (countMap[l.organization_product_id] || 0) + 1;
+      }
+    }
+
+    const result = (orgProducts || []).map(o => ({
+      ...o,
+      companyCount: countMap[o.id] || 0,
+      isShared: (countMap[o.id] || 0) > 1,
+    }));
+    res.json({ organizationProducts: result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /organization-products/:id/companies — drill-down: which company product
+// rows are linked to this organization product, with company name + row detail.
+app.get("/organization-products/:id/companies", requireAuth, async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
+
+    // Verify the requested org product belongs to the requester's organization —
+    // never let a company see another organization's product detail.
+    const { data: orgProduct } = await supabase.from("organization_products")
+      .select("id, name, organization_id").eq("id", req.params.id).maybeSingle();
+    if (!orgProduct || orgProduct.organization_id !== orgId) {
+      return res.status(404).json({ error: "Organization product not found" });
+    }
+
+    const { data: rows, error } = await supabase.from("products")
+      .select("id, company_id, code, name, unit_cost, unit_price, is_active, companies(id, name)")
+      .eq("organization_product_id", req.params.id)
+      .order("created_at");
+    if (error) throw error;
+
+    const companies = (rows || []).map(r => ({
+      productId: r.id,
+      companyId: r.company_id,
+      companyName: r.companies?.name || null,
+      code: r.code,
+      name: r.name,
+      unitCost: r.unit_cost,
+      unitPrice: r.unit_price,
+      isActive: r.is_active,
+    }));
+    res.json({ organizationProduct: { id: orgProduct.id, name: orgProduct.name }, companies });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── GET /categories ──────────────────────────────────────────────
 app.get("/categories", requireAuth, async (req, res) => {
   try {
