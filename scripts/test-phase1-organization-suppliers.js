@@ -85,13 +85,16 @@ async function run() {
     assert("Product referencing MODA (VHAUS) still resolves to original supplier row", modaProduct.supplier_id === moda[0].id);
   }
 
-  // ── 8. No new permission/endpoint surface (Phase 1 is schema-only) ──
-  console.log("\n── 8. Endpoint Surface (No API Changes Yet) ──");
+  // ── 8. Endpoint surface — write logic still unchanged (read-only endpoints added in Phase 2) ──
+  console.log("\n── 8. Endpoint Surface (Write Logic Unchanged) ──");
   const fs = require("fs");
   const path = require("path");
   const serverCode = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert("server.js does NOT yet reference organization_suppliers (Phase 3 work)", !serverCode.includes("organization_suppliers"));
   assert("GET /suppliers endpoint unchanged (still company_id scoped)", serverCode.includes('app.get("/suppliers", requireAuth'));
+  assert("POST/PUT/DELETE /suppliers write guards unchanged since Phase 1",
+    serverCode.includes('app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE)') &&
+    serverCode.includes('app.put("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT)') &&
+    serverCode.includes('app.delete("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT)'));
 
   // Summary
   console.log(`\n${"═".repeat(60)}`);

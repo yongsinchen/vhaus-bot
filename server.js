@@ -87,6 +87,14 @@ function getActiveCompanyId(req) {
   return req.activeCompanyId || req._validatedCompanyId || req.user?.company_id || null;
 }
 
+// Resolve the organization_id for the active company. Never trust a client-supplied organization_id.
+async function getActiveOrganizationId(req) {
+  const cid = getActiveCompanyId(req);
+  if (!cid) return null;
+  const { data: comp } = await supabase.from("companies").select("organization_id").eq("id", cid).maybeSingle();
+  return comp?.organization_id || null;
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -5920,7 +5928,7 @@ app.delete("/branches/:id", ...requirePerm(PERMS.COMPANY_MANAGE_BRANCHES), async
 app.get("/suppliers", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at").order("name");
+    let query = supabase.from("suppliers").select("id, name, code, contact, cost_divisor, color_mode, is_active, created_at, organization_supplier_id").order("name");
     if (cid) query = query.eq("company_id", cid);
     const { data, error } = await query;
     if (error) throw error;
@@ -5995,6 +6003,74 @@ app.delete("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, r
     const { error } = await supabase.from("suppliers").delete().eq("id", id).eq("company_id", company_id);
     if (error) throw error;
     res.json({ ok: true, products_unassigned: productCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /organization-suppliers — read-only org supplier visibility (Phase 2) ──
+// Lists organization-level supplier masters for the active company's organization,
+// with a count of how many company-level supplier rows are linked to each.
+// Does not affect supplier create/edit/delete behavior or any FK.
+app.get("/organization-suppliers", requireAuth, async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.json({ organizationSuppliers: [] });
+
+    const { data: orgSuppliers, error } = await supabase.from("organization_suppliers")
+      .select("id, name, code, notes, is_active, created_at")
+      .eq("organization_id", orgId).eq("is_active", true).order("name");
+    if (error) throw error;
+
+    const orgSupplierIds = (orgSuppliers || []).map(o => o.id);
+    let countMap = {};
+    if (orgSupplierIds.length > 0) {
+      const { data: links } = await supabase.from("suppliers")
+        .select("organization_supplier_id")
+        .in("organization_supplier_id", orgSupplierIds).eq("is_active", true);
+      for (const l of (links || [])) {
+        countMap[l.organization_supplier_id] = (countMap[l.organization_supplier_id] || 0) + 1;
+      }
+    }
+
+    const result = (orgSuppliers || []).map(o => ({
+      ...o,
+      companyCount: countMap[o.id] || 0,
+      isShared: (countMap[o.id] || 0) > 1,
+    }));
+    res.json({ organizationSuppliers: result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /organization-suppliers/:id/companies — drill-down: which company supplier
+// rows are linked to this organization supplier, with company name + row detail.
+app.get("/organization-suppliers/:id/companies", requireAuth, async (req, res) => {
+  try {
+    const orgId = await getActiveOrganizationId(req);
+    if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
+
+    // Verify the requested org supplier belongs to the requester's organization —
+    // never let a company see another organization's supplier detail.
+    const { data: orgSupplier } = await supabase.from("organization_suppliers")
+      .select("id, name, organization_id").eq("id", req.params.id).maybeSingle();
+    if (!orgSupplier || orgSupplier.organization_id !== orgId) {
+      return res.status(404).json({ error: "Organization supplier not found" });
+    }
+
+    const { data: rows, error } = await supabase.from("suppliers")
+      .select("id, company_id, name, code, contact, is_active, companies(id, name)")
+      .eq("organization_supplier_id", req.params.id)
+      .order("created_at");
+    if (error) throw error;
+
+    const companies = (rows || []).map(r => ({
+      supplierId: r.id,
+      companyId: r.company_id,
+      companyName: r.companies?.name || null,
+      name: r.name,
+      code: r.code,
+      contact: r.contact,
+      isActive: r.is_active,
+    }));
+    res.json({ organizationSupplier: { id: orgSupplier.id, name: orgSupplier.name }, companies });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
