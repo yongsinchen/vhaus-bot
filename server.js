@@ -3704,7 +3704,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       customer_id: customer_id || null,
       amount: Number(amount), payment_method: payment_method || "cash",
       reference_no: reference_no || null, recorded_by: req.user.id,
-      notes: proof_url ? `Proof: ${proof_url}` : null,
+      proof_url: proof_url || null,
       company_id: cid,
     }).select().single();
     if (error) throw error;
