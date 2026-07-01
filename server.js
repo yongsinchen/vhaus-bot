@@ -6301,6 +6301,16 @@ app.patch("/organization-suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), a
       .update(patch).eq("id", req.params.id)
       .select("id, name, code, notes, contact, phone, email, address, is_active, share_enabled, version").single();
     if (error) throw error;
+
+    // M3 down-propagation: push contact to all linked company suppliers rows.
+    // Only the contact column exists on the company-level suppliers table today;
+    // phone/email/address are org-master-only fields introduced in M1.
+    if (patch.contact !== undefined) {
+      await supabase.from("suppliers")
+        .update({ contact: patch.contact })
+        .eq("organization_supplier_id", req.params.id);
+    }
+
     res.json({ organizationSupplier: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6490,6 +6500,20 @@ app.patch("/organization-products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), asy
       .update(patch).eq("id", req.params.id)
       .select("id, code, name, size, color, brand, description, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, is_active, share_enabled, version").single();
     if (error) throw error;
+
+    // M3 down-propagation: push shared fields to all linked company products rows.
+    // Only fields that exist on the products table are propagated.
+    // Pricing (unit_cost, unit_price) stays out — companies may have their own
+    // pricing; full price propagation comes with the price_override model in M4.
+    const downPatch = {};
+    if (patch.description !== undefined) downPatch.description = patch.description;
+    if (patch.is_customizable !== undefined) downPatch.is_customizable = patch.is_customizable;
+    if (Object.keys(downPatch).length > 0) {
+      await supabase.from("products")
+        .update(downPatch)
+        .eq("organization_product_id", req.params.id);
+    }
+
     res.json({ organizationProduct: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
