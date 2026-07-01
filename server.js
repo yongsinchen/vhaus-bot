@@ -6089,15 +6089,23 @@ const parseColorMode = (v) => (v === "split" ? "split" : "combined");
 app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { name, code, contact, cost_divisor, color_mode } = req.body;
+    const { name, code, contact, cost_divisor, color_mode, organization_supplier_id: explicitOrgSupplierId } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
 
     let orgId = null, orgSupplierId = null;
     if (await isOrgSharingEnabledForCompany(req)) {
       try {
         orgId = await getActiveOrganizationIdOrThrow(req);
-        const orgSupplier = await orgIdentity.findOrCreateSupplier({ organizationId: orgId, name });
-        orgSupplierId = orgSupplier.id;
+        if (explicitOrgSupplierId) {
+          // User explicitly picked an existing org master — verify it belongs to this org
+          const { data: owned } = await supabase.from("organization_suppliers")
+            .select("id").eq("id", explicitOrgSupplierId).eq("organization_id", orgId).maybeSingle();
+          if (!owned) return res.status(400).json({ error: "organization_supplier_id not found in this organization" });
+          orgSupplierId = explicitOrgSupplierId;
+        } else {
+          const orgSupplier = await orgIdentity.findOrCreateSupplier({ organizationId: orgId, name });
+          orgSupplierId = orgSupplier.id;
+        }
       } catch (orgErr) {
         console.error("[POST /suppliers] organization identity resolution failed:", orgErr.message);
         return res.status(500).json({ error: "Could not resolve organization identity for this supplier: " + orgErr.message });
@@ -6192,7 +6200,40 @@ app.get("/organization-suppliers", requireAuth, async (req, res) => {
       companyCount: countMap[o.id] || 0,
       isShared: (countMap[o.id] || 0) > 1,
     }));
-    res.json({ organizationSuppliers: result });
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    res.json({ organizationSuppliers: result, isCatalogueGroup: !!catalogueGroupId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /organization-suppliers/search?q= — typeahead search against org supplier
+// masters for the active company's catalogue group (or organization). Used by the
+// search-first creation flow so users can pick an existing master before creating.
+app.get("/organization-suppliers/search", requireAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || "").trim();
+    if (!q) return res.json({ suppliers: [] });
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    let query = supabase.from("organization_suppliers")
+      .select("id, name, code")
+      .eq("is_active", true).eq("share_enabled", true)
+      .ilike("name", `%${q}%`)
+      .order("name").limit(20);
+    if (catalogueGroupId) {
+      // catalogue-group companies: scope by catalogue_group_id on org_suppliers
+      // (org_suppliers don't have catalogue_group_id yet — scope by organization_id
+      // of the catalogue group instead, which is the same org for all group members)
+      const { data: grp } = await supabase.from("catalogue_groups")
+        .select("organization_id").eq("id", catalogueGroupId).maybeSingle();
+      if (grp?.organization_id) query = query.eq("organization_id", grp.organization_id);
+      else return res.json({ suppliers: [] });
+    } else {
+      const orgId = await getActiveOrganizationId(req);
+      if (!orgId) return res.json({ suppliers: [] });
+      query = query.eq("organization_id", orgId);
+    }
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ suppliers: data || [], isCatalogueGroup: !!catalogueGroupId });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6323,6 +6364,48 @@ app.get("/organization-products", requireAuth, async (req, res) => {
       isShared: (countMap[o.id] || 0) > 1,
     }));
     res.json({ organizationProducts: result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /organization-products/search?q= — typeahead search against org product
+// masters for the active company's catalogue group (or organization). Returns
+// matches on code OR name so users can find an existing master before creating.
+app.get("/organization-products/search", requireAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || "").trim();
+    if (!q) return res.json({ products: [] });
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    let orgId = null;
+    if (catalogueGroupId) {
+      const { data: grp } = await supabase.from("catalogue_groups")
+        .select("organization_id").eq("id", catalogueGroupId).maybeSingle();
+      orgId = grp?.organization_id || null;
+    } else {
+      orgId = await getActiveOrganizationId(req);
+    }
+    if (!orgId) return res.json({ products: [] });
+
+    const [byCode, byName] = await Promise.all([
+      supabase.from("organization_products")
+        .select("id, code, name, size, color")
+        .eq("organization_id", orgId).eq("is_active", true).eq("share_enabled", true)
+        .ilike("code", `%${q}%`).order("name").limit(20),
+      supabase.from("organization_products")
+        .select("id, code, name, size, color")
+        .eq("organization_id", orgId).eq("is_active", true).eq("share_enabled", true)
+        .ilike("name", `%${q}%`).order("name").limit(20),
+    ]);
+    if (byCode.error) throw byCode.error;
+    if (byName.error) throw byName.error;
+
+    // Merge, deduplicate by id
+    const seen = new Set();
+    const products = [];
+    for (const p of [...(byCode.data || []), ...(byName.data || [])]) {
+      if (!seen.has(p.id)) { seen.add(p.id); products.push(p); }
+    }
+    products.sort((a, b) => a.name.localeCompare(b.name));
+    res.json({ products: products.slice(0, 20), isCatalogueGroup: !!catalogueGroupId });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6597,15 +6680,23 @@ app.get("/products", requireAuth, async (req, res) => {
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point } = req.body;
+    const { code, name, description, color, size, supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, organization_product_id: explicitOrgProductId } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
 
     let orgProductId = null;
     if (await isOrgSharingEnabledForCompany(req)) {
       try {
         const orgId = await getActiveOrganizationIdOrThrow(req);
-        const orgProduct = await orgIdentity.findOrCreateProduct({ organizationId: orgId, code, name, size, color, baseCost: unit_cost, basePrice: unit_price });
-        orgProductId = orgProduct.id;
+        if (explicitOrgProductId) {
+          // User explicitly picked an existing org master — verify it belongs to this org
+          const { data: owned } = await supabase.from("organization_products")
+            .select("id").eq("id", explicitOrgProductId).eq("organization_id", orgId).maybeSingle();
+          if (!owned) return res.status(400).json({ error: "organization_product_id not found in this organization" });
+          orgProductId = explicitOrgProductId;
+        } else {
+          const orgProduct = await orgIdentity.findOrCreateProduct({ organizationId: orgId, code, name, size, color, baseCost: unit_cost, basePrice: unit_price });
+          orgProductId = orgProduct.id;
+        }
       } catch (orgErr) {
         console.error("[POST /products] organization identity resolution failed:", orgErr.message);
         return res.status(500).json({ error: "Could not resolve organization identity for this product: " + orgErr.message });
