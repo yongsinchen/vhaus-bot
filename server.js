@@ -6732,7 +6732,7 @@ app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, r
 // existing order, PO, or inventory code sees any pricing change.
 app.get("/products", requireAuth, async (req, res) => {
   try {
-    const { search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
+    const { search, supplier_id, org_supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
     const cid = getActiveCompanyId(req);
     let query = supabase
       .from("products")
@@ -6745,6 +6745,18 @@ app.get("/products", requireAuth, async (req, res) => {
     if (cid) query = query.eq("company_id", cid);
     if (search) query = query.or(`name.ilike.%${search}%,code.ilike.%${search}%`);
     if (supplier_id) query = query.eq("supplier_id", supplier_id);
+    // org_supplier_id: filter by org master — resolve to this company's supplier row(s)
+    // first, then filter products by those ids. Used by catalogue-group companies whose
+    // supplier filter dropdown shows org masters instead of company-specific rows.
+    if (org_supplier_id && cid) {
+      const { data: compSups } = await supabase.from("suppliers")
+        .select("id").eq("organization_supplier_id", org_supplier_id).eq("company_id", cid);
+      const ids = (compSups || []).map(s => s.id);
+      if (ids.length === 0) {
+        return res.json({ products: [], total: 0, page: Number(page), limit: Number(limit) });
+      }
+      query = query.in("supplier_id", ids);
+    }
     // category_id filter accepts either a legacy product_categories.id or, for
     // catalogue-group companies, an organization_categories.id — try both
     // columns since the caller doesn't know which kind of id it's passing.
