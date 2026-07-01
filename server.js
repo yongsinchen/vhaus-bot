@@ -134,6 +134,20 @@ async function getActiveCatalogueGroupId(req) {
   return comp?.catalogue_group_id || null;
 }
 
+// For catalogue-group companies the canonical organization_id for org masters
+// lives on catalogue_groups.organization_id (one shared org for all companies
+// in the group). This resolver returns that canonical id when available and
+// falls back to the company's own organization_id for non-group companies.
+async function getCatalogueGroupAwareOrgId(req) {
+  const cgId = await getActiveCatalogueGroupId(req);
+  if (cgId) {
+    const { data: grp } = await supabase.from("catalogue_groups")
+      .select("organization_id").eq("id", cgId).maybeSingle();
+    if (grp?.organization_id) return grp.organization_id;
+  }
+  return await getActiveOrganizationId(req);
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -6096,7 +6110,8 @@ app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) 
     let orgId = null, orgSupplierId = null;
     if (await isOrgSharingEnabledForCompany(req)) {
       try {
-        orgId = await getActiveOrganizationIdOrThrow(req);
+        orgId = await getCatalogueGroupAwareOrgId(req);
+        if (!orgId) throw new Error("No organization found for this company");
         if (explicitOrgSupplierId) {
           // User explicitly picked an existing org master — verify it belongs to this org
           const { data: owned } = await supabase.from("organization_suppliers")
@@ -6253,7 +6268,7 @@ app.get("/organization-suppliers/search", requireAuth, async (req, res) => {
 // rows are linked to this organization supplier, with company name + row detail.
 app.get("/organization-suppliers/:id/companies", requireAuth, async (req, res) => {
   try {
-    const orgId = await getActiveOrganizationId(req);
+    const orgId = await getCatalogueGroupAwareOrgId(req);
     if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
 
     // Verify the requested org supplier belongs to the requester's organization —
@@ -6287,7 +6302,7 @@ app.get("/organization-suppliers/:id/companies", requireAuth, async (req, res) =
 // Accepts share_enabled toggle (existing) plus all new M1 contact fields.
 app.patch("/organization-suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res) => {
   try {
-    const orgId = await getActiveOrganizationId(req);
+    const orgId = await getCatalogueGroupAwareOrgId(req);
     if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
 
     const { data: orgSupplier } = await supabase.from("organization_suppliers")
@@ -6456,7 +6471,7 @@ app.get("/organization-products/search", requireAuth, async (req, res) => {
 // rows are linked to this organization product, with company name + row detail.
 app.get("/organization-products/:id/companies", requireAuth, async (req, res) => {
   try {
-    const orgId = await getActiveOrganizationId(req);
+    const orgId = await getCatalogueGroupAwareOrgId(req);
     if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
 
     // Verify the requested org product belongs to the requester's organization —
@@ -6492,7 +6507,7 @@ app.get("/organization-products/:id/companies", requireAuth, async (req, res) =>
 // Ownership check: the product must belong to the caller's organization.
 app.patch("/organization-products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
-    const orgId = await getActiveOrganizationId(req);
+    const orgId = await getCatalogueGroupAwareOrgId(req);
     if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
 
     const { data: orgProduct } = await supabase.from("organization_products")
@@ -6786,7 +6801,8 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
     let orgProductId = null;
     if (await isOrgSharingEnabledForCompany(req)) {
       try {
-        const orgId = await getActiveOrganizationIdOrThrow(req);
+        const orgId = await getCatalogueGroupAwareOrgId(req);
+        if (!orgId) throw new Error("No organization found for this company");
         if (explicitOrgProductId) {
           // User explicitly picked an existing org master — verify it belongs to this org
           const { data: owned } = await supabase.from("organization_products")
@@ -6843,7 +6859,7 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
     // unit_cost / unit_price are written as price_override / cost_override on M3;
     // for now, the org master retains its own values (backfilled in M1).
     if (existing.organization_product_id) {
-      const orgId = await getActiveOrganizationId(req);
+      const orgId = await getCatalogueGroupAwareOrgId(req);
       if (orgId) {
         const sharedPatch = {};
         if (description !== undefined) sharedPatch.description = description || null;
