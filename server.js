@@ -3691,6 +3691,48 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
 });
 
 // ── Cross-Order Payments ────────────────────────────────────────
+// Mirror a payment into the sales_orders table so its derived balance
+// (subtotal - discount + gst - deposit) reflects money collected. Legacy
+// `orders.balance` is decremented directly; sales_orders has no balance
+// column, so we increment `deposit` (capped at gross) by the paid amount.
+// Without this, a payment recorded from the customer view updates the
+// customer balance but never shows up under Orders → Order.
+async function applyPaymentToSalesOrder(legacyOrderId, amount, cid) {
+  const paid = Number(amount) || 0;
+  if (!legacyOrderId || paid <= 0) return;
+  try {
+    // Resolve the legacy order so we can locate its sales_orders twin.
+    const { data: legacy } = await supabase.from("orders")
+      .select("so_number, company_id").eq("id", legacyOrderId).single();
+    const companyId = cid || legacy?.company_id;
+
+    // sales_orders links back via legacy_order_id; fall back to order_number.
+    let so = null;
+    {
+      const { data } = await supabase.from("sales_orders")
+        .select("id, subtotal, discount, gst_amount, gst_waived, deposit")
+        .eq("legacy_order_id", legacyOrderId).maybeSingle();
+      so = data || null;
+    }
+    if (!so && legacy?.so_number) {
+      let q = supabase.from("sales_orders")
+        .select("id, subtotal, discount, gst_amount, gst_waived, deposit")
+        .eq("order_number", legacy.so_number);
+      if (companyId) q = q.eq("company_id", companyId);
+      const { data } = await q.maybeSingle();
+      so = data || null;
+    }
+    if (!so) return; // no matching sales order (e.g. Service order) — nothing to sync
+
+    const gross = (Number(so.subtotal) || 0) - (Number(so.discount) || 0)
+      + (!so.gst_waived ? (Number(so.gst_amount) || 0) : 0);
+    const newDeposit = Math.min(gross, (Number(so.deposit) || 0) + paid);
+    await supabase.from("sales_orders").update({ deposit: newDeposit }).eq("id", so.id);
+  } catch (e) {
+    console.error("applyPaymentToSalesOrder error:", e.message);
+  }
+}
+
 // ORDER_ROLES (not MANAGE_ROLES): salesmen create the orders and collect
 // payment from customers in the field, so they must be able to record it.
 app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
@@ -3719,12 +3761,14 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
         const { data: order } = await supabase.from("orders").select("balance").eq("id", a.order_id).single();
         const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - a.amount);
         await supabase.from("orders").update({ balance: newBal }).eq("id", a.order_id);
+        await applyPaymentToSalesOrder(a.order_id, a.amount, cid);
       }
     } else if (order_id) {
       // Single order payment
       const { data: order } = await supabase.from("orders").select("balance").eq("id", order_id).single();
       const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
       await supabase.from("orders").update({ balance: newBal }).eq("id", order_id);
+      await applyPaymentToSalesOrder(order_id, Number(amount), cid);
     }
     // Auto-recalculate commissions for affected orders
     const affectedOrderIds = Array.isArray(allocations) ? allocations.map(a => a.order_id) : order_id ? [order_id] : [];
@@ -4339,6 +4383,7 @@ app.post("/statements/:id/reconcile", requireRole(MANAGE_ROLES), async (req, res
         const { data: order } = await supabase.from("orders").select("balance").eq("id", txn.matched_order_id).single();
         const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - txn.amount);
         await supabase.from("orders").update({ balance: newBal }).eq("id", txn.matched_order_id);
+        await applyPaymentToSalesOrder(txn.matched_order_id, txn.amount, getActiveCompanyId(req));
         // Link payment
         await supabase.from("statement_transactions").update({ match_status: "reconciled", matched_payment_id: payment.id }).eq("id", txn.id);
         recorded++;
