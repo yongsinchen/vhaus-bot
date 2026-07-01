@@ -509,6 +509,36 @@ const uploadImageToStorage = async (base64Image, bucket, filename) => {
   } catch (e) { console.error("uploadImageToStorage error:", e.message); return null; }
 };
 
+// ── Supabase Storage — delete objects by public URL ──────────────
+// Reverse-maps Supabase public URLs (".../storage/v1/object/public/<bucket>/<path>")
+// back to { bucket, path } and removes them. Best-effort: never throws, so a
+// storage hiccup can't block the DB operation that triggered the cleanup.
+// Accepts a single URL or a comma/whitespace-separated list.
+const deleteStorageObjectsByPublicUrl = async (urls) => {
+  const list = (Array.isArray(urls) ? urls : String(urls || "").split(","))
+    .map(u => u.trim()).filter(Boolean);
+  // Group object paths by bucket so we can remove() in one call per bucket.
+  const byBucket = {};
+  for (const url of list) {
+    const marker = "/storage/v1/object/public/";
+    const idx = url.indexOf(marker);
+    if (idx === -1) continue;
+    const rest = url.slice(idx + marker.length).split("?")[0]; // drop any query string
+    const slash = rest.indexOf("/");
+    if (slash === -1) continue;
+    const bucket = decodeURIComponent(rest.slice(0, slash));
+    const path = decodeURIComponent(rest.slice(slash + 1));
+    if (!bucket || !path) continue;
+    (byBucket[bucket] ||= []).push(path);
+  }
+  for (const [bucket, paths] of Object.entries(byBucket)) {
+    try {
+      const { error } = await supabase.storage.from(bucket).remove(paths);
+      if (error) console.error(`Storage cleanup error (${bucket}):`, error.message);
+    } catch (e) { console.error(`Storage cleanup error (${bucket}):`, e.message); }
+  }
+};
+
 // ── Telegram user lookup ─────────────────────────────────────────
 const getTelegramUser = async (telegramId) => {
   const { data } = await supabase
@@ -3975,6 +4005,13 @@ app.delete("/payments/:id", requireRole(["master"]), async (req, res) => {
     await supabase.from("statement_transactions")
       .update({ matched_payment_id: null, match_status: "confirmed" })
       .eq("matched_payment_id", id);
+
+    // Clean up any uploaded proof image(s) from storage (best-effort — never
+    // blocks the deletion). proof_url may hold a comma-separated list of URLs.
+    if (payment.proof_url) {
+      try { await deleteStorageObjectsByPublicUrl(payment.proof_url); }
+      catch (e) { console.error("proof cleanup error:", e.message); }
+    }
 
     // Remove allocation rows first (FK), then the payment itself.
     await supabase.from("payment_allocations").delete().eq("payment_id", id);
