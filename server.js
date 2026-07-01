@@ -255,6 +255,139 @@ async function propagateProductToSiblings(req, orgProductId, fields) {
   }
 }
 
+// Normalize an incoming product-supplier reference into both the company-level
+// supplier row id (stored on products.supplier_id) and the shared org supplier
+// id (used to propagate across the catalogue group).
+//
+// The client may send either shape:
+//   - org_supplier_id  → catalogue-group UI picks from the org master list
+//   - supplier_id      → per-company UI picks the company's own supplier row
+// For robustness we also accept a supplier_id that is actually an org supplier
+// id (older catalogue-group UI), transparently resolving it.
+//
+// @returns { companySupplierId, orgSupplierId } (either may be null)
+async function resolveIncomingProductSupplier(companyId, { supplier_id, org_supplier_id } = {}) {
+  if (org_supplier_id) {
+    const { data: compSup } = await supabase.from("suppliers")
+      .select("id").eq("company_id", companyId).eq("organization_supplier_id", org_supplier_id).maybeSingle();
+    return { companySupplierId: compSup?.id || null, orgSupplierId: org_supplier_id };
+  }
+  if (supplier_id) {
+    const { data: sup } = await supabase.from("suppliers")
+      .select("id, organization_supplier_id").eq("id", supplier_id).eq("company_id", companyId).maybeSingle();
+    if (sup) return { companySupplierId: sup.id, orgSupplierId: sup.organization_supplier_id || null };
+    // Not a company supplier row — maybe an org supplier id was passed as supplier_id.
+    const { data: orgSup } = await supabase.from("organization_suppliers").select("id").eq("id", supplier_id).maybeSingle();
+    if (orgSup) {
+      const { data: compSup } = await supabase.from("suppliers")
+        .select("id").eq("company_id", companyId).eq("organization_supplier_id", orgSup.id).maybeSingle();
+      return { companySupplierId: compSup?.id || null, orgSupplierId: orgSup.id };
+    }
+    return { companySupplierId: null, orgSupplierId: null };
+  }
+  return { companySupplierId: null, orgSupplierId: null };
+}
+
+// Make a shared product's supplier consistent across the whole catalogue group.
+// Keeps the org-master default supplier (organization_product_suppliers.is_default)
+// in sync AND sets products.supplier_id on every company's row for this org
+// product to that company's own supplier row for the same org supplier.
+// No-op outside a catalogue group. Best-effort — never throws (a propagation
+// failure must not fail the primary write that already succeeded).
+async function syncSharedProductSupplier(req, orgProductId, orgSupplierId) {
+  if (!orgProductId || !orgSupplierId) return;
+  try {
+    const cgId = await getActiveCatalogueGroupId(req);
+    if (!cgId) return;
+
+    // 1. Keep the single org-master default supplier in sync (unique index
+    //    enforces at most one is_default=true row per organization_product).
+    const { data: existingDefault } = await supabase.from("organization_product_suppliers")
+      .select("id, organization_supplier_id")
+      .eq("organization_product_id", orgProductId).eq("is_default", true).maybeSingle();
+    if (!existingDefault) {
+      await supabase.from("organization_product_suppliers").insert({
+        organization_product_id: orgProductId, organization_supplier_id: orgSupplierId,
+        is_default: true, is_preferred: true,
+      });
+    } else if (existingDefault.organization_supplier_id !== orgSupplierId) {
+      await supabase.from("organization_product_suppliers")
+        .update({ organization_supplier_id: orgSupplierId }).eq("id", existingDefault.id);
+    }
+
+    // 2. Resolve the org supplier to each group company's own supplier row, then
+    //    stamp products.supplier_id on every company row linked to this org product.
+    const { data: companies } = await supabase.from("companies").select("id").eq("catalogue_group_id", cgId);
+    const companyIds = (companies || []).map(c => c.id);
+    if (companyIds.length === 0) return;
+    const { data: compSups } = await supabase.from("suppliers")
+      .select("id, company_id").eq("organization_supplier_id", orgSupplierId).in("company_id", companyIds);
+    const supByCompany = new Map((compSups || []).map(s => [s.company_id, s.id]));
+    for (const companyId of companyIds) {
+      const supId = supByCompany.get(companyId);
+      if (!supId) continue; // company has no matching supplier row yet — nothing to point at
+      await supabase.from("products")
+        .update({ supplier_id: supId })
+        .eq("organization_product_id", orgProductId).eq("company_id", companyId);
+    }
+  } catch (err) {
+    console.error("[syncSharedProductSupplier] failed (non-fatal):", err.message);
+  }
+}
+
+// Read-side resolution for GET /products: a shared product may have no
+// company-level supplier_id (e.g. it was propagated into this company without
+// one). In that case fall back to the org-master default supplier and resolve
+// it to this company's own supplier row so the supplier shows consistently in
+// every company. Also annotates each row with org_supplier_id / org_supplier_name
+// so catalogue-group UIs can preselect the shared supplier. Mutates and returns
+// the rows.
+async function resolveProductSuppliersForView(companyId, rows) {
+  if (!companyId || !rows || rows.length === 0) return rows;
+
+  const needFallback = rows.filter(r => r.organization_product_id && !r.suppliers);
+  const opToOrgSup = new Map();
+  const orgSupName = new Map();
+  const compSupByOrg = new Map();
+
+  if (needFallback.length > 0) {
+    const orgProductIds = [...new Set(needFallback.map(r => r.organization_product_id))];
+    const { data: defaults } = await supabase.from("organization_product_suppliers")
+      .select("organization_product_id, organization_supplier_id")
+      .in("organization_product_id", orgProductIds).eq("is_default", true).eq("is_active", true);
+    for (const d of (defaults || [])) opToOrgSup.set(d.organization_product_id, d.organization_supplier_id);
+
+    const orgSupIds = [...new Set([...opToOrgSup.values()])];
+    if (orgSupIds.length > 0) {
+      const { data: compSups } = await supabase.from("suppliers")
+        .select("id, name, organization_supplier_id").eq("company_id", companyId).in("organization_supplier_id", orgSupIds);
+      for (const s of (compSups || [])) compSupByOrg.set(s.organization_supplier_id, { id: s.id, name: s.name });
+      const { data: orgSups } = await supabase.from("organization_suppliers").select("id, name").in("id", orgSupIds);
+      for (const o of (orgSups || [])) orgSupName.set(o.id, o.name);
+    }
+  }
+
+  for (const r of rows) {
+    if (r.suppliers) {
+      // Company already has its own supplier row for this product.
+      r.org_supplier_id = r.suppliers.organization_supplier_id || null;
+      r.org_supplier_name = r.suppliers.name || null;
+      continue;
+    }
+    const orgSupId = r.organization_product_id ? opToOrgSup.get(r.organization_product_id) : null;
+    if (orgSupId) {
+      const compSup = compSupByOrg.get(orgSupId) || null;
+      r.suppliers = compSup; // this company's supplier row (null if not propagated yet)
+      r.org_supplier_id = orgSupId;
+      r.org_supplier_name = orgSupName.get(orgSupId) || compSup?.name || null;
+    } else {
+      r.org_supplier_id = null;
+      r.org_supplier_name = null;
+    }
+  }
+  return rows;
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -6882,7 +7015,7 @@ app.get("/products", requireAuth, async (req, res) => {
       // Include all org master fields needed by composeProductView: the
       // price/cost fields are fetched so composeProductView can use them as
       // last-resort fallback (when company row has no price at all).
-      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name,organization_supplier_id), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
@@ -6908,8 +7041,11 @@ app.get("/products", requireAuth, async (req, res) => {
     if (is_active === "false") query = query.eq("is_active", false);
     const { data, error, count } = await query;
     if (error) throw error;
+    // Fill in the shared org supplier for rows that have no company-level
+    // supplier, so a shared product shows the same supplier in every company.
+    const resolved = await resolveProductSuppliersForView(cid, data || []);
     res.json({
-      products: (data || []).map(composeProductView),
+      products: resolved.map(composeProductView),
       total: count || 0,
       page: Number(page),
       limit: Number(limit),
@@ -6923,8 +7059,12 @@ app.get("/products", requireAuth, async (req, res) => {
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, organization_product_id: explicitOrgProductId } = req.body;
+    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, organization_product_id: explicitOrgProductId } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
+
+    // Normalize the incoming supplier reference into this company's supplier row
+    // (stored on the product) and the shared org supplier id (propagated below).
+    const { companySupplierId, orgSupplierId } = await resolveIncomingProductSupplier(cid, { supplier_id, org_supplier_id });
 
     let orgProductId = null;
     if (await isOrgSharingEnabledForCompany(req)) {
@@ -6951,7 +7091,7 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
     // product picks one kind of category depending on whether the active
     // company is in a catalogue group (see GET/POST /categories).
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProductId })
+      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProductId })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -6964,6 +7104,11 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
       code, name, description, color, size, organization_category_id, is_standard, is_customizable,
     });
 
+    // Supplier is a shared attribute for catalogue-group products: mirror it onto
+    // every company's row (and the org-master default) so it never shows in one
+    // company but blank in another.
+    await syncSharedProductSupplier(req, orgProductId, orgSupplierId);
+
     res.status(201).json({ product: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6971,7 +7116,7 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
 app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
+    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
 
     // Fetch current product to discover organization_product_id before update
     const { data: existing } = await supabase.from("products")
@@ -6979,8 +7124,11 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
       .eq("id", req.params.id).eq("company_id", cid).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Product not found" });
 
+    // Normalize the incoming supplier reference (see resolveIncomingProductSupplier).
+    const { companySupplierId, orgSupplierId } = await resolveIncomingProductSupplier(cid, { supplier_id, org_supplier_id });
+
     const { data, error } = await supabase.from("products")
-      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
+      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
       .eq("id", req.params.id).eq("company_id", cid)
       .select("*, organization_products(id, code, name, brand, description, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, version)").single();
     if (error) {
@@ -7008,6 +7156,12 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
           });
         }
       }
+    }
+
+    // Propagate the supplier change to every company in the catalogue group so
+    // the shared product keeps the same supplier everywhere.
+    if (existing.organization_product_id) {
+      await syncSharedProductSupplier(req, existing.organization_product_id, orgSupplierId);
     }
 
     res.json({ product: composeProductView(data) });
@@ -7067,7 +7221,19 @@ app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res
     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "ids must be a non-empty array" });
 
     const patch = {};
-    if (set.supplier_id !== undefined) patch.supplier_id = set.supplier_id || null;
+    // Supplier: resolve either a shared org supplier id (catalogue-group UI) or a
+    // company supplier id into this company's own supplier row. The shared org
+    // supplier id is remembered so it can be propagated to the group after update.
+    let bulkOrgSupplierId = null;
+    if (set.org_supplier_id !== undefined) {
+      const r = await resolveIncomingProductSupplier(company_id, { org_supplier_id: set.org_supplier_id || null });
+      patch.supplier_id = r.companySupplierId;
+      bulkOrgSupplierId = r.orgSupplierId;
+    } else if (set.supplier_id !== undefined) {
+      const r = await resolveIncomingProductSupplier(company_id, { supplier_id: set.supplier_id || null });
+      patch.supplier_id = r.companySupplierId;
+      bulkOrgSupplierId = r.orgSupplierId;
+    }
     if (set.organization_category_id !== undefined) { patch.organization_category_id = set.organization_category_id || null; patch.category_id = null; }
     else if (set.category_id !== undefined) patch.category_id = set.category_id || null;
     if (set.is_active !== undefined) patch.is_active = set.is_active;
@@ -7082,6 +7248,15 @@ app.patch("/products/bulk", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res
       const { data, error } = await supabase.from("products").update(patch).eq("company_id", company_id).in("id", ids).select("id");
       if (error) throw error;
       updated = data?.length || 0;
+    }
+
+    // Share the supplier across the catalogue group for each affected org product.
+    if (bulkOrgSupplierId) {
+      const { data: affected } = await supabase.from("products")
+        .select("organization_product_id").eq("company_id", company_id).in("id", ids)
+        .not("organization_product_id", "is", null);
+      const orgProductIds = [...new Set((affected || []).map(p => p.organization_product_id))];
+      for (const opId of orgProductIds) await syncSharedProductSupplier(req, opId, bulkOrgSupplierId);
     }
 
     const divisor = parseCostDivisor(cost_divisor);

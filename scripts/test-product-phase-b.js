@@ -104,12 +104,15 @@ async function run() {
   const { error: pcColErr } = await supabase.from("product_categories").select("organization_category_id").limit(1);
   assert("product_categories.organization_category_id exists (Phase Cat-A)", !pcColErr, pcColErr?.message);
 
-  // ── 9. No premature API surface ──
-  console.log("\n── 9. No Premature API Surface ──");
+  // ── 9. API surface now wired (shared product supplier) ──
+  // The many-to-many supplier table is now read/written by the API to keep a
+  // shared product's supplier consistent across every company in the group.
+  console.log("\n── 9. Shared Product Supplier API Surface ──");
   const serverCode = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert("server.js does not yet reference organization_product_suppliers", !serverCode.includes("organization_product_suppliers"));
-  assert("GET /products endpoint unchanged", serverCode.includes('app.get("/products", requireAuth'));
-  assert("GET /suppliers endpoint unchanged", serverCode.includes('app.get("/suppliers", requireAuth'));
+  assert("server.js references organization_product_suppliers (shared supplier wiring)", serverCode.includes("organization_product_suppliers"));
+  assert("server.js syncs shared product supplier across the group", serverCode.includes("syncSharedProductSupplier"));
+  assert("GET /products endpoint present", serverCode.includes('app.get("/products", requireAuth'));
+  assert("GET /suppliers endpoint present", serverCode.includes('app.get("/suppliers", requireAuth'));
 
   // Cleanup any leftover test artifact from uniqueness test (in case insert unexpectedly succeeded)
   await supabase.from("organization_product_suppliers").delete()
