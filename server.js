@@ -1062,7 +1062,7 @@ const buildOrderPreview = (data) => {
     `\n\n_Reply:_\n` +
     `*YES* = save  |  *CANCEL* = discard\n` +
     `Or tell me what to change naturally.\n` +
-    `_e.g. "delivery date is October", "balance is 3840", "item 2 is queen size", "remove item 3"_`
+    `_e.g. "order date is 5/6/2026", "delivery date is October", "balance is 3840", "item 2 is queen size", "remove item 3"_`
   );
 };
 
@@ -1079,7 +1079,10 @@ const parseKVPairs = (str) => {
 
 // ── Update Draft with Natural Language (GPT) ─────────────────────
 const updateDraftWithNaturalLanguage = async (draft, correctionText) => {
+  const today = getMalaysiaDate();
   const prompt = `You are a sales order assistant. The user has reviewed an extracted sales order and wants to correct some fields.
+
+Today's date (Malaysia) is ${today}.
 
 Current order draft (JSON):
 ${JSON.stringify(draft, null, 2)}
@@ -1092,6 +1095,7 @@ Apply the user's correction to the draft. Return ONLY the updated JSON object wi
 Rules:
 - Preserve ALL existing fields unless the user specifically changes them.
 - For items: if user says "item 2 is X", update items[1]. If user says "remove item 3", remove items[2]. If user says "add item X", append to items array.
+- For order date: when the user changes it (e.g. "order date is 5/6/2026", "order date yesterday", "backdate to 28 May", "order date 3 days ago"), store it in orderDate as a strict YYYY-MM-DD string. Resolve relative dates against today (${today}) and interpret ambiguous numeric dates as DD/MM/YYYY. The order date may be in the past (backdating) but must never be in the future — if the user gives a future date, clamp it to ${today}.
 - For delivery date: store the user's natural language value as-is into deliveryDate (e.g. "October", "Aug - Sept", "ASAP", "3/6/2026"). Also update originalDeliveryText to match. The normalizeDeliveryDate function will handle ISO conversion before saving.
 - For balance/amount: extract numeric value only, no RM symbol.
 - For items added by user: use structure { itemName, unit, supplier, itemCode } — leave supplier and itemCode empty string if not mentioned.
@@ -3823,6 +3827,29 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Keep the linked sales order's paid amount in sync when a payment is recorded.
+// The Orders → Order (sales_orders) screen derives its balance as
+// (subtotal − discount + gst) − deposit, so "deposit" here means "amount paid
+// to date". Adding the newly-collected amount to deposit makes that screen
+// reflect the payment. We add the actual payment amount (not total − balance)
+// so a stale delivery orders.balance can never erase a real prior deposit.
+// Capped at the order total so overpayments show a zero balance, not negative.
+async function syncSalesOrderPaidFromOrder(orderId, paidAmount) {
+  const add = Number(paidAmount) || 0;
+  if (add <= 0) return;
+  const { data: ord } = await supabase.from("orders")
+    .select("so_number, company_id").eq("id", orderId).single();
+  if (!ord?.so_number) return;
+  const { data: so } = await supabase.from("sales_orders")
+    .select("id, subtotal, discount, gst_amount, gst_waived, deposit")
+    .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
+  if (!so) return;
+  const total = (Number(so.subtotal) || 0) - (Number(so.discount) || 0)
+    + (so.gst_waived ? 0 : (Number(so.gst_amount) || 0));
+  const paid = Math.min(total, (Number(so.deposit) || 0) + add);
+  await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
+}
+
 // ── Cross-Order Payments ────────────────────────────────────────
 // ORDER_ROLES (not MANAGE_ROLES): salesmen create the orders and collect
 // payment from customers in the field, so they must be able to record it.
@@ -3859,9 +3886,18 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
       await supabase.from("orders").update({ balance: newBal }).eq("id", order_id);
     }
-    // Auto-recalculate commissions for affected orders
-    const affectedOrderIds = Array.isArray(allocations) ? allocations.map(a => a.order_id) : order_id ? [order_id] : [];
-    for (const oid of affectedOrderIds) {
+    // Amount applied per order (fold into the sales order's paid/deposit total).
+    const paidByOrder = new Map();
+    if (Array.isArray(allocations) && allocations.length > 0) {
+      for (const a of allocations) {
+        if (a.order_id && Number(a.amount) > 0) paidByOrder.set(a.order_id, (paidByOrder.get(a.order_id) || 0) + Number(a.amount));
+      }
+    } else if (order_id) {
+      paidByOrder.set(order_id, Number(amount));
+    }
+    // Sync sales-order paid total + recalculate commissions for affected orders
+    for (const [oid, amt] of paidByOrder) {
+      try { await syncSalesOrderPaidFromOrder(oid, amt); } catch (e) { console.error("SO paid sync error:", e.message); }
       try { await calculateCommission(oid, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc error:", e.message); }
     }
     res.json({ payment });
@@ -4472,6 +4508,7 @@ app.post("/statements/:id/reconcile", requireRole(MANAGE_ROLES), async (req, res
         const { data: order } = await supabase.from("orders").select("balance").eq("id", txn.matched_order_id).single();
         const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - txn.amount);
         await supabase.from("orders").update({ balance: newBal }).eq("id", txn.matched_order_id);
+        try { await syncSalesOrderPaidFromOrder(txn.matched_order_id, txn.amount); } catch (e) { console.error("SO paid sync error:", e.message); }
         // Link payment
         await supabase.from("statement_transactions").update({ match_status: "reconciled", matched_payment_id: payment.id }).eq("id", txn.id);
         recorded++;
@@ -4890,6 +4927,12 @@ Please contact your manager to set up your account.`);
       data.createdByUserId = message._telegramUser.id;
       // Default credited salesman to the submitter; refined below if OCR salesman matches another user
       data.mainSalesmanUserId = message._telegramUser.id;
+    }
+
+    // Default order date to today (Malaysia) if the photo had none — the salesman
+    // can still backdate/change it via a natural-language correction at confirm.
+    if (!data.orderDate || !/^\d{4}-\d{2}-\d{2}$/.test(data.orderDate)) {
+      data.orderDate = getMalaysiaDate();
     }
 
     const normalized = normalizeDeliveryDate(data.deliveryDate, data.orderDate);
@@ -5900,6 +5943,7 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
     const { data: order } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
     const newBalance = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
     await supabase.from("orders").update({ balance: newBalance }).eq("id", sched.order_id);
+    try { await syncSalesOrderPaidFromOrder(sched.order_id, Number(amount)); } catch (e) { console.error("SO paid sync error:", e.message); }
     try { await calculateCommission(sched.order_id, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc:", e.message); }
     res.json({ ok: true, new_balance: newBalance });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -8568,7 +8612,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         customer_contact: customer_contact || null, customer_address: customer_address || null,
         salesman_name: resolvedSalesman, status: status || "draft",
         branch_id: branch_id || null,
-        order_date: order_date || null,
+        order_date: order_date || getMalaysiaDate(),
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
