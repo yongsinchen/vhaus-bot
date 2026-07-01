@@ -8744,36 +8744,44 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
 
-    // Detect amendments on confirmed/delivered orders
+    // Detect material amendments on confirmed/delivered orders → require re-approval
     let finalStatus = status;
     let amendmentNote = null;
     const wasConfirmed = ["confirmed", "delivered"].includes(existing.status);
-    if (wasConfirmed && Array.isArray(items)) {
-      const oldItems = existing.sales_order_items || [];
+    const newOrderDate = order_date !== undefined ? (order_date || null) : (existing.order_date || null);
+    const orderDateChanged = newOrderDate !== (existing.order_date || null);
+    if (wasConfirmed) {
       const changes = [];
-      // Check for new items
-      const oldNames = new Set(oldItems.map(i => (i.product_name || "").toLowerCase()));
-      const newItems = items.filter(i => !oldNames.has((i.product_name || "").toLowerCase()));
-      if (newItems.length > 0) changes.push(`+${newItems.length} new item${newItems.length > 1 ? "s" : ""}: ${newItems.map(i => i.product_name || i.product_code).join(", ")}`);
-      // Check for removed items
-      const newNames = new Set(items.map(i => (i.product_name || "").toLowerCase()));
-      const removed = oldItems.filter(i => !newNames.has((i.product_name || "").toLowerCase()));
-      if (removed.length > 0) changes.push(`-${removed.length} removed: ${removed.map(i => i.product_name || i.product_code).join(", ")}`);
-      // Check for price changes
-      const oldPriceMap = new Map(oldItems.map(i => [(i.product_name || "").toLowerCase(), Number(i.unit_price) || 0]));
-      for (const ni of items) {
-        const key = (ni.product_name || "").toLowerCase();
-        const oldPrice = oldPriceMap.get(key);
-        if (oldPrice !== undefined && oldPrice !== (Number(ni.unit_price) || 0)) {
-          changes.push(`${ni.product_name}: RM${oldPrice} → RM${Number(ni.unit_price) || 0}`);
+      if (Array.isArray(items)) {
+        const oldItems = existing.sales_order_items || [];
+        // Check for new items
+        const oldNames = new Set(oldItems.map(i => (i.product_name || "").toLowerCase()));
+        const newItems = items.filter(i => !oldNames.has((i.product_name || "").toLowerCase()));
+        if (newItems.length > 0) changes.push(`+${newItems.length} new item${newItems.length > 1 ? "s" : ""}: ${newItems.map(i => i.product_name || i.product_code).join(", ")}`);
+        // Check for removed items
+        const newNames = new Set(items.map(i => (i.product_name || "").toLowerCase()));
+        const removed = oldItems.filter(i => !newNames.has((i.product_name || "").toLowerCase()));
+        if (removed.length > 0) changes.push(`-${removed.length} removed: ${removed.map(i => i.product_name || i.product_code).join(", ")}`);
+        // Check for price changes
+        const oldPriceMap = new Map(oldItems.map(i => [(i.product_name || "").toLowerCase(), Number(i.unit_price) || 0]));
+        for (const ni of items) {
+          const key = (ni.product_name || "").toLowerCase();
+          const oldPrice = oldPriceMap.get(key);
+          if (oldPrice !== undefined && oldPrice !== (Number(ni.unit_price) || 0)) {
+            changes.push(`${ni.product_name}: RM${oldPrice} → RM${Number(ni.unit_price) || 0}`);
+          }
+        }
+        // Check subtotal change
+        const newSubtotal = items.reduce((s, it) => s + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+        const oldSubtotal = Number(existing.subtotal) || 0;
+        if (Math.abs(newSubtotal - oldSubtotal) > 0.01) {
+          changes.push(`Total: RM${oldSubtotal.toFixed(2)} → RM${newSubtotal.toFixed(2)}`);
         }
       }
-      // Check subtotal change
-      const newSubtotal = items.reduce((s, it) => s + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
-      const oldSubtotal = Number(existing.subtotal) || 0;
-      if (Math.abs(newSubtotal - oldSubtotal) > 0.01) {
-        changes.push(`Total: RM${oldSubtotal.toFixed(2)} → RM${newSubtotal.toFixed(2)}`);
-      }
+      // Date changes are material too (order date drives the commission month;
+      // delivery date drives scheduling) — flag them for manager re-approval.
+      if (orderDateChanged) changes.push(`Order date: ${existing.order_date || "-"} → ${newOrderDate || "-"}`);
+      if ((delivery_date || null) !== (existing.delivery_date || null)) changes.push(`Delivery date: ${existing.delivery_date || "-"} → ${delivery_date || "-"}`);
       if (changes.length > 0) {
         finalStatus = "amended";
         amendmentNote = `[${new Date().toISOString().slice(0, 16).replace("T", " ")}] Amended by ${req.user.name || req.user.salesman_name || "user"}: ${changes.join("; ")}`;
@@ -8821,12 +8829,14 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (deliveryOrderId) {
       try { await recomputeOrderPaid(deliveryOrderId); } catch (e) { console.error("recomputeOrderPaid on order edit:", e.message); }
     }
-    // If this order already has commissions, re-run the calc so an edited order
-    // date re-buckets the payout month (and amounts follow any total change).
+    // Re-run the commission calc so an edited order date re-buckets the payout
+    // month (order in June → payout July; back-dated to April → payout May), and
+    // amounts follow any total change. Fire when the order already has a
+    // commission, or whenever the order date changed (even if the row is missing).
     if (deliveryOrderId) {
       try {
         const { data: existingComm } = await supabase.from("commissions").select("id").eq("order_id", deliveryOrderId).limit(1).maybeSingle();
-        if (existingComm) await calculateCommission(deliveryOrderId, company_id);
+        if (existingComm || (orderDateChanged && wasConfirmed)) await calculateCommission(deliveryOrderId, company_id);
       } catch (e) { console.error("commission recalc on order edit:", e.message); }
     }
     res.json({ order: full });
