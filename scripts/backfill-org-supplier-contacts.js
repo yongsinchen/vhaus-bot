@@ -34,11 +34,20 @@ async function run() {
   console.log(`  Mode: ${DRY_RUN ? "DRY RUN" : "⚠️  LIVE"}`);
   console.log(`${"═".repeat(60)}\n`);
 
-  // Load org suppliers that have at least one NULL contact field
-  const { data: orgSuppliers, error: osErr } = await supabase
-    .from("organization_suppliers")
-    .select("id, name, contact, phone, email, address");
-  if (osErr) { console.error("Failed to fetch org suppliers:", osErr.message); process.exit(1); }
+  // Load ALL org suppliers with pagination (Supabase default limit is 1000)
+  const FETCH_BATCH = 1000;
+  let orgSuppliers = [];
+  let from = 0;
+  while (true) {
+    const { data, error: osErr } = await supabase
+      .from("organization_suppliers")
+      .select("id, name, contact, phone, email, address")
+      .range(from, from + FETCH_BATCH - 1);
+    if (osErr) { console.error("Failed to fetch org suppliers:", osErr.message); process.exit(1); }
+    orgSuppliers = orgSuppliers.concat(data || []);
+    if (!data || data.length < FETCH_BATCH) break;
+    from += FETCH_BATCH;
+  }
 
   const toFill = (orgSuppliers || []).filter(o =>
     !o.contact || !o.phone || !o.email || !o.address

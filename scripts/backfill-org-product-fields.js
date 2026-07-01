@@ -49,12 +49,21 @@ async function run() {
     return av - bv;
   });
 
-  // Load all org products
-  const { data: orgProducts, error: opErr } = await supabase
-    .from("organization_products")
-    .select("id, code, name, description, unit_cost, unit_price, is_customizable");
-  if (opErr) { console.error("Failed to fetch org products:", opErr.message); process.exit(1); }
-  console.log(`  Total org products: ${(orgProducts || []).length}`);
+  // Load ALL org products with pagination (Supabase default limit is 1000)
+  const FETCH_BATCH = 1000;
+  let orgProducts = [];
+  let from = 0;
+  while (true) {
+    const { data, error: opErr } = await supabase
+      .from("organization_products")
+      .select("id, code, name, description, unit_cost, unit_price, is_customizable")
+      .range(from, from + FETCH_BATCH - 1);
+    if (opErr) { console.error("Failed to fetch org products:", opErr.message); process.exit(1); }
+    orgProducts = orgProducts.concat(data || []);
+    if (!data || data.length < FETCH_BATCH) break;
+    from += FETCH_BATCH;
+  }
+  console.log(`  Total org products: ${orgProducts.length}`);
 
   // Only backfill orgs that have at least one NULL field we can fill
   const needsFill = (orgProducts || []).filter(o =>
