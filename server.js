@@ -3691,7 +3691,9 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
 });
 
 // ── Cross-Order Payments ────────────────────────────────────────
-app.post("/payments/record", requireRole(MANAGE_ROLES), async (req, res) => {
+// ORDER_ROLES (not MANAGE_ROLES): salesmen create the orders and collect
+// payment from customers in the field, so they must be able to record it.
+app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   try {
     const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations } = req.body;
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
