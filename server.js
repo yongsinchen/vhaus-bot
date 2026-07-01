@@ -6180,7 +6180,7 @@ app.get("/organization-suppliers", requireAuth, async (req, res) => {
     if (!orgId) return res.json({ organizationSuppliers: [] });
 
     const { data: orgSuppliers, error } = await supabase.from("organization_suppliers")
-      .select("id, name, code, notes, is_active, share_enabled, created_at")
+      .select("id, name, code, notes, contact, phone, email, address, is_active, share_enabled, version, created_at")
       .eq("organization_id", orgId).eq("is_active", true).order("name");
     if (error) throw error;
 
@@ -6271,15 +6271,12 @@ app.get("/organization-suppliers/:id/companies", requireAuth, async (req, res) =
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PATCH /organization-suppliers/:id — toggle whether this organization supplier
-// master is open for other companies to auto-link into. Does not affect
-// already-linked company supplier rows; it only controls future matching.
+// PATCH /organization-suppliers/:id — update org supplier master fields.
+// Accepts share_enabled toggle (existing) plus all new M1 contact fields.
 app.patch("/organization-suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, res) => {
   try {
     const orgId = await getActiveOrganizationId(req);
     if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
-    const { share_enabled } = req.body;
-    if (typeof share_enabled !== "boolean") return res.status(400).json({ error: "share_enabled (boolean) is required" });
 
     const { data: orgSupplier } = await supabase.from("organization_suppliers")
       .select("id, organization_id").eq("id", req.params.id).maybeSingle();
@@ -6287,8 +6284,21 @@ app.patch("/organization-suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), a
       return res.status(404).json({ error: "Organization supplier not found" });
     }
 
+    const { share_enabled, name, notes, contact, phone, email, address, is_active } = req.body;
+    const patch = {};
+    if (share_enabled !== undefined) patch.share_enabled = share_enabled;
+    if (name !== undefined) patch.name = name?.trim() || null;
+    if (notes !== undefined) patch.notes = notes?.trim() || null;
+    if (contact !== undefined) patch.contact = contact?.trim() || null;
+    if (phone !== undefined) patch.phone = phone?.trim() || null;
+    if (email !== undefined) patch.email = email?.trim() || null;
+    if (address !== undefined) patch.address = address?.trim() || null;
+    if (is_active !== undefined) patch.is_active = is_active;
+    if (Object.keys(patch).length === 0) return res.status(400).json({ error: "No updatable fields provided" });
+
     const { data, error } = await supabase.from("organization_suppliers")
-      .update({ share_enabled }).eq("id", req.params.id).select("id, name, share_enabled").single();
+      .update(patch).eq("id", req.params.id)
+      .select("id, name, code, notes, contact, phone, email, address, is_active, share_enabled, version").single();
     if (error) throw error;
     res.json({ organizationSupplier: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -6343,7 +6353,7 @@ app.get("/organization-products", requireAuth, async (req, res) => {
     if (!orgId) return res.json({ organizationProducts: [] });
 
     const { data: orgProducts, error } = await supabase.from("organization_products")
-      .select("id, code, name, brand, dimensions, specification, image_url, barcode, is_active, share_enabled, created_at")
+      .select("id, code, name, size, color, brand, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, is_active, share_enabled, version, created_at")
       .eq("organization_id", orgId).eq("is_active", true).order("name");
     if (error) throw error;
 
@@ -6444,15 +6454,13 @@ app.get("/organization-products/:id/companies", requireAuth, async (req, res) =>
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PATCH /organization-products/:id — toggle whether this organization product
-// master is open for other companies to auto-link into. Does not affect
-// already-linked company product rows; it only controls future matching.
+// PATCH /organization-products/:id — update org product master fields.
+// Accepts share_enabled toggle (existing) plus all new M1 shared fields.
+// Ownership check: the product must belong to the caller's organization.
 app.patch("/organization-products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const orgId = await getActiveOrganizationId(req);
     if (!orgId) return res.status(404).json({ error: "Organization not found for active company" });
-    const { share_enabled } = req.body;
-    if (typeof share_enabled !== "boolean") return res.status(400).json({ error: "share_enabled (boolean) is required" });
 
     const { data: orgProduct } = await supabase.from("organization_products")
       .select("id, organization_id").eq("id", req.params.id).maybeSingle();
@@ -6460,12 +6468,32 @@ app.patch("/organization-products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), asy
       return res.status(404).json({ error: "Organization product not found" });
     }
 
+    const { share_enabled, name, brand, description, dimensions, specification,
+            image_url, barcode, unit_cost, unit_price, is_customizable, is_active } = req.body;
+    const patch = {};
+    if (share_enabled !== undefined) patch.share_enabled = share_enabled;
+    if (name !== undefined) patch.name = name?.trim() || null;
+    if (brand !== undefined) patch.brand = brand?.trim() || null;
+    if (description !== undefined) patch.description = description?.trim() || null;
+    if (dimensions !== undefined) patch.dimensions = dimensions?.trim() || null;
+    if (specification !== undefined) patch.specification = specification?.trim() || null;
+    if (image_url !== undefined) patch.image_url = image_url?.trim() || null;
+    if (barcode !== undefined) patch.barcode = barcode?.trim() || null;
+    if (unit_cost !== undefined) patch.unit_cost = unit_cost === "" ? null : Number(unit_cost);
+    if (unit_price !== undefined) patch.unit_price = unit_price === "" ? null : Number(unit_price);
+    if (is_customizable !== undefined) patch.is_customizable = is_customizable;
+    if (is_active !== undefined) patch.is_active = is_active;
+    if (Object.keys(patch).length === 0) return res.status(400).json({ error: "No updatable fields provided" });
+
     const { data, error } = await supabase.from("organization_products")
-      .update({ share_enabled }).eq("id", req.params.id).select("id, name, share_enabled").single();
+      .update(patch).eq("id", req.params.id)
+      .select("id, code, name, size, color, brand, description, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, is_active, share_enabled, version").single();
     if (error) throw error;
     res.json({ organizationProduct: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// PATCH /organization-suppliers/:id already exists below — see next handler
 
 // ── GET /categories ──────────────────────────────────────────────
 // Categories collapse to org-level for companies in a catalogue_group (migration
