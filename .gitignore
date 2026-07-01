@@ -1,6 +1,6 @@
-.env 
-node_modules.env
+.env
+node_modules/
 scripts/link-*-report-*.json
 scripts/link-organization-product-suppliers-report-*.json
 scripts/link-organization-categories-report-*.json
-scripts/backfill-*-report-*.json
+scripts/backfill-*.json
