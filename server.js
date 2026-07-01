@@ -9,6 +9,7 @@ const multer = require("multer");
 const { PermissionEngine } = require("./permission-engine");
 const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry");
 const { OrganizationIdentityService } = require("./organization-identity-service");
+const { composeProductView, composeSupplierView } = require("./lib/product-view-composer");
 
 const app = express();
 
@@ -6493,8 +6494,6 @@ app.patch("/organization-products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), asy
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PATCH /organization-suppliers/:id already exists below — see next handler
-
 // ── GET /categories ──────────────────────────────────────────────
 // Categories collapse to org-level for companies in a catalogue_group (migration
 // 008): no more per-company product_categories row — the category IS the
@@ -6749,16 +6748,45 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
   try {
     const cid = getActiveCompanyId(req);
     const { code, name, description, color, size, supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
+
+    // Fetch current product to discover organization_product_id before update
+    const { data: existing } = await supabase.from("products")
+      .select("id, organization_product_id")
+      .eq("id", req.params.id).eq("company_id", cid).maybeSingle();
+    if (!existing) return res.status(404).json({ error: "Product not found" });
+
     const { data, error } = await supabase.from("products")
       .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: supplier_id || null, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
       .eq("id", req.params.id).eq("company_id", cid)
-      .select().single();
+      .select("*, organization_products(id, code, name, brand, description, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, version)").single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
       throw error;
     }
-    if (!data) return res.status(404).json({ error: "Product not found" });
-    res.json({ product: data });
+
+    // M2 dual-write: if this product is linked to an org master, propagate
+    // shared fields so the org master stays in sync. Shared fields are those
+    // not company-specific: description, is_customizable.
+    // unit_cost / unit_price are written as price_override / cost_override on M3;
+    // for now, the org master retains its own values (backfilled in M1).
+    if (existing.organization_product_id) {
+      const orgId = await getActiveOrganizationId(req);
+      if (orgId) {
+        const sharedPatch = {};
+        if (description !== undefined) sharedPatch.description = description || null;
+        if (is_customizable !== undefined) sharedPatch.is_customizable = !!is_customizable;
+        if (Object.keys(sharedPatch).length > 0) {
+          // Use the RPC for ownership-verified, trigger-aware update
+          await supabase.rpc("update_org_product_master", {
+            p_org_product_id: existing.organization_product_id,
+            p_organization_id: orgId,
+            p_fields: sharedPatch,
+          });
+        }
+      }
+    }
+
+    res.json({ product: composeProductView(data) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
