@@ -6701,13 +6701,23 @@ app.delete("/categories/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, r
 });
 
 // ── GET /products ────────────────────────────────────────────────
+// M4 read migration: each row is passed through composeProductView() which
+// merges org master shared fields (brand, dimensions, specification, image_url,
+// barcode) into the response. These fields do not exist on the products table
+// itself — they only come from organization_products. Existing fields that DO
+// exist at company level (unit_price, unit_cost, description, name) retain the
+// company value as priority; org master is only the fallback. This means no
+// existing order, PO, or inventory code sees any pricing change.
 app.get("/products", requireAuth, async (req, res) => {
   try {
     const { search, supplier_id, category_id, is_active, page = 1, limit = 50 } = req.query;
     const cid = getActiveCompanyId(req);
     let query = supabase
       .from("products")
-      .select("id, code, name, description, color, size, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, suppliers(id,name), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_product_id, organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode)", { count: "exact" })
+      // Include all org master fields needed by composeProductView: the
+      // price/cost fields are fetched so composeProductView can use them as
+      // last-resort fallback (when company row has no price at all).
+      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
@@ -6721,7 +6731,12 @@ app.get("/products", requireAuth, async (req, res) => {
     if (is_active === "false") query = query.eq("is_active", false);
     const { data, error, count } = await query;
     if (error) throw error;
-    res.json({ products: data || [], total: count || 0, page: Number(page), limit: Number(limit) });
+    res.json({
+      products: (data || []).map(composeProductView),
+      total: count || 0,
+      page: Number(page),
+      limit: Number(limit),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
