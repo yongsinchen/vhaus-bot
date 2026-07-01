@@ -198,6 +198,21 @@ async function countDistinctCompaniesByOrgLink(linkTable, linkColumn, orgIds) {
   return countMap;
 }
 
+// Return the other companies in the active company's catalogue group — i.e.
+// every company that shares the same catalogue_group_id, excluding the one that
+// just created the item. Empty array if the active company isn't in a group.
+// Used by auto-propagate-on-create so a new product/supplier immediately shows
+// scope = all-companies instead of scope = 1 until a backfill runs.
+async function getSiblingCompaniesInGroup(req) {
+  const cgId = await getActiveCatalogueGroupId(req);
+  if (!cgId) return [];
+  const cid = getActiveCompanyId(req);
+  const { data: companies } = await supabase.from("companies")
+    .select("id, name, org_sharing_enabled")
+    .eq("catalogue_group_id", cgId);
+  return (companies || []).filter(c => c.id !== cid);
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -6187,6 +6202,35 @@ app.post("/suppliers", ...requirePerm(PERMS.SUPPLIERS_CREATE), async (req, res) 
       })
       .select().single();
     if (error) throw error;
+
+    // Auto-propagate: mirror this supplier into the other companies in the
+    // catalogue group so the org master immediately shows scope = all companies
+    // (no backfill needed). Best-effort — a failure here must not fail the create,
+    // since the primary row already exists and the periodic backfill can recover.
+    if (orgSupplierId) {
+      try {
+        const siblings = await getSiblingCompaniesInGroup(req);
+        if (siblings.length > 0) {
+          // Which siblings already have a row linked to this org master? Skip those.
+          const { data: existing } = await supabase.from("suppliers")
+            .select("company_id")
+            .eq("organization_supplier_id", orgSupplierId)
+            .in("company_id", siblings.map(s => s.id));
+          const have = new Set((existing || []).map(r => r.company_id));
+          const rows = siblings
+            .filter(s => !have.has(s.id) && s.org_sharing_enabled !== false)
+            .map(s => ({
+              company_id: s.id, name: name.trim(), code: code?.trim() || null,
+              color_mode: parseColorMode(color_mode),
+              organization_id: orgId, organization_supplier_id: orgSupplierId,
+            }));
+          if (rows.length > 0) await supabase.from("suppliers").insert(rows);
+        }
+      } catch (propErr) {
+        console.error("[POST /suppliers] auto-propagate failed (non-fatal):", propErr.message);
+      }
+    }
+
     res.status(201).json({ supplier: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6863,6 +6907,52 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
       throw error;
     }
+
+    // Auto-propagate: mirror this product into the other companies in the
+    // catalogue group so the org master immediately shows scope = all companies.
+    // Company-specific fields (price/cost/supplier) are intentionally left blank
+    // for siblings — each company sets its own. Best-effort: a sibling that
+    // already has a product with this code is skipped (unique constraint), and
+    // any failure is non-fatal since the primary row already exists.
+    if (orgProductId) {
+      try {
+        const siblings = await getSiblingCompaniesInGroup(req);
+        const sharing = siblings.filter(s => s.org_sharing_enabled !== false);
+        if (sharing.length > 0) {
+          const siblingIds = sharing.map(s => s.id);
+          const normCode = code.trim().toUpperCase();
+
+          // Two targeted lookups (each returns a tiny result set, so no 1000-row
+          // truncation risk): siblings already linked to this master, and siblings
+          // that already own the same (code, size) — the latter would violate the
+          // unique constraint and must be skipped.
+          const [{ data: linkedRows }, { data: codeRows }] = await Promise.all([
+            supabase.from("products").select("company_id")
+              .eq("organization_product_id", orgProductId).in("company_id", siblingIds),
+            supabase.from("products").select("company_id, size")
+              .eq("code", normCode).in("company_id", siblingIds),
+          ]);
+          const linked = new Set((linkedRows || []).map(r => r.company_id));
+          const codeTaken = new Set((codeRows || [])
+            .filter(r => (r.size || "") === (size || ""))
+            .map(r => r.company_id));
+
+          const rows = sharing
+            .filter(s => !linked.has(s.id) && !codeTaken.has(s.id))
+            .map(s => ({
+              company_id: s.id, code: normCode, name: name.trim(),
+              description: description || null, color: color || null, size: size || null,
+              organization_category_id: organization_category_id || null,
+              is_standard: is_standard !== false, is_customizable: is_customizable === true,
+              reorder_point: 0, is_active: true, organization_product_id: orgProductId,
+            }));
+          if (rows.length > 0) await supabase.from("products").insert(rows);
+        }
+      } catch (propErr) {
+        console.error("[POST /products] auto-propagate failed (non-fatal):", propErr.message);
+      }
+    }
+
     res.status(201).json({ product: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
