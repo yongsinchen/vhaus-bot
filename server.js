@@ -6177,8 +6177,20 @@ app.delete("/suppliers/:id", ...requirePerm(PERMS.SUPPLIERS_EDIT), async (req, r
 // Does not affect supplier create/edit/delete behavior or any FK.
 app.get("/organization-suppliers", requireAuth, async (req, res) => {
   try {
-    const orgId = await getActiveOrganizationId(req);
-    if (!orgId) return res.json({ organizationSuppliers: [] });
+    // For catalogue-group companies, resolve the shared organization_id via the
+    // catalogue_groups table — the same scoping used by the search endpoint.
+    // This ensures VHAUS and VHAUS_PG (different company organization_ids but same
+    // catalogue group) both see the same merged master supplier list.
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    let orgId;
+    if (catalogueGroupId) {
+      const { data: grp } = await supabase.from("catalogue_groups")
+        .select("organization_id").eq("id", catalogueGroupId).maybeSingle();
+      orgId = grp?.organization_id || null;
+    } else {
+      orgId = await getActiveOrganizationId(req);
+    }
+    if (!orgId) return res.json({ organizationSuppliers: [], isCatalogueGroup: false });
 
     const { data: orgSuppliers, error } = await supabase.from("organization_suppliers")
       .select("id, name, code, notes, contact, phone, email, address, is_active, share_enabled, version, created_at")
@@ -6201,7 +6213,6 @@ app.get("/organization-suppliers", requireAuth, async (req, res) => {
       companyCount: countMap[o.id] || 0,
       isShared: (countMap[o.id] || 0) > 1,
     }));
-    const catalogueGroupId = await getActiveCatalogueGroupId(req);
     res.json({ organizationSuppliers: result, isCatalogueGroup: !!catalogueGroupId });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6360,7 +6371,18 @@ app.patch("/organization-companies/:id", requireRole(["master"]), async (req, re
 // Does not affect product create/edit/delete behavior or any FK.
 app.get("/organization-products", requireAuth, async (req, res) => {
   try {
-    const orgId = await getActiveOrganizationId(req);
+    // Same catalogue-group-aware scoping as GET /organization-suppliers and the
+    // search endpoints — resolves via catalogue_groups table when available so all
+    // companies in the same catalogue group see the same master product list.
+    const catalogueGroupId = await getActiveCatalogueGroupId(req);
+    let orgId;
+    if (catalogueGroupId) {
+      const { data: grp } = await supabase.from("catalogue_groups")
+        .select("organization_id").eq("id", catalogueGroupId).maybeSingle();
+      orgId = grp?.organization_id || null;
+    } else {
+      orgId = await getActiveOrganizationId(req);
+    }
     if (!orgId) return res.json({ organizationProducts: [] });
 
     const { data: orgProducts, error } = await supabase.from("organization_products")
