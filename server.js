@@ -3857,29 +3857,44 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Keep the linked sales order's paid amount in sync when a payment is recorded
-// or deleted. The Orders → Order (sales_orders) screen derives its balance as
-// (subtotal − discount + gst) − deposit, so "deposit" here means "amount paid
-// to date". Applying the collected amount as a signed delta to deposit makes
-// that screen reflect the change. We apply the actual payment amount (not
-// total − balance) so a stale delivery orders.balance can never erase a real
-// prior deposit; pass a negative delta to reverse a payment on deletion.
-// Clamped to [0, order total] so overpayments show a zero balance (not
-// negative) and reversals never drive the deposit below zero.
-async function syncSalesOrderPaidFromOrder(orderId, paidAmount) {
-  const delta = Number(paidAmount) || 0;
-  if (delta === 0) return;
+// Recompute a sales order's paid/deposit total and its delivery order balance
+// from the authoritative ledger, given any one of its delivery orders' id.
+//
+// The Orders → Order (sales_orders) screen derives balance as
+// (subtotal − discount + gst) − deposit, so "deposit" means "amount paid to
+// date" = initial_deposit (the upfront deposit) + every recorded payment.
+// Recomputing from the ledger — instead of nudging deposit by a signed delta —
+// is exact and fully reversible: recording or deleting a payment always lands
+// on the correct total, so a capped over-/double-payment can never wipe the
+// original deposit. Clamped to [0, order total].
+async function recomputeOrderPaid(orderId) {
   const { data: ord } = await supabase.from("orders")
     .select("so_number, company_id").eq("id", orderId).single();
   if (!ord?.so_number) return;
   const { data: so } = await supabase.from("sales_orders")
-    .select("id, subtotal, discount, gst_amount, gst_waived, deposit")
+    .select("id, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit")
     .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
   if (!so) return;
+
   const total = (Number(so.subtotal) || 0) - (Number(so.discount) || 0)
     + (so.gst_waived ? 0 : (Number(so.gst_amount) || 0));
-  const paid = Math.max(0, Math.min(total, (Number(so.deposit) || 0) + delta));
+  // Fall back to the legacy deposit if initial_deposit hasn't been backfilled.
+  const initial = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
+
+  // Sum every payment recorded against this SO (across its delivery orders).
+  const { data: dOrders } = await supabase.from("orders")
+    .select("id").eq("company_id", ord.company_id).eq("so_number", ord.so_number);
+  const ids = (dOrders || []).map(o => o.id);
+  let paidFromPayments = 0;
+  if (ids.length) {
+    const { data: pays } = await supabase.from("payments").select("amount").in("order_id", ids);
+    paidFromPayments = (pays || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  }
+
+  const paid = Math.max(0, Math.min(total, initial + paidFromPayments));
+  const balance = Math.max(0, total - paid);
   await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
+  for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
 }
 
 // ── Cross-Order Payments ────────────────────────────────────────
@@ -3900,36 +3915,21 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       company_id: cid,
     }).select().single();
     if (error) throw error;
-    // Allocate to orders
+    // Allocate to orders. Balance is not adjusted by hand — recomputeOrderPaid
+    // below derives it from the full ledger (initial deposit + all payments).
+    const affectedOrders = new Set();
     if (Array.isArray(allocations) && allocations.length > 0) {
       const rows = allocations.filter(a => a.order_id && Number(a.amount) > 0).map(a => ({
         payment_id: payment.id, order_id: a.order_id, amount: Number(a.amount),
       }));
       if (rows.length > 0) await supabase.from("payment_allocations").insert(rows);
-      // Update each order's balance
-      for (const a of rows) {
-        const { data: order } = await supabase.from("orders").select("balance").eq("id", a.order_id).single();
-        const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - a.amount);
-        await supabase.from("orders").update({ balance: newBal }).eq("id", a.order_id);
-      }
+      for (const a of rows) affectedOrders.add(a.order_id);
     } else if (order_id) {
-      // Single order payment
-      const { data: order } = await supabase.from("orders").select("balance").eq("id", order_id).single();
-      const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
-      await supabase.from("orders").update({ balance: newBal }).eq("id", order_id);
+      affectedOrders.add(order_id);
     }
-    // Amount applied per order (fold into the sales order's paid/deposit total).
-    const paidByOrder = new Map();
-    if (Array.isArray(allocations) && allocations.length > 0) {
-      for (const a of allocations) {
-        if (a.order_id && Number(a.amount) > 0) paidByOrder.set(a.order_id, (paidByOrder.get(a.order_id) || 0) + Number(a.amount));
-      }
-    } else if (order_id) {
-      paidByOrder.set(order_id, Number(amount));
-    }
-    // Sync sales-order paid total + recalculate commissions for affected orders
-    for (const [oid, amt] of paidByOrder) {
-      try { await syncSalesOrderPaidFromOrder(oid, amt); } catch (e) { console.error("SO paid sync error:", e.message); }
+    // Recompute paid/deposit + balance from the ledger, then recalc commissions.
+    for (const oid of affectedOrders) {
+      try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
       try { await calculateCommission(oid, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc error:", e.message); }
     }
     res.json({ payment });
@@ -3974,30 +3974,13 @@ app.delete("/payments/:id", requireRole(["master"]), async (req, res) => {
     if (fetchErr) throw fetchErr;
     if (!payment) return res.status(404).json({ error: "Payment not found" });
 
-    // Amount to reverse per order: prefer explicit allocations, else the whole
-    // payment against its single linked order.
-    const reverseByOrder = new Map();
+    // Orders this payment touched (from explicit allocations, else its single
+    // linked order). We recompute their paid/balance from the ledger AFTER the
+    // payment is gone — so the reversal is exact, never a fragile delta.
+    const affectedOrders = new Set();
     const allocs = Array.isArray(payment.payment_allocations) ? payment.payment_allocations : [];
-    if (allocs.length > 0) {
-      for (const a of allocs) {
-        if (a.order_id && Number(a.amount) > 0) reverseByOrder.set(a.order_id, (reverseByOrder.get(a.order_id) || 0) + Number(a.amount));
-      }
-    } else if (payment.order_id) {
-      reverseByOrder.set(payment.order_id, Number(payment.amount) || 0);
-    }
-
-    for (const [oid, amt] of reverseByOrder) {
-      // Restore the delivery order's outstanding balance (never above the order total).
-      const { data: order } = await supabase.from("orders").select("balance, order_amount").eq("id", oid).single();
-      if (order) {
-        let restored = (parseFloat(order.balance) || 0) + amt;
-        if (order.order_amount != null) restored = Math.min(restored, Number(order.order_amount));
-        await supabase.from("orders").update({ balance: restored }).eq("id", oid);
-      }
-      // Roll back the sales order's paid/deposit total, then re-bucket commissions.
-      try { await syncSalesOrderPaidFromOrder(oid, -amt); } catch (e) { console.error("SO paid reverse error:", e.message); }
-      try { await calculateCommission(oid, cid); } catch (e) { console.error("commission recalc error:", e.message); }
-    }
+    for (const a of allocs) { if (a.order_id) affectedOrders.add(a.order_id); }
+    if (affectedOrders.size === 0 && payment.order_id) affectedOrders.add(payment.order_id);
 
     // If this payment came from bank-statement reconciliation, unlink the
     // statement transaction so it is no longer marked reconciled to a deleted
@@ -4018,7 +4001,14 @@ app.delete("/payments/:id", requireRole(["master"]), async (req, res) => {
     const { error: delErr } = await supabase.from("payments").delete().eq("id", id);
     if (delErr) throw delErr;
 
-    res.json({ ok: true, reversed_orders: reverseByOrder.size });
+    // Now the payment is gone, recompute each affected order's paid/deposit +
+    // balance from the remaining ledger and re-bucket commissions.
+    for (const oid of affectedOrders) {
+      try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
+      try { await calculateCommission(oid, cid); } catch (e) { console.error("commission recalc error:", e.message); }
+    }
+
+    res.json({ ok: true, reversed_orders: affectedOrders.size });
   } catch (err) { console.error("DELETE /payments error:", err); res.status(500).json({ error: err.message }); }
 });
 
@@ -4601,11 +4591,8 @@ app.post("/statements/:id/reconcile", requireRole(MANAGE_ROLES), async (req, res
         recorded_by: req.user.id, notes: `Statement reconciliation: ${txn.description || ""}`.trim(),
       }).select().single();
       if (payment) {
-        // Update order balance
-        const { data: order } = await supabase.from("orders").select("balance").eq("id", txn.matched_order_id).single();
-        const newBal = Math.max(0, (parseFloat(order?.balance) || 0) - txn.amount);
-        await supabase.from("orders").update({ balance: newBal }).eq("id", txn.matched_order_id);
-        try { await syncSalesOrderPaidFromOrder(txn.matched_order_id, txn.amount); } catch (e) { console.error("SO paid sync error:", e.message); }
+        // Recompute paid/deposit + balance from the ledger (payment now recorded).
+        try { await recomputeOrderPaid(txn.matched_order_id); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
         // Link payment
         await supabase.from("statement_transactions").update({ match_status: "reconciled", matched_payment_id: payment.id }).eq("id", txn.id);
         recorded++;
@@ -6036,13 +6023,11 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
       order_id: sched.order_id, amount: Number(amount), payment_method: method || "cash",
       reference_no: reference_no || null, recorded_by: req.user.id, notes: `Collected on delivery`,
     });
-    // Update order balance
-    const { data: order } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
-    const newBalance = Math.max(0, (parseFloat(order?.balance) || 0) - Number(amount));
-    await supabase.from("orders").update({ balance: newBalance }).eq("id", sched.order_id);
-    try { await syncSalesOrderPaidFromOrder(sched.order_id, Number(amount)); } catch (e) { console.error("SO paid sync error:", e.message); }
+    // Recompute paid/deposit + balance from the ledger (payment now recorded).
+    try { await recomputeOrderPaid(sched.order_id); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
     try { await calculateCommission(sched.order_id, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc:", e.message); }
-    res.json({ ok: true, new_balance: newBalance });
+    const { data: updatedOrder } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
+    res.json({ ok: true, new_balance: Number(updatedOrder?.balance) || 0 });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -8712,7 +8697,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         order_date: order_date || getMalaysiaDate(),
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
-        discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+        discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
         country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
         subtotal, notes: notes || null, created_by, sales_channel: sales_channel || "branch",
       })
@@ -8803,7 +8788,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
-      discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+      discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false, sales_channel: sales_channel || "branch",
     };
     if (amendmentNote) {
@@ -8830,6 +8815,12 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
     const deliveryOrderId = await syncSalesOrderToDelivery(full, full.sales_order_items);
+    // Fold any recorded payments back into the paid/deposit + balance now that
+    // the edited deposit/total has been written (sync set balance = total −
+    // deposit; recompute adds initial_deposit + payments so payments aren't lost).
+    if (deliveryOrderId) {
+      try { await recomputeOrderPaid(deliveryOrderId); } catch (e) { console.error("recomputeOrderPaid on order edit:", e.message); }
+    }
     // If this order already has commissions, re-run the calc so an edited order
     // date re-buckets the payout month (and amounts follow any total change).
     if (deliveryOrderId) {
