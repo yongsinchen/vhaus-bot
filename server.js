@@ -3827,16 +3827,18 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Keep the linked sales order's paid amount in sync when a payment is recorded.
-// The Orders → Order (sales_orders) screen derives its balance as
+// Keep the linked sales order's paid amount in sync when a payment is recorded
+// or deleted. The Orders → Order (sales_orders) screen derives its balance as
 // (subtotal − discount + gst) − deposit, so "deposit" here means "amount paid
-// to date". Adding the newly-collected amount to deposit makes that screen
-// reflect the payment. We add the actual payment amount (not total − balance)
-// so a stale delivery orders.balance can never erase a real prior deposit.
-// Capped at the order total so overpayments show a zero balance, not negative.
+// to date". Applying the collected amount as a signed delta to deposit makes
+// that screen reflect the change. We apply the actual payment amount (not
+// total − balance) so a stale delivery orders.balance can never erase a real
+// prior deposit; pass a negative delta to reverse a payment on deletion.
+// Clamped to [0, order total] so overpayments show a zero balance (not
+// negative) and reversals never drive the deposit below zero.
 async function syncSalesOrderPaidFromOrder(orderId, paidAmount) {
-  const add = Number(paidAmount) || 0;
-  if (add <= 0) return;
+  const delta = Number(paidAmount) || 0;
+  if (delta === 0) return;
   const { data: ord } = await supabase.from("orders")
     .select("so_number, company_id").eq("id", orderId).single();
   if (!ord?.so_number) return;
@@ -3846,7 +3848,7 @@ async function syncSalesOrderPaidFromOrder(orderId, paidAmount) {
   if (!so) return;
   const total = (Number(so.subtotal) || 0) - (Number(so.discount) || 0)
     + (so.gst_waived ? 0 : (Number(so.gst_amount) || 0));
-  const paid = Math.min(total, (Number(so.deposit) || 0) + add);
+  const paid = Math.max(0, Math.min(total, (Number(so.deposit) || 0) + delta));
   await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
 }
 
@@ -3923,6 +3925,64 @@ app.get("/payments", requireAuth, async (req, res) => {
     }
     res.json({ payments: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /payments/:id — master-only. Removes a recorded payment and reverses
+// every effect it had: restores each delivery order's outstanding balance,
+// rolls back the linked sales order's paid/deposit total, and recalculates
+// commissions (which may drop back to "pending" if the deposit gate is no
+// longer met). Keeps the customer payment history and Orders screen in sync.
+app.delete("/payments/:id", requireRole(["master"]), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { id } = req.params;
+
+    // Load the payment (company-scoped) with its per-order allocations.
+    let q = supabase.from("payments").select("*, payment_allocations(order_id, amount)").eq("id", id);
+    if (cid) q = q.eq("company_id", cid);
+    const { data: payment, error: fetchErr } = await q.maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!payment) return res.status(404).json({ error: "Payment not found" });
+
+    // Amount to reverse per order: prefer explicit allocations, else the whole
+    // payment against its single linked order.
+    const reverseByOrder = new Map();
+    const allocs = Array.isArray(payment.payment_allocations) ? payment.payment_allocations : [];
+    if (allocs.length > 0) {
+      for (const a of allocs) {
+        if (a.order_id && Number(a.amount) > 0) reverseByOrder.set(a.order_id, (reverseByOrder.get(a.order_id) || 0) + Number(a.amount));
+      }
+    } else if (payment.order_id) {
+      reverseByOrder.set(payment.order_id, Number(payment.amount) || 0);
+    }
+
+    for (const [oid, amt] of reverseByOrder) {
+      // Restore the delivery order's outstanding balance (never above the order total).
+      const { data: order } = await supabase.from("orders").select("balance, order_amount").eq("id", oid).single();
+      if (order) {
+        let restored = (parseFloat(order.balance) || 0) + amt;
+        if (order.order_amount != null) restored = Math.min(restored, Number(order.order_amount));
+        await supabase.from("orders").update({ balance: restored }).eq("id", oid);
+      }
+      // Roll back the sales order's paid/deposit total, then re-bucket commissions.
+      try { await syncSalesOrderPaidFromOrder(oid, -amt); } catch (e) { console.error("SO paid reverse error:", e.message); }
+      try { await calculateCommission(oid, cid); } catch (e) { console.error("commission recalc error:", e.message); }
+    }
+
+    // If this payment came from bank-statement reconciliation, unlink the
+    // statement transaction so it is no longer marked reconciled to a deleted
+    // payment (leaves it matched to the order, ready to reconcile again).
+    await supabase.from("statement_transactions")
+      .update({ matched_payment_id: null, match_status: "confirmed" })
+      .eq("matched_payment_id", id);
+
+    // Remove allocation rows first (FK), then the payment itself.
+    await supabase.from("payment_allocations").delete().eq("payment_id", id);
+    const { error: delErr } = await supabase.from("payments").delete().eq("id", id);
+    if (delErr) throw delErr;
+
+    res.json({ ok: true, reversed_orders: reverseByOrder.size });
+  } catch (err) { console.error("DELETE /payments error:", err); res.status(500).json({ error: err.message }); }
 });
 
 // ── Product Incentives ──────────────────────────────────────────
