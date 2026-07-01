@@ -3884,9 +3884,15 @@ async function getCommCache(companyId) {
 
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
 async function calculateCommission(orderId, companyId) {
-  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, items, sales_channel")
+  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel")
     .eq("id", orderId).single();
   if (!order) return;
+
+  // Which month an order belongs to is driven by the order's own date, not when the
+  // commission record happened to be created. Editing an order's date (e.g. back-dating
+  // from June to April) must re-bucket its payout. Fall back to created_at for legacy
+  // orders that have no order_date.
+  const commissionDate = order.order_date || order.created_at;
 
   const gross = Number(order.order_amount) || 0;
   const totalPaid = gross - (Number(order.balance) || 0);
@@ -3963,7 +3969,7 @@ async function calculateCommission(orderId, companyId) {
       commission_amt: totalComm, deposit_met: depositMet,
       status: depositMet ? "eligible" : "pending",
       eligible_at: depositMet ? new Date().toISOString() : null,
-      payout_month: depositMet ? getPayoutMonth(order.created_at) : null,
+      payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
     };
     if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
     else await supabase.from("commissions").insert({ order_id: orderId, user_id: salesUser.id, role_name: "salesman", company_id: companyId, ...commData });
@@ -3985,7 +3991,7 @@ async function calculateCommission(orderId, companyId) {
         commission_amt: overrideAmt, deposit_met: depositMet,
         status: depositMet ? "eligible" : "pending",
         eligible_at: depositMet ? new Date().toISOString() : null,
-        payout_month: depositMet ? getPayoutMonth(order.created_at) : null,
+        payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
       };
       if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
       else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", company_id: companyId, ...commData });
@@ -8239,7 +8245,7 @@ async function syncSalesOrderToDelivery(order, items) {
       customer_id,
       address: order.customer_address || null,
       contact: order.customer_contact || null,
-      order_date: (order.created_at || new Date().toISOString()).slice(0, 10),
+      order_date: order.order_date || (order.created_at || new Date().toISOString()).slice(0, 10),
       salesman: order.salesman_name || null,
       order_amount: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) + (!order.gst_waived ? (Number(order.gst_amount) || 0) : 0),
       balance: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) + (!order.gst_waived ? (Number(order.gst_amount) || 0) : 0) - (Number(order.deposit) || 0),
@@ -8265,8 +8271,10 @@ async function syncSalesOrderToDelivery(order, items) {
       }));
       await supabase.from("order_items").insert(oiRows);
     }
+    return orderId;
   } catch (e) {
     console.error("syncSalesOrderToDelivery error:", e.message);
+    return null;
   }
 }
 
@@ -8363,7 +8371,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const { id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
-            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel } = req.body;
+            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel, order_date } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
@@ -8385,6 +8393,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         customer_contact: customer_contact || null, customer_address: customer_address || null,
         salesman_name: resolvedSalesman, status: status || "draft",
         branch_id: branch_id || null,
+        order_date: order_date || null,
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
@@ -8429,7 +8438,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
-            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel } = req.body;
+            branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel, order_date } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
@@ -8475,6 +8484,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
       salesman_name: salesman_names || null, status: finalStatus, notes: notes || null, subtotal,
       branch_id: branch_id || null,
+      order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
@@ -8503,7 +8513,15 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     }
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
-    await syncSalesOrderToDelivery(full, full.sales_order_items);
+    const deliveryOrderId = await syncSalesOrderToDelivery(full, full.sales_order_items);
+    // If this order already has commissions, re-run the calc so an edited order
+    // date re-buckets the payout month (and amounts follow any total change).
+    if (deliveryOrderId) {
+      try {
+        const { data: existingComm } = await supabase.from("commissions").select("id").eq("order_id", deliveryOrderId).limit(1).maybeSingle();
+        if (existingComm) await calculateCommission(deliveryOrderId, company_id);
+      } catch (e) { console.error("commission recalc on order edit:", e.message); }
+    }
     res.json({ order: full });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
