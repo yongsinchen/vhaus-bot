@@ -213,6 +213,48 @@ async function getSiblingCompaniesInGroup(req) {
   return (companies || []).filter(c => c.id !== cid);
 }
 
+// Mirror a just-created product into the other companies in the catalogue group,
+// all linked to the same org master, so the master immediately shows scope =
+// all-companies. Company-specific fields (price/cost/supplier) are left blank —
+// each company sets its own. Best-effort and idempotent: siblings already linked
+// to the master, or that already own the same (code, size), are skipped (the
+// latter would violate the unique constraint). Never throws — a propagation
+// failure must not fail the primary create that already succeeded.
+async function propagateProductToSiblings(req, orgProductId, fields) {
+  if (!orgProductId) return;
+  try {
+    const siblings = (await getSiblingCompaniesInGroup(req)).filter(s => s.org_sharing_enabled !== false);
+    if (siblings.length === 0) return;
+    const siblingIds = siblings.map(s => s.id);
+    const normCode = (fields.code || "").trim().toUpperCase();
+    const size = fields.size || null;
+
+    const [{ data: linkedRows }, { data: codeRows }] = await Promise.all([
+      supabase.from("products").select("company_id")
+        .eq("organization_product_id", orgProductId).in("company_id", siblingIds),
+      supabase.from("products").select("company_id, size")
+        .eq("code", normCode).in("company_id", siblingIds),
+    ]);
+    const linked = new Set((linkedRows || []).map(r => r.company_id));
+    const codeTaken = new Set((codeRows || [])
+      .filter(r => (r.size || "") === (size || ""))
+      .map(r => r.company_id));
+
+    const rows = siblings
+      .filter(s => !linked.has(s.id) && !codeTaken.has(s.id))
+      .map(s => ({
+        company_id: s.id, code: normCode, name: (fields.name || "").trim(),
+        description: fields.description || null, color: fields.color || null, size,
+        organization_category_id: fields.organization_category_id || null,
+        is_standard: fields.is_standard !== false, is_customizable: fields.is_customizable === true,
+        reorder_point: 0, is_active: true, organization_product_id: orgProductId,
+      }));
+    if (rows.length > 0) await supabase.from("products").insert(rows);
+  } catch (propErr) {
+    console.error("[propagateProductToSiblings] failed (non-fatal):", propErr.message);
+  }
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -6908,50 +6950,11 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
       throw error;
     }
 
-    // Auto-propagate: mirror this product into the other companies in the
-    // catalogue group so the org master immediately shows scope = all companies.
-    // Company-specific fields (price/cost/supplier) are intentionally left blank
-    // for siblings — each company sets its own. Best-effort: a sibling that
-    // already has a product with this code is skipped (unique constraint), and
-    // any failure is non-fatal since the primary row already exists.
-    if (orgProductId) {
-      try {
-        const siblings = await getSiblingCompaniesInGroup(req);
-        const sharing = siblings.filter(s => s.org_sharing_enabled !== false);
-        if (sharing.length > 0) {
-          const siblingIds = sharing.map(s => s.id);
-          const normCode = code.trim().toUpperCase();
-
-          // Two targeted lookups (each returns a tiny result set, so no 1000-row
-          // truncation risk): siblings already linked to this master, and siblings
-          // that already own the same (code, size) — the latter would violate the
-          // unique constraint and must be skipped.
-          const [{ data: linkedRows }, { data: codeRows }] = await Promise.all([
-            supabase.from("products").select("company_id")
-              .eq("organization_product_id", orgProductId).in("company_id", siblingIds),
-            supabase.from("products").select("company_id, size")
-              .eq("code", normCode).in("company_id", siblingIds),
-          ]);
-          const linked = new Set((linkedRows || []).map(r => r.company_id));
-          const codeTaken = new Set((codeRows || [])
-            .filter(r => (r.size || "") === (size || ""))
-            .map(r => r.company_id));
-
-          const rows = sharing
-            .filter(s => !linked.has(s.id) && !codeTaken.has(s.id))
-            .map(s => ({
-              company_id: s.id, code: normCode, name: name.trim(),
-              description: description || null, color: color || null, size: size || null,
-              organization_category_id: organization_category_id || null,
-              is_standard: is_standard !== false, is_customizable: is_customizable === true,
-              reorder_point: 0, is_active: true, organization_product_id: orgProductId,
-            }));
-          if (rows.length > 0) await supabase.from("products").insert(rows);
-        }
-      } catch (propErr) {
-        console.error("[POST /products] auto-propagate failed (non-fatal):", propErr.message);
-      }
-    }
+    // Auto-propagate into the other companies in the catalogue group so the org
+    // master immediately shows scope = all companies (see helper for details).
+    await propagateProductToSiblings(req, orgProductId, {
+      code, name, description, color, size, organization_category_id, is_standard, is_customizable,
+    });
 
     res.status(201).json({ product: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -7155,7 +7158,10 @@ app.post("/product-review-queue/create-and-link", ...requirePerm(PERMS.PRODUCTS_
     let orgProductId = null;
     if (await isOrgSharingEnabledForCompany(req)) {
       try {
-        const orgId = await getActiveOrganizationIdOrThrow(req);
+        // Catalogue-group-aware org id (not the company's own) so all companies
+        // in the group share ONE org master — same fix as POST /products.
+        const orgId = await getCatalogueGroupAwareOrgId(req);
+        if (!orgId) throw new Error("No organization found for this company");
         const orgProduct = await orgIdentity.findOrCreateProduct({ organizationId: orgId, code, name: product_name, size, color, baseCost: unit_cost, basePrice: unit_price });
         orgProductId = orgProduct.id;
       } catch (orgErr) {
@@ -7176,6 +7182,12 @@ app.post("/product-review-queue/create-and-link", ...requirePerm(PERMS.PRODUCTS_
     await supabase.from("sales_order_items")
       .update({ product_id: product.id, requires_product_review: false, is_custom: false })
       .in("id", item_ids);
+
+    // Auto-propagate into the other companies in the catalogue group.
+    await propagateProductToSiblings(req, orgProductId, {
+      code, name: product_name, color, size, is_standard: true, is_customizable: false,
+    });
+
     res.json({ ok: true, product_id: product.id, linked: item_ids.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -7562,7 +7574,12 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const catalogueGroupId = await getActiveCatalogueGroupId(req);
     let orgId;
     try {
-      orgId = await getActiveOrganizationIdOrThrow(req);
+      // Catalogue-group-aware: use the group's canonical organization_id so all
+      // companies in the group share ONE org master — same fix as POST /products
+      // and the Telegram create-and-link path. Without this, importing as VHAUS_PG
+      // created a separate per-company org master (the root cause of orphaned masters).
+      orgId = await getCatalogueGroupAwareOrgId(req);
+      if (!orgId) throw new Error("No organization found for active company");
     } catch (orgCtxErr) {
       console.error("[catalogue-import/commit] organization resolution failed:", orgCtxErr.message);
       return res.status(500).json({ error: "Could not resolve organization for active company: " + orgCtxErr.message });
@@ -7643,6 +7660,7 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
 
     let imported = 0, skipped = skippedCount;
     const rowUpdates = [];
+    const importedForPropagation = []; // { orgProductId, code, name, size, color, is_customizable, categoryId }
 
     for (const row of toImport) {
       if (!row.product_code || !row.product_name) { skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: "Missing code or name", product_id: null }); continue; }
@@ -7686,9 +7704,70 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         .insert({ company_id, supplier_id: supplierId, category_id: catalogueGroupId ? null : categoryId, organization_category_id: catalogueGroupId ? categoryId : null, code: row.product_code, name: row.product_name, color: row.color || null, size: row.size || null, is_customizable: row.is_customizable || false, unit_cost: row.unit_cost, unit_price: row.unit_price, is_standard: true, reorder_point: 0, is_active: true, organization_product_id: orgProduct.id })
         .select("id").single();
       if (insertErr) { console.error("Product insert error:", insertErr.code, insertErr.message, "| code:", row.product_code, "| size:", row.size, "| color:", row.color); skipped++; rowUpdates.push({ id: row.id, action: "skip", error_message: insertErr.message, product_id: null }); }
-      else { imported++; rowUpdates.push({ id: row.id, action: "import", product_id: product.id }); }
+      else {
+        imported++;
+        rowUpdates.push({ id: row.id, action: "import", product_id: product.id });
+        importedForPropagation.push({
+          orgProductId: orgProduct.id, code: row.product_code, name: row.product_name,
+          size: row.size, color: row.color, is_customizable: row.is_customizable || false,
+          categoryId: catalogueGroupId ? categoryId : null,
+        });
+      }
       // Prevent two identical variants within the same batch from both inserting
       if (!insertErr) existingKeys.add(variantKey(row.product_code, row.product_name, row.size, row.color));
+    }
+
+    // Auto-propagate every imported product into the other companies in the
+    // catalogue group so each org master shows scope = all companies. Done as a
+    // single batch (not per-row) to keep a large import fast. Best-effort: any
+    // failure logs but never fails the commit that already succeeded.
+    try {
+      const siblings = (await getSiblingCompaniesInGroup(req)).filter(s => s.org_sharing_enabled !== false);
+      if (siblings.length > 0 && importedForPropagation.length > 0) {
+        const siblingIds = siblings.map(s => s.id);
+        const orgIds = [...new Set(importedForPropagation.map(p => p.orgProductId))];
+        const codes = [...new Set(importedForPropagation.map(p => (p.code || "").toUpperCase()))];
+
+        // Bulk conflict lookups, chunked to stay under the URL length limit.
+        const linkedSet = new Set();   // "company|orgProductId"
+        const codeSet = new Set();     // "company|CODE|size"
+        const chunk = (arr, n) => { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; };
+        for (const idc of chunk(orgIds, 150)) {
+          const { data } = await supabase.from("products").select("company_id, organization_product_id")
+            .in("organization_product_id", idc).in("company_id", siblingIds);
+          for (const r of (data || [])) linkedSet.add(`${r.company_id}|${r.organization_product_id}`);
+        }
+        for (const cc of chunk(codes, 150)) {
+          const { data } = await supabase.from("products").select("company_id, code, size")
+            .in("code", cc).in("company_id", siblingIds);
+          for (const r of (data || [])) codeSet.add(`${r.company_id}|${(r.code || "").toUpperCase()}|${r.size || ""}`);
+        }
+
+        const rows = [];
+        for (const p of importedForPropagation) {
+          const normCode = (p.code || "").toUpperCase();
+          for (const s of siblings) {
+            if (linkedSet.has(`${s.id}|${p.orgProductId}`)) continue;
+            if (codeSet.has(`${s.id}|${normCode}|${p.size || ""}`)) continue;
+            // Guard against duplicate (code,size) appearing twice in this import batch
+            codeSet.add(`${s.id}|${normCode}|${p.size || ""}`);
+            rows.push({
+              company_id: s.id, code: normCode, name: p.name,
+              color: p.color || null, size: p.size || null,
+              organization_category_id: p.categoryId || null,
+              is_customizable: p.is_customizable === true, is_standard: true,
+              reorder_point: 0, is_active: true, organization_product_id: p.orgProductId,
+            });
+          }
+        }
+        for (let i = 0; i < rows.length; i += 100) {
+          const batch = rows.slice(i, i + 100);
+          const { error: propErr } = await supabase.from("products").insert(batch);
+          if (propErr) console.error("[catalogue-import/commit] sibling propagation batch failed:", propErr.message);
+        }
+      }
+    } catch (propErr) {
+      console.error("[catalogue-import/commit] auto-propagate failed (non-fatal):", propErr.message);
     }
 
     await Promise.all(rowUpdates.map(u => supabase.from("catalogue_import_rows").update({ action: u.action, product_id: u.product_id }).eq("id", u.id)));
@@ -7715,7 +7794,10 @@ app.get("/catalogue-import/:job_id/commit-preview", requireRole(MANAGE_ROLES), a
 
     let orgId;
     try {
-      orgId = await getActiveOrganizationIdOrThrow(req);
+      // Match the real commit's catalogue-group-aware resolution so the preview's
+      // "would create / would match" counts are accurate for grouped companies.
+      orgId = await getCatalogueGroupAwareOrgId(req);
+      if (!orgId) throw new Error("No organization found for active company");
     } catch (orgCtxErr) {
       console.error("[catalogue-import/commit-preview] organization resolution failed:", orgCtxErr.message);
       return res.status(500).json({ error: "Could not resolve organization for active company: " + orgCtxErr.message });
