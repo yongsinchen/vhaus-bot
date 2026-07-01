@@ -148,6 +148,56 @@ async function getCatalogueGroupAwareOrgId(req) {
   return await getActiveOrganizationId(req);
 }
 
+// Count DISTINCT companies linked to each org master id.
+//
+// Used by GET /organization-suppliers and GET /organization-products to compute
+// the "Shared · N companies" scope badge. Two things this must get right:
+//   1. Paginate — the link table (suppliers/products) can exceed Supabase's
+//      1000-row default; a single un-ranged query silently truncates and makes
+//      most masters look like "Single company".
+//   2. Count distinct company_id, not rows — one company may have several rows
+//      linked to the same master (e.g. product variants), which must not inflate
+//      the count.
+//
+// @param linkTable   "suppliers" | "products"
+// @param linkColumn  "organization_supplier_id" | "organization_product_id"
+// @param orgIds      array of org master ids to count for
+// @returns { [orgId]: distinctCompanyCount }
+async function countDistinctCompaniesByOrgLink(linkTable, linkColumn, orgIds) {
+  const countMap = {};
+  if (!orgIds || orgIds.length === 0) return countMap;
+
+  const seen = {}; // orgId -> Set(company_id)
+
+  // Chunk the id list: an .in() with thousands of UUIDs blows past PostgREST's
+  // URL length limit and errors out. 200 ids per request keeps the URL well
+  // under any limit. Each chunk is itself paginated in case the link table has
+  // more than 1000 matching rows for the chunk.
+  const idChunkSize = 200;
+  const pageSize = 1000;
+  for (let c = 0; c < orgIds.length; c += idChunkSize) {
+    const chunk = orgIds.slice(c, c + idChunkSize);
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from(linkTable)
+        .select(`${linkColumn}, company_id`)
+        .in(linkColumn, chunk).eq("is_active", true)
+        .range(from, from + pageSize - 1);
+      if (error) throw error;
+      for (const row of (data || [])) {
+        const oid = row[linkColumn];
+        if (!seen[oid]) seen[oid] = new Set();
+        if (row.company_id != null) seen[oid].add(row.company_id);
+      }
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+  }
+
+  for (const [oid, set] of Object.entries(seen)) countMap[oid] = set.size;
+  return countMap;
+}
+
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
@@ -6213,15 +6263,7 @@ app.get("/organization-suppliers", requireAuth, async (req, res) => {
     if (error) throw error;
 
     const orgSupplierIds = (orgSuppliers || []).map(o => o.id);
-    let countMap = {};
-    if (orgSupplierIds.length > 0) {
-      const { data: links } = await supabase.from("suppliers")
-        .select("organization_supplier_id")
-        .in("organization_supplier_id", orgSupplierIds).eq("is_active", true);
-      for (const l of (links || [])) {
-        countMap[l.organization_supplier_id] = (countMap[l.organization_supplier_id] || 0) + 1;
-      }
-    }
+    const countMap = await countDistinctCompaniesByOrgLink("suppliers", "organization_supplier_id", orgSupplierIds);
 
     const result = (orgSuppliers || []).map(o => ({
       ...o,
@@ -6406,15 +6448,7 @@ app.get("/organization-products", requireAuth, async (req, res) => {
     if (error) throw error;
 
     const orgProductIds = (orgProducts || []).map(o => o.id);
-    let countMap = {};
-    if (orgProductIds.length > 0) {
-      const { data: links } = await supabase.from("products")
-        .select("organization_product_id")
-        .in("organization_product_id", orgProductIds).eq("is_active", true);
-      for (const l of (links || [])) {
-        countMap[l.organization_product_id] = (countMap[l.organization_product_id] || 0) + 1;
-      }
-    }
+    const countMap = await countDistinctCompaniesByOrgLink("products", "organization_product_id", orgProductIds);
 
     const result = (orgProducts || []).map(o => ({
       ...o,
