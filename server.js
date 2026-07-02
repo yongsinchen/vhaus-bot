@@ -3727,6 +3727,26 @@ app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) =>
   res.json(data);
 });
 
+// GET /orders — legacy orders for linking (e.g. the Service create "Link to
+// Order" search). Company-scoped, excludes Service orders, optional ?search=
+// on so_number/customer_name. Returns the bigint id services.order_id expects.
+app.get("/orders", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { search } = req.query;
+    let q = supabase.from("orders")
+      .select("id, so_number, customer_name, contact, address, delivery_date, type, status")
+      .or("type.is.null,type.neq.Service")
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (cid) q = q.eq("company_id", cid);
+    if (search) q = q.or(`so_number.ilike.%${search}%,customer_name.ilike.%${search}%`);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get("/services", requireAuth, async (req, res) => {
   const { salesman, status } = req.query;
   const cid = getActiveCompanyId(req);
