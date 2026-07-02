@@ -46,9 +46,10 @@ async function makeSO(companyId, orderNumber, items) {
   const { data: soi, error: iErr } = await supabase.from("sales_order_items").insert(rows).select();
   if (iErr) die("fixture sales_order_items insert failed: " + iErr.message);
 
+  // NOTE: legacy orders.balance is BIGINT (whole ringgit) — decimals rejected
   const { data: legacy, error: lErr } = await supabase.from("orders").insert({
     company_id: companyId, so_number: orderNumber, customer_name: "DO2A Test Customer",
-    status: "Pending", balance: 123.45, items: "[]",
+    status: "Pending", balance: 120, items: "[]",
   }).select().single();
   if (lErr) die("fixture orders insert failed: " + lErr.message);
   created.orders.push(legacy.id);
@@ -120,7 +121,7 @@ async function main() {
     assert("sales_orders status=partially_delivered", so1.status === "partially_delivered", so1.status);
     const ord1 = await getOrder(f1.legacy.id);
     assert("legacy orders status=Partially Delivered", ord1.status === "Partially Delivered", ord1.status);
-    assert("legacy balance untouched (123.45)", Number(ord1.balance) === 123.45, String(ord1.balance));
+    assert("legacy balance untouched (120)", Number(ord1.balance) === 120, String(ord1.balance));
 
     const { data: schedAfter } = await supabase.from("delivery_schedules").select("*").eq("id", sched1.id).single();
     assert("schedule attempt closed (delivered + delivered_at)", schedAfter.status === "delivered" && !!schedAfter.delivered_at);
@@ -170,7 +171,7 @@ async function main() {
     assert("no payments rows created by completion", (payCount || 0) === 0);
     const { count: commCount } = await supabase.from("commissions").select("id", { count: "exact", head: true }).in("order_id", [f1.legacy.id, f2.legacy.id]);
     assert("no commissions rows created by completion", (commCount || 0) === 0);
-    assert("fixture-2 legacy balance untouched", Number((await getOrder(f2.legacy.id)).balance) === 123.45);
+    assert("fixture-2 legacy balance untouched", Number((await getOrder(f2.legacy.id)).balance) === 120);
 
   } finally {
     console.log("\n── Cleanup ──");
