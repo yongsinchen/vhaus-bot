@@ -7717,9 +7717,16 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
   try {
     const company_id = getActiveCompanyId(req);
     const { id: created_by } = req.user;
-    const { supplier_id, category_id } = req.body;
+    const { supplier_id: rawSupplierId, category_id } = req.body;
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No file uploaded" });
+
+    // Catalogue-group companies submit the ORG master supplier id (the Import
+    // dropdown lists the shared org supplier list) — normalize to this
+    // company's own suppliers row before any lookup or the job insert, or the
+    // catalogue_import_jobs.supplier_id FK rejects it.
+    const { companySupplierId: supplier_id } = await resolveIncomingProductSupplier(company_id, { supplier_id: rawSupplierId });
+    if (rawSupplierId && !supplier_id) return res.status(400).json({ error: "Supplier not found for this company" });
 
     // Resolve costing rule for this import. A cost_divisor in the request is an
     // explicit choice (number = derive cost from price, blank = use catalogue cost)
