@@ -2963,6 +2963,7 @@ const handleDOPhoto = async (chatId, base64Image) => {
           results.duplicate.push({ itemName: item.itemName, soNumber: item.soNumber });
         } else {
           await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
+          await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
           results.updated.push({ itemName: item.itemName, soNumber: item.soNumber });
           updatedAny = true;
         }
@@ -3562,6 +3563,7 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
         return oi;
       });
       await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
+      await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
     }
   }
 
@@ -5335,6 +5337,28 @@ app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), 
       }
     }
     const packings = [];
+    // Phase 3: optional delivery_order_id scopes labels to a Delivery Order —
+    // packings link do_item_id by product match, labels stamp delivery_order_id.
+    const { delivery_order_id } = req.body;
+    let doItemByMatch = null, doValid = false;
+    if (delivery_order_id) {
+      const { data: dord } = await supabase.from("delivery_orders")
+        .select("id, delivery_order_items(id, product_code, product_name, status)")
+        .eq("id", delivery_order_id).maybeSingle();
+      if (dord) {
+        doValid = true;
+        doItemByMatch = (code, name) => {
+          const c = (code || "").trim().toLowerCase(), n = (name || "").trim().toLowerCase();
+          for (const di of (dord.delivery_order_items || [])) {
+            if (di.status === "cancelled") continue;
+            const dc = (di.product_code || "").trim().toLowerCase(), dn = (di.product_name || "").trim().toLowerCase();
+            if ((c && dc && c === dc) || (n && dn && (n === dn || n.startsWith(dn + " ") || dn.startsWith(n + " ")))) return di.id;
+          }
+          return null;
+        };
+      }
+    }
+
     for (const item of items) {
       // Try to find the order_item to link
       let orderItemId = item.order_item_id || null;
@@ -5346,11 +5370,12 @@ app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), 
           if (oi) orderItemId = oi.id;
         }
       }
+      const doItemId = doItemByMatch ? doItemByMatch(item.product_code || item.item_code, item.product_name || item.item_name) : null;
       const cartons = Number(item.carton_count) || 1;
       for (let c = 1; c <= cartons; c++) {
         packings.push({
           order_item_id: orderItemId,
-          do_item_id: null,
+          do_item_id: doItemId,
           qty_packed: 1,
           qr_code: generatePackingQR(),
           qr_type: "order_unit",
@@ -5376,6 +5401,7 @@ app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), 
         qr_code: p.qr_code,
         warehouse_id: item.warehouse_id || null,
         status: "pending",
+        delivery_order_id: doValid ? delivery_order_id : null,
       };
     });
     if (labels.length > 0) await supabase.from("package_labels").insert(labels);
@@ -5570,12 +5596,20 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
       const { data: dord } = await supabase.from("delivery_orders")
         .select("id, status, order_id, do_number").eq("id", delivery_order_id).eq("company_id", cid).maybeSingle();
       if (!dord) return res.status(404).json({ error: "Delivery order not found" });
-      if (dord.status !== "draft") return res.status(409).json({ error: `Delivery order ${dord.do_number} is already ${dord.status}` });
+      // draft = first attempt; failed = re-attempt (Phase 5). Anything else is
+      // already in flight or terminal.
+      if (!["draft", "failed"].includes(dord.status)) {
+        return res.status(409).json({ error: `Delivery order ${dord.do_number} is already ${dord.status}` });
+      }
+      const isReattempt = dord.status === "failed";
+      const { data: prevAttempts } = await supabase.from("delivery_schedules")
+        .select("attempt_no").eq("delivery_order_id", dord.id).order("attempt_no", { ascending: false }).limit(1);
+      const attemptNo = (prevAttempts?.[0]?.attempt_no || 0) + 1;
 
       const { data: schedule, error: schedErr } = await supabase.from("delivery_schedules")
         .insert({
           order_id: dord.order_id, // keep legacy joins (driver route, pick list) working
-          delivery_order_id: dord.id, attempt_no: 1,
+          delivery_order_id: dord.id, attempt_no: attemptNo,
           team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null,
           sort_order: sort_order || 0, status: "scheduled", is_ready: false, company_id: cid,
         }).select().single();
@@ -5583,7 +5617,8 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
 
       await supabase.from("delivery_orders")
         .update({ status: "scheduled", delivery_date: scheduled_date }).eq("id", dord.id);
-      await logDoEvent(dord.id, "scheduled", { scheduled_date, team_id: team_id || null, schedule_id: schedule.id }, req.user.id);
+      await logDoEvent(dord.id, isReattempt ? "rescheduled" : "scheduled",
+        { scheduled_date, team_id: team_id || null, schedule_id: schedule.id, attempt_no: attemptNo }, req.user.id);
       return res.status(201).json({ schedule });
     }
 
@@ -5675,14 +5710,19 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
     const seenSO = new Set();
     const pickItems = [];
 
-    // Source 1: delivery_schedules (new system)
+    // Source 1: delivery_schedules (new system). Phase 3: DO schedules pick
+    // ONLY that shipment's items (product-matched), tagged with the DO number.
     const { data: schedules } = await supabase.from("delivery_schedules")
-      .select("*, orders(id, so_number, customer_name, address)")
+      .select("*, orders(id, so_number, customer_name, address), delivery_orders(id, do_number, delivery_order_items(product_code, product_name, quantity, status))")
       .gte("scheduled_date", startDate).lte("scheduled_date", endDate).in("status", ["scheduled", "picking"]);
     for (const sched of (schedules || [])) {
       if (!sched.orders?.id) continue;
+      const doInfo = sched.delivery_orders
+        ? { doNumber: sched.delivery_orders.do_number, matcher: buildDoItemMatcher(sched.delivery_orders) }
+        : null;
+      // A DO schedule must not ALSO trigger the whole-order fallback below
       seenSO.add(sched.orders.so_number);
-      await addPickItemsForOrder(sched.orders.id, sched.orders.so_number, sched.orders.customer_name, sched.scheduled_date, pickItems);
+      await addPickItemsForOrder(sched.orders.id, sched.orders.so_number, sched.orders.customer_name, sched.scheduled_date, pickItems, doInfo);
     }
 
     // Source 2: orders with delivery_date in range (text column, string compare works for YYYY-MM-DD)
@@ -5763,7 +5803,32 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-async function addPickItemsForOrder(orderId, soNumber, customerName, deliveryDate, pickItems) {
+// Phase 3: build a product matcher from a Delivery Order's item snapshots so
+// warehouse lists can be scoped to ONE shipment. Physical packages aren't yet
+// linked to DO items (do_item_id lands with full warehouse wiring), so the
+// scope is product-level: a package matches when its code equals a DO item's
+// code, or its name prefixes/equals a DO item's name (case-insensitive).
+function buildDoItemMatcher(dord) {
+  const codes = new Set(), names = [];
+  for (const it of (dord?.delivery_order_items || [])) {
+    if (it.status === "cancelled") continue;
+    if (it.product_code) codes.add(String(it.product_code).trim().toLowerCase());
+    if (it.product_name) names.push(String(it.product_name).trim().toLowerCase());
+  }
+  return (productCode, productName) => {
+    const c = (productCode || "").trim().toLowerCase();
+    const n = (productName || "").trim().toLowerCase();
+    if (c && codes.has(c)) return true;
+    if (n) for (const dn of names) { if (n === dn || n.startsWith(dn + " ") || dn.startsWith(n + " ")) return true; }
+    return false;
+  };
+}
+
+async function addPickItemsForOrder(orderId, soNumber, customerName, deliveryDate, pickItems, doInfo = null) {
+  // doInfo (Phase 3): { doNumber, matcher } — restrict output to the Delivery
+  // Order's items and tag rows with the DO number. Null = whole order (legacy).
+  const matches = doInfo ? doInfo.matcher : null;
+  const doTag = doInfo ? { _do_number: doInfo.doNumber } : {};
   // Check order_item_packings first
   const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", orderId);
   const oiIds = (orderItems || []).map(oi => oi.id);
@@ -5772,7 +5837,8 @@ async function addPickItemsForOrder(orderId, soNumber, customerName, deliveryDat
     const { data: packings } = await supabase.from("order_item_packings").select("*").in("order_item_id", oiIds).in("status", ["put_away"]);
     for (const p of (packings || [])) {
       const { data: oi } = await supabase.from("order_items").select("product_name, product_code").eq("id", p.order_item_id).maybeSingle();
-      pickItems.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate });
+      if (matches && !matches(oi?.product_code, oi?.product_name)) continue;
+      pickItems.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate, ...doTag });
       found = true;
     }
   }
@@ -5780,7 +5846,8 @@ async function addPickItemsForOrder(orderId, soNumber, customerName, deliveryDat
   if (!found) {
     const { data: labels } = await supabase.from("package_labels").select("*").eq("so_number", soNumber).in("status", ["stored", "put_away"]);
     for (const l of (labels || [])) {
-      pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, location_code: l.location_code, _product_name: l.product_name, _product_code: l.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate, _source: "package_labels" });
+      if (matches && !matches(l.product_code, l.product_name)) continue;
+      pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, location_code: l.location_code, _product_name: l.product_name, _product_code: l.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate, _source: "package_labels", ...doTag });
     }
   }
 }
@@ -5790,7 +5857,7 @@ app.get("/unified-loading-list", requireAuth, async (req, res) => {
   try {
     const { team_id, date } = req.query;
     if (!team_id && !date) return res.status(400).json({ error: "team_id or date required" });
-    let q = supabase.from("delivery_schedules").select("*, orders(id, so_number, customer_name)");
+    let q = supabase.from("delivery_schedules").select("*, orders(id, so_number, customer_name), delivery_orders(id, do_number, delivery_order_items(product_code, product_name, quantity, status))");
     if (team_id) q = q.eq("team_id", team_id);
     if (date) q = q.eq("scheduled_date", date);
     q = q.in("status", ["scheduled", "picking", "loading"]);
@@ -5798,18 +5865,22 @@ app.get("/unified-loading-list", requireAuth, async (req, res) => {
     const items = [];
     for (const sched of (schedules || [])) {
       if (!sched.orders?.id) continue;
+      // Phase 3: DO schedules load only that shipment's items
+      const doMatch = sched.delivery_orders ? buildDoItemMatcher(sched.delivery_orders) : null;
       const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", sched.orders.id);
       const oiIds = (orderItems || []).map(oi => oi.id);
       if (oiIds.length > 0) {
         const { data: packings } = await supabase.from("order_item_packings").select("*").in("order_item_id", oiIds).in("status", ["picked", "loaded"]);
         for (const p of (packings || [])) {
           const { data: oi } = await supabase.from("order_items").select("product_name, product_code").eq("id", p.order_item_id).maybeSingle();
+          if (doMatch && !doMatch(oi?.product_code, oi?.product_name)) continue;
           items.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: sched.orders.customer_name, _so_number: sched.orders.so_number });
         }
       }
       // Fallback to package_labels
       const { data: labels } = await supabase.from("package_labels").select("*").eq("so_number", sched.orders.so_number).in("status", ["picked", "loaded"]);
       for (const l of (labels || [])) {
+        if (doMatch && !doMatch(l.product_code, l.product_name)) continue;
         if (!items.find(i => i.qr_code === l.qr_code)) {
           items.push({ id: l.id, qr_code: l.qr_code, status: l.status, _product_name: l.product_name, _product_code: l.product_code, _customer: sched.orders.customer_name, _so_number: l.so_number, _source: "package_labels" });
         }
@@ -6044,6 +6115,20 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
     // ledger incremented, item/SO/legacy-order statuses rolled up, schedule
     // rows closed, event logged. Idempotent — a double-tap returns
     // already_completed without double-incrementing.
+    // Phase 5: failed delivery attempt — closes THIS attempt with a reason and
+    // returns the DO to the reschedule pool. The DO document survives intact;
+    // rescheduling creates attempt_no+1. Legacy schedules unaffected.
+    if (existing.delivery_order_id && status === "failed") {
+      const reason = (req.body.reason || "").trim() || null;
+      const { data: failedSched, error: fErr } = await supabase.from("delivery_schedules")
+        .update({ status: "failed", failed_reason: reason })
+        .eq("id", existing.id).select("*, orders(id, so_number, status)").single();
+      if (fErr) throw fErr;
+      await supabase.from("delivery_orders").update({ status: "failed" }).eq("id", existing.delivery_order_id);
+      await logDoEvent(existing.delivery_order_id, "failed", { schedule_id: existing.id, reason }, req.user.id);
+      return res.json({ schedule: failedSched });
+    }
+
     if (existing.delivery_order_id && (status === "delivered" || status === "completed")) {
       const cid = getActiveCompanyId(req);
       const { data: result, error: rpcErr } = await supabase.rpc("complete_delivery_order", {
@@ -6500,10 +6585,44 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
       });
     }
 
-    // Auto-update is_ready on delivery_schedules
+    // Auto-update is_ready on delivery_schedules.
+    // Phase 3: whole-order readiness applies only to legacy (NULL-DO) rows —
+    // a DO schedule is ready when ITS OWN items have arrived, judged below,
+    // so the arrived sofa ships while the wardrobe is still at the supplier.
     for (const r of results) {
-      await supabase.from("delivery_schedules").update({ is_ready: r.is_ready }).eq("order_id", r.order_id);
+      await supabase.from("delivery_schedules").update({ is_ready: r.is_ready }).eq("order_id", r.order_id).is("delivery_order_id", null);
     }
+
+    // Per-DO readiness for DO schedules in the window
+    try {
+      const { data: doScheds } = await supabase.from("delivery_schedules")
+        .select("id, scheduled_date, delivery_orders(id, do_number, order_id, delivery_order_items(sales_order_item_id, product_code, product_name, status))")
+        .not("delivery_order_id", "is", null)
+        .gte("scheduled_date", startDate).lte("scheduled_date", endDate)
+        .in("status", ["scheduled", "picking"]);
+      for (const sched of (doScheds || [])) {
+        const dord = sched.delivery_orders;
+        if (!dord) continue;
+        const doItems = (dord.delivery_order_items || []).filter(i => i.status !== "cancelled");
+        // Arrival per item: sales_order_items.arrived_at first, legacy orders.items JSON fallback
+        const soiIds = doItems.map(i => i.sales_order_item_id).filter(Boolean);
+        let soiById = new Map();
+        if (soiIds.length > 0) {
+          const { data: sois } = await supabase.from("sales_order_items").select("id, arrived_at, product_code, product_name").in("id", soiIds);
+          soiById = new Map((sois || []).map(s => [s.id, s]));
+        }
+        let legacySet = new Set();
+        if (dord.order_id) {
+          const { data: legacyOrd } = await supabase.from("orders").select("items").eq("id", dord.order_id).maybeSingle();
+          legacySet = doLib.buildLegacyArrivalSet(legacyOrd?.items);
+        }
+        const allArrived = doItems.length > 0 && doItems.every(i => {
+          const soi = i.sales_order_item_id ? soiById.get(i.sales_order_item_id) : null;
+          return doLib.isItemArrived(soi || { product_code: i.product_code, product_name: i.product_name }, legacySet);
+        });
+        await supabase.from("delivery_schedules").update({ is_ready: allArrived }).eq("id", sched.id);
+      }
+    } catch (doReadyErr) { console.error("[delivery-readiness] DO readiness failed (non-fatal):", doReadyErr.message); }
 
     results.sort((a, b) => (a.delivery_date || "").localeCompare(b.delivery_date || ""));
     res.json({ orders: results, ready: results.filter(r => r.is_ready).length, total: results.length });
@@ -8818,6 +8937,7 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
         });
         if (matched) {
           await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
+          await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
           results.updated.push({ item: item.itemName, so: item.soNumber });
 
           // Also try to mark PO items as received
@@ -8904,6 +9024,7 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
     });
     if (!updated) return res.status(404).json({ error: "Item not found" });
     await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", req.params.id);
+    await syncArrivalsToSalesOrderItems(req.params.id); // Phase 4 dual-write
     res.json({ ok: true, items });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -8927,6 +9048,52 @@ async function nextOrderNumber(company_id) {
   const lastSeq = lastOrder?.[0]?.order_number ? parseInt(lastOrder[0].order_number.slice(-3)) || 0 : 0;
   const seq = String(Math.max((count || 0) + 1, lastSeq + 1)).padStart(3, "0");
   return `SO${ymd}-${seq}`;
+}
+
+// Phase 4: arrival dual-write. Arrival truth historically lives in
+// orders.items JSON ({itemCode, itemName, arrivalDate}); the DO system reads
+// sales_order_items.arrived_at with a JSON fallback. This helper re-syncs the
+// FULL arrival state of one legacy order into its sales_order_items rows
+// (sets AND clears), so every JSON writer just calls it after updating.
+// Best-effort by design — a sync failure must never fail the write that
+// already happened; the JSON fallback still covers display.
+async function syncArrivalsToSalesOrderItems(legacyOrderId) {
+  try {
+    const { data: ord } = await supabase.from("orders")
+      .select("id, company_id, so_number, items").eq("id", legacyOrderId).maybeSingle();
+    if (!ord?.so_number) return;
+    const { data: so } = await supabase.from("sales_orders")
+      .select("id, sales_order_items(id, product_code, product_name, arrived_at)")
+      .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
+    if (!so || !(so.sales_order_items || []).length) return;
+
+    let jsonItems = ord.items;
+    if (typeof jsonItems === "string") { try { jsonItems = JSON.parse(jsonItems || "[]"); } catch { jsonItems = []; } }
+    if (!Array.isArray(jsonItems)) jsonItems = [];
+
+    // Match a JSON item to an SO item: code exact (ci), or the composite JSON
+    // itemName ("name size color") equals/prefixes the SO item's product_name.
+    const findArrival = (soi) => {
+      const code = (soi.product_code || "").trim().toLowerCase();
+      const name = (soi.product_name || "").trim().toLowerCase();
+      for (const ji of jsonItems) {
+        const jCode = (ji.itemCode || "").trim().toLowerCase();
+        const jName = (ji.itemName || "").trim().toLowerCase();
+        const codeHit = code && jCode && code === jCode;
+        const nameHit = name && jName && (jName === name || jName.startsWith(name + " "));
+        if (codeHit || nameHit) return ji.arrivalDate || null;
+      }
+      return null;
+    };
+
+    for (const soi of so.sales_order_items) {
+      const arrival = findArrival(soi);
+      const current = soi.arrived_at || null;
+      if ((arrival || null) !== current) {
+        await supabase.from("sales_order_items").update({ arrived_at: arrival || null }).eq("id", soi.id);
+      }
+    }
+  } catch (e) { console.error("[syncArrivalsToSalesOrderItems] non-fatal:", e.message); }
 }
 
 // Map sales-order status → delivery (orders table) status

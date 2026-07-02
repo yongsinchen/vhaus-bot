@@ -166,6 +166,14 @@ async function main() {
     const { error: e6 } = await rpc(do4.id, "00000000-0000-0000-0000-000000000001");
     assert("wrong-company completion blocked", e6 && e6.message.includes("wrong_company"), e6?.message);
 
+    console.log("\n── 5b. Failed attempt → retry completes (Phase 5) ──");
+    const f3 = await makeSO(cid, `TEST-DO2A-${stamp}-3`, [["Bed D", 1]]);
+    const soiD = f3.soi[0];
+    const do6 = await makeDO(cid, f3.so, f3.legacy, `TEST-DO2A-${stamp}-D6`, [[soiD, 1]], "failed");
+    const { data: r6, error: e6b } = await rpc(do6.id, cid);
+    assert("completing a previously-failed DO (retry succeeded) works", !e6b && r6?.already_completed === false, e6b?.message);
+    assert("retry completion delivers the item", Number((await getSoi(soiD.id)).delivered_qty) === 1);
+
     console.log("\n── 6. Payment / commission untouched ──");
     const { count: payCount } = await supabase.from("payments").select("id", { count: "exact", head: true }).in("order_id", [f1.legacy.id, f2.legacy.id]);
     assert("no payments rows created by completion", (payCount || 0) === 0);
