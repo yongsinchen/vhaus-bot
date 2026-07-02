@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
 const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
@@ -23,7 +24,25 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
 app.options("*", cors());
+// Compress JSON responses (gzip, or brotli when the client accepts it).
+// compression() skips already-compressed content types by default and only
+// kicks in above 1KB — image/file streams from storage URLs are unaffected
+// because those are served by Supabase Storage, not this server.
+app.use(compression());
 app.use(express.json());
+
+// TEMP-PERF-LOG — request timing instrumentation. Enabled only when the
+// PERF_LOG env var is set (dev). Delete this block to remove entirely.
+if (process.env.PERF_LOG) {
+  app.use((req, res, next) => {
+    const t = Date.now();
+    res.on("finish", () => {
+      const len = res.getHeader("content-length") || "-";
+      console.log(`[perf] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - t}ms ${len}B enc=${res.getHeader("content-encoding") || "identity"} cid=${req.activeCompanyId || "-"}`);
+    });
+    next();
+  });
+}
 
 // ── Clients ───────────────────────────────────────────────────────
 const supabase = createClient(
@@ -2958,6 +2977,20 @@ const handleDOPhoto = async (chatId, base64Image, fromTelegramId = null) => {
 
 // ── Service Pending API ──────────────────────────────────────────
 
+// GET /operations/pending-counts — head-count only, for the sidebar badge.
+// Lets the app show the Operations badge at startup without fetching the
+// full service_pending + do_review row sets (those load when the page opens).
+app.get("/operations/pending-counts", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    let spQ = supabase.from("service_pending").select("id", { count: "exact", head: true }).eq("status", "Pending");
+    let drQ = supabase.from("do_review").select("id", { count: "exact", head: true }).eq("status", "Pending");
+    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.eq("company_id", cid); }
+    const [{ count: sp }, { count: dr }] = await Promise.all([spQ, drQ]);
+    res.json({ service_pending: sp || 0, do_review: dr || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /service-pending
 app.get("/service-pending", requireAuth, async (req, res) => {
   const cid = getActiveCompanyId(req);
@@ -4334,6 +4367,56 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
       byUser[uid].total += (Number(c.commission_amt) || 0) + adjTotal - holdTotal;
     }
     res.json({ payout_month: month, users: Object.values(byUser), total: Object.values(byUser).reduce((s, u) => s + u.total, 0) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /commission-summary — lightweight totals for the dashboard stat card.
+// Same commission selection + adjustment/hold math as /commission-payout,
+// but NO nested orders/users joins and NO row detail in the response.
+// The Commission page keeps using /commission-payout; only the Overview
+// stat should call this.
+app.get("/commission-summary", requireAuth, async (req, res) => {
+  try {
+    const { payout_month } = req.query;
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company context required" });
+    const month = payout_month || `${new Date().toISOString().slice(0, 7)}-01`;
+    const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
+    const user_id = isSalesman ? req.user.id : req.query.user_id;
+
+    let eq = supabase.from("commissions").select("id, commission_amt, status")
+      .eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid);
+    if (user_id) eq = eq.eq("user_id", user_id);
+    let pq = supabase.from("commissions").select("id, commission_amt, status")
+      .eq("status", "pending").eq("company_id", cid);
+    if (user_id) pq = pq.eq("user_id", user_id);
+    const [{ data: eligibleComms }, { data: pendingComms }] = await Promise.all([eq, pq]);
+    const comms = [...(eligibleComms || []), ...(pendingComms || [])];
+
+    const commIds = comms.map(c => c.id);
+    let adjustments = [], holds = [];
+    if (commIds.length > 0) {
+      const [{ data: adjs }, { data: hs }] = await Promise.all([
+        supabase.from("commission_adjustments").select("commission_id, delta_amt").in("commission_id", commIds),
+        supabase.from("wrong_item_holds").select("commission_id, held_amt, status").in("commission_id", commIds),
+      ]);
+      adjustments = adjs || []; holds = hs || [];
+    }
+
+    const netOf = (c) => {
+      const adjTotal = adjustments.filter(a => a.commission_id === c.id).reduce((s, a) => s + (Number(a.delta_amt) || 0), 0);
+      const holdTotal = holds.filter(h => h.commission_id === c.id && h.status === "held").reduce((s, h) => s + (Number(h.held_amt) || 0), 0);
+      return (Number(c.commission_amt) || 0) + adjTotal - holdTotal;
+    };
+    let total = 0, paid = 0, pending = 0, eligible = 0;
+    for (const c of comms) {
+      const net = netOf(c);
+      total += net;
+      if (c.status === "paid") paid += net;
+      else if (c.status === "pending") pending += net;
+      else eligible += net; // eligible + held
+    }
+    res.json({ payout_month: month, total, paid, unpaid: total - paid, eligible, pending });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
