@@ -10,6 +10,7 @@ const { PermissionEngine } = require("./permission-engine");
 const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry");
 const { OrganizationIdentityService } = require("./organization-identity-service");
 const { composeProductView, composeSupplierView } = require("./lib/product-view-composer");
+const doLib = require("./lib/delivery-orders");
 
 const app = express();
 
@@ -5553,11 +5554,44 @@ app.get("/delivery-schedules", requireAuth, async (req, res) => {
 
 app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (req, res) => {
   try {
-    const { order_id, team_id, scheduled_date, area, slot, sort_order } = req.body;
-    if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
+    const { order_id, team_id, scheduled_date, area, slot, sort_order, delivery_order_id } = req.body;
     const cid = getActiveCompanyId(req);
-    // If already scheduled for this date, update the team instead of blocking
-    let dupQ = supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date);
+
+    // ── DO path (Phase 1): schedule a Delivery Order ──────────────
+    // Without delivery_order_id the legacy whole-order path below runs
+    // byte-for-byte as before.
+    if (delivery_order_id) {
+      if (!scheduled_date) return res.status(400).json({ error: "scheduled_date required" });
+      // Scheduling a DO needs its own permission on top of DELIVERY_CREATE
+      const allowed = req.activeRoleKey === "MASTER"
+        || (await permEngine.can(req.user.id, req.activeCompanyId, PERMS.DELIVERY_ORDER_SCHEDULE)).allowed;
+      if (!allowed) return res.status(403).json({ error: "Permission denied: DELIVERY_ORDER_SCHEDULE" });
+
+      const { data: dord } = await supabase.from("delivery_orders")
+        .select("id, status, order_id, do_number").eq("id", delivery_order_id).eq("company_id", cid).maybeSingle();
+      if (!dord) return res.status(404).json({ error: "Delivery order not found" });
+      if (dord.status !== "draft") return res.status(409).json({ error: `Delivery order ${dord.do_number} is already ${dord.status}` });
+
+      const { data: schedule, error: schedErr } = await supabase.from("delivery_schedules")
+        .insert({
+          order_id: dord.order_id, // keep legacy joins (driver route, pick list) working
+          delivery_order_id: dord.id, attempt_no: 1,
+          team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null,
+          sort_order: sort_order || 0, status: "scheduled", is_ready: false, company_id: cid,
+        }).select().single();
+      if (schedErr) throw schedErr;
+
+      await supabase.from("delivery_orders")
+        .update({ status: "scheduled", delivery_date: scheduled_date }).eq("id", dord.id);
+      await logDoEvent(dord.id, "scheduled", { scheduled_date, team_id: team_id || null, schedule_id: schedule.id }, req.user.id);
+      return res.status(201).json({ schedule });
+    }
+
+    // ── Legacy whole-order path (unchanged) ───────────────────────
+    if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
+    // If already scheduled for this date, update the team instead of blocking.
+    // Only NULL-DO rows participate — a DO schedule must never be hijacked.
+    let dupQ = supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date).is("delivery_order_id", null);
     if (cid) dupQ = dupQ.eq("company_id", cid);
     const { data: dup } = await dupQ.maybeSingle();
     if (dup) {
@@ -5973,16 +6007,45 @@ app.get("/driver/my-route", requireAuth, async (req, res) => {
 app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, res) => {
   try {
     const { status } = req.body;
+
+    // DO-aware guard (Phase 1): fetch the schedule first to see if it carries
+    // a Delivery Order. DO completion mutates the quantity ledger
+    // (delivered_qty) and rolls up the SO status — that must be one atomic
+    // RPC (Phase 2). A partial JS implementation here could double-count
+    // delivered_qty on a retried request, so completion is explicitly
+    // blocked for DO schedules until then. Legacy (NULL DO) schedules keep
+    // today's behavior exactly.
+    const { data: existing } = await supabase.from("delivery_schedules")
+      .select("id, delivery_order_id").eq("id", req.params.id).maybeSingle();
+    if (!existing) return res.status(404).json({ error: "Schedule not found" });
+    if (existing.delivery_order_id && status === "delivered") {
+      return res.status(409).json({ error: "Delivery Order completion is not enabled in Phase 1. The DO stays out_for_delivery — complete it after Phase 2 ships the atomic completion flow." });
+    }
+
     const updates = { status };
     if (status === "arrived") updates.notes = (updates.notes || "") + `\nArrived: ${new Date().toLocaleString("en-MY", { timeZone: "Asia/Kuala_Lumpur" })}`;
     if (status === "delivered") updates.delivered_at = new Date().toISOString();
     const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
     if (error) throw error;
-    // Also update the order status in orders table
+
+    // Propagate movement statuses to the DO + its event log
+    if (existing.delivery_order_id) {
+      if (status === "Out for Delivery") {
+        await supabase.from("delivery_orders").update({ status: "out_for_delivery" }).eq("id", existing.delivery_order_id);
+        await logDoEvent(existing.delivery_order_id, "out_for_delivery", { schedule_id: existing.id }, req.user.id);
+      } else if (status === "arrived") {
+        await supabase.from("delivery_orders").update({ status: "arrived" }).eq("id", existing.delivery_order_id);
+        await logDoEvent(existing.delivery_order_id, "arrived", { schedule_id: existing.id }, req.user.id);
+      }
+    }
+
+    // Also update the order status in orders table.
+    // For DO schedules, "Delivered" is unreachable here (blocked above) —
+    // the whole-order flip only ever happens on legacy schedules.
     if (status === "delivered" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
     }
-    if (status === "Out for Delivery" && data.orders?.id) {
+    if (status === "Out for Delivery" && data.orders?.id && !existing.delivery_order_id) {
       await supabase.from("orders").update({ status: "Out for Delivery" }).eq("id", data.orders.id);
     }
     res.json({ schedule: data });
@@ -6028,6 +6091,280 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
     try { await calculateCommission(sched.order_id, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc:", e.message); }
     const { data: updatedOrder } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
     res.json({ ok: true, new_balance: Number(updatedOrder?.balance) || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// Delivery Orders (DO) — Phase 1
+//
+// One Sales Order → many Delivery Orders. A DO is a shipment document;
+// driver/team/vehicle/date live on delivery_schedules (the attempt layer).
+// Quantity allocation is mathematically enforced via lib/delivery-orders.js:
+// remaining = ordered − delivered − allocated-in-active-DOs.
+// Payment NEVER attaches to a DO — the ledger stays on orders/sales_orders.
+// ══════════════════════════════════════════════════════════════════
+
+// Append an event to the DO's immutable timeline. Best-effort: an event
+// write failure must not fail the business operation that already happened.
+async function logDoEvent(deliveryOrderId, eventType, payload, actorId) {
+  try {
+    await supabase.from("delivery_order_events").insert({
+      delivery_order_id: deliveryOrderId, event_type: eventType,
+      payload: payload || null, actor_id: actorId || null,
+    });
+  } catch (e) { console.error(`[do-event] ${eventType} failed:`, e.message); }
+}
+
+// Load everything the allocation math needs for one sales order:
+// the SO with items, all its DOs with items, and the legacy orders row
+// (arrival JSON + is_multi_trip guard). Company-scoped — returns null
+// if the SO doesn't belong to the caller's active company.
+async function loadDoContext(salesOrderId, companyId) {
+  const { data: so } = await supabase.from("sales_orders")
+    .select("*, sales_order_items(*)")
+    .eq("id", salesOrderId).eq("company_id", companyId).maybeSingle();
+  if (!so) return null;
+  const { data: deliveryOrders } = await supabase.from("delivery_orders")
+    .select("*, delivery_order_items(*)")
+    .eq("sales_order_id", salesOrderId).order("created_at");
+  const { data: legacyOrder } = await supabase.from("orders")
+    .select("id, so_number, items, is_multi_trip, customer_id, address, contact")
+    .eq("company_id", companyId).eq("so_number", so.order_number).maybeSingle();
+  return { so, deliveryOrders: deliveryOrders || [], legacyOrder: legacyOrder || null };
+}
+
+// Per-item allocation summary used by several responses.
+function buildAllocationSummary(so, deliveryOrders, legacyOrder) {
+  const allocations = doLib.computeAllocations(so.sales_order_items || [], deliveryOrders);
+  const legacyArrivalSet = doLib.buildLegacyArrivalSet(legacyOrder?.items);
+  return (so.sales_order_items || []).map(soi => {
+    const alloc = allocations.get(soi.id);
+    const arrived = doLib.isItemArrived(soi, legacyArrivalSet);
+    return {
+      sales_order_item_id: soi.id,
+      product_code: soi.product_code, product_name: soi.product_name,
+      size: soi.size, color: soi.color,
+      ordered_qty: alloc.ordered_qty, allocated_qty: alloc.allocated_qty,
+      delivered_qty: alloc.delivered_qty, remaining_qty: alloc.remaining_qty,
+      arrived,
+      delivery_status: doLib.deriveItemDeliveryStatus(alloc, arrived),
+    };
+  });
+}
+
+// POST /sales-orders/:id/delivery-orders — create a DO from selected items
+app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_CREATE), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const { items, delivery_date, remark, override_arrival } = req.body;
+
+    const ctx = await loadDoContext(req.params.id, companyId);
+    if (!ctx) return res.status(404).json({ error: "Sales order not found" });
+    const { so, deliveryOrders, legacyOrder } = ctx;
+
+    if (so.status === "cancelled") return res.status(400).json({ error: "Cannot create a Delivery Order for a cancelled sales order" });
+    // Telegram multi-trip orders keep their existing flow until Phase 2 absorption —
+    // one delivery system per order, never both.
+    if (legacyOrder?.is_multi_trip) {
+      return res.status(409).json({ error: "This order uses the Telegram multi-trip flow. Delivery Orders are not available for it until multi-trip absorption (Phase 2)." });
+    }
+
+    // override_arrival needs its own permission on top of DELIVERY_ORDER_CREATE
+    let overrideAllowed = false;
+    if (override_arrival === true) {
+      overrideAllowed = req.activeRoleKey === "MASTER"
+        || (await permEngine.can(req.user.id, req.activeCompanyId, PERMS.DELIVERY_ORDER_OVERRIDE_ARRIVAL)).allowed;
+      if (!overrideAllowed) return res.status(403).json({ error: "Permission denied: DELIVERY_ORDER_OVERRIDE_ARRIVAL" });
+    }
+
+    const allocations = doLib.computeAllocations(so.sales_order_items || [], deliveryOrders);
+    const legacyArrivalSet = doLib.buildLegacyArrivalSet(legacyOrder?.items);
+    const check = doLib.validateDoRequest(items, so.sales_order_items || [], allocations, {
+      overrideArrival: overrideAllowed, legacyArrivalSet,
+    });
+    if (!check.ok) return res.status(400).json({ error: check.errors.join("; "), errors: check.errors });
+
+    // Race-safe DO number (counter-table RPC — never count-rows)
+    const { data: doNumber, error: numErr } = await supabase.rpc("next_do_number", { p_company_id: companyId });
+    if (numErr) throw new Error("DO number generation failed: " + numErr.message);
+
+    const { data: dord, error: doErr } = await supabase.from("delivery_orders").insert({
+      company_id: companyId, do_number: doNumber,
+      sales_order_id: so.id, order_id: legacyOrder?.id || null,
+      customer_id: legacyOrder?.customer_id || null,
+      delivery_address: so.customer_address || legacyOrder?.address || null,
+      contact: so.customer_contact || legacyOrder?.contact || null,
+      status: "draft", pick_status: "pending",
+      delivery_date: delivery_date || null, remark: remark || null,
+      created_by: req.user.id,
+    }).select().single();
+    if (doErr) throw doErr;
+
+    const itemRows = check.normalized.map(({ soi, quantity }) => ({
+      delivery_order_id: dord.id, sales_order_item_id: soi.id,
+      ...doLib.snapshotFromSoi(soi), quantity, status: "pending",
+    }));
+    const { data: doItems, error: itemsErr } = await supabase.from("delivery_order_items").insert(itemRows).select();
+    if (itemsErr) {
+      // Don't leave a header row without items
+      await supabase.from("delivery_orders").delete().eq("id", dord.id);
+      throw itemsErr;
+    }
+
+    // Refresh each touched SO item's stored delivery_status
+    const newAllocations = doLib.computeAllocations(so.sales_order_items || [],
+      [...deliveryOrders, { ...dord, delivery_order_items: doItems }]);
+    for (const { soi } of check.normalized) {
+      const alloc = newAllocations.get(soi.id);
+      const arrived = doLib.isItemArrived(soi, legacyArrivalSet);
+      await supabase.from("sales_order_items")
+        .update({ delivery_status: doLib.deriveItemDeliveryStatus(alloc, arrived) })
+        .eq("id", soi.id);
+    }
+
+    await logDoEvent(dord.id, "created", {
+      do_number: doNumber,
+      items: itemRows.map(r => ({ sales_order_item_id: r.sales_order_item_id, product_name: r.product_name, quantity: r.quantity })),
+      override_arrival: override_arrival === true,
+    }, req.user.id);
+
+    res.status(201).json({ delivery_order: { ...dord, delivery_order_items: doItems } });
+  } catch (err) { console.error("[POST delivery-orders]", err.message); res.status(500).json({ error: err.message }); }
+});
+
+// GET /sales-orders/:id/delivery-orders — all DOs + per-item allocation summary
+app.get("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const ctx = await loadDoContext(req.params.id, companyId);
+    if (!ctx) return res.status(404).json({ error: "Sales order not found" });
+    const { so, deliveryOrders, legacyOrder } = ctx;
+
+    const doIds = deliveryOrders.map(d => d.id);
+    let eventsByDo = {};
+    if (doIds.length > 0) {
+      const { data: events } = await supabase.from("delivery_order_events")
+        .select("*").in("delivery_order_id", doIds).order("created_at");
+      for (const ev of (events || [])) {
+        (eventsByDo[ev.delivery_order_id] = eventsByDo[ev.delivery_order_id] || []).push(ev);
+      }
+    }
+
+    res.json({
+      sales_order_id: so.id,
+      order_number: so.order_number,
+      delivery_orders: deliveryOrders.map(d => ({ ...d, events: eventsByDo[d.id] || [] })),
+      items: buildAllocationSummary(so, deliveryOrders, legacyOrder),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-orders/:id — one DO with SO, items, events, schedule attempts
+app.get("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const { data: dord } = await supabase.from("delivery_orders")
+      .select("*, delivery_order_items(*), sales_orders(id, order_number, customer_name, customer_contact, customer_address, status), customers(id, name, phone)")
+      .eq("id", req.params.id).eq("company_id", companyId).maybeSingle();
+    if (!dord) return res.status(404).json({ error: "Delivery order not found" });
+
+    const [{ data: events }, { data: schedules }] = await Promise.all([
+      supabase.from("delivery_order_events").select("*").eq("delivery_order_id", dord.id).order("created_at"),
+      supabase.from("delivery_schedules").select("*, delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate))").eq("delivery_order_id", dord.id).order("created_at"),
+    ]);
+    res.json({ delivery_order: { ...dord, events: events || [], schedules: schedules || [] } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /delivery-orders/:id — Phase 1 safe fields only
+app.patch("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_EDIT), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const { data: dord } = await supabase.from("delivery_orders")
+      .select("id, status, delivery_date").eq("id", req.params.id).eq("company_id", companyId).maybeSingle();
+    if (!dord) return res.status(404).json({ error: "Delivery order not found" });
+    if (["completed", "cancelled"].includes(dord.status)) {
+      return res.status(400).json({ error: `Cannot edit a ${dord.status} delivery order` });
+    }
+
+    const { delivery_date, remark, customer_confirmed } = req.body;
+    const patch = {};
+    if (delivery_date !== undefined) patch.delivery_date = delivery_date || null;
+    if (remark !== undefined) patch.remark = remark || null;
+    if (customer_confirmed !== undefined) patch.customer_confirmed = customer_confirmed === true;
+    if (Object.keys(patch).length === 0) return res.status(400).json({ error: "No updatable fields provided (Phase 1: delivery_date, remark, customer_confirmed)" });
+
+    const { data, error } = await supabase.from("delivery_orders")
+      .update(patch).eq("id", dord.id).select("*, delivery_order_items(*)").single();
+    if (error) throw error;
+
+    if (patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date) {
+      await logDoEvent(dord.id, "rescheduled", { from: dord.delivery_date, to: patch.delivery_date }, req.user.id);
+    }
+    res.json({ delivery_order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /delivery-orders/:id/cancel — cancel draft/scheduled DO, freeing allocation
+app.post("/delivery-orders/:id/cancel", ...requirePerm(PERMS.DELIVERY_ORDER_CANCEL), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const { data: dord } = await supabase.from("delivery_orders")
+      .select("*, delivery_order_items(*)").eq("id", req.params.id).eq("company_id", companyId).maybeSingle();
+    if (!dord) return res.status(404).json({ error: "Delivery order not found" });
+    if (!doLib.CANCELLABLE_DO_STATUSES.includes(dord.status)) {
+      return res.status(400).json({ error: `Cannot cancel a ${dord.status} delivery order — only draft or scheduled` });
+    }
+
+    await supabase.from("delivery_orders").update({ status: "cancelled" }).eq("id", dord.id);
+    await supabase.from("delivery_order_items").update({ status: "cancelled" }).eq("delivery_order_id", dord.id);
+    // Remove any pending schedule attempts for this DO (delivered ones can't exist pre-completion)
+    await supabase.from("delivery_schedules").delete().eq("delivery_order_id", dord.id);
+    await logDoEvent(dord.id, "cancelled", { reason: req.body?.reason || null }, req.user.id);
+
+    // Allocation is freed implicitly (cancelled DOs stop counting); refresh item statuses
+    const ctx = await loadDoContext(dord.sales_order_id, companyId);
+    if (ctx) {
+      const legacyArrivalSet = doLib.buildLegacyArrivalSet(ctx.legacyOrder?.items);
+      const allocations = doLib.computeAllocations(ctx.so.sales_order_items || [], ctx.deliveryOrders);
+      const touchedIds = new Set((dord.delivery_order_items || []).map(i => i.sales_order_item_id).filter(Boolean));
+      for (const soi of ctx.so.sales_order_items || []) {
+        if (!touchedIds.has(soi.id)) continue;
+        const alloc = allocations.get(soi.id);
+        const arrived = doLib.isItemArrived(soi, legacyArrivalSet);
+        await supabase.from("sales_order_items")
+          .update({ delivery_status: doLib.deriveItemDeliveryStatus(alloc, arrived) })
+          .eq("id", soi.id);
+      }
+    }
+    res.json({ ok: true, delivery_order_id: dord.id, status: "cancelled" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /sales-orders/:id/delivery-recommendation — deterministic AI hook (no LLM).
+// Phase 1: pure logic. Later phases can feed this same shape into an LLM.
+app.get("/sales-orders/:id/delivery-recommendation", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const ctx = await loadDoContext(req.params.id, companyId);
+    if (!ctx) return res.status(404).json({ error: "Sales order not found" });
+    const summary = buildAllocationSummary(ctx.so, ctx.deliveryOrders, ctx.legacyOrder);
+
+    const ready_items = summary.filter(i => i.arrived && i.remaining_qty > 0);
+    const waiting_items = summary.filter(i => !i.arrived && i.remaining_qty > 0);
+    const already_allocated_items = summary.filter(i => i.allocated_qty > 0);
+    const blockers = [];
+    if (ctx.legacyOrder?.is_multi_trip) blockers.push("Order uses Telegram multi-trip flow — DO creation blocked until Phase 2");
+    if (ctx.so.status === "cancelled") blockers.push("Sales order is cancelled");
+    if (waiting_items.length > 0) blockers.push(`${waiting_items.length} item(s) not arrived: ${waiting_items.map(i => i.product_name).join(", ")}`);
+
+    res.json({
+      sales_order_id: ctx.so.id,
+      order_number: ctx.so.order_number,
+      ready_items, waiting_items, already_allocated_items,
+      suggested_items_for_next_do: ready_items.map(i => ({ sales_order_item_id: i.sales_order_item_id, product_name: i.product_name, quantity: i.remaining_qty })),
+      blockers,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -8778,6 +9115,24 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
+
+    // Delivery Orders guard (Phase 1): item edits delete+reinsert every
+    // sales_order_items row, which would orphan the quantity allocations on
+    // any active DO. Block item changes while active DOs exist — header-only
+    // edits (dates, remark, deposit, …) stay allowed since they don't touch
+    // the item rows.
+    if (Array.isArray(items)) {
+      const { data: activeDos } = await supabase.from("delivery_orders")
+        .select("id, do_number, status")
+        .eq("sales_order_id", id)
+        .in("status", doLib.ACTIVE_DO_STATUSES);
+      if (activeDos && activeDos.length > 0) {
+        return res.status(409).json({
+          error: "This sales order has active Delivery Orders. Cancel or complete the Delivery Orders before editing items.",
+          active_delivery_orders: activeDos,
+        });
+      }
+    }
 
     // Detect material amendments on confirmed/delivered orders → require re-approval
     let finalStatus = status;
