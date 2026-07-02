@@ -61,6 +61,14 @@ BEGIN
       RAISE EXCEPTION 'delivery_order_items has % rows — refusing to drop. Review manually before running migration 015.', v_count;
     END IF;
   END IF;
+  -- order_item_packings.do_item_id FKs the old delivery_order_items table.
+  -- Verified before writing this: the column is NULL on every row (5 rows
+  -- checked) and application code only ever writes NULL to it. Drop the
+  -- constraint explicitly (NOT via CASCADE — keep the drop auditable);
+  -- the column and its (all-NULL) data are untouched. It is re-pointed at
+  -- the NEW delivery_order_items table in section 5b below.
+  ALTER TABLE IF EXISTS public.order_item_packings DROP CONSTRAINT IF EXISTS order_item_packings_do_item_id_fkey;
+
   -- Both verified empty (or absent) — safe to clear
   DROP TABLE IF EXISTS public.delivery_order_items;
   DROP TABLE IF EXISTS public.delivery_orders CASCADE;
@@ -180,6 +188,21 @@ ALTER TABLE sales_order_items ADD COLUMN IF NOT EXISTS arrived_at DATE;
 ALTER TABLE sales_order_items ADD COLUMN IF NOT EXISTS delivery_status TEXT;
 
 ALTER TABLE package_labels ADD COLUMN IF NOT EXISTS delivery_order_id UUID REFERENCES delivery_orders(id);
+
+-- ── 5b. Re-point order_item_packings.do_item_id at the NEW table ──
+-- The old FK (dropped in section 0) referenced the abandoned
+-- delivery_order_items. All values are NULL, so this validates instantly.
+-- Pre-wires Phase 2: warehouse packings will link to DO items.
+DO $$
+BEGIN
+  IF to_regclass('public.order_item_packings') IS NOT NULL THEN
+    ALTER TABLE public.order_item_packings
+      ADD CONSTRAINT order_item_packings_do_item_id_fkey
+      FOREIGN KEY (do_item_id) REFERENCES delivery_order_items(id) ON DELETE SET NULL;
+  END IF;
+EXCEPTION WHEN duplicate_object THEN
+  NULL; -- constraint already exists (rerun) — fine
+END $$;
 
 -- ── 6. Permissions: DELIVERY_ORDER_* under the DELIVERY module ────
 -- Idempotent inserts. Global (company_id IS NULL) role templates only —
