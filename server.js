@@ -6610,12 +6610,25 @@ app.get("/organization-suppliers", requireAuth, async (req, res) => {
     }
     if (!orgId) return res.json({ organizationSuppliers: [], isCatalogueGroup: false });
 
-    const { data: orgSuppliers, error } = await supabase.from("organization_suppliers")
-      .select("id, name, code, notes, contact, phone, email, address, is_active, share_enabled, version, created_at")
-      .eq("organization_id", orgId).eq("is_active", true).order("name");
-    if (error) throw error;
+    // Paginate past Supabase's 1000-row default (same truncation bug as
+    // GET /organization-products — masters past row 1000 vanished client-side).
+    const orgSuppliers = [];
+    {
+      const pageSize = 1000;
+      let from = 0;
+      while (true) {
+        const { data, error } = await supabase.from("organization_suppliers")
+          .select("id, name, code, notes, contact, phone, email, address, is_active, share_enabled, version, created_at")
+          .eq("organization_id", orgId).eq("is_active", true).order("name")
+          .range(from, from + pageSize - 1);
+        if (error) throw error;
+        orgSuppliers.push(...(data || []));
+        if (!data || data.length < pageSize) break;
+        from += pageSize;
+      }
+    }
 
-    const orgSupplierIds = (orgSuppliers || []).map(o => o.id);
+    const orgSupplierIds = orgSuppliers.map(o => o.id);
     const countMap = await countDistinctCompaniesByOrgLink("suppliers", "organization_supplier_id", orgSupplierIds);
 
     const result = (orgSuppliers || []).map(o => ({
@@ -6795,12 +6808,27 @@ app.get("/organization-products", requireAuth, async (req, res) => {
     }
     if (!orgId) return res.json({ organizationProducts: [] });
 
-    const { data: orgProducts, error } = await supabase.from("organization_products")
-      .select("id, code, name, size, color, brand, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, is_active, share_enabled, version, created_at")
-      .eq("organization_id", orgId).eq("is_active", true).order("name");
-    if (error) throw error;
+    // Paginate past Supabase's 1000-row default. With 2400+ active masters a
+    // single un-ranged query silently truncates to the first 1000 by name —
+    // every master sorting after that vanished from the client's scope map and
+    // rendered as "Single company" even though it was linked to all companies.
+    const orgProducts = [];
+    {
+      const pageSize = 1000;
+      let from = 0;
+      while (true) {
+        const { data, error } = await supabase.from("organization_products")
+          .select("id, code, name, size, color, brand, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, is_active, share_enabled, version, created_at")
+          .eq("organization_id", orgId).eq("is_active", true).order("name")
+          .range(from, from + pageSize - 1);
+        if (error) throw error;
+        orgProducts.push(...(data || []));
+        if (!data || data.length < pageSize) break;
+        from += pageSize;
+      }
+    }
 
-    const orgProductIds = (orgProducts || []).map(o => o.id);
+    const orgProductIds = orgProducts.map(o => o.id);
     const countMap = await countDistinctCompaniesByOrgLink("products", "organization_product_id", orgProductIds);
 
     const result = (orgProducts || []).map(o => ({
