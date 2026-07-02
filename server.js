@@ -12,6 +12,7 @@ const { OrganizationIdentityService } = require("./organization-identity-service
 const { composeProductView, composeSupplierView } = require("./lib/product-view-composer");
 const doLib = require("./lib/delivery-orders");
 const { createSupplierDOService } = require("./lib/supplier-do");
+const SELECTS = require("./lib/selects");
 
 const app = express();
 
@@ -1302,7 +1303,7 @@ const handleScheduleCommand = async (chatId, text) => {
   const dateStr = dateObj.toISOString().split("T")[0];
   const dateLabel = dateObj.toLocaleDateString("en-MY", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 
-  const { data: orders, error } = await supabase.from("orders").select("*").eq("delivery_date", dateStr);
+  const { data: orders, error } = await supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("delivery_date", dateStr);
   if (error) { await sendMessage(chatId, `❌ Error: ${error.message}`); return; }
   if (!orders || orders.length === 0) { await sendMessage(chatId, `📅 No orders found for *${dateLabel}*`); return; }
 
@@ -2282,14 +2283,14 @@ app.get("/delivery/routes", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
   const cid = getActiveCompanyId(req);
-  let rq = supabase.from("delivery_routes").select("*").eq("delivery_date", date).order("created_at");
+  let rq = supabase.from("delivery_routes").select(SELECTS.DELIVERY_ROUTE_SELECT).eq("delivery_date", date).order("created_at");
   if (cid) rq = rq.eq("company_id", cid);
   const { data: routes, error: routeErr } = await rq;
   if (routeErr) return res.status(500).json({ error: routeErr.message });
   const routesWithOrders = await Promise.all(routes.map(async (route) => {
     const { data: routeOrders } = await supabase
       .from("delivery_route_orders")
-      .select("*, orders(*)")
+      .select(SELECTS.ROUTE_ORDERS_NESTED_SELECT)
       .eq("route_id", route.id)
       .order("sequence_no");
     return { ...route, orders: routeOrders || [] };
@@ -2303,7 +2304,7 @@ app.get("/delivery/unassigned", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
   const cid = getActiveCompanyId(req);
-  let q = supabase.from("orders").select("*").eq("delivery_date", date).not("status", "in", '("Delivered","Cancelled")');
+  let q = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("delivery_date", date).not("status", "in", '("Delivered","Cancelled")');
   if (cid) q = q.eq("company_id", cid);
   const { data: orders, error: ordErr } = await q;
   if (ordErr) return res.status(500).json({ error: ordErr.message });
@@ -3040,7 +3041,7 @@ app.get("/auto-schedule/orders", requireAuth, async (req, res) => {
   if (!date) return res.status(400).json({ error: "date required" });
 
   // Get unassigned orders for the date
-  let query = supabase.from("orders").select("*")
+  let query = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT)
     .eq("delivery_date", date)
     .in("status", ["Pending", "In Progress"]);
   if (company_id) query = query.eq("company_id", company_id);
@@ -3416,7 +3417,7 @@ app.get("/permissions/effective", requireAuth, async (req, res) => {
 // GET /do-review — list all pending DO review items
 app.get("/do-review", requireAuth, async (req, res) => {
   const cid = getActiveCompanyId(req);
-  let q = supabase.from("do_review").select("*").eq("status", "Pending").order("created_at", { ascending: false });
+  let q = supabase.from("do_review").select(SELECTS.DO_REVIEW_SELECT).eq("status", "Pending").order("created_at", { ascending: false });
   if (cid) q = q.eq("company_id", cid);
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
@@ -3609,7 +3610,7 @@ app.patch("/admin/users/:id/password", requireRole(["master", "manager"]), async
 // GET /services/unscheduled — service orders with no delivery_date
 app.get("/services/unscheduled", requireAuth, async (req, res) => {
   const { company_id } = req.query;
-  let query = supabase.from("orders").select("*")
+  let query = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT)
     .eq("type", "Service")
     .is("delivery_date", null)
     .not("status", "in", '("Delivered","Serviced","Cancelled")')
@@ -3654,7 +3655,7 @@ app.get("/orders", requireAuth, async (req, res) => {
 app.get("/services", requireAuth, async (req, res) => {
   const { salesman, status } = req.query;
   const cid = getActiveCompanyId(req);
-  let query = supabase.from("orders").select("*").eq("type", "Service").order("created_at", { ascending: false });
+  let query = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("type", "Service").order("created_at", { ascending: false });
   if (cid) query = query.eq("company_id", cid);
   if (status) query = query.eq("status", status);
   const { data, error } = await query;
@@ -4182,7 +4183,7 @@ app.get("/commissions", requireAuth, async (req, res) => {
     // filter to a specific person via user_id, defaulting to everyone if omitted.
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
-    let q = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, status, company_id), users(name, salesman_name), wrong_item_holds(hold_reason, status)").order("created_at", { ascending: false });
+    let q = supabase.from("commissions").select(`${SELECTS.COMMISSION_LIST_SELECT}, wrong_item_holds(hold_reason, status)`).order("created_at", { ascending: false });
     if (cid) q = q.eq("company_id", cid);
     if (user_id) q = q.eq("user_id", user_id);
     if (status) q = q.eq("status", status);
@@ -4294,12 +4295,12 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
     // Get eligible commissions for payout month + all pending (any month)
-    let eq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, status, company_id), users(name, salesman_name)")
+    let eq = supabase.from("commissions").select(SELECTS.COMMISSION_LIST_SELECT)
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
     if (cid) eq = eq.eq("company_id", cid);
     if (user_id) eq = eq.eq("user_id", user_id);
     const { data: eligibleComms } = await eq;
-    let pq = supabase.from("commissions").select("*, orders(so_number, customer_name, order_amount, balance, status, company_id), users(name, salesman_name)")
+    let pq = supabase.from("commissions").select(SELECTS.COMMISSION_LIST_SELECT)
       .eq("status", "pending");
     if (user_id) pq = pq.eq("user_id", user_id);
     if (cid) pq = pq.eq("company_id", cid);
@@ -4797,7 +4798,7 @@ app.patch("/service-part-claims/:id", requireRole(MANAGE_ROLES), async (req, res
 app.get("/supplier-deliveries", requireAuth, async (req, res) => {
   const { supplier, from_date, to_date, status, limit = 100 } = req.query;
   const cid = getActiveCompanyId(req);
-  let query = supabase.from("supplier_deliveries").select("*").order("created_at", { ascending: false }).limit(parseInt(limit));
+  let query = supabase.from("supplier_deliveries").select(SELECTS.SUPPLIER_DELIVERY_LIST_SELECT).order("created_at", { ascending: false }).limit(parseInt(limit));
   if (cid) query = query.eq("company_id", cid);
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
@@ -4812,7 +4813,7 @@ app.get("/supplier-deliveries/:id", requireAuth, async (req, res) => {
   try {
     const { data: delivery, error } = await supabase.from("supplier_deliveries").select("*").eq("id", req.params.id).single();
     if (error || !delivery) return res.status(404).json({ error: "Not found" });
-    const { data: reviews } = await supabase.from("do_review").select("*").eq("supplier_delivery_id", delivery.id).order("created_at");
+    const { data: reviews } = await supabase.from("do_review").select(SELECTS.DO_REVIEW_SELECT).eq("supplier_delivery_id", delivery.id).order("created_at");
     res.json({ delivery, items: reviews || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4858,7 +4859,7 @@ const SUPPLIER_DO_ROLES = ["master", "manager", "company_admin", "salesman"];
 app.get("/supplier-dos", requireAuth, async (req, res) => {
   const { supplier, from_date, to_date, status, source, limit = 100 } = req.query;
   const cid = getActiveCompanyId(req);
-  let query = supabase.from("supplier_deliveries").select("*").order("created_at", { ascending: false }).limit(parseInt(limit));
+  let query = supabase.from("supplier_deliveries").select(SELECTS.SUPPLIER_DELIVERY_LIST_SELECT).order("created_at", { ascending: false }).limit(parseInt(limit));
   if (cid) query = query.eq("company_id", cid);
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
@@ -4973,7 +4974,7 @@ app.get("/supplier-dos/:id", requireAuth, async (req, res) => {
     if (error || !delivery) return res.status(404).json({ error: "Not found" });
     const cid = getActiveCompanyId(req);
     if (cid && delivery.company_id && delivery.company_id !== cid) return res.status(404).json({ error: "Not found" });
-    const { data: reviewItems } = await supabase.from("do_review").select("*").eq("supplier_delivery_id", delivery.id).order("created_at");
+    const { data: reviewItems } = await supabase.from("do_review").select(SELECTS.DO_REVIEW_SELECT).eq("supplier_delivery_id", delivery.id).order("created_at");
     res.json({ delivery, items: reviewItems || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5666,7 +5667,7 @@ app.get("/delivery-schedules", requireAuth, async (req, res) => {
   try {
     const { date, team_id } = req.query;
     const cid = getActiveCompanyId(req);
-    let q = supabase.from("delivery_schedules").select("*, orders(so_number, customer_name, address, contact, items, status, balance, type, salesman, time_slot, remark), delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate)), delivery_orders(id, do_number, status, delivery_order_items(product_name, quantity, status))").order("sort_order");
+    let q = supabase.from("delivery_schedules").select(SELECTS.DELIVERY_SCHEDULE_LIST_SELECT).order("sort_order");
     if (date) q = q.eq("scheduled_date", date);
     if (team_id) q = q.eq("team_id", team_id);
     if (cid) q = q.eq("company_id", cid);
@@ -6166,7 +6167,7 @@ app.get("/driver/my-route", requireAuth, async (req, res) => {
       // Phase 2B: also join the Delivery Order (with its items) so DO schedules
       // can render a DO card with ONLY that shipment's items. NULL for legacy rows.
       const { data: sched } = await supabase.from("delivery_schedules")
-        .select("*, orders(id, so_number, customer_name, address, contact, items, balance, status, type, remark, time_slot, photo_url), delivery_orders(id, do_number, status, delivery_date, remark, delivery_order_items(id, product_code, product_name, size, color, quantity, status))")
+        .select(SELECTS.DRIVER_SCHEDULE_SELECT)
         .in("team_id", teamIds).order("sort_order");
       schedules = sched || [];
     }
