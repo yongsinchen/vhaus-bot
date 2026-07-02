@@ -34,7 +34,12 @@
 
 const normalizeName = (name) => (name || "").trim().toLowerCase();
 const normalizeCode = (code) => (code || "").trim().toUpperCase();
-const productKey = (code, size, color) => [normalizeCode(code), normalizeName(size), normalizeName(color)].join("|");
+// Product identity across companies in an organization. Name is part of the key
+// (normalized like size/color) so two rows that share code+size+color but differ
+// by name — e.g. sofa modules "1L" vs "1L/W" under one model code — resolve to
+// SEPARATE org masters instead of collapsing into one. This must stay in lockstep
+// with variantKey (server.js) and the products unique index (migration 018).
+const productKey = (code, name, size, color) => [normalizeCode(code), normalizeName(name), normalizeName(size), normalizeName(color)].join("|");
 
 class OrganizationIdentityService {
   constructor(supabase) {
@@ -151,17 +156,17 @@ class OrganizationIdentityService {
     const trimmedCode = (code || "").trim();
     const trimmedName = (name || "").trim();
     if (!trimmedCode || !trimmedName) throw new Error("code and name are required");
-    const key = productKey(trimmedCode, size, color);
+    const key = productKey(trimmedCode, trimmedName, size, color);
 
     const { data: candidates, error: selErr } = await this.supabase
       .from("organization_products")
-      .select("id, code, size, color")
+      .select("id, code, name, size, color")
       .eq("organization_id", organizationId)
       .eq("share_enabled", true)
       .ilike("code", trimmedCode);
     if (selErr) throw new Error(`organization_products lookup failed: ${selErr.message}`);
 
-    const match = (candidates || []).find(p => productKey(p.code, p.size, p.color) === key);
+    const match = (candidates || []).find(p => productKey(p.code, p.name, p.size, p.color) === key);
     if (match) return { id: match.id, created: false, wouldCreate: false };
     if (dryRun) return { id: null, created: false, wouldCreate: true };
 
@@ -178,11 +183,11 @@ class OrganizationIdentityService {
       if (insErr.code === "23505") {
         const { data: refetched, error: refErr } = await this.supabase
           .from("organization_products")
-          .select("id, code, size, color")
+          .select("id, code, name, size, color")
           .eq("organization_id", organizationId)
           .ilike("code", trimmedCode);
         if (refErr) throw new Error(`organization_products re-fetch after create race failed: ${refErr.message}`);
-        const won = (refetched || []).find(p => productKey(p.code, p.size, p.color) === key);
+        const won = (refetched || []).find(p => productKey(p.code, p.name, p.size, p.color) === key);
         if (won) return { id: won.id, created: false, wouldCreate: false };
       }
       throw new Error(`organization_products create failed: ${insErr.message}`);

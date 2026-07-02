@@ -72,10 +72,10 @@ async function run() {
 
     console.log(`\n── ${org.name} (${allProducts.length} products across ${companyIds.length} companies) ──`);
 
-    // Group by exact code+size+color within the organization
+    // Group by exact code+name+size+color within the organization
     const groups = new Map();
     for (const p of allProducts) {
-      const key = productKey(p.code, p.size, p.color);
+      const key = productKey(p.code, p.name, p.size, p.color);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(p);
     }

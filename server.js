@@ -229,16 +229,24 @@ async function propagateProductToSiblings(req, orgProductId, fields) {
     const siblingIds = siblings.map(s => s.id);
     const normCode = (fields.code || "").trim().toUpperCase();
     const size = fields.size || null;
+    const color = fields.color || null;
+    const nameKey = (fields.name || "").trim().toLowerCase();
 
     const [{ data: linkedRows }, { data: codeRows }] = await Promise.all([
       supabase.from("products").select("company_id")
         .eq("organization_product_id", orgProductId).in("company_id", siblingIds),
-      supabase.from("products").select("company_id, size")
+      supabase.from("products").select("company_id, size, color, name")
         .eq("code", normCode).in("company_id", siblingIds),
     ]);
     const linked = new Set((linkedRows || []).map(r => r.company_id));
+    // A sibling already owns the (code, size, color, name) slot the unique index
+    // enforces (migration 018) — only then would our insert collide. Name is part
+    // of the identity, so a different-named variant of the same code still gets
+    // propagated instead of being wrongly skipped.
     const codeTaken = new Set((codeRows || [])
-      .filter(r => (r.size || "") === (size || ""))
+      .filter(r => (r.size || "") === (size || "")
+        && (r.color || "") === (color || "")
+        && (r.name || "").trim().toLowerCase() === nameKey)
       .map(r => r.company_id));
 
     const rows = siblings
@@ -1870,6 +1878,11 @@ const getNextSvNumber = async () => {
   return `SV-${String(maxNum + 1).padStart(3, "0")}`;
 };
 
+// Service-case creation (services + legs + inert legacy order + link) is done
+// atomically by the create_service_case Postgres RPC (migration 019), called
+// from POST /service-cases and POST /service-pending/:id/convert. The former
+// JS helper was removed in favour of the RPC's all-or-nothing transaction.
+
 // ── Parse Delivery Template from Group B ─────────────────────────
 const parseDeliveryTemplate = (text) => {
   const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
@@ -3081,68 +3094,27 @@ app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, 
     adminRemark ? `Admin: ${adminRemark}` : null,
   ].filter(Boolean).join(" | ");
 
-  // 1. Create services record (new system — source of truth)
-  const { data: svc, error: svcErr } = await supabase.from("services").insert({
-    company_id: companyId,
-    order_id: origOrder?.id || null,
-    service_type: svcType,
-    status: delivery_date ? "scheduled" : "open",
-    description: description,
-    issue_description: sp.note || null,
-    source: "service_pending",
-    source_pending_id: sp.id,
-    original_order_id: origOrder?.id || null,
-    customer_name: origOrder?.customer_name || null,
-    customer_phone: origOrder?.contact || null,
-    customer_address: origOrder?.address || null,
-    priority: "normal",
-    due_date: delivery_date || null,
-    created_by: req.user.id,
-  }).select().single();
-  if (svcErr) return res.status(500).json({ error: "Service create failed: " + svcErr.message });
+  // Atomic create: services + legs + inert legacy order + link (RPC). Same rules
+  // as the manual POST /service-cases path — convert just adds the
+  // service_pending bookkeeping after the RPC returns.
+  const { data: result, error: rpcErr } = await supabase.rpc("create_service_case", {
+    p_company_id: companyId, p_service_type: svcType, p_created_by: req.user.id,
+    p_order_id: origOrder?.id || null, p_description: description || null,
+    p_customer_name: origOrder?.customer_name || null, p_customer_phone: origOrder?.contact || null, p_customer_address: origOrder?.address || null,
+    p_priority: "normal", p_schedule_date: delivery_date || null,
+    p_source_so_number: sp.so_number || null,
+    p_source: "service_pending", p_source_pending_id: sp.id, p_original_order_id: origOrder?.id || null,
+  });
+  if (rpcErr) return res.status(500).json({ error: "Service create failed: " + rpcErr.message });
+  const svc = result.service;
+  const newOrder = result.order;
 
-  // 2. Auto-create service legs
-  const legs = [];
-  if (svcType === 1 || svcType === 3) {
-    legs.push({ service_id: svc.id, leg_order: 1, leg_type: "pickup", from_location: "Customer", to_location: "Warehouse", status: "pending", scheduled_date: delivery_date || null });
-    legs.push({ service_id: svc.id, leg_order: 2, leg_type: "delivery", from_location: "Warehouse", to_location: "Customer", status: "pending" });
-  } else {
-    legs.push({ service_id: svc.id, leg_order: 1, leg_type: "visit", from_location: "Warehouse", to_location: "Customer", status: "pending", scheduled_date: delivery_date || null });
-  }
-  if (legs.length > 0) await supabase.from("service_legs").insert(legs);
-
-  // 3. Create legacy orders row for delivery scheduling compatibility
-  const svNumber = await getNextSvNumber();
-  const serviceNote = `Linked to SO: ${sp.so_number} | ${description}`;
-
-  const { data: newOrder, error: insertErr } = await supabase
-    .from("orders").insert({
-      so_number: sp.so_number, sv_number: svNumber,
-      customer_name: origOrder?.customer_name || null,
-      address: origOrder?.address || null,
-      contact: origOrder?.contact || null,
-      salesman: origOrder?.salesman || null,
-      order_amount: origOrder?.order_amount || null,
-      balance: origOrder?.balance || null,
-      delivery_date: delivery_date || null,
-      type: "Service", service_note: serviceNote, remark: serviceNote,
-      status: "Pending",
-      items: origOrder?.items || JSON.stringify([]),
-      linked_so: sp.so_number,
-      company_id: companyId,
-      photo_url: origOrder?.photo_url || null,
-    }).select().single();
-
-  // 4. Link everything together
+  // Link the pending row to the created service (+ order)
   const updateSp = { status: "Converted", converted_at: new Date().toISOString(), converted_service_id: svc.id };
-  if (newOrder) {
-    updateSp.converted_order_id = newOrder.id;
-    // Link service to legacy order
-    await supabase.from("services").update({ legacy_order_id: newOrder.id }).eq("id", svc.id);
-  }
+  if (newOrder) updateSp.converted_order_id = newOrder.id;
   await supabase.from("service_pending").update(updateSp).eq("id", id);
 
-  res.json({ success: true, svNumber, service: svc, order: newOrder, service_id: svc.id });
+  res.json({ success: true, svNumber: result.sv_number || null, service: svc, order: newOrder, service_id: svc.id });
 });
 
 // DELETE /service-pending/:id — remove (not applicable)
@@ -3872,8 +3844,10 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
 // original deposit. Clamped to [0, order total].
 async function recomputeOrderPaid(orderId) {
   const { data: ord } = await supabase.from("orders")
-    .select("so_number, company_id").eq("id", orderId).single();
+    .select("so_number, company_id, type").eq("id", orderId).single();
   if (!ord?.so_number) return;
+  // Service orders are financially inert — never recompute paid/balance from them.
+  if (ord.type === "Service") return;
   const { data: so } = await supabase.from("sales_orders")
     .select("id, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit")
     .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
@@ -3886,7 +3860,7 @@ async function recomputeOrderPaid(orderId) {
 
   // Sum every payment recorded against this SO (across its delivery orders).
   const { data: dOrders } = await supabase.from("orders")
-    .select("id").eq("company_id", ord.company_id).eq("so_number", ord.so_number);
+    .select("id").eq("company_id", ord.company_id).eq("so_number", ord.so_number).or("type.is.null,type.neq.Service");
   const ids = (dOrders || []).map(o => o.id);
   let paidFromPayments = 0;
   if (ids.length) {
@@ -4143,9 +4117,11 @@ async function getCommCache(companyId) {
 
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
 async function calculateCommission(orderId, companyId) {
-  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel")
+  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type")
     .eq("id", orderId).single();
   if (!order) return;
+  // Service orders are logistics-only and financially inert — never commissionable.
+  if (order.type === "Service") return;
 
   // Which month an order belongs to is driven by the order's own date, not when the
   // commission record happened to be created. Editing an order's date (e.g. back-dating
@@ -4195,7 +4171,7 @@ async function calculateCommission(orderId, companyId) {
     if (monthlySales === undefined) {
       const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
       const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman")
-        .eq("company_id", companyId).ilike("salesman", `%${name}%`)
+        .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
         .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
       // Orders shared between multiple sales assistants count only this salesman's
       // fractional share toward their own monthly cumulative sales (and therefore
@@ -4614,6 +4590,7 @@ app.get("/aging-report", requireAuth, async (req, res) => {
     if (!cid) return res.status(400).json({ error: "company_id required" });
     let ordQ = supabase.from("orders").select("id, so_number, customer_name, contact, order_amount, balance, status, created_at, delivery_date, customer_id, salesman")
       .eq("company_id", cid).gt("balance", 0)
+      .or("type.is.null,type.neq.Service")
       .not("status", "in", '("Cancelled")');
     // Salesman: only their orders
     if (req.user.role === "salesman" && req.user.salesman_name) {
@@ -4709,49 +4686,65 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
 
 app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date } = req.body;
+    const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date } = req.body;
     if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange)" });
-    // Auto-fill customer info from order if linked
-    let custName = customer_name, custPhone = customer_phone, custAddr = customer_address;
-    if (order_id && !custName) {
-      const { data: o } = await supabase.from("orders").select("customer_name, contact, address").eq("id", order_id).maybeSingle();
-      if (o) { custName = o.customer_name; custPhone = o.contact; custAddr = o.address; }
+    const svcType = Number(service_type);
+    const companyId = getActiveCompanyId(req);
+    // The schedule date the delivery route reads lives on orders.delivery_date
+    // (a TEXT column compared as a string by GET /delivery/unassigned). Accept
+    // whichever field the client sends and keep the same value everywhere.
+    const scheduleDate = delivery_date || due_date || null;
+
+    // Auto-fill customer info + source SO number from the linked order.
+    let custName = customer_name, custPhone = customer_phone, custAddr = customer_address, sourceSoNumber = null;
+    if (order_id) {
+      const { data: o } = await supabase.from("orders")
+        .select("id, so_number, customer_name, contact, address")
+        .eq("id", order_id).maybeSingle();
+      if (o) {
+        sourceSoNumber = o.so_number || null;
+        if (!custName) { custName = o.customer_name; custPhone = o.contact; custAddr = o.address; }
+      }
     }
-    const { data, error } = await supabase.from("services").insert({
-      company_id: getActiveCompanyId(req), order_id: order_id || null,
-      service_type: Number(service_type), status: "open",
-      description: description || null, issue_description: description || null,
-      assigned_to: assigned_to || null, source: "manual",
-      customer_name: custName || null, customer_phone: custPhone || null,
-      customer_address: custAddr || null, priority: priority || "normal",
-      due_date: due_date || null, created_by: req.user.id,
-    }).select().single();
+
+    // Atomic: services + legs + inert legacy order + link, all-or-nothing (RPC).
+    const { data: result, error } = await supabase.rpc("create_service_case", {
+      p_company_id: companyId, p_service_type: svcType, p_created_by: req.user.id,
+      p_order_id: order_id || null, p_description: description || null,
+      p_assigned_to: assigned_to || null,
+      p_customer_name: custName || null, p_customer_phone: custPhone || null, p_customer_address: custAddr || null,
+      p_priority: priority || "normal", p_schedule_date: scheduleDate,
+      p_source_so_number: sourceSoNumber,
+    });
     if (error) throw error;
-    // Auto-create legs based on type
-    const legs = [];
-    if (service_type === 1 || service_type === 3) {
-      // Warranty or exchange: pick up + deliver back
-      legs.push({ service_id: data.id, leg_order: 1, from_location: "Customer", to_location: "Warehouse", status: "pending" });
-      legs.push({ service_id: data.id, leg_order: 2, from_location: "Warehouse", to_location: "Customer", status: "pending" });
-    } else if (service_type === 2) {
-      // Assembly: single visit
-      legs.push({ service_id: data.id, leg_order: 1, from_location: "Warehouse", to_location: "Customer", status: "pending" });
-    }
-    if (legs.length > 0) await supabase.from("service_legs").insert(legs);
-    res.status(201).json({ service: data, legs });
+    res.status(201).json({ service: result.service, legs: result.legs, order: result.order });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { status, description, assigned_to } = req.body;
+    const { status, description, assigned_to, due_date, delivery_date } = req.body;
     const updates = {};
     if (status !== undefined) updates.status = status;
     if (description !== undefined) updates.description = description;
     if (assigned_to !== undefined) updates.assigned_to = assigned_to;
     if (status === "closed") updates.closed_at = new Date().toISOString();
+    // Accept either field name for the schedule date; keep both sides aligned.
+    const newDate = delivery_date !== undefined ? delivery_date : (due_date !== undefined ? due_date : undefined);
+    if (newDate !== undefined) updates.due_date = newDate || null;
     const { data, error } = await supabase.from("services").update(updates).eq("id", req.params.id).select().single();
     if (error) throw error;
+
+    // Keep the linked legacy Service order in step so it doesn't drift from the
+    // case: date sync, and status sync so a done/cancelled case leaves the
+    // delivery route (unassigned excludes Delivered/Cancelled).
+    if (data?.legacy_order_id) {
+      const orderPatch = {};
+      if (newDate !== undefined) orderPatch.delivery_date = newDate || null;
+      if (status === "cancelled") orderPatch.status = "Cancelled";
+      else if (["closed", "resolved", "completed"].includes(status)) orderPatch.status = "Delivered";
+      if (Object.keys(orderPatch).length > 0) await supabase.from("orders").update(orderPatch).eq("id", data.legacy_order_id);
+    }
     res.json({ service: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4759,10 +4752,17 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 app.delete("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { data: svc } = await supabase.from("services").select("id").eq("id", req.params.id).eq("company_id", cid).single();
+    const { data: svc } = await supabase.from("services").select("id, legacy_order_id").eq("id", req.params.id).eq("company_id", cid).single();
     if (!svc) return res.status(404).json({ error: "Service case not found" });
     await supabase.from("service_part_claims").delete().eq("service_id", req.params.id);
     await supabase.from("service_legs").delete().eq("service_id", req.params.id);
+    // Cascade to the auto-created legacy Service order so it doesn't linger in the
+    // delivery route. Cancel (not hard-delete) to preserve FK-linked schedules and
+    // an audit trail; also drop any pending schedule attempts for it.
+    if (svc.legacy_order_id) {
+      await supabase.from("delivery_schedules").delete().eq("order_id", svc.legacy_order_id);
+      await supabase.from("orders").update({ status: "Cancelled" }).eq("id", svc.legacy_order_id);
+    }
     await supabase.from("services").delete().eq("id", req.params.id);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4783,8 +4783,14 @@ app.patch("/service-legs/:id", requireRole([...MANAGE_ROLES, "driver", "operatio
     // Auto-advance service status
     const { data: allLegs } = await supabase.from("service_legs").select("status").eq("service_id", data.service_id);
     const allDone = (allLegs || []).every(l => l.status === "completed");
-    if (allDone) await supabase.from("services").update({ status: "resolved" }).eq("id", data.service_id);
-    else if (status === "in_progress") await supabase.from("services").update({ status: "in_progress" }).eq("id", data.service_id);
+    if (allDone) {
+      // Resolve the case and mark the linked legacy order done so it leaves the
+      // delivery route (unassigned excludes Delivered).
+      const { data: svc } = await supabase.from("services").update({ status: "resolved" }).eq("id", data.service_id).select("legacy_order_id").single();
+      if (svc?.legacy_order_id) await supabase.from("orders").update({ status: "Delivered" }).eq("id", svc.legacy_order_id);
+    } else if (status === "in_progress") {
+      await supabase.from("services").update({ status: "in_progress" }).eq("id", data.service_id);
+    }
     res.json({ leg: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -8612,7 +8618,12 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
 
         // Bulk conflict lookups, chunked to stay under the URL length limit.
         const linkedSet = new Set();   // "company|orgProductId"
-        const codeSet = new Set();     // "company|CODE|size"
+        const codeSet = new Set();     // "company|CODE|size|color|name" — full identity (migration 018)
+        // Slot key mirrors the products unique index: code (upper), size/color
+        // raw, name lower(trim). A different-named variant of the same code is a
+        // distinct slot, so it propagates instead of being skipped.
+        const slotKey = (company, code, size, color, name) =>
+          `${company}|${(code || "").toUpperCase()}|${size || ""}|${color || ""}|${(name || "").trim().toLowerCase()}`;
         const chunk = (arr, n) => { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; };
         for (const idc of chunk(orgIds, 150)) {
           const { data } = await supabase.from("products").select("company_id, organization_product_id")
@@ -8620,9 +8631,9 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
           for (const r of (data || [])) linkedSet.add(`${r.company_id}|${r.organization_product_id}`);
         }
         for (const cc of chunk(codes, 150)) {
-          const { data } = await supabase.from("products").select("company_id, code, size")
+          const { data } = await supabase.from("products").select("company_id, code, size, color, name")
             .in("code", cc).in("company_id", siblingIds);
-          for (const r of (data || [])) codeSet.add(`${r.company_id}|${(r.code || "").toUpperCase()}|${r.size || ""}`);
+          for (const r of (data || [])) codeSet.add(slotKey(r.company_id, r.code, r.size, r.color, r.name));
         }
 
         const rows = [];
@@ -8630,9 +8641,10 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
           const normCode = (p.code || "").toUpperCase();
           for (const s of siblings) {
             if (linkedSet.has(`${s.id}|${p.orgProductId}`)) continue;
-            if (codeSet.has(`${s.id}|${normCode}|${p.size || ""}`)) continue;
-            // Guard against duplicate (code,size) appearing twice in this import batch
-            codeSet.add(`${s.id}|${normCode}|${p.size || ""}`);
+            const key = slotKey(s.id, normCode, p.size, p.color, p.name);
+            if (codeSet.has(key)) continue;
+            // Guard against the same (code,size,color,name) appearing twice in this import batch
+            codeSet.add(key);
             rows.push({
               company_id: s.id, code: normCode, name: p.name,
               color: p.color || null, size: p.size || null,

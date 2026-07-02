@@ -57,8 +57,11 @@ async function fetchAllIn(table, cols, column, values) {
   return all;
 }
 
-function orgKey(code, size, color) {
-  return `${(code || "").toUpperCase()}|${(size || "").toLowerCase().trim()}|${(color || "").toLowerCase().trim()}`;
+// Identity includes name (migration 018) so a company product only links to the
+// org master that matches its code+name+size+color — same-code pieces that differ
+// by name link to their own masters instead of collapsing onto the first one.
+function orgKey(code, name, size, color) {
+  return `${(code || "").toUpperCase()}|${(name || "").toLowerCase().trim()}|${(size || "").toLowerCase().trim()}|${(color || "").toLowerCase().trim()}`;
 }
 
 async function main() {
@@ -94,7 +97,7 @@ async function main() {
     );
     const orgByKey = new Map();
     for (const op of orgProducts) {
-      orgByKey.set(orgKey(op.code, op.size, op.color), op);
+      orgByKey.set(orgKey(op.code, op.name, op.size, op.color), op);
     }
     console.log(`Org master products: ${orgProducts.length}`);
 
@@ -114,7 +117,7 @@ async function main() {
     const updates = []; // { id, organization_product_id }
 
     for (const p of unlinked) {
-      const key = orgKey(p.code, p.size, p.color);
+      const key = orgKey(p.code, p.name, p.size, p.color);
       const orgMaster = orgByKey.get(key);
       if (!orgMaster) {
         noMatch++;

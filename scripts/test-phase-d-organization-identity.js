@@ -60,8 +60,10 @@ async function run() {
   assert("normalizeName trims + lowercases", normalizeName("  MODA  ") === "moda");
   assert("normalizeName handles null/undefined", normalizeName(null) === "" && normalizeName(undefined) === "");
   assert("normalizeCode trims + uppercases", normalizeCode("  abc-123  ") === "ABC-123");
-  assert("productKey combines code+size+color consistently regardless of case/whitespace",
-    productKey("sf-01", " L ", "Red") === productKey("SF-01", "l", " red "));
+  assert("productKey combines code+name+size+color consistently regardless of case/whitespace",
+    productKey("sf-01", " Sofa 1L ", " L ", "Red") === productKey("SF-01", "sofa 1l", "l", " red "));
+  assert("productKey treats same code+size+color but different name as DIFFERENT products",
+    productKey("8529", "1L", "L112", "-") !== productKey("8529", "1L/W", "L112", "-"));
 
   // ── 3. findOrCreateSupplier — live "find" path only (read-only, safe to repeat) ──
   console.log("\n── 3. findOrCreateSupplier (Live, Read-Only) ──");

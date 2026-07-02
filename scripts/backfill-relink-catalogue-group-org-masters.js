@@ -195,8 +195,10 @@ async function processSuppliers(catalogueGroup, companies, report) {
 // ── products ──────────────────────────────────────────────────────────────────
 
 function productKey(p) {
-  // Unique identity for a product: code + optional size + optional color
-  return [normalizeCode(p.code), normalizeName(p.size || ""), normalizeName(p.color || "")].join("|");
+  // Unique identity for a product: code + name + optional size + optional color.
+  // Name is part of the identity (migration 018 / organization-identity-service.js)
+  // so same-code pieces that differ only by name resolve to separate masters.
+  return [normalizeCode(p.code), normalizeName(p.name || ""), normalizeName(p.size || ""), normalizeName(p.color || "")].join("|");
 }
 
 async function processProducts(catalogueGroup, companies, report) {
