@@ -5535,7 +5535,7 @@ app.get("/delivery-schedules", requireAuth, async (req, res) => {
   try {
     const { date, team_id } = req.query;
     const cid = getActiveCompanyId(req);
-    let q = supabase.from("delivery_schedules").select("*, orders(so_number, customer_name, address, contact, items, status, balance, type, salesman, time_slot, remark), delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate))").order("sort_order");
+    let q = supabase.from("delivery_schedules").select("*, orders(so_number, customer_name, address, contact, items, status, balance, type, salesman, time_slot, remark), delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate)), delivery_orders(id, do_number, status, delivery_order_items(product_name, quantity, status))").order("sort_order");
     if (date) q = q.eq("scheduled_date", date);
     if (team_id) q = q.eq("team_id", team_id);
     if (cid) q = q.eq("company_id", cid);
@@ -5987,8 +5987,10 @@ app.get("/driver/my-route", requireAuth, async (req, res) => {
     const teamIds = myTeams.map(t => t.id);
     let schedules = [];
     if (teamIds.length > 0) {
+      // Phase 2B: also join the Delivery Order (with its items) so DO schedules
+      // can render a DO card with ONLY that shipment's items. NULL for legacy rows.
       const { data: sched } = await supabase.from("delivery_schedules")
-        .select("*, orders(id, so_number, customer_name, address, contact, items, balance, status, type, remark, time_slot, photo_url)")
+        .select("*, orders(id, so_number, customer_name, address, contact, items, balance, status, type, remark, time_slot, photo_url), delivery_orders(id, do_number, status, delivery_date, remark, delivery_order_items(id, product_code, product_name, size, color, quantity, status))")
         .in("team_id", teamIds).order("sort_order");
       schedules = sched || [];
     }
@@ -6294,6 +6296,29 @@ app.get("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER
       delivery_orders: deliveryOrders.map(d => ({ ...d, events: eventsByDo[d.id] || [] })),
       items: buildAllocationSummary(so, deliveryOrders, legacyOrder),
     });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-orders — company-scoped DO list (Phase 2B: feeds the
+// DeliverySchedule unassigned pool). Optional ?status= filter accepts a
+// single status or comma list, e.g. ?status=draft or ?status=draft,scheduled.
+app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    if (!companyId) return res.json({ delivery_orders: [] });
+    const { status } = req.query;
+    let q = supabase.from("delivery_orders")
+      .select("*, delivery_order_items(id, product_code, product_name, size, color, quantity, status), sales_orders(id, order_number, customer_name, customer_contact, customer_address, delivery_date, delivery_time_slot)")
+      .eq("company_id", companyId)
+      .order("created_at", { ascending: false })
+      .limit(500);
+    if (status) {
+      const list = String(status).split(",").map(s => s.trim()).filter(Boolean);
+      q = list.length > 1 ? q.in("status", list) : q.eq("status", list[0]);
+    }
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ delivery_orders: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
