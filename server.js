@@ -11,6 +11,7 @@ const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry")
 const { OrganizationIdentityService } = require("./organization-identity-service");
 const { composeProductView, composeSupplierView } = require("./lib/product-view-composer");
 const doLib = require("./lib/delivery-orders");
+const { createSupplierDOService } = require("./lib/supplier-do");
 
 const app = express();
 
@@ -37,6 +38,16 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
 const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
+
+// Supplier DO intake service — single write path shared by the Telegram
+// Group-C flow and the webapp upload endpoints. Deps are lambda-wrapped
+// because some helpers (uploadImageToStorage) are consts defined below.
+const supplierDO = createSupplierDOService({
+  supabase,
+  uploadImageToStorage: (...a) => uploadImageToStorage(...a),
+  syncArrivalsToSalesOrderItems: (...a) => syncArrivalsToSalesOrderItems(...a),
+  updatePOStatus: (...a) => updatePOStatus(...a),
+});
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
 // ── Auth middleware (used by all protected routes) ───────────────
@@ -2852,7 +2863,9 @@ No extra text.`;
 };
 
 // ── Handle DO Group Photo ─────────────────────────────────────────
-const handleDOPhoto = async (chatId, base64Image) => {
+// Thin Telegram wrapper around the shared supplier DO service — extraction,
+// matching, and persistence are identical to the webapp flow.
+const handleDOPhoto = async (chatId, base64Image, fromTelegramId = null) => {
   await sendMessage(chatId, "📦 Processing delivery order...");
 
   let doData;
@@ -2868,139 +2881,30 @@ const handleDOPhoto = async (chatId, base64Image) => {
     return;
   }
 
-  const arrivalDate = new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
+  // Best-effort uploader context — historic Telegram DOs had no company/user
+  let uploadedBy = null, companyId = null;
+  if (fromTelegramId) {
+    try {
+      const tgUser = await getTelegramUser(fromTelegramId);
+      if (tgUser) { uploadedBy = tgUser.id; companyId = tgUser.company_id || null; }
+    } catch {}
+  }
 
-  // Upload DO photo to Supabase Storage
-  let doPhotoUrl = null;
-  const doMonth = new Date().toISOString().slice(0, 7);
-  const safeSupplier = (doData.supplier || "unknown").replace(/[^a-zA-Z0-9]/g, "-").substring(0, 30);
-  const doFilename = `${doMonth}/DO-${safeSupplier}-${Date.now()}.jpg`;
-  doPhotoUrl = await uploadImageToStorage(base64Image, "supplier-do-photos", doFilename);
+  const doPhotoUrl = await supplierDO.storeDOPhoto(base64Image, doData.supplier);
 
-  // Create supplier_deliveries record
-  const { data: supplierDelivery } = await supabase.from("supplier_deliveries").insert({
-    do_number: doData.doNumber || null,
-    supplier: doData.supplier || null,
-    do_date: doData.doDate || arrivalDate,
-    supplier_reference: doData.supplierReference || null,
-    photo_url: doPhotoUrl,
-    status: "Processed",
-  }).select().single();
-  const supplierDeliveryId = supplierDelivery?.id || null;
-
-  const results = { updated: [], notFound: [], showroom: [], duplicate: [] };
-
-  for (const item of doData.items) {
-    // Showroom items — log to do_review
-    if (item.isShowroom || !item.soNumber) {
-      await supabase.from("do_review").insert({
-        do_number: doData.doNumber || null,
-        supplier: doData.supplier || null,
-        do_date: doData.doDate || arrivalDate,
-        so_number: item.soNumber || null,
-        item_code: item.itemCode || null,
-        item_name: item.itemName || null,
-        quantity: item.quantity || null,
-        reason: item.isShowroom ? "showroom" : "no_so",
-        status: "Pending",
-        supplier_delivery_id: supplierDeliveryId || null,
-      });
-      if (item.isShowroom) results.showroom.push(item.itemName);
-      else results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
-      continue;
-    }
-
-    // Find matching orders by SO number
-    const { data: orders } = await supabase
-      .from("orders")
-      .select("id, so_number, items, status")
-      .eq("so_number", item.soNumber)
-      .in("status", ["Pending", "In Progress"]);
-
-    if (!orders || orders.length === 0) {
-      await supabase.from("do_review").insert({
-        do_number: doData.doNumber || null,
-        supplier: doData.supplier || null,
-        do_date: doData.doDate || arrivalDate,
-        so_number: item.soNumber,
-        item_code: item.itemCode || null,
-        item_name: item.itemName || null,
-        quantity: item.quantity || null,
-        reason: "so_not_found",
-        status: "Pending",
-        supplier_delivery_id: supplierDeliveryId || null,
-      });
-      results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
-      continue;
-    }
-
-    let updatedAny = false;
-    let alreadyHasDate = false;
-
-    for (const order of orders) {
-      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-      let matched = false;
-
-      const updatedItems = items.map(oi => {
-        // Match by item code first, then by name (case-insensitive partial match)
-        const codeMatch = item.itemCode && oi.itemCode &&
-          oi.itemCode.toLowerCase().trim() === item.itemCode.toLowerCase().trim();
-        const nameMatch = item.itemName && oi.itemName &&
-          (oi.itemName.toLowerCase().includes(item.itemName.toLowerCase().substring(0, 8)) ||
-           item.itemName.toLowerCase().includes(oi.itemName.toLowerCase().substring(0, 8)));
-
-        if (codeMatch || nameMatch) {
-          matched = true;
-          if (oi.arrivalDate) {
-            alreadyHasDate = true;
-            return oi; // keep existing date, flag as duplicate
-          }
-          return { ...oi, arrivalDate };
-        }
-        return oi;
-      });
-
-      if (matched) {
-        if (alreadyHasDate) {
-          // Duplicate — flag for review
-          await supabase.from("do_review").insert({
-            do_number: doData.doNumber || null,
-            supplier: doData.supplier || null,
-            do_date: doData.doDate || arrivalDate,
-            so_number: item.soNumber,
-            item_code: item.itemCode || null,
-            item_name: item.itemName || null,
-            quantity: item.quantity || null,
-            reason: "duplicate_arrival",
-            status: "Pending",
-        supplier_delivery_id: supplierDeliveryId || null,
-          });
-          results.duplicate.push({ itemName: item.itemName, soNumber: item.soNumber });
-        } else {
-          await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
-          await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
-          results.updated.push({ itemName: item.itemName, soNumber: item.soNumber });
-          updatedAny = true;
-        }
-      }
-    }
-
-    if (!updatedAny && !alreadyHasDate) {
-      // Item not matched in any order items
-      await supabase.from("do_review").insert({
-        do_number: doData.doNumber || null,
-        supplier: doData.supplier || null,
-        do_date: doData.doDate || arrivalDate,
-        so_number: item.soNumber,
-        item_code: item.itemCode || null,
-        item_name: item.itemName || null,
-        quantity: item.quantity || null,
-        reason: "item_not_matched",
-        status: "Pending",
-        supplier_delivery_id: supplierDeliveryId || null,
-      });
-      results.notFound.push({ itemName: item.itemName, soNumber: item.soNumber });
-    }
+  let arrivalDate, results;
+  try {
+    // Telegram behavior preserved: duplicates allowed, matching NOT
+    // company-scoped, no PO receiving, no product-master check.
+    ({ arrivalDate, results } = await supplierDO.processSupplierDOUpload({
+      source: "telegram",
+      extractedPayload: doData,
+      uploadedBy, companyId,
+      photoUrl: doPhotoUrl,
+    }));
+  } catch (err) {
+    await sendMessage(chatId, `❌ Failed to save the DO.\n\nReason: ${err.message}`);
+    return;
   }
 
   // Build reply
@@ -4942,6 +4846,138 @@ app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, re
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Supplier DOs API (webapp upload flow) ─────────────────────────
+// Two-step intake on top of the shared supplier DO service:
+//   1. POST /supplier-dos/upload        — OCR + match PREVIEW, no DB writes
+//   2. POST /supplier-dos               — confirm save (single write path,
+//                                         same service as Telegram)
+// Plus list/detail reads over supplier_deliveries + do_review.
+const SUPPLIER_DO_ROLES = ["master", "manager", "company_admin", "salesman"];
+
+// GET /supplier-dos — company-scoped list
+app.get("/supplier-dos", requireAuth, async (req, res) => {
+  const { supplier, from_date, to_date, status, source, limit = 100 } = req.query;
+  const cid = getActiveCompanyId(req);
+  let query = supabase.from("supplier_deliveries").select("*").order("created_at", { ascending: false }).limit(parseInt(limit));
+  if (cid) query = query.eq("company_id", cid);
+  if (supplier) query = query.ilike("supplier", `%${supplier}%`);
+  if (from_date) query = query.gte("do_date", from_date);
+  if (to_date) query = query.lte("do_date", to_date);
+  if (status) query = query.eq("status", status);
+  if (source) query = query.eq("source", source);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// POST /supplier-dos/upload — extract + preview. Only side effect: the photo
+// is stored so the later confirm can reference it without re-uploading.
+app.post("/supplier-dos/upload", requireRole(SUPPLIER_DO_ROLES), upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    const base64Image = file.buffer.toString("base64");
+
+    let doData;
+    try {
+      doData = await extractDOFromImage(base64Image);
+    } catch (err) {
+      return res.status(422).json({ error: "Could not read the DO: " + err.message });
+    }
+    if (!doData.items || doData.items.length === 0) {
+      return res.status(422).json({ error: "No items found in the DO" });
+    }
+
+    const cid = getActiveCompanyId(req);
+    const photoUrl = await supplierDO.storeDOPhoto(base64Image, doData.supplier);
+    const items = await supplierDO.previewMatch({ items: doData.items, companyId: cid });
+
+    // Non-blocking duplicate warning — the confirm step enforces it
+    let duplicateOf = null;
+    if (doData.doNumber) {
+      let dupQ = supabase.from("supplier_deliveries").select("id, do_number, supplier, created_at").eq("do_number", doData.doNumber).limit(1);
+      if (cid) dupQ = dupQ.eq("company_id", cid);
+      const { data: existing } = await dupQ;
+      if (existing?.length) duplicateOf = existing[0];
+    }
+
+    res.json({
+      header: {
+        do_number: doData.doNumber || "", supplier: doData.supplier || "",
+        do_date: doData.doDate || "", supplier_reference: doData.supplierReference || "",
+      },
+      photo_url: photoUrl, items, duplicate_of: duplicateOf,
+    });
+  } catch (err) { console.error("supplier-dos/upload error:", err); res.status(500).json({ error: err.message }); }
+});
+
+// POST /supplier-dos/preview-match — stateless re-match after manual fixes
+app.post("/supplier-dos/preview-match", requireRole(SUPPLIER_DO_ROLES), async (req, res) => {
+  try {
+    const { items } = req.body || {};
+    if (!Array.isArray(items)) return res.status(400).json({ error: "items array required" });
+    const out = await supplierDO.previewMatch({ items, companyId: getActiveCompanyId(req) });
+    res.json({ items: out });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /supplier-dos — confirm save. Body: { header, photo_url, items }
+// Each item: { itemCode, itemName, quantity, soNumber, isShowroom,
+//              _target?: { order_id, item_index }, product_id? }
+app.post("/supplier-dos", requireRole(SUPPLIER_DO_ROLES), async (req, res) => {
+  try {
+    const { header = {}, photo_url = null, items, allow_duplicate = false } = req.body || {};
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items array required" });
+
+    let outcome;
+    try {
+      outcome = await supplierDO.processSupplierDOUpload({
+        source: "webapp",
+        extractedPayload: {
+          doNumber: header.do_number || null,
+          supplier: header.supplier || null,
+          doDate: header.do_date || null,
+          supplierReference: header.supplier_reference || null,
+          items,
+        },
+        uploadedBy: req.user?.id || null,
+        companyId: getActiveCompanyId(req),
+        branchId: req.body.branch_id || null,
+        photoUrl: photo_url,
+        rejectDuplicate: !allow_duplicate,
+        scopeMatchingToCompany: true,
+        receivePOItems: true,
+        checkProducts: true,
+      });
+    } catch (err) {
+      if (err.code === "DUPLICATE_DO") return res.status(409).json({ error: err.message, existing: err.existing });
+      throw err;
+    }
+
+    res.json({
+      id: outcome.supplierDeliveryId,
+      arrival_date: outcome.arrivalDate,
+      matched: outcome.results.updated.length,
+      pending_review: outcome.results.notFound.length + outcome.results.duplicate.length,
+      showroom: outcome.results.showroom.length,
+      unrecognized: outcome.results.unrecognized.length,
+      results: outcome.results,
+    });
+  } catch (err) { console.error("supplier-dos commit error:", err); res.status(500).json({ error: err.message }); }
+});
+
+// GET /supplier-dos/:id — header + FULL item list (Matched + exceptions)
+app.get("/supplier-dos/:id", requireAuth, async (req, res) => {
+  try {
+    const { data: delivery, error } = await supabase.from("supplier_deliveries").select("*").eq("id", req.params.id).single();
+    if (error || !delivery) return res.status(404).json({ error: "Not found" });
+    const cid = getActiveCompanyId(req);
+    if (cid && delivery.company_id && delivery.company_id !== cid) return res.status(404).json({ error: "Not found" });
+    const { data: reviewItems } = await supabase.from("do_review").select("*").eq("supplier_delivery_id", delivery.id).order("created_at");
+    res.json({ delivery, items: reviewItems || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Telegram Webhook ──────────────────────────────────────────────
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200);
@@ -4966,7 +5002,7 @@ app.post("/telegram/webhook", async (req, res) => {
         const photo = message.photo[message.photo.length - 1];
         const fileUrl = await getFileUrl(photo.file_id);
         const base64Image = await downloadImageAsBase64(fileUrl);
-        await handleDOPhoto(chatId, base64Image);
+        await handleDOPhoto(chatId, base64Image, message.from?.id);
       } else if (message.text) {
         await sendMessage(chatId, "📷 Please send a photo of the supplier delivery order to process it.");
       }
@@ -8923,8 +8959,9 @@ app.patch("/delivery-notes/:id/status", requireRole(["master", "manager", "compa
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Web DO Upload ────────────────────────────────────────────────
-// Reuses the same OCR + matching logic as the Telegram flow
+// ── Web DO Upload (legacy one-shot) ──────────────────────────────
+// Kept for the Operations-tab uploader. Delegates to the shared supplier DO
+// service (same path as Telegram + /supplier-dos); response shape unchanged.
 app.post("/do-upload", requireRole(["master", "manager", "company_admin", "salesman"]), upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -8937,167 +8974,45 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
     } catch (err) {
       return res.status(422).json({ error: "Could not read the DO: " + err.message });
     }
-
     if (!doData.items || doData.items.length === 0) {
       return res.status(422).json({ error: "No items found in the DO" });
     }
 
-    // Duplicate DO check
-    if (doData.doNumber) {
-      const { data: existing } = await supabase.from("supplier_deliveries")
-        .select("id, do_number, supplier, created_at")
-        .eq("do_number", doData.doNumber).limit(1);
-      if (existing && existing.length > 0) {
-        return res.status(409).json({ error: `DO #${doData.doNumber} already exists (uploaded ${new Date(existing[0].created_at).toLocaleDateString()})` });
-      }
+    const doPhotoUrl = await supplierDO.storeDOPhoto(base64Image, doData.supplier);
+
+    let outcome;
+    try {
+      outcome = await supplierDO.processSupplierDOUpload({
+        source: "webapp",
+        extractedPayload: doData,
+        uploadedBy: req.user?.id || null,
+        companyId: getActiveCompanyId(req),
+        photoUrl: doPhotoUrl,
+        rejectDuplicate: true,
+        scopeMatchingToCompany: true,
+        receivePOItems: true,
+        checkProducts: true,
+      });
+    } catch (err) {
+      if (err.code === "DUPLICATE_DO") return res.status(409).json({ error: err.message });
+      throw err;
     }
 
-    const arrivalDate = new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
-
-    // Upload photo to storage
-    let doPhotoUrl = null;
-    const doMonth = new Date().toISOString().slice(0, 7);
-    const safeSupplier = (doData.supplier || "unknown").replace(/[^a-zA-Z0-9]/g, "-").substring(0, 30);
-    const doFilename = `${doMonth}/DO-${safeSupplier}-${Date.now()}.jpg`;
-    doPhotoUrl = await uploadImageToStorage(base64Image, "supplier-do-photos", doFilename);
-
-    // Create supplier_deliveries record
-    const { data: supplierDelivery } = await supabase.from("supplier_deliveries").insert({
-      do_number: doData.doNumber || null,
-      supplier: doData.supplier || null,
-      do_date: doData.doDate || arrivalDate,
-      supplier_reference: doData.supplierReference || null,
-      photo_url: doPhotoUrl,
-      status: "Processed",
-      company_id: getActiveCompanyId(req),
-    }).select().single();
-    const supplierDeliveryId = supplierDelivery?.id || null;
-
-    const results = { updated: [], review: [], showroom: [] };
-
-    for (const item of doData.items) {
-      if (item.isShowroom || !item.soNumber) {
-        await supabase.from("do_review").insert({
-          do_number: doData.doNumber || null, supplier: doData.supplier || null,
-          do_date: doData.doDate || arrivalDate, so_number: item.soNumber || null,
-          item_code: item.itemCode || null, item_name: item.itemName || null,
-          quantity: item.quantity || null, reason: item.isShowroom ? "showroom" : "no_so",
-          status: "Pending", supplier_delivery_id: supplierDeliveryId,
-        });
-        if (item.isShowroom) results.showroom.push(item.itemName);
-        else results.review.push({ item: item.itemName, reason: "no_so" });
-        continue;
-      }
-
-      // Match against legacy orders
-      const { data: orders } = await supabase.from("orders")
-        .select("id, so_number, items, status")
-        .eq("so_number", item.soNumber).in("status", ["Pending", "In Progress"]);
-
-      if (!orders || orders.length === 0) {
-        await supabase.from("do_review").insert({
-          do_number: doData.doNumber || null, supplier: doData.supplier || null,
-          do_date: doData.doDate || arrivalDate, so_number: item.soNumber,
-          item_code: item.itemCode || null, item_name: item.itemName || null,
-          quantity: item.quantity || null, reason: "so_not_found",
-          status: "Pending", supplier_delivery_id: supplierDeliveryId,
-        });
-        results.review.push({ item: item.itemName, reason: "so_not_found" });
-        continue;
-      }
-
-      let matched = false;
-      // Extract meaningful keywords from DO item — expand abbreviations, skip noise
-      const ABBREV = { pil: "pillow", mat: "mattress", tbl: "table", chr: "chair", cab: "cabinet", drs: "dresser", bfr: "bedframe", stl: "stool" };
-      const SKIP = /^(mal|sg|pcs|unit|set|ctn|box|dun|cs\d*|qty|\+)$/;
-      const doKeywords = (item.itemName || "").split(/[\s,\-\/]+/)
-        .map(w => w.toLowerCase().trim()).filter(w => w.length > 2 && !/^\d+x?\d*c?m?$/.test(w) && !SKIP.test(w))
-        .map(w => ABBREV[w] || w);
-      for (const order of orders) {
-        const oItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-        const updatedItems = oItems.map(oi => {
-          const oiCode = (oi.itemCode || "").toLowerCase().trim();
-          const oiName = (oi.itemName || "").toLowerCase();
-          const doCode = (item.itemCode || "").toLowerCase().trim();
-          // 1. Exact code match
-          const codeMatch = doCode && oiCode && oiCode === doCode;
-          // 2. Code contained in order item name or vice versa
-          const codeInName = doCode && doCode.length >= 3 && (oiName.includes(doCode) || (oiCode && doCode.includes(oiCode)));
-          // 3. Keyword match: at least 2 DO keywords found in order item name, or 1 keyword >= 5 chars
-          const kwMatches = doKeywords.filter(kw => oiName.includes(kw) || oiCode.includes(kw));
-          const keywordMatch = kwMatches.length >= 2 || kwMatches.some(kw => kw.length >= 5);
-          if ((codeMatch || codeInName || keywordMatch) && !oi.arrivalDate) { matched = true; return { ...oi, arrivalDate }; }
-          return oi;
-        });
-        if (matched) {
-          await supabase.from("orders").update({ items: JSON.stringify(updatedItems) }).eq("id", order.id);
-          await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
-          results.updated.push({ item: item.itemName, so: item.soNumber });
-
-          // Also try to mark PO items as received
-          try {
-            const { data: poItems } = await supabase.from("purchase_order_items")
-              .select("id, po_id, quantity")
-              .or(`product_code.eq.${item.itemCode},product_name.ilike.%${(item.itemName || "").substring(0, 10)}%`);
-            for (const pi of (poItems || [])) {
-              await supabase.from("purchase_order_items").update({ received_qty: pi.quantity, received_date: arrivalDate }).eq("id", pi.id);
-              await updatePOStatus(pi.po_id);
-            }
-          } catch {}
-
-          // Check if item exists in product master (fuzzy match)
-          try {
-            const cid = getActiveCompanyId(req);
-            const code = (item.itemCode || "").toUpperCase().trim();
-            const name = (item.itemName || "").trim();
-            // Extract keywords from DO item name (skip short words, dimensions, abbreviations)
-            const keywords = name.split(/[\s,\-\/]+/).filter(w => w.length > 2 && !/^\d+x?\d*c?m?$/i.test(w) && !/^(MAL|SG|PCS|UNIT|SET|CTN|BOX)$/i.test(w));
-            let found = false;
-            // 1. Exact code match
-            if (code) {
-              const { data: m1 } = await supabase.from("products").select("id").eq("company_id", cid).eq("code", code).limit(1);
-              if (m1?.length) found = true;
-            }
-            // 2. Partial code match (code contained in product code or vice versa)
-            if (!found && code.length >= 3) {
-              const { data: m2 } = await supabase.from("products").select("id").eq("company_id", cid).ilike("code", `%${code}%`).limit(1);
-              if (m2?.length) found = true;
-            }
-            // 3. Keyword search in product name (try longest keywords first)
-            if (!found && keywords.length > 0) {
-              const sorted = [...keywords].sort((a, b) => b.length - a.length);
-              for (const kw of sorted.slice(0, 3)) {
-                const { data: m3 } = await supabase.from("products").select("id").eq("company_id", cid).ilike("name", `%${kw}%`).limit(1);
-                if (m3?.length) { found = true; break; }
-              }
-            }
-            if (!found) {
-              if (!results.unrecognized) results.unrecognized = [];
-              results.unrecognized.push({ code: item.itemCode, name: item.itemName, so: item.soNumber });
-            }
-          } catch {}
-          break;
-        }
-      }
-
-      if (!matched) {
-        await supabase.from("do_review").insert({
-          do_number: doData.doNumber || null, supplier: doData.supplier || null,
-          do_date: doData.doDate || arrivalDate, so_number: item.soNumber,
-          item_code: item.itemCode || null, item_name: item.itemName || null,
-          quantity: item.quantity || null, reason: "item_not_matched",
-          status: "Pending", supplier_delivery_id: supplierDeliveryId,
-        });
-        results.review.push({ item: item.itemName, reason: "item_not_matched" });
-      }
-    }
-
+    const { arrivalDate, results } = outcome;
+    // Legacy response shape: review[] = every line that needs attention
+    const review = [
+      ...results.notFound.map(n => ({ item: n.itemName, reason: n.reason })),
+      ...results.duplicate.map(d => ({ item: d.itemName, reason: "duplicate_arrival" })),
+    ];
     res.json({
       supplier: doData.supplier, do_number: doData.doNumber, do_date: doData.doDate || arrivalDate,
       photo_url: doPhotoUrl, total_items: doData.items.length,
-      matched: results.updated.length, pending_review: results.review.length,
-      showroom: results.showroom.length, unrecognized: (results.unrecognized || []).length,
-      results,
+      matched: results.updated.length, pending_review: review.length,
+      showroom: results.showroom.length, unrecognized: results.unrecognized.length,
+      results: {
+        updated: results.updated.map(u => ({ item: u.itemName, so: u.soNumber })),
+        review, showroom: results.showroom, unrecognized: results.unrecognized,
+      },
     });
   } catch (err) { console.error("do-upload error:", err); res.status(500).json({ error: err.message }); }
 });
