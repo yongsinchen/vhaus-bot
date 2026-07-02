@@ -2302,19 +2302,18 @@ app.get("/delivery/routes", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
   const cid = getActiveCompanyId(req);
-  let rq = supabase.from("delivery_routes").select(SELECTS.DELIVERY_ROUTE_SELECT).eq("delivery_date", date).order("created_at");
+  // Single nested query (was an N+1: one delivery_route_orders query per
+  // route). Response shape unchanged: route fields + orders: [routeOrder rows
+  // each embedding its `orders` record].
+  let rq = supabase.from("delivery_routes")
+    .select(`${SELECTS.DELIVERY_ROUTE_SELECT}, route_orders:delivery_route_orders(${SELECTS.ROUTE_ORDERS_NESTED_SELECT})`)
+    .eq("delivery_date", date)
+    .order("created_at")
+    .order("sequence_no", { foreignTable: "route_orders" });
   if (cid) rq = rq.eq("company_id", cid);
   const { data: routes, error: routeErr } = await rq;
   if (routeErr) return res.status(500).json({ error: routeErr.message });
-  const routesWithOrders = await Promise.all(routes.map(async (route) => {
-    const { data: routeOrders } = await supabase
-      .from("delivery_route_orders")
-      .select(SELECTS.ROUTE_ORDERS_NESTED_SELECT)
-      .eq("route_id", route.id)
-      .order("sequence_no");
-    return { ...route, orders: routeOrders || [] };
-  }));
-  res.json(routesWithOrders);
+  res.json((routes || []).map(({ route_orders, ...route }) => ({ ...route, orders: route_orders || [] })));
 });
 
 
@@ -3688,7 +3687,8 @@ app.get("/orders", requireAuth, async (req, res) => {
 app.get("/services", requireAuth, async (req, res) => {
   const { salesman, status } = req.query;
   const cid = getActiveCompanyId(req);
-  let query = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("type", "Service").order("created_at", { ascending: false });
+  // Growth guard: newest-first cap (currently 4 rows — behaviour unchanged)
+  let query = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("type", "Service").order("created_at", { ascending: false }).limit(Math.min(Number(req.query.limit) || 500, 2000));
   if (cid) query = query.eq("company_id", cid);
   if (status) query = query.eq("status", status);
   const { data, error } = await query;
@@ -4211,19 +4211,22 @@ app.get("/commissions", requireAuth, async (req, res) => {
   try {
     const { status, payout_month } = req.query;
     const cid = getActiveCompanyId(req);
+    // Growth guard: newest-first cap, client-overridable up to 5000. At the
+    // current ~360 rows this returns everything, so behaviour is unchanged.
+    const lim = Math.min(Number(req.query.limit) || 1000, 5000);
     // A salesman can only ever see their own commission records — never trust a
     // client-supplied user_id for this; managers/admins/finance may optionally
     // filter to a specific person via user_id, defaulting to everyone if omitted.
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
-    let q = supabase.from("commissions").select(`${SELECTS.COMMISSION_LIST_SELECT}, wrong_item_holds(hold_reason, status)`).order("created_at", { ascending: false });
+    let q = supabase.from("commissions").select(`${SELECTS.COMMISSION_LIST_SELECT}, wrong_item_holds(hold_reason, status)`).order("created_at", { ascending: false }).limit(lim);
     if (cid) q = q.eq("company_id", cid);
     if (user_id) q = q.eq("user_id", user_id);
     if (status) q = q.eq("status", status);
     if (payout_month) q = q.eq("payout_month", payout_month);
     const { data, error } = await q;
     if (error) {
-      let q2 = supabase.from("commissions").select("*").order("created_at", { ascending: false });
+      let q2 = supabase.from("commissions").select("*").order("created_at", { ascending: false }).limit(lim);
       if (cid) q2 = q2.eq("company_id", cid);
       if (user_id) q2 = q2.eq("user_id", user_id);
       if (status) q2 = q2.eq("status", status);
