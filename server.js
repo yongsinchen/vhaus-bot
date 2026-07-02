@@ -2225,9 +2225,11 @@ app.get("/delivery/vehicles", requireAuth, async (req, res) => {
 app.post("/delivery/vehicles", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   const { driver_name, vehicle_plate, vehicle_type, status } = req.body;
   if (!driver_name && !vehicle_plate) return res.status(400).json({ error: "driver_name or vehicle_plate is required" });
+  // Stamp the active company — GET /delivery/vehicles filters by company_id, so
+  // a vehicle inserted without it is created but never shows in the list.
   const { data, error } = await supabase
     .from("delivery_vehicles")
-    .insert({ driver_name, vehicle_plate, vehicle_type, status: status || "Active" })
+    .insert({ driver_name, vehicle_plate, vehicle_type, status: status || "Active", company_id: getActiveCompanyId(req) })
     .select()
     .single();
   if (error) return res.status(500).json({ error: error.message });
@@ -4686,14 +4688,17 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
 
 app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date } = req.body;
+    const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date, service_date, schedule_tbc } = req.body;
     if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange)" });
     const svcType = Number(service_type);
     const companyId = getActiveCompanyId(req);
     // The schedule date the delivery route reads lives on orders.delivery_date
     // (a TEXT column compared as a string by GET /delivery/unassigned). Accept
     // whichever field the client sends and keep the same value everywhere.
-    const scheduleDate = delivery_date || due_date || null;
+    // TBC = deliberately unscheduled: create undated, then stamp the legacy order
+    // delivery_date = 'TBC' so it stays OUT of the unassigned pool.
+    const isTbc = schedule_tbc === true || schedule_tbc === "true";
+    const scheduleDate = isTbc ? null : (delivery_date || due_date || null);
 
     // Auto-fill customer info + source SO number from the linked order.
     let custName = customer_name, custPhone = customer_phone, custAddr = customer_address, sourceSoNumber = null;
@@ -4717,30 +4722,57 @@ app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
       p_source_so_number: sourceSoNumber,
     });
     if (error) throw error;
+
+    // Persist the extra fields the RPC doesn't take (keeps the RPC untouched):
+    // service_date (creation date) and schedule_tbc. For TBC, stamp the linked
+    // legacy order delivery_date = 'TBC' so it stays out of the unassigned pool.
+    const svcPatch = {};
+    if (service_date) svcPatch.service_date = service_date;
+    if (isTbc) svcPatch.schedule_tbc = true;
+    if (Object.keys(svcPatch).length) {
+      const { data: upd } = await supabase.from("services").update(svcPatch).eq("id", result.service.id).select().single();
+      if (upd) result.service = upd;
+    }
+    if (isTbc && result.order?.id) {
+      await supabase.from("orders").update({ delivery_date: "TBC" }).eq("id", result.order.id);
+      if (result.order) result.order.delivery_date = "TBC";
+    }
+
     res.status(201).json({ service: result.service, legs: result.legs, order: result.order });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { status, description, assigned_to, due_date, delivery_date } = req.body;
+    const { status, description, assigned_to, due_date, delivery_date, service_date, schedule_tbc } = req.body;
     const updates = {};
     if (status !== undefined) updates.status = status;
     if (description !== undefined) updates.description = description;
     if (assigned_to !== undefined) updates.assigned_to = assigned_to;
     if (status === "closed") updates.closed_at = new Date().toISOString();
-    // Accept either field name for the schedule date; keep both sides aligned.
+    if (service_date !== undefined) updates.service_date = service_date || null;
+
+    const tbcProvided = schedule_tbc !== undefined;
+    const isTbc = schedule_tbc === true || schedule_tbc === "true";
+    if (tbcProvided) updates.schedule_tbc = isTbc;
+
+    // Schedule date. TBC clears the date but stamps the order 'TBC' (out of the
+    // unassigned pool); a real/blank date syncs to the linked order. Accept
+    // either field name. orderDeliveryDate === undefined means "don't touch".
     const newDate = delivery_date !== undefined ? delivery_date : (due_date !== undefined ? due_date : undefined);
-    if (newDate !== undefined) updates.due_date = newDate || null;
+    let orderDeliveryDate;
+    if (isTbc) { updates.due_date = null; orderDeliveryDate = "TBC"; }
+    else if (newDate !== undefined) { updates.due_date = newDate || null; orderDeliveryDate = newDate || null; }
+    else if (tbcProvided) { updates.due_date = null; orderDeliveryDate = null; } // TBC toggled off, no date → unscheduled
+
     const { data, error } = await supabase.from("services").update(updates).eq("id", req.params.id).select().single();
     if (error) throw error;
 
-    // Keep the linked legacy Service order in step so it doesn't drift from the
-    // case: date sync, and status sync so a done/cancelled case leaves the
-    // delivery route (unassigned excludes Delivered/Cancelled).
+    // Keep the linked legacy Service order in step: date/TBC sync, and status
+    // sync so a done/cancelled case leaves the delivery route.
     if (data?.legacy_order_id) {
       const orderPatch = {};
-      if (newDate !== undefined) orderPatch.delivery_date = newDate || null;
+      if (orderDeliveryDate !== undefined) orderPatch.delivery_date = orderDeliveryDate;
       if (status === "cancelled") orderPatch.status = "Cancelled";
       else if (["closed", "resolved", "completed"].includes(status)) orderPatch.status = "Delivered";
       if (Object.keys(orderPatch).length > 0) await supabase.from("orders").update(orderPatch).eq("id", data.legacy_order_id);
