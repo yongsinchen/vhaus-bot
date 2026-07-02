@@ -8275,6 +8275,22 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
     const { companySupplierId: supplier_id } = await resolveIncomingProductSupplier(company_id, { supplier_id: rawSupplierId });
     if (rawSupplierId && !supplier_id) return res.status(400).json({ error: "Supplier not found for this company" });
 
+    // Category: catalogue-group companies pick from organization_categories
+    // (org-level, migration 008) while others pick product_categories — the
+    // incoming id must land in the matching FK column or the insert fails.
+    let jobCategoryId = null, jobOrgCategoryId = null;
+    if (category_id) {
+      const { data: orgCat } = await supabase.from("organization_categories")
+        .select("id").eq("id", category_id).maybeSingle();
+      if (orgCat) jobOrgCategoryId = orgCat.id;
+      else {
+        const { data: compCat } = await supabase.from("product_categories")
+          .select("id").eq("id", category_id).eq("company_id", company_id).maybeSingle();
+        if (compCat) jobCategoryId = compCat.id;
+        else return res.status(400).json({ error: "Category not found for this company" });
+      }
+    }
+
     // Resolve costing rule for this import. A cost_divisor in the request is an
     // explicit choice (number = derive cost from price, blank = use catalogue cost)
     // and is persisted on the supplier so it is remembered next time. When the
@@ -8335,7 +8351,8 @@ app.post("/catalogue-import/upload", requireRole(MANAGE_ROLES), upload.single("f
     // Create job
     const { data: job, error: jobError } = await supabase.from("catalogue_import_jobs")
       .insert({
-        company_id, supplier_id: supplier_id || null, category_id: category_id || null,
+        company_id, supplier_id: supplier_id || null,
+        category_id: jobCategoryId, organization_category_id: jobOrgCategoryId,
         source_type, source_url: publicUrl || null, status: "processing",
         parse_method: parseMethod, cost_divisor: costDivisor, color_mode: colorMode, started_at: new Date().toISOString(), created_by,
       })
@@ -8557,8 +8574,10 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
         const matched = supplierMap.get(row.supplier_name.toLowerCase());
         if (matched) supplierId = matched;
       }
-      // Resolve category: per-row category_name > job-level category_id
-      let categoryId = job.category_id || null;
+      // Resolve category: per-row category_name > job-level default. The
+      // job-level default lives in organization_category_id for
+      // catalogue-group companies, category_id otherwise (migration 017).
+      let categoryId = (catalogueGroupId ? job.organization_category_id : job.category_id) || null;
       if (row.category_name) {
         const matched = categoryMap.get(row.category_name.toLowerCase());
         if (matched) categoryId = matched;
