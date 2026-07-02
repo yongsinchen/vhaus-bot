@@ -4654,11 +4654,22 @@ const SERVICE_TYPES = { 1: "Warranty Repair", 2: "Assembly/Installation", 3: "Ex
 
 app.get("/service-cases", requireAuth, async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, so_number } = req.query;
     const cid = getActiveCompanyId(req);
+    // Optional: restrict to services linked to the legacy order(s) with this
+    // so_number — used by the order detail page to list an order's services.
+    let orderIdFilter = null;
+    if (so_number) {
+      let oq = supabase.from("orders").select("id").eq("so_number", so_number);
+      if (cid) oq = oq.eq("company_id", cid);
+      const { data: legacyOrders } = await oq;
+      orderIdFilter = (legacyOrders || []).map(o => o.id);
+      if (orderIdFilter.length === 0) return res.json({ services: [] });
+    }
     let q = supabase.from("services").select("*").order("created_at", { ascending: false });
     if (cid) q = q.eq("company_id", cid);
     if (status) q = q.eq("status", status);
+    if (orderIdFilter) q = q.in("order_id", orderIdFilter);
     const { data, error } = await q;
     if (error) throw error;
     // Enrich with order info where available
