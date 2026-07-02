@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS delivery_orders (
   company_id         UUID NOT NULL REFERENCES companies(id),
   do_number          TEXT NOT NULL,
   sales_order_id     UUID NOT NULL REFERENCES sales_orders(id),
-  order_id           UUID REFERENCES orders(id),          -- legacy runtime anchor (payments/driver joins)
+  order_id           BIGINT REFERENCES orders(id),        -- legacy runtime anchor (payments/driver joins) — orders.id is BIGINT, not UUID
   customer_id        UUID REFERENCES customers(id),
   delivery_address   TEXT,
   contact            TEXT,
