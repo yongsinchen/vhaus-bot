@@ -5616,6 +5616,29 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
       if (!check) return res.status(404).json({ error: "Schedule not found" });
     }
     const { team_id, sort_order, status, slot, area, is_ready, notes } = req.body;
+
+    // Phase 2A: an admin marking a DO schedule "delivered" must go through
+    // the same atomic completion RPC as the driver path — otherwise the
+    // quantity ledger would be bypassed. Legacy (NULL DO) rows unaffected.
+    if (status === "delivered") {
+      const { data: schedRow } = await supabase.from("delivery_schedules")
+        .select("id, delivery_order_id").eq("id", req.params.id).maybeSingle();
+      if (schedRow?.delivery_order_id) {
+        const { data: result, error: rpcErr } = await supabase.rpc("complete_delivery_order", {
+          p_delivery_order_id: schedRow.delivery_order_id,
+          p_company_id: cid,
+          p_actor_id: req.user.id,
+        });
+        if (rpcErr) {
+          const msg = rpcErr.message || "";
+          if (msg.includes("cancelled")) return res.status(400).json({ error: "Cannot complete a cancelled delivery order" });
+          if (msg.includes("wrong_company") || msg.includes("not_found")) return res.status(404).json({ error: "Delivery order not found" });
+          throw rpcErr;
+        }
+        const { data: fresh } = await supabase.from("delivery_schedules").select("*").eq("id", req.params.id).single();
+        return res.json({ schedule: fresh, delivery_order: result });
+      }
+    }
     const updates = {};
     if (team_id !== undefined) updates.team_id = team_id;
     if (sort_order !== undefined) updates.sort_order = sort_order;
@@ -6008,18 +6031,33 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
   try {
     const { status } = req.body;
 
-    // DO-aware guard (Phase 1): fetch the schedule first to see if it carries
-    // a Delivery Order. DO completion mutates the quantity ledger
-    // (delivered_qty) and rolls up the SO status — that must be one atomic
-    // RPC (Phase 2). A partial JS implementation here could double-count
-    // delivered_qty on a retried request, so completion is explicitly
-    // blocked for DO schedules until then. Legacy (NULL DO) schedules keep
-    // today's behavior exactly.
+    // DO-aware routing: fetch the schedule first to see if it carries a
+    // Delivery Order. Legacy (NULL DO) schedules keep today's behavior exactly.
     const { data: existing } = await supabase.from("delivery_schedules")
       .select("id, delivery_order_id").eq("id", req.params.id).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Schedule not found" });
-    if (existing.delivery_order_id && status === "delivered") {
-      return res.status(409).json({ error: "Delivery Order completion is not enabled in Phase 1. The DO stays out_for_delivery — complete it after Phase 2 ships the atomic completion flow." });
+
+    // Phase 2A: DO completion runs as ONE atomic Postgres transaction
+    // (complete_delivery_order RPC): DO + items delivered, delivered_qty
+    // ledger incremented, item/SO/legacy-order statuses rolled up, schedule
+    // rows closed, event logged. Idempotent — a double-tap returns
+    // already_completed without double-incrementing.
+    if (existing.delivery_order_id && (status === "delivered" || status === "completed")) {
+      const cid = getActiveCompanyId(req);
+      const { data: result, error: rpcErr } = await supabase.rpc("complete_delivery_order", {
+        p_delivery_order_id: existing.delivery_order_id,
+        p_company_id: cid,
+        p_actor_id: req.user.id,
+      });
+      if (rpcErr) {
+        const msg = rpcErr.message || "";
+        if (msg.includes("cancelled")) return res.status(400).json({ error: "Cannot complete a cancelled delivery order" });
+        if (msg.includes("wrong_company") || msg.includes("not_found")) return res.status(404).json({ error: "Delivery order not found" });
+        throw rpcErr;
+      }
+      const { data: fresh } = await supabase.from("delivery_schedules")
+        .select("*, orders(id, so_number, status)").eq("id", existing.id).single();
+      return res.json({ schedule: fresh, delivery_order: result });
     }
 
     const updates = { status };
@@ -8870,6 +8908,10 @@ async function nextOrderNumber(company_id) {
 function deliveryStatusFromSO(s) {
   if (s === "delivered") return "Delivered";
   if (s === "cancelled") return "Cancelled";
+  // Phase 2A: partial DO completions must survive SO edits/syncs — without
+  // this mapping, syncSalesOrderToDelivery would stomp the legacy order
+  // back to "Pending" after every header edit.
+  if (s === "partially_delivered") return "Partially Delivered";
   return "Pending";
 }
 
