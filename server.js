@@ -3706,6 +3706,9 @@ app.get("/customers", requireAuth, async (req, res) => {
   try {
     const { search, limit = 50 } = req.query;
     const cid = getActiveCompanyId(req);
+    const searchFilter = search
+      ? `name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%${normalizeIc(search) ? `,ic_number_normalized.ilike.%${normalizeIc(search)}%` : ""}`
+      : null;
     // Salesman: only show customers from their orders
     if (req.user.role === "salesman" && req.user.salesman_name) {
       const name = req.user.salesman_name;
@@ -3714,13 +3717,13 @@ app.get("/customers", requireAuth, async (req, res) => {
       const custIds = [...new Set((myOrders || []).map(o => o.customer_id).filter(Boolean))];
       if (custIds.length === 0) return res.json({ customers: [], total: 0 });
       let q = supabase.from("customers").select("*", { count: "exact" }).in("id", custIds).order("name").limit(Number(limit));
-      if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%`);
+      if (searchFilter) q = q.or(searchFilter);
       const { data, count } = await q;
       return res.json({ customers: data || [], total: count || 0 });
     }
     let q = supabase.from("customers").select("*", { count: "exact" }).order("name").limit(Number(limit));
     if (cid) q = q.eq("company_id", cid);
-    if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%`);
+    if (searchFilter) q = q.or(searchFilter);
     const { data, count, error } = await q;
     if (error) throw error;
     res.json({ customers: data || [], total: count || 0 });
@@ -3755,8 +3758,9 @@ app.post("/customers", requireRole(MANAGE_ROLES), async (req, res) => {
     const { name, phone, email, address, ic_number, company_name: custCompany, notes } = req.body;
     if (!name) return res.status(400).json({ error: "Name required" });
     // Duplicate check — I/C number first (strongest identity), then phone.
-    if (ic_number?.trim()) {
-      const { data: dupIc } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("ic_number", ic_number.trim()).limit(1);
+    const icNorm = normalizeIc(ic_number);
+    if (icNorm) {
+      const { data: dupIc } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("ic_number_normalized", icNorm).limit(1);
       if (dupIc && dupIc[0]) return res.status(400).json({ error: `Customer with I/C ${ic_number.trim()} already exists: ${dupIc[0].name}`, existing: dupIc[0] });
     }
     if (phone) {
@@ -9235,12 +9239,20 @@ function deliveryStatusFromSO(s) {
 // Mirror a sales order into the legacy `orders` table so the dashboard,
 // calendar, and delivery routes pick it up. Keyed by so_number + company_id.
 // Find an existing customer by phone (within company), or create one from order details.
+// Strip everything but letters/digits and lowercase — mirrors the
+// customers.ic_number_normalized generated column (migration 026) so I/C
+// entered with or without dashes/spaces matches the same person.
+function normalizeIc(v) {
+  return (v || "").replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+}
+
 async function findOrCreateCustomerForOrder(order) {
   try {
     const company_id = order.company_id;
     const name = (order.customer_name || "").trim();
     const phone = (order.customer_contact || "").trim();
     const ic = (order.customer_id_no || "").trim();
+    const icNorm = normalizeIc(ic);
     const email = (order.customer_email || "").trim();
     const address = order.customer_address || null;
     if (!name && !phone && !ic) return null;
@@ -9248,9 +9260,9 @@ async function findOrCreateCustomerForOrder(order) {
     // Identity match, strongest first: I/C (or passport) number, then phone.
     // I/C uniquely identifies a person even if the name is spelled differently.
     let existing = null;
-    if (ic) {
+    if (icNorm) {
       const { data } = await supabase.from("customers")
-        .select("id, ic_number, email").eq("company_id", company_id).eq("ic_number", ic).limit(1);
+        .select("id, ic_number, email").eq("company_id", company_id).eq("ic_number_normalized", icNorm).limit(1);
       existing = (data && data[0]) || null;
     }
     if (!existing && phone) {
