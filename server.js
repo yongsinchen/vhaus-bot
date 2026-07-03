@@ -8704,8 +8704,10 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
     const existingKeys = new Set((existing || []).map(p => variantKey(p.code, p.name, p.size, p.color)));
 
     // Build supplier name → id lookup for per-row supplier assignment
-    const { data: allSuppliers } = await supabase.from("suppliers").select("id, name").eq("company_id", company_id);
+    const { data: allSuppliers } = await supabase.from("suppliers").select("id, name, organization_supplier_id").eq("company_id", company_id);
     const supplierMap = new Map((allSuppliers || []).map(s => [s.name.toLowerCase(), s.id]));
+    // supplier row id → its shared org supplier id (for cross-company propagation)
+    const supOrgMap = new Map((allSuppliers || []).map(s => [s.id, s.organization_supplier_id]));
 
     // Build category name → id lookup; auto-create missing categories.
     //
@@ -8819,6 +8821,8 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
           orgProductId: orgProduct.id, code: row.product_code, name: row.product_name,
           size: row.size, color: row.color, is_customizable: row.is_customizable || false,
           categoryId: catalogueGroupId ? categoryId : null,
+          orgSupplierId: supplierId ? supOrgMap.get(supplierId) || null : null,
+          unit_cost: row.unit_cost, unit_price: row.unit_price,
         });
       }
       // Prevent two identical variants within the same batch from both inserting
@@ -8856,6 +8860,17 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
           for (const r of (data || [])) codeSet.add(slotKey(r.company_id, r.code, r.size, r.color, r.name));
         }
 
+        // Resolve each sibling company's own supplier row for the org suppliers
+        // used in this batch, so propagated rows carry the supplier (and appear
+        // under the supplier filter) in every company.
+        const sibSupMap = new Map(); // `${orgSupplierId}|${companyId}` -> supplierId
+        const orgSupIds = [...new Set(importedForPropagation.map(p => p.orgSupplierId).filter(Boolean))];
+        for (const osc of chunk(orgSupIds, 150)) {
+          const { data } = await supabase.from("suppliers").select("id, company_id, organization_supplier_id")
+            .in("organization_supplier_id", osc).in("company_id", siblingIds);
+          for (const r of (data || [])) sibSupMap.set(`${r.organization_supplier_id}|${r.company_id}`, r.id);
+        }
+
         const rows = [];
         for (const p of importedForPropagation) {
           const normCode = (p.code || "").toUpperCase();
@@ -8869,6 +8884,8 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
               company_id: s.id, code: normCode, name: p.name,
               color: p.color || null, size: p.size || null,
               organization_category_id: p.categoryId || null,
+              supplier_id: p.orgSupplierId ? (sibSupMap.get(`${p.orgSupplierId}|${s.id}`) || null) : null,
+              unit_cost: p.unit_cost ?? null, unit_price: p.unit_price ?? null,
               is_customizable: p.is_customizable === true, is_standard: true,
               reorder_point: 0, is_active: true, organization_product_id: p.orgProductId,
             });
@@ -8878,6 +8895,26 @@ app.post("/catalogue-import/:job_id/commit", requireRole(MANAGE_ROLES), async (r
           const batch = rows.slice(i, i + 100);
           const { error: propErr } = await supabase.from("products").insert(batch);
           if (propErr) console.error("[catalogue-import/commit] sibling propagation batch failed:", propErr.message);
+        }
+
+        // Ensure each imported product's org master has its default supplier link
+        // (drives the shared-supplier fallback + supplier consistency group-wide).
+        const orgDefault = new Map(); // orgProductId -> orgSupplierId
+        importedForPropagation.forEach(p => { if (p.orgSupplierId) orgDefault.set(p.orgProductId, p.orgSupplierId); });
+        if (orgDefault.size) {
+          const opIds = [...orgDefault.keys()];
+          const haveDef = new Set();
+          for (const c of chunk(opIds, 150)) {
+            const { data } = await supabase.from("organization_product_suppliers")
+              .select("organization_product_id").in("organization_product_id", c).eq("is_default", true);
+            (data || []).forEach(r => haveDef.add(r.organization_product_id));
+          }
+          const defRows = [];
+          for (const [op, os] of orgDefault) if (!haveDef.has(op)) defRows.push({ organization_product_id: op, organization_supplier_id: os, is_default: true, is_preferred: true });
+          for (let i = 0; i < defRows.length; i += 100) {
+            const { error } = await supabase.from("organization_product_suppliers").insert(defRows.slice(i, i + 100));
+            if (error) console.error("[catalogue-import/commit] org default supplier insert failed:", error.message);
+          }
         }
       }
     } catch (propErr) {
