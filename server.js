@@ -8044,6 +8044,10 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
       const orgId = await getCatalogueGroupAwareOrgId(req);
       if (orgId) {
         const sharedPatch = {};
+        // name is org-master-authoritative in composeProductView, so it MUST
+        // propagate to the master or the edit won't show (the read falls back to
+        // the master's old name).
+        if (name !== undefined && name.trim()) sharedPatch.name = name.trim();
         if (description !== undefined) sharedPatch.description = description || null;
         if (is_customizable !== undefined) sharedPatch.is_customizable = !!is_customizable;
         if (Object.keys(sharedPatch).length > 0) {
