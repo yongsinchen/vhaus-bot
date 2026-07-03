@@ -3707,7 +3707,7 @@ app.get("/customers", requireAuth, async (req, res) => {
     const { search, limit = 50 } = req.query;
     const cid = getActiveCompanyId(req);
     const searchFilter = search
-      ? `name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%${normalizeIc(search) ? `,ic_number_normalized.ilike.%${normalizeIc(search)}%` : ""}`
+      ? `name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%${normalizeIc(search) ? `,ic_number_normalized.ilike.%${normalizeIc(search)}%` : ""}${normalizePhone(search) ? `,phone_normalized.ilike.%${normalizePhone(search)}%` : ""}`
       : null;
     // Salesman: only show customers from their orders
     if (req.user.role === "salesman" && req.user.salesman_name) {
@@ -3763,9 +3763,10 @@ app.post("/customers", requireRole(MANAGE_ROLES), async (req, res) => {
       const { data: dupIc } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("ic_number_normalized", icNorm).limit(1);
       if (dupIc && dupIc[0]) return res.status(400).json({ error: `Customer with I/C ${ic_number.trim()} already exists: ${dupIc[0].name}`, existing: dupIc[0] });
     }
-    if (phone) {
-      const { data: dup } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("phone", phone.trim()).maybeSingle();
-      if (dup) return res.status(400).json({ error: `Customer with phone ${phone} already exists: ${dup.name}`, existing: dup });
+    const phoneNorm = normalizePhone(phone);
+    if (phoneNorm) {
+      const { data: dup } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("phone_normalized", phoneNorm).limit(1);
+      if (dup && dup[0]) return res.status(400).json({ error: `Customer with phone ${phone} already exists: ${dup[0].name}`, existing: dup[0] });
     }
     const { data, error } = await supabase.from("customers").insert({
       company_id: getActiveCompanyId(req), name: name.trim(), phone: phone?.trim() || null,
@@ -9246,6 +9247,11 @@ function normalizeIc(v) {
   return (v || "").replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
+// Digits-only phone — mirrors customers.phone_normalized (migration 027).
+function normalizePhone(v) {
+  return (v || "").replace(/[^0-9]/g, "");
+}
+
 async function findOrCreateCustomerForOrder(order) {
   try {
     const company_id = order.company_id;
@@ -9265,9 +9271,10 @@ async function findOrCreateCustomerForOrder(order) {
         .select("id, ic_number, email").eq("company_id", company_id).eq("ic_number_normalized", icNorm).limit(1);
       existing = (data && data[0]) || null;
     }
-    if (!existing && phone) {
+    const phoneNorm = normalizePhone(phone);
+    if (!existing && phoneNorm) {
       const { data } = await supabase.from("customers")
-        .select("id, ic_number, email").eq("company_id", company_id).eq("phone", phone).limit(1);
+        .select("id, ic_number, email").eq("company_id", company_id).eq("phone_normalized", phoneNorm).limit(1);
       existing = (data && data[0]) || null;
     }
     if (existing) {
