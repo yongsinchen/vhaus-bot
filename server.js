@@ -5255,8 +5255,8 @@ app.get("/company-settings", requireAuth, async (req, res) => {
 app.post("/company-settings", ...requirePerm(PERMS.COMPANY_EDIT_SETTINGS), async (req, res) => {
   try {
     const company_id = getActiveCompanyId(req);
-    const { company_name, registration_no, address, hotline, bank_account, branches_display, work_start, work_end, base_address, countries, sales_channels } = req.body;
-    const row = { company_id, company_name, registration_no, address, hotline, bank_account, branches_display, work_start: work_start || "09:00", work_end: work_end || "18:00", base_address, countries: countries || null, sales_channels: sales_channels || null, updated_at: new Date().toISOString() };
+    const { company_name, registration_no, address, hotline, bank_account, branches_display, work_start, work_end, base_address, countries, sales_channels, logo_url } = req.body;
+    const row = { company_id, company_name, registration_no, address, hotline, bank_account, branches_display, work_start: work_start || "09:00", work_end: work_end || "18:00", base_address, countries: countries || null, sales_channels: sales_channels || null, logo_url: logo_url ?? null, updated_at: new Date().toISOString() };
     const { data: existing } = await supabase.from("company_settings").select("id").eq("company_id", company_id).maybeSingle();
     let result;
     if (existing) {
@@ -5269,6 +5269,31 @@ app.post("/company-settings", ...requirePerm(PERMS.COMPANY_EDIT_SETTINGS), async
       result = data;
     }
     res.json({ settings: result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /company-settings/logo — upload a company logo, persist logo_url, return it
+app.post("/company-settings/logo", ...requirePerm(PERMS.COMPANY_EDIT_SETTINGS), upload.single("file"), async (req, res) => {
+  try {
+    const company_id = getActiveCompanyId(req);
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    const ext = (file.originalname.split(".").pop() || "png").toLowerCase();
+    const path = `company-logos/${company_id}/logo-${Date.now()}.${ext}`;
+    let publicUrl = null;
+    const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: true });
+    if (upErr) {
+      const { error: upErr2 } = await supabase.storage.from("catalogue-imports").upload(path, file.buffer, { contentType: file.mimetype, upsert: true });
+      if (upErr2) return res.status(500).json({ error: "Upload failed: " + upErr.message + " / fallback: " + upErr2.message });
+      publicUrl = supabase.storage.from("catalogue-imports").getPublicUrl(path).data?.publicUrl || null;
+    } else {
+      publicUrl = supabase.storage.from("order-attachments").getPublicUrl(path).data?.publicUrl || null;
+    }
+    // Persist onto company_settings (create row if none yet)
+    const { data: existing } = await supabase.from("company_settings").select("id").eq("company_id", company_id).maybeSingle();
+    if (existing) await supabase.from("company_settings").update({ logo_url: publicUrl, updated_at: new Date().toISOString() }).eq("id", existing.id);
+    else await supabase.from("company_settings").insert({ company_id, logo_url: publicUrl, updated_at: new Date().toISOString() });
+    res.json({ url: publicUrl });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -9293,7 +9318,7 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
     const ascending = sort_order === "asc";
 
     // Lightweight columns — NO items, payment_proofs, customer_signature
-    const listCols = "id, company_id, order_number, customer_name, customer_contact, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark";
+    const listCols = "id, company_id, order_number, customer_name, customer_contact, customer_id_type, customer_id_no, customer_email, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark";
 
     // Build count query + data query in parallel
     let countQ = supabase.from("sales_orders").select("id", { count: "exact", head: true }).eq("company_id", company_id);
@@ -9372,7 +9397,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const company_id = getActiveCompanyId(req);
     const { id: created_by, salesman_name, name } = req.user;
-    const { customer_name, customer_contact, customer_address, status, notes, items,
+    const { customer_name, customer_contact, customer_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel, order_date } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
@@ -9394,6 +9419,8 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
       .insert({
         company_id, order_number, customer_name,
         customer_contact: customer_contact || null, customer_address: customer_address || null,
+        customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
+        customer_email: customer_email || null,
         salesman_name: resolvedSalesman, status: status || "draft",
         branch_id: branch_id || null,
         order_date: order_date || getMalaysiaDate(),
@@ -9439,7 +9466,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const company_id = getActiveCompanyId(req);
     const { id } = req.params;
-    const { customer_name, customer_contact, customer_address, status, notes, items,
+    const { customer_name, customer_contact, customer_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel, order_date } = req.body;
 
@@ -9511,6 +9538,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const subtotal = (items || []).reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
     const updateData = {
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
+      customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
+      customer_email: customer_email || null,
       salesman_name: salesman_names || null, status: finalStatus, notes: notes || null, subtotal,
       branch_id: branch_id || null,
       order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
