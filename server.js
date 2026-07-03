@@ -3714,13 +3714,13 @@ app.get("/customers", requireAuth, async (req, res) => {
       const custIds = [...new Set((myOrders || []).map(o => o.customer_id).filter(Boolean))];
       if (custIds.length === 0) return res.json({ customers: [], total: 0 });
       let q = supabase.from("customers").select("*", { count: "exact" }).in("id", custIds).order("name").limit(Number(limit));
-      if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
+      if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%`);
       const { data, count } = await q;
       return res.json({ customers: data || [], total: count || 0 });
     }
     let q = supabase.from("customers").select("*", { count: "exact" }).order("name").limit(Number(limit));
     if (cid) q = q.eq("company_id", cid);
-    if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
+    if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%`);
     const { data, count, error } = await q;
     if (error) throw error;
     res.json({ customers: data || [], total: count || 0 });
@@ -3754,7 +3754,11 @@ app.post("/customers", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { name, phone, email, address, ic_number, company_name: custCompany, notes } = req.body;
     if (!name) return res.status(400).json({ error: "Name required" });
-    // Check duplicate by phone
+    // Duplicate check — I/C number first (strongest identity), then phone.
+    if (ic_number?.trim()) {
+      const { data: dupIc } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("ic_number", ic_number.trim()).limit(1);
+      if (dupIc && dupIc[0]) return res.status(400).json({ error: `Customer with I/C ${ic_number.trim()} already exists: ${dupIc[0].name}`, existing: dupIc[0] });
+    }
     if (phone) {
       const { data: dup } = await supabase.from("customers").select("id, name").eq("company_id", getActiveCompanyId(req)).eq("phone", phone.trim()).maybeSingle();
       if (dup) return res.status(400).json({ error: `Customer with phone ${phone} already exists: ${dup.name}`, existing: dup });
@@ -9236,15 +9240,37 @@ async function findOrCreateCustomerForOrder(order) {
     const company_id = order.company_id;
     const name = (order.customer_name || "").trim();
     const phone = (order.customer_contact || "").trim();
-    if (!name && !phone) return null;
-    if (phone) {
-      const { data: existing } = await supabase.from("customers")
-        .select("id").eq("company_id", company_id).eq("phone", phone).maybeSingle();
-      if (existing) return existing.id;
+    const ic = (order.customer_id_no || "").trim();
+    const email = (order.customer_email || "").trim();
+    const address = order.customer_address || null;
+    if (!name && !phone && !ic) return null;
+
+    // Identity match, strongest first: I/C (or passport) number, then phone.
+    // I/C uniquely identifies a person even if the name is spelled differently.
+    let existing = null;
+    if (ic) {
+      const { data } = await supabase.from("customers")
+        .select("id, ic_number, email").eq("company_id", company_id).eq("ic_number", ic).limit(1);
+      existing = (data && data[0]) || null;
     }
+    if (!existing && phone) {
+      const { data } = await supabase.from("customers")
+        .select("id, ic_number, email").eq("company_id", company_id).eq("phone", phone).limit(1);
+      existing = (data && data[0]) || null;
+    }
+    if (existing) {
+      // Backfill I/C and email onto an existing record that's missing them, so
+      // later purchases can be matched by I/C.
+      const patch = {};
+      if (ic && !existing.ic_number) patch.ic_number = ic;
+      if (email && !existing.email) patch.email = email;
+      if (Object.keys(patch).length) await supabase.from("customers").update(patch).eq("id", existing.id);
+      return existing.id;
+    }
+
     const { data: created, error } = await supabase.from("customers").insert({
-      company_id, name: name || phone, phone: phone || null,
-      address: order.customer_address || null,
+      company_id, name: name || phone || ic, phone: phone || null,
+      email: email || null, ic_number: ic || null, address,
     }).select("id").single();
     if (error) throw error;
     return created?.id || null;
