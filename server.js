@@ -2976,6 +2976,64 @@ const handleDOPhoto = async (chatId, base64Image, fromTelegramId = null) => {
 
 // ── Service Pending API ──────────────────────────────────────────
 
+// GET /dashboard/bootstrap — everything the dashboard needs from the backend
+// in ONE round-trip (the legacy orders themselves come via the frontend's
+// direct Supabase fetch). Replaces three separate startup calls:
+//   /services + /commission-summary + /operations/pending-counts
+// Each section is computed exactly like its standalone endpoint, which all
+// remain available and unchanged.
+app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
+    const isSalesman = roleKey === "salesman";
+
+    // 1. Services (legacy orders, type=Service) — same shape as GET /services
+    let svcQ = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT)
+      .eq("type", "Service").order("created_at", { ascending: false }).limit(500);
+    if (cid) svcQ = svcQ.eq("company_id", cid);
+
+    // 2. Ops badge counts — same as GET /operations/pending-counts
+    let spQ = supabase.from("service_pending").select("id", { count: "exact", head: true }).eq("status", "Pending");
+    let drQ = supabase.from("do_review").select("id", { count: "exact", head: true }).eq("status", "Pending");
+    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.eq("company_id", cid); }
+
+    // 3. Commission summary — only computed for salesmen (the only role whose
+    //    dashboard shows the stat card); same math as GET /commission-summary
+    const month = `${new Date().toISOString().slice(0, 7)}-01`;
+    const commissionPromise = (isSalesman && cid) ? (async () => {
+      const [{ data: elig }, { data: pend }] = await Promise.all([
+        supabase.from("commissions").select("id, commission_amt, status").eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid).eq("user_id", req.user.id),
+        supabase.from("commissions").select("id, commission_amt, status").eq("status", "pending").eq("company_id", cid).eq("user_id", req.user.id),
+      ]);
+      const comms = [...(elig || []), ...(pend || [])];
+      const ids = comms.map(c => c.id);
+      let adjustments = [], holds = [];
+      if (ids.length > 0) {
+        const [{ data: adjs }, { data: hs }] = await Promise.all([
+          supabase.from("commission_adjustments").select("commission_id, delta_amt").in("commission_id", ids),
+          supabase.from("wrong_item_holds").select("commission_id, held_amt, status").in("commission_id", ids),
+        ]);
+        adjustments = adjs || []; holds = hs || [];
+      }
+      let total = 0;
+      for (const c of comms) {
+        const adj = adjustments.filter(a => a.commission_id === c.id).reduce((s, a) => s + (Number(a.delta_amt) || 0), 0);
+        const hold = holds.filter(h => h.commission_id === c.id && h.status === "held").reduce((s, h) => s + (Number(h.held_amt) || 0), 0);
+        total += (Number(c.commission_amt) || 0) + adj - hold;
+      }
+      return { payout_month: month, total };
+    })() : Promise.resolve(null);
+
+    const [{ data: services }, { count: sp }, { count: dr }, commission] = await Promise.all([svcQ, spQ, drQ, commissionPromise]);
+    res.json({
+      services: services || [],
+      pending_counts: { service_pending: sp || 0, do_review: dr || 0 },
+      commission_summary: commission,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /operations/pending-counts — head-count only, for the sidebar badge.
 // Lets the app show the Operations badge at startup without fetching the
 // full service_pending + do_review row sets (those load when the page opens).
@@ -6543,7 +6601,7 @@ app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDE
       company_id: companyId, do_number: doNumber,
       sales_order_id: so.id, order_id: legacyOrder?.id || null,
       customer_id: legacyOrder?.customer_id || null,
-      delivery_address: so.customer_address || legacyOrder?.address || null,
+      delivery_address: so.delivery_address || so.customer_address || legacyOrder?.address || null,
       contact: so.customer_contact || legacyOrder?.contact || null,
       status: "draft", pick_status: "pending",
       delivery_date: delivery_date || null, remark: remark || null,
@@ -9076,7 +9134,7 @@ app.post("/sales-orders/:id/generate-do", requireRole(["master", "manager", "com
     const do_number = await nextDONumber(company_id);
     const { data: dn, error } = await supabase.from("delivery_notes").insert({
       company_id, do_number, sales_order_id: order.id,
-      customer_name: order.customer_name, customer_address: order.customer_address,
+      customer_name: order.customer_name, customer_address: order.delivery_address || order.customer_address,
       customer_contact: order.customer_contact, delivery_date: order.delivery_date,
       warehouse_id: warehouse_id || null, status: "pending",
       created_by: req.user.id,
@@ -9357,7 +9415,9 @@ async function syncSalesOrderToDelivery(order, items) {
       so_number: order.order_number,
       customer_name: order.customer_name,
       customer_id,
-      address: order.customer_address || null,
+      // Drivers and the delivery schedule read orders.address — use the
+      // deliver-to address when the order ships somewhere other than billing.
+      address: order.delivery_address || order.customer_address || null,
       contact: order.customer_contact || null,
       order_date: order.order_date || (order.created_at || new Date().toISOString()).slice(0, 10),
       salesman: order.salesman_name || null,
@@ -9483,7 +9543,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const company_id = getActiveCompanyId(req);
     const { id: created_by, salesman_name, name } = req.user;
-    const { customer_name, customer_contact, customer_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
+    const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel, order_date } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
@@ -9507,6 +9567,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         customer_contact: customer_contact || null, customer_address: customer_address || null,
         customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
         customer_email: customer_email || null,
+        delivery_address: delivery_address || null,
         salesman_name: resolvedSalesman, status: status || "draft",
         branch_id: branch_id || null,
         order_date: order_date || getMalaysiaDate(),
@@ -9552,7 +9613,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const company_id = getActiveCompanyId(req);
     const { id } = req.params;
-    const { customer_name, customer_contact, customer_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
+    const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
             delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel, order_date } = req.body;
 
@@ -9626,6 +9687,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
       customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
       customer_email: customer_email || null,
+      delivery_address: delivery_address || null,
       salesman_name: salesman_names || null, status: finalStatus, notes: notes || null, subtotal,
       branch_id: branch_id || null,
       order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
