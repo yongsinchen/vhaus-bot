@@ -14,6 +14,7 @@ const { composeProductView, composeSupplierView } = require("./lib/product-view-
 const doLib = require("./lib/delivery-orders");
 const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
+const { getCommissionableAmount } = require("./lib/commission");
 
 const app = express();
 
@@ -4144,7 +4145,7 @@ async function getCommCache(companyId) {
 
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
 async function calculateCommission(orderId, companyId) {
-  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type")
+  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type, country, address")
     .eq("id", orderId).single();
   if (!order) return;
   // Service orders are logistics-only and financially inert — never commissionable.
@@ -4159,7 +4160,11 @@ async function calculateCommission(orderId, companyId) {
   const gross = Number(order.order_amount) || 0;
   const totalPaid = gross - (Number(order.balance) || 0);
   const depositPct = gross > 0 ? (totalPaid / gross) * 100 : 0;
-  const net = gross;
+  // Commission base: Singapore orders are commissioned on the GST-exclusive
+  // amount (order_amount / 1.09); everyone else on the full amount. The
+  // deposit gate above stays on gross — payments are made against the full
+  // invoice amount.
+  const net = getCommissionableAmount(order);
   const channel = order.sales_channel || "branch";
 
   const cache = await getCommCache(companyId);
@@ -4197,15 +4202,18 @@ async function calculateCommission(orderId, companyId) {
     let monthlySales = cache.monthlySales[monthKey];
     if (monthlySales === undefined) {
       const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
-      const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman")
+      const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman, country, address")
         .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
         .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
       // Orders shared between multiple sales assistants count only this salesman's
       // fractional share toward their own monthly cumulative sales (and therefore
       // tier matching) — not the full order amount for every assistant on it.
+      // Singapore orders count GST-exclusive here too, so tier matching uses the
+      // same commissionable base as the commission itself.
       monthlySales = (monthOrders || []).reduce((s, o) => {
         const namesOnOrder = (o.salesman || "").split("/").map(n => n.trim()).filter(Boolean);
-        const share = namesOnOrder.length > 0 ? (Number(o.order_amount) || 0) / namesOnOrder.length : (Number(o.order_amount) || 0);
+        const commissionable = getCommissionableAmount(o);
+        const share = namesOnOrder.length > 0 ? commissionable / namesOnOrder.length : commissionable;
         return s + share;
       }, 0);
       cache.monthlySales[monthKey] = monthlySales;
@@ -9428,6 +9436,7 @@ async function syncSalesOrderToDelivery(order, items) {
       type: order.delivery_type || "Delivery",
       remark: order.remark || null,
       sales_channel: order.sales_channel || "branch",
+      country: order.country || null,
       status: deliveryStatusFromSO(order.status),
       items: JSON.stringify(deliveryItems),
     };
@@ -9550,6 +9559,15 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
     const subtotal = items.reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+
+    // E-invoice details are mandatory only for confirmed orders above RM10,000.
+    // The amount alone decides — manual/legacy SO numbers add no requirement of
+    // their own. Backend is the source of truth for this rule.
+    const einvTotal = subtotal - (Number(discount) || 0) + (gst_waived ? 0 : (Number(gst_amount) || 0));
+    if (status === "confirmed" && einvTotal > 10000 && (!customer_id_no?.trim() || !customer_email?.trim())) {
+      return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
+    }
+
     let order_number;
     if (customOrderNumber?.trim()) {
       const { data: dup } = await supabase.from("sales_orders").select("id").eq("company_id", company_id).eq("order_number", customOrderNumber.trim()).maybeSingle();
@@ -9683,6 +9701,15 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     }
 
     const subtotal = (items || []).reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+
+    // E-invoice rule on edits too: confirmed/delivered orders above RM10,000
+    // must carry e-invoice details (same rule as POST; backend is source of truth).
+    const einvSubtotal = Array.isArray(items) ? subtotal : (Number(existing.subtotal) || 0);
+    const einvTotal = einvSubtotal - (Number(discount) || 0) + (gst_waived ? 0 : (Number(gst_amount) || 0));
+    if (["confirmed", "delivered"].includes(status) && einvTotal > 10000 && (!customer_id_no?.trim() || !customer_email?.trim())) {
+      return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
+    }
+
     const updateData = {
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
       customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
@@ -9747,9 +9774,17 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
     const { status, cancel_reason } = req.body;
     // Only master/manager can re-confirm amended orders
     if (status === "confirmed") {
-      const { data: existing } = await supabase.from("sales_orders").select("status").eq("id", req.params.id).single();
+      const { data: existing } = await supabase.from("sales_orders")
+        .select("status, subtotal, discount, gst_amount, gst_waived, customer_id_no, customer_email")
+        .eq("id", req.params.id).single();
       if (existing?.status === "amended" && !["master", "manager"].includes(req.user.role)) {
         return res.status(403).json({ error: "Only manager can re-confirm amended orders" });
+      }
+      // E-invoice rule also guards direct status flips (dropdown confirm,
+      // amended re-approval) — same RM10,000 threshold as POST/PUT.
+      const einvTotal = (Number(existing?.subtotal) || 0) - (Number(existing?.discount) || 0) + (existing?.gst_waived ? 0 : (Number(existing?.gst_amount) || 0));
+      if (einvTotal > 10000 && (!existing?.customer_id_no || !existing?.customer_email)) {
+        return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
       }
     }
     // Cancel requires reason
