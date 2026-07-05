@@ -3765,8 +3765,19 @@ app.get("/customers", requireAuth, async (req, res) => {
   try {
     const { search, limit = 50 } = req.query;
     const cid = getActiveCompanyId(req);
+    // SO-number lookup: the customer page can find a customer by any of
+    // their orders' SO numbers (legacy orders carry the customer link; SOs
+    // sync there with so_number = order_number, so both eras are covered).
+    let soCustIds = [];
+    if (search) {
+      let soQ = supabase.from("orders").select("customer_id")
+        .ilike("so_number", `%${search}%`).not("customer_id", "is", null).limit(200);
+      if (cid) soQ = soQ.eq("company_id", cid);
+      const { data: soOrders } = await soQ;
+      soCustIds = [...new Set((soOrders || []).map(o => o.customer_id))];
+    }
     const searchFilter = search
-      ? `name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%${normalizeIc(search) ? `,ic_number_normalized.ilike.%${normalizeIc(search)}%` : ""}${normalizePhone(search) ? `,phone_normalized.ilike.%${normalizePhone(search)}%` : ""}`
+      ? `name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%,ic_number.ilike.%${search}%${normalizeIc(search) ? `,ic_number_normalized.ilike.%${normalizeIc(search)}%` : ""}${normalizePhone(search) ? `,phone_normalized.ilike.%${normalizePhone(search)}%` : ""}${soCustIds.length > 0 ? `,id.in.(${soCustIds.join(",")})` : ""}`
       : null;
     // Salesman: only show customers from their orders
     if (req.user.role === "salesman" && req.user.salesman_name) {
