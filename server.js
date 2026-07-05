@@ -8288,8 +8288,13 @@ app.post("/product-review-queue/link", ...requirePerm(PERMS.PRODUCTS_EDIT), asyn
   try {
     const { item_ids, product_id } = req.body;
     if (!Array.isArray(item_ids) || !product_id) return res.status(400).json({ error: "item_ids and product_id required" });
+    // Linking ONLY sets the link fields. It must never touch the order-level
+    // item data (custom_dimensions, size, color, qty, price, notes, arrival
+    // fields) — product master data and order item data are different things.
+    // is_custom stays as ordered so the item's options remain visible/editable;
+    // linked_custom_item records the link for display history.
     const { error } = await supabase.from("sales_order_items")
-      .update({ product_id, requires_product_review: false, is_custom: false })
+      .update({ product_id, requires_product_review: false, linked_custom_item: true })
       .in("id", item_ids);
     if (error) throw error;
     res.json({ ok: true, updated: item_ids.length });
@@ -8330,9 +8335,10 @@ app.post("/product-review-queue/create-and-link", ...requirePerm(PERMS.PRODUCTS_
       is_standard: true, is_active: true, organization_product_id: orgProductId,
     }).select("id").single();
     if (pErr) throw pErr;
-    // Link all items
+    // Link all items — link fields only; order-level item data stays untouched
+    // (same contract as POST /product-review-queue/link).
     await supabase.from("sales_order_items")
-      .update({ product_id: product.id, requires_product_review: false, is_custom: false })
+      .update({ product_id: product.id, requires_product_review: false, linked_custom_item: true })
       .in("id", item_ids);
 
     // Auto-propagate into the other companies in the catalogue group.
@@ -9528,6 +9534,19 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Merge linked product-master info onto review-linked items as `products`
+// (display only — the item's own ordered fields are never replaced).
+// Done in JS because sales_order_items.product_id has no FK in the DB, so
+// PostgREST cannot embed products directly.
+async function attachLinkedProducts(items) {
+  const ids = [...new Set((items || []).filter(i => i.product_id && i.linked_custom_item).map(i => i.product_id))];
+  if (ids.length === 0) return items;
+  const { data: prods } = await supabase.from("products").select("id, code, name").in("id", ids);
+  const map = new Map((prods || []).map(p => [p.id, { code: p.code, name: p.name }]));
+  for (const it of items || []) { if (map.has(it.product_id)) it.products = map.get(it.product_id); }
+  return items;
+}
+
 // GET /sales-orders/:id — full detail with items, proofs, signature
 app.get("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
@@ -9536,6 +9555,7 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
       .select("*, sales_order_items(*)")
       .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).single();
     if (error || !data) return res.status(404).json({ error: "Order not found" });
+    await attachLinkedProducts(data.sales_order_items);
     // Load legacy order for arrival data
     let legacyOrder = null;
     if (data.order_number) {
@@ -9615,11 +9635,13 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
       attachment_url: it.attachment_url || null,
       notes: it.notes || null,
       requires_product_review: !it.product_id ? true : false,
+      linked_custom_item: it.linked_custom_item === true,
     }));
     const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
     if (itemsErr) throw itemsErr;
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", order.id).single();
+    await attachLinkedProducts(full?.sales_order_items);
     await syncSalesOrderToDelivery(full, full.sales_order_items);
     res.status(201).json({ order: full });
   } catch (err) { console.error("POST /sales-orders error:", err); res.status(500).json({ error: err.message }); }
@@ -9740,12 +9762,16 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
         attachment_url: it.attachment_url || null, notes: it.notes || null,
         requires_product_review: !it.product_id ? true : false,
+        // Item edits delete+reinsert rows — the linked-custom flag must
+        // round-trip through the form or linking history is lost on edit.
+        linked_custom_item: it.linked_custom_item === true,
       }));
       const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
       if (itemsErr) throw itemsErr;
     }
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
+    await attachLinkedProducts(full?.sales_order_items);
     const deliveryOrderId = await syncSalesOrderToDelivery(full, full.sales_order_items);
     // Fold any recorded payments back into the paid/deposit + balance now that
     // the edited deposit/total has been written (sync set balance = total −
