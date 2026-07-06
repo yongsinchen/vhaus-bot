@@ -1359,6 +1359,130 @@ const handleScheduleCommand = async (chatId, text) => {
   await sendMessage(chatId, reply);
 };
 
+// ── Day-load helpers (salesman scheduling assistant) ─────────────
+// A date counts as "busy" at this many booked orders; override via env.
+const BUSY_DAY_THRESHOLD = Number(process.env.BUSY_DAY_THRESHOLD) || 8;
+
+// How loaded is a delivery date: booked orders, how many are still unassigned
+// to a lorry, and how many teams exist. "Unassigned" mirrors the
+// GET /delivery/unassigned definition (not in old routes nor new schedules).
+const getDayLoad = async (dateStr, companyId = null) => {
+  let ordQ = supabase.from("orders").select("id").eq("delivery_date", dateStr).not("status", "in", '("Delivered","Cancelled")');
+  if (companyId) ordQ = ordQ.eq("company_id", companyId);
+  let teamQ = supabase.from("delivery_teams").select("id", { count: "exact", head: true }).eq("team_date", dateStr);
+  if (companyId) teamQ = teamQ.eq("company_id", companyId);
+  const [{ data: orders }, { data: oldAssigned }, { data: newAssigned }, teamsRes] = await Promise.all([
+    ordQ,
+    supabase.from("delivery_route_orders").select("order_id, delivery_routes!inner(delivery_date)").eq("delivery_routes.delivery_date", dateStr),
+    supabase.from("delivery_schedules").select("order_id").eq("scheduled_date", dateStr),
+    teamQ,
+  ]);
+  const assignedIds = new Set([...(oldAssigned || []).map(a => a.order_id), ...(newAssigned || []).map(s => s.order_id)]);
+  const total = (orders || []).length;
+  const unassigned = (orders || []).filter(o => !assignedIds.has(o.id)).length;
+  return { date: dateStr, total, unassigned, teams: teamsRes.count || 0 };
+};
+
+// Rank the next N days by emptiness (fewest booked orders first).
+const suggestDeliveryDates = async (companyId = null, days = 7) => {
+  // UTC arithmetic on the Malaysia calendar date — toISOString on a local
+  // Date shifts a day on non-UTC servers.
+  const base = new Date(getMalaysiaDate() + "T00:00:00Z");
+  const dates = [];
+  for (let i = 1; i <= days; i++) {
+    const d = new Date(base); d.setUTCDate(d.getUTCDate() + i);
+    dates.push(d.toISOString().split("T")[0]);
+  }
+  const loads = await Promise.all(dates.map(ds => getDayLoad(ds, companyId)));
+  return loads.sort((a, b) => a.total - b.total || a.unassigned - b.unassigned);
+};
+
+const loadDot = (l) => l.total >= BUSY_DAY_THRESHOLD ? "🔴" : l.total >= Math.ceil(BUSY_DAY_THRESHOLD / 2) ? "🟡" : "🟢";
+
+// "2026-07-12" → "12/7/2026" (a chip the date parser understands, year-safe)
+const chipDate = (ds) => { const [y, m, d] = ds.split("-"); return `${Number(d)}/${Number(m)}/${y}`; };
+
+// ── Natural-language intent parsing (Telegram + web chat) ────────
+// Turns free text ("move 31006 to next friday", "where is 31006", "how busy
+// is tomorrow") into a structured intent. Any model failure returns
+// "unknown" so the rigid commands and menus keep working without it.
+const parseAssistantIntent = async (text) => {
+  const today = getMalaysiaDate();
+  const weekday = new Date(today + "T00:00:00Z").toLocaleDateString("en-MY", { weekday: "long", timeZone: "UTC" });
+  const prompt = `You are the intent parser for a furniture delivery scheduling assistant in Malaysia. Users are salesmen writing casual English/Malay/Chinese mixes.
+Today is ${today} (${weekday}).
+
+User message:
+"${text}"
+
+Classify into ONE intent and extract fields. Return ONLY a JSON object, no markdown:
+{"intent": "...", "so_number": "...", "date": "..."}
+
+Intents:
+- "schedule"     — wants to schedule/reschedule/move/postpone a delivery. Extract so_number if mentioned, and date if mentioned.
+- "order_status" — asks where an order is, its status, or when it delivers. Extract so_number.
+- "day_load"     — asks how busy/full/free a specific day is. Extract date.
+- "best_date"    — asks for the best/emptiest day(s) to deliver.
+- "help"         — greeting or asking what the assistant can do.
+- "unknown"      — anything else.
+
+Rules:
+- date must be strict YYYY-MM-DD resolved against today (${today}). "tomorrow"/"esok" = day after today. "next friday" = the first Friday after today. Ambiguous numeric dates are DD/MM. Omit the field when no date is given. Use "TBC" if the user says TBC/no date yet.
+- so_number: the order number token only (e.g. "31006"). Omit if absent.
+- Return valid JSON only.`;
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 120,
+    });
+    const raw = response.choices[0].message.content.trim().replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.intent !== "string") return { intent: "unknown" };
+    if (parsed.date && parsed.date !== "TBC" && !/^\d{4}-\d{2}-\d{2}$/.test(parsed.date)) delete parsed.date;
+    return parsed;
+  } catch (e) {
+    console.error("parseAssistantIntent:", e.message);
+    return { intent: "unknown" };
+  }
+};
+
+// Order status lookup ("where is SO 31006") shared by both channels.
+// Returns null when the SO is not found.
+const buildOrderStatusReply = async (soToken, companyId = null) => {
+  let q = supabase.from("orders")
+    .select("id, so_number, customer_name, status, delivery_date, time_slot, balance, items, type, salesman")
+    .eq("so_number", String(soToken).trim()).limit(1);
+  if (companyId) q = q.eq("company_id", companyId);
+  const { data: found } = await q;
+  const o = found?.[0];
+  if (!o) return null;
+  let items = [];
+  try { items = typeof o.items === "string" ? JSON.parse(o.items || "[]") : (o.items || []); } catch { items = []; }
+  const arrived = items.filter(i => i.arrivalDate).length;
+  const pending = items.filter(i => !i.arrivalDate).map(i => i.itemName).filter(Boolean);
+  return [
+    `📋 SO ${o.so_number} — ${o.customer_name || "-"}${o.type === "Service" ? " (Service)" : ""}`,
+    `Status: ${o.status || "-"}`,
+    `Delivery: ${o.delivery_date ? fmtDate(o.delivery_date) : "TBC"}${o.time_slot ? ` (${o.time_slot})` : ""}`,
+    o.salesman ? `Salesman: ${o.salesman}` : null,
+    items.length ? `Items arrived: ${arrived}/${items.length}${pending.length ? ` — pending: ${pending.slice(0, 3).join(", ")}${pending.length > 3 ? "…" : ""}` : ""}` : null,
+    parseFloat(o.balance) > 0 ? `🔴 Outstanding balance: RM ${o.balance}` : null,
+  ].filter(Boolean).join("\n");
+};
+
+const buildDateSuggestionMsg = (loads) => {
+  const lines = [
+    "📅 *Best delivery dates — next 7 days*",
+    "_Emptiest days first_",
+    "",
+    ...loads.map(l => `${loadDot(l)} *${fmtDate(l.date)}* — ${l.total} order${l.total === 1 ? "" : "s"} booked, ${l.unassigned} unassigned${l.teams ? `, ${l.teams} lorr${l.teams === 1 ? "y" : "ies"}` : ""}`),
+    "",
+    "_Reply *2* to reschedule an order to one of these dates._",
+  ];
+  return lines.join("\n");
+};
+
 // ── Handle /approve and /reject commands (OM only) ───────────────
 const handleApprovalCommand = async (chatId, userId, text) => {
   if (String(userId) !== OPERATION_MANAGER_ID) {
@@ -1420,8 +1544,10 @@ const showMenu = async (chatId, intro = "") => {
     "2\u{32}\u{FE0F}\u{20E3} Reschedule",
     "3\u{33}\u{FE0F}\u{20E3} Flag Wrong Order",
     "4\u{34}\u{FE0F}\u{20E3} Help",
+    "5\u{35}\u{FE0F}\u{20E3} Best Delivery Date",
     "",
-    "_Reply with a number or keyword_",
+    "_Reply with a number, or just type naturally —_",
+    "_e.g. \"move 31006 to next friday\", \"where is 31006\"_",
   ].filter(l => l !== null);
   await sendMessage(chatId, lines.join("\n"));
 };
@@ -1461,6 +1587,105 @@ const createTrips = async (soNumber, svNumber, totalTrips, deliveryDate = null) 
   }));
   const { error } = await supabase.from("order_trips").insert(trips);
   return error;
+};
+
+// ── Apply a reschedule date ───────────────────────────────────────
+// Shared by the reschedule waiting_date step and the busy-date confirm step.
+// Keeps the 2-working-day / confirmed-route OM approval gate.
+const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null) => {
+  const { soNumber, tripNo, tripId, orderId, currentDate, customerName, isTrip } = data;
+  const isTbc = newDate === "TBC";
+  const dbDate = isTbc ? null : newDate;
+  const displayDate = isTbc ? "TBC (no date set)" : fmtDate(newDate);
+  const loadLine = load ? `📊 That day: ${load.total} order${load.total === 1 ? "" : "s"} booked, ${load.unassigned} unassigned (before this one).\n` : "";
+
+  // ── 2-working-day rule check ──────────────────────────────
+  if (!isTbc && isWithinWorkingDays(newDate, 2)) {
+    // Check if date has a Confirmed route
+    const { data: confirmedRoutes } = await supabase
+      .from("delivery_routes")
+      .select("id, lorry_plate, driver_name")
+      .eq("delivery_date", newDate)
+      .eq("status", "Confirmed");
+
+    if (confirmedRoutes && confirmedRoutes.length > 0) {
+      const salesmanName = from?.first_name
+        ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
+        : (from?.username || "Unknown");
+
+      // Store pending approval
+      pendingApprovals.set(soNumber, {
+        isTrip, tripId, tripNo, orderId, newDate,
+        soNumber, customerName, salesmanName,
+        salesmanChatId: chatId,
+      });
+
+      clearSession(key);
+
+      // Tell salesman request is pending
+      await sendMessage(chatId,
+        `⚠️ *Approval Required*\n\n` +
+        `${fmtDate(newDate)} is within the next 2 working days and already has a *Confirmed* route.\n\n` +
+        `Your reschedule request for SO *${soNumber}* has been sent to the Operation Manager for approval.\n\n` +
+        `_You will be notified once approved or rejected._`
+      );
+
+      // Notify Operation Manager
+      const routeInfo = confirmedRoutes.map(r => `${r.lorry_plate || ""} ${r.driver_name || ""}`.trim()).join(", ");
+      await sendMessage(OPERATION_MANAGER_ID,
+        `🔔 *Reschedule Approval Needed*\n\n` +
+        `👤 Salesman: ${salesmanName}\n` +
+        `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
+        (isTrip ? `🔄 Trip ${tripNo}\n` : "") +
+        `📅 Requested date: *${fmtDate(newDate)}*\n\n` +
+        `⚠️ This date already has a Confirmed route: ${routeInfo}\n\n` +
+        `Reply:\n` +
+        `✅ /approve ${soNumber} — to approve\n` +
+        `❌ /reject ${soNumber} — to reject`
+      );
+      return;
+    }
+  }
+
+  // No confirmed route conflict — apply directly
+  if (isTrip) {
+    const updatePayload = { scheduled_date: dbDate };
+    if (isTbc) updatePayload.status = "Scheduled";
+    const { error } = await supabase.from("order_trips").update(updatePayload).eq("id", tripId);
+    if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return; }
+    if (tripNo === 1) {
+      await supabase.from("orders").update({ delivery_date: dbDate }).eq("so_number", soNumber);
+    }
+    clearSession(key);
+    await sendMessage(chatId,
+      `✅ *Trip ${isTbc ? "Set to TBC" : "Rescheduled"}*\n\n` +
+      `📋 SO: ${soNumber} — Trip ${tripNo}\n` +
+      `📅 Old date: ${fmtDate(currentDate)}\n` +
+      `📅 New date: *${displayDate}*\n` +
+      loadLine + `\n` +
+      (tripNo === 1 ? `_Delivery date on order updated to match._\n` : "") +
+      `_Delivery schedule has been updated._`
+    );
+  } else {
+    const { data: existingOrder } = await supabase.from("orders").select("remark").eq("id", orderId).single();
+    const updatedRemark = isTbc && existingOrder
+      ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
+      : existingOrder?.remark;
+    const { error } = await supabase.from("orders").update({
+      delivery_date: dbDate,
+      ...(isTbc && { remark: updatedRemark })
+    }).eq("id", orderId);
+    if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return; }
+    clearSession(key);
+    await sendMessage(chatId,
+      `✅ *Delivery Date ${isTbc ? "Set to TBC" : "Updated"}*\n\n` +
+      `📋 SO: ${soNumber}${customerName ? ` — ${customerName}` : ""}\n` +
+      `📅 Old date: ${fmtDate(currentDate)}\n` +
+      `📅 New date: *${displayDate}*\n` +
+      loadLine + `\n` +
+      `_Delivery schedule has been updated._`
+    );
+  }
 };
 
 // ── Handle session input (guided menu router) ─────────────────────
@@ -1598,104 +1823,45 @@ Reply YES / CANCEL or correct again.`);
     }
 
 
-     // step: waiting_date
-     if (session.step === "waiting_date") {
-       const newDate = parseDateInput(text);
-       if (!newDate) {
-         await sendMessage(chatId, `⚠️ Could not understand date: "${text}"\nPlease use format like: 5/3, 5/3/2026, tmr, or TBC`);
-         return true;
+     // step: waiting_date / confirm_busy_date — the busy-day gate: before a
+     // date is applied the bot checks how loaded that day already is (booked
+     // orders + how many are still unassigned to lorries). Busy days need a
+     // YES confirm and the bot suggests emptier days instead.
+     if (session.step === "waiting_date" || session.step === "confirm_busy_date") {
+       let newDate;
+       if (session.step === "confirm_busy_date" && ["yes", "confirm", "ok"].includes(text.trim().toLowerCase())) {
+         newDate = session.data.pendingDate;
+       } else {
+         newDate = parseDateInput(text);
+         if (!newDate) {
+           await sendMessage(chatId, session.step === "confirm_busy_date"
+             ? `⚠️ Reply *YES* to keep ${fmtDate(session.data.pendingDate)}, send a different date, or *cancel*.`
+             : `⚠️ Could not understand date: "${text}"\nPlease use format like: 5/3, 5/3/2026, tmr, or TBC`);
+           return true;
+         }
        }
 
-       const { soNumber, tripNo, tripId, orderId, currentDate, customerName, isTrip } = session.data;
-       const isTbc = newDate === "TBC";
-       const dbDate = isTbc ? null : newDate;
-       const displayDate = isTbc ? "TBC (no date set)" : fmtDate(newDate);
-
-       // ── 2-working-day rule check ──────────────────────────────
-       if (!isTbc && isWithinWorkingDays(newDate, 2)) {
-         // Check if date has a Confirmed route
-         const { data: confirmedRoutes } = await supabase
-           .from("delivery_routes")
-           .select("id, lorry_plate, driver_name")
-           .eq("delivery_date", newDate)
-           .eq("status", "Confirmed");
-
-         if (confirmedRoutes && confirmedRoutes.length > 0) {
-           const salesmanName = from?.first_name
-             ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
-             : (from?.username || "Unknown");
-
-           // Store pending approval
-           pendingApprovals.set(soNumber, {
-             isTrip, tripId, tripNo, orderId, newDate,
-             soNumber, customerName, salesmanName,
-             salesmanChatId: chatId,
-           });
-
-           clearSession(key);
-
-           // Tell salesman request is pending
+       let load = null;
+       if (newDate !== "TBC") {
+         const tgUser = await getTelegramUser(userId);
+         const companyId = tgUser?.company_id || null;
+         load = await getDayLoad(newDate, companyId);
+         const alreadyConfirmed = session.step === "confirm_busy_date" && newDate === session.data.pendingDate;
+         if (load.total >= BUSY_DAY_THRESHOLD && !alreadyConfirmed) {
+           const alternatives = (await suggestDeliveryDates(companyId, 7)).filter(l => l.date !== newDate).slice(0, 3);
+           setSession(key, "reschedule", "confirm_busy_date", { ...session.data, pendingDate: newDate });
            await sendMessage(chatId,
-             `⚠️ *Approval Required*\n\n` +
-             `${fmtDate(newDate)} is within the next 2 working days and already has a *Confirmed* route.\n\n` +
-             `Your reschedule request for SO *${soNumber}* has been sent to the Operation Manager for approval.\n\n` +
-             `_You will be notified once approved or rejected._`
-           );
-
-           // Notify Operation Manager
-           const routeInfo = confirmedRoutes.map(r => `${r.lorry_plate || ""} ${r.driver_name || ""}`.trim()).join(", ");
-           await sendMessage(OPERATION_MANAGER_ID,
-             `🔔 *Reschedule Approval Needed*\n\n` +
-             `👤 Salesman: ${salesmanName}\n` +
-             `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
-             (isTrip ? `🔄 Trip ${tripNo}\n` : "") +
-             `📅 Requested date: *${fmtDate(newDate)}*\n\n` +
-             `⚠️ This date already has a Confirmed route: ${routeInfo}\n\n` +
-             `Reply:\n` +
-             `✅ /approve ${soNumber} — to approve\n` +
-             `❌ /reject ${soNumber} — to reject`
+             `⚠️ *${fmtDate(newDate)} is a busy day*\n\n` +
+             `📦 ${load.total} orders already booked — *${load.unassigned} still unassigned* to lorries.\n\n` +
+             `*Emptier days:*\n` +
+             alternatives.map(l => `${loadDot(l)} ${fmtDate(l.date)} — ${l.total} order${l.total === 1 ? "" : "s"} booked`).join("\n") +
+             `\n\nReply *YES* to keep ${fmtDate(newDate)} anyway, send a different date, or *cancel*.`
            );
            return true;
          }
        }
 
-       // No confirmed route conflict — apply directly
-       if (isTrip) {
-         const updatePayload = { scheduled_date: dbDate };
-         if (isTbc) updatePayload.status = "Scheduled";
-         const { error } = await supabase.from("order_trips").update(updatePayload).eq("id", tripId);
-         if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
-         if (tripNo === 1) {
-           await supabase.from("orders").update({ delivery_date: dbDate }).eq("so_number", soNumber);
-         }
-         clearSession(key);
-         await sendMessage(chatId,
-           `✅ *Trip ${isTbc ? "Set to TBC" : "Rescheduled"}*\n\n` +
-           `📋 SO: ${soNumber} — Trip ${tripNo}\n` +
-           `📅 Old date: ${fmtDate(currentDate)}\n` +
-           `📅 New date: *${displayDate}*\n\n` +
-           (tripNo === 1 ? `_Delivery date on order updated to match._\n` : "") +
-           `_Delivery schedule has been updated._`
-         );
-       } else {
-         const { data: existingOrder } = await supabase.from("orders").select("remark").eq("id", orderId).single();
-         const updatedRemark = isTbc && existingOrder
-           ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
-           : existingOrder?.remark;
-         const { error } = await supabase.from("orders").update({
-           delivery_date: dbDate,
-           ...(isTbc && { remark: updatedRemark })
-         }).eq("id", orderId);
-         if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return true; }
-         clearSession(key);
-         await sendMessage(chatId,
-           `✅ *Delivery Date ${isTbc ? "Set to TBC" : "Updated"}*\n\n` +
-           `📋 SO: ${soNumber}${customerName ? ` — ${customerName}` : ""}\n` +
-           `📅 Old date: ${fmtDate(currentDate)}\n` +
-           `📅 New date: *${displayDate}*\n\n` +
-           `_Delivery schedule has been updated._`
-         );
-       }
+       await applyRescheduleDate(chatId, key, from, session.data, newDate, load);
        return true;
      }
    }
@@ -5151,6 +5317,221 @@ app.get("/supplier-dos/:id", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Web Delivery Assistant (chat) ─────────────────────────────────
+// Web version of the Telegram scheduling flow for salesmen/managers:
+// reschedule an order with the same busy-day gate and day-load check,
+// rank the emptiest upcoming days, and report a specific day's load.
+// Session state reuses the bot session store, keyed per web user.
+// Replies are plain text plus `suggestions` (quick-reply chips).
+app.post("/assistant/chat", requireAuth, async (req, res) => {
+  try {
+    if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const companyId = getActiveCompanyId(req);
+    const key = `web:${req.user.id}`;
+    const text = String(req.body.message || "").trim();
+    const lower = text.toLowerCase();
+    const isManager = MANAGE_ROLES.includes(req.user.role);
+    const reply = (msg, suggestions = []) => res.json({ reply: msg, suggestions });
+
+    const HELP = [
+      "I can help you schedule deliveries. Try:",
+      "• Type an SO number (e.g. 31006) to reschedule that order",
+      "• \"best date\" — emptiest delivery days in the next 7 days",
+      "• \"load 15/7\" — how busy a specific day is",
+      "• Or just ask naturally — \"move 31006 to next Friday\", \"where is 31006\", \"how busy is tomorrow\"",
+      "• \"cancel\" — start over",
+    ].join("\n");
+
+    if (!text) return reply(HELP, ["best date"]);
+    if (lower === "cancel") { clearSession(key); return reply("Cancelled.\n\n" + HELP, ["best date"]); }
+    if (["help", "menu", "hi", "hello", "/start"].includes(lower)) { clearSession(key); return reply(HELP, ["best date"]); }
+
+    // Best-date suggestions (works any time, keeps any active session)
+    if (/^(best|suggest)/.test(lower) || lower === "/bestdate") {
+      const loads = await suggestDeliveryDates(companyId, 7);
+      return reply([
+        "Best delivery dates — next 7 days (emptiest first):",
+        "",
+        ...loads.map(l => `${loadDot(l)} ${fmtDate(l.date)} — ${l.total} order${l.total === 1 ? "" : "s"} booked, ${l.unassigned} unassigned${l.teams ? `, ${l.teams} lorr${l.teams === 1 ? "y" : "ies"}` : ""}`),
+        "",
+        "Type an SO number to schedule an order onto one of these days.",
+      ].join("\n"), loads.slice(0, 3).map(l => chipDate(l.date)));
+    }
+
+    const session = getSession(key);
+
+    // Process a chosen date for a scheduling session: busy-day gate, OM
+    // approval rule, then apply. `step` distinguishes first ask vs confirm.
+    const processDate = async (data, step, newDate) => {
+      const { soNumber, orderId, currentDate, customerName, isMultiTrip } = data;
+      const isTbc = newDate === "TBC";
+      let load = null;
+
+      if (!isTbc) {
+        load = await getDayLoad(newDate, companyId);
+        const alreadyConfirmed = step === "confirm_busy" && newDate === data.pendingDate;
+        if (load.total >= BUSY_DAY_THRESHOLD && !alreadyConfirmed) {
+          const alternatives = (await suggestDeliveryDates(companyId, 7)).filter(l => l.date !== newDate).slice(0, 3);
+          setSession(key, "web_schedule", "confirm_busy", { ...data, pendingDate: newDate });
+          return reply([
+            `⚠️ ${fmtDate(newDate)} is a busy day: ${load.total} orders booked, ${load.unassigned} still unassigned to lorries.`,
+            "",
+            "Emptier days:",
+            ...alternatives.map(l => `${loadDot(l)} ${fmtDate(l.date)} — ${l.total} order${l.total === 1 ? "" : "s"} booked`),
+            "",
+            `Reply YES to keep ${fmtDate(newDate)} anyway, or send a different date.`,
+          ].join("\n"), ["YES", ...alternatives.map(l => chipDate(l.date)), "cancel"]);
+        }
+
+        // OM approval rule for salesmen (managers can already change dates
+        // freely in the web UI, so the chat doesn't gate them either).
+        if (!isManager && isWithinWorkingDays(newDate, 2)) {
+          const { data: confirmedRoutes } = await supabase.from("delivery_routes")
+            .select("id, lorry_plate, driver_name").eq("delivery_date", newDate).eq("status", "Confirmed");
+          if (confirmedRoutes && confirmedRoutes.length > 0) {
+            const salesmanName = req.user.salesman_name || req.user.name || "Web user";
+            pendingApprovals.set(soNumber, {
+              isTrip: false, orderId, newDate, soNumber, customerName, salesmanName, salesmanChatId: null,
+            });
+            clearSession(key);
+            const routeInfo = confirmedRoutes.map(r => `${r.lorry_plate || ""} ${r.driver_name || ""}`.trim()).join(", ");
+            await sendMessage(OPERATION_MANAGER_ID,
+              `🔔 *Reschedule Approval Needed* _(from web chat)_\n\n` +
+              `👤 Salesman: ${salesmanName}\n` +
+              `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
+              `📅 Requested date: *${fmtDate(newDate)}*\n\n` +
+              `⚠️ This date already has a Confirmed route: ${routeInfo}\n\n` +
+              `Reply:\n✅ /approve ${soNumber} — to approve\n❌ /reject ${soNumber} — to reject`
+            ).catch(e => console.error("assistant OM notify:", e.message));
+            return reply(`⚠️ ${fmtDate(newDate)} is within the next 2 working days and already has a confirmed lorry route.\n\nYour request for SO ${soNumber} was sent to the Operation Manager for approval. The date will change once approved.`);
+          }
+        }
+      }
+
+      const dbDate = isTbc ? null : newDate;
+      const { data: existingOrder } = await supabase.from("orders").select("remark").eq("id", orderId).single();
+      const updatedRemark = isTbc && existingOrder
+        ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
+        : existingOrder?.remark;
+      const { error } = await supabase.from("orders").update({
+        delivery_date: dbDate,
+        ...(isTbc && { remark: updatedRemark }),
+      }).eq("id", orderId);
+      if (error) return reply(`❌ Failed to update: ${error.message}`);
+      // Multi-trip orders: keep trip 1 in step with the order's delivery date
+      // (same behaviour as the Telegram trip-1 reschedule).
+      if (isMultiTrip) {
+        await supabase.from("order_trips").update({ scheduled_date: dbDate }).eq("so_number", soNumber).eq("trip_no", 1);
+      }
+      clearSession(key);
+      return reply([
+        `✅ SO ${soNumber}${customerName ? ` — ${customerName}` : ""} ${isTbc ? "set to TBC (no date)" : `scheduled for ${fmtDate(newDate)}`}.`,
+        `Old date: ${fmtDate(currentDate)}`,
+        load ? `That day: ${load.total} order${load.total === 1 ? "" : "s"} booked, ${load.unassigned} unassigned (before this one).` : null,
+        isMultiTrip ? "Note: this is a multi-trip order — trip 1 was updated; manage other trips via the delivery schedule." : null,
+      ].filter(Boolean).join("\n"), ["best date"]);
+    };
+
+    // Look up an SO and open a scheduling session. Replies + returns null on
+    // failure; returns the session data when ready for a date.
+    const beginSchedule = async (soToken) => {
+      let q = supabase.from("orders")
+        .select("id, so_number, customer_name, delivery_date, type, status, is_multi_trip")
+        .eq("so_number", String(soToken).trim()).in("type", ["Delivery", "Service"]).limit(1);
+      if (companyId) q = q.eq("company_id", companyId);
+      const { data: found } = await q;
+      const order = found?.[0];
+      if (!order) { reply(`SO ${soToken} not found. Check the number and try again, or type "help".`); return null; }
+      if (["Delivered", "Cancelled"].includes(order.status)) { reply(`SO ${order.so_number} is already ${order.status} — it can't be rescheduled.`); return null; }
+      const data = {
+        soNumber: order.so_number, orderId: order.id, currentDate: order.delivery_date,
+        customerName: order.customer_name, isMultiTrip: order.is_multi_trip === true,
+      };
+      setSession(key, "web_schedule", "waiting_date", data);
+      return data;
+    };
+
+    const askForDate = async (data) => {
+      const upcoming = (await suggestDeliveryDates(companyId, 7)).slice(0, 3);
+      return reply([
+        `SO ${data.soNumber} — ${data.customerName || ""}`,
+        `Currently scheduled: ${fmtDate(data.currentDate)}`,
+        "",
+        "When should it be delivered? (e.g. 15/7, tmr, TBC)",
+        "",
+        "Emptiest upcoming days:",
+        ...upcoming.map(l => `${loadDot(l)} ${fmtDate(l.date)} — ${l.total} order${l.total === 1 ? "" : "s"} booked`),
+      ].join("\n"), [...upcoming.map(l => chipDate(l.date)), "TBC", "cancel"]);
+    };
+
+    // Active scheduling session — the message is a date (or YES on busy confirm)
+    if (session?.mode === "web_schedule" && (session.step === "waiting_date" || session.step === "confirm_busy")) {
+      let newDate;
+      if (session.step === "confirm_busy" && ["yes", "confirm", "ok"].includes(lower)) {
+        newDate = session.data.pendingDate;
+      } else {
+        newDate = parseDateInput(text);
+        if (!newDate) {
+          return reply(session.step === "confirm_busy"
+            ? `Reply YES to keep ${fmtDate(session.data.pendingDate)}, send a different date, or "cancel".`
+            : "I couldn't understand that date. Try formats like 15/7, 15/7/2026, tmr, or TBC.",
+            session.step === "confirm_busy" ? ["YES", "cancel"] : ["cancel"]);
+        }
+      }
+      return processDate(session.data, session.step, newDate);
+    }
+
+    // Day load: "load 15/7" or a bare date
+    const loadMatch = lower.match(/^load\s+(.+)$/);
+    if (loadMatch || (parseDateInput(text) && parseDateInput(text) !== "TBC")) {
+      const ds = parseDateInput(loadMatch ? loadMatch[1] : text);
+      if (!ds || ds === "TBC") return reply('Which date? e.g. "load 15/7"');
+      const l = await getDayLoad(ds, companyId);
+      return reply(`${loadDot(l)} ${fmtDate(l.date)}\n${l.total} order${l.total === 1 ? "" : "s"} booked, ${l.unassigned} unassigned, ${l.teams} lorr${l.teams === 1 ? "y" : "ies"} assigned.`, ["best date"]);
+    }
+
+    // Bare SO number → start a scheduling session (must contain a digit so
+    // plain words fall through to the natural-language parser)
+    if (/^(?=.*\d)[\w-]+$/.test(text)) {
+      const data = await beginSchedule(text);
+      if (data) await askForDate(data);
+      return;
+    }
+
+    // ── Natural language fallback (shared intent parser with Telegram) ──
+    const intent = await parseAssistantIntent(text);
+    if (intent.intent === "best_date") {
+      const loads = await suggestDeliveryDates(companyId, 7);
+      return reply([
+        "Best delivery dates — next 7 days (emptiest first):",
+        "",
+        ...loads.map(l => `${loadDot(l)} ${fmtDate(l.date)} — ${l.total} order${l.total === 1 ? "" : "s"} booked, ${l.unassigned} unassigned`),
+      ].join("\n"), loads.slice(0, 3).map(l => chipDate(l.date)));
+    }
+    if (intent.intent === "day_load" && intent.date && intent.date !== "TBC") {
+      const l = await getDayLoad(intent.date, companyId);
+      return reply(`${loadDot(l)} ${fmtDate(l.date)}\n${l.total} order${l.total === 1 ? "" : "s"} booked, ${l.unassigned} unassigned, ${l.teams} lorr${l.teams === 1 ? "y" : "ies"} assigned.`, ["best date"]);
+    }
+    if (intent.intent === "order_status" && intent.so_number) {
+      const msg = await buildOrderStatusReply(intent.so_number, companyId);
+      return reply(msg || `SO ${intent.so_number} not found.`, msg ? [intent.so_number, "best date"] : []);
+    }
+    if (intent.intent === "schedule") {
+      if (!intent.so_number) return reply("Which SO number do you want to schedule?");
+      const data = await beginSchedule(intent.so_number);
+      if (!data) return;
+      if (intent.date) return processDate(data, "waiting_date", intent.date);
+      return askForDate(data);
+    }
+    if (intent.intent === "help") { clearSession(key); return reply(HELP, ["best date"]); }
+
+    return reply("Sorry, I didn't understand that.\n\n" + HELP, ["best date"]);
+  } catch (err) {
+    console.error("POST /assistant/chat error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Telegram Webhook ──────────────────────────────────────────────
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200);
@@ -5242,6 +5623,53 @@ Please contact your manager to set up your account.`);
         return;
       }
       if (["4", "help", "/help", "/start", "menu", "hi", "hello"].includes(lower)) {
+        clearSession(draftKey);
+        await showMenu(chatId);
+        return;
+      }
+      if (["5", "best date", "bestdate", "/bestdate", "suggest", "suggest date"].includes(lower)) {
+        clearSession(draftKey);
+        await sendMessage(chatId, "📊 Checking the next 7 days…");
+        const loads = await suggestDeliveryDates(message._telegramUser?.company_id || null, 7);
+        await sendMessage(chatId, buildDateSuggestionMsg(loads));
+        return;
+      }
+
+      // ── Natural language fallback (shared intent parser with web chat) ──
+      const intent = await parseAssistantIntent(text);
+      const nlCompanyId = message._telegramUser?.company_id || null;
+      if (intent.intent === "best_date") {
+        const loads = await suggestDeliveryDates(nlCompanyId, 7);
+        await sendMessage(chatId, buildDateSuggestionMsg(loads));
+        return;
+      }
+      if (intent.intent === "day_load" && intent.date && intent.date !== "TBC") {
+        const l = await getDayLoad(intent.date, nlCompanyId);
+        await sendMessage(chatId, `${loadDot(l)} *${fmtDate(l.date)}*\n${l.total} order${l.total === 1 ? "" : "s"} booked, ${l.unassigned} unassigned, ${l.teams} lorr${l.teams === 1 ? "y" : "ies"} assigned.`);
+        return;
+      }
+      if (intent.intent === "order_status" && intent.so_number) {
+        const statusMsg = await buildOrderStatusReply(intent.so_number, nlCompanyId);
+        await sendMessage(chatId, statusMsg || `❌ SO *${intent.so_number}* not found.`);
+        return;
+      }
+      if (intent.intent === "schedule") {
+        // Enter the existing reschedule flow (keeps the busy-day gate and OM
+        // approval); when the message already carried a date, feed it through
+        // the same session steps immediately.
+        setSession(draftKey, "reschedule", "waiting_so", {});
+        if (!intent.so_number) {
+          await sendMessage(chatId, "📅 *Reschedule*\n\nWhich SO number do you want to schedule?\n\nType *cancel* to go back.");
+          return;
+        }
+        await handleSession(chatId, userId, intent.so_number, message.from);
+        const nlSess = getSession(draftKey);
+        if (intent.date && nlSess?.mode === "reschedule" && nlSess.step === "waiting_date") {
+          await handleSession(chatId, userId, intent.date === "TBC" ? "TBC" : chipDate(intent.date), message.from);
+        }
+        return;
+      }
+      if (intent.intent === "help") {
         clearSession(draftKey);
         await showMenu(chatId);
         return;
