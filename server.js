@@ -3783,14 +3783,14 @@ app.get("/salesman-names", requireRole(ORDER_ROLES), async (req, res) => {
     if (!cid) return res.json({ salesmen: [] });
 
     const { data: primaryUsers } = await supabase.from("users")
-      .select("id, name, salesman_name").eq("company_id", cid).eq("is_active", true).not("salesman_name", "is", null);
+      .select("id, name, salesman_name, branch_id").eq("company_id", cid).eq("is_active", true).not("salesman_name", "is", null);
     const { data: accessRows } = await supabase.from("user_company_access")
       .select("user_id").eq("company_id", cid).eq("is_active", true).is("deleted_at", null);
     const accessUserIds = (accessRows || []).map(a => a.user_id);
     let accessUsers = [];
     if (accessUserIds.length > 0) {
       const { data } = await supabase.from("users")
-        .select("id, name, salesman_name").in("id", accessUserIds).eq("is_active", true).not("salesman_name", "is", null);
+        .select("id, name, salesman_name, branch_id").in("id", accessUserIds).eq("is_active", true).not("salesman_name", "is", null);
       accessUsers = data || [];
     }
     const seen = new Set();
@@ -3800,6 +3800,11 @@ app.get("/salesman-names", requireRole(ORDER_ROLES), async (req, res) => {
       seen.add(u.id);
       salesmen.push(u);
     }
+    // Resolve branch names so the order form can group the picker by branch.
+    const { data: branchRows } = await supabase.from("branches").select("id, name").eq("company_id", cid);
+    const branchMap = {};
+    (branchRows || []).forEach(b => { branchMap[b.id] = b.name; });
+    salesmen.forEach(u => { u.branch_name = u.branch_id ? (branchMap[u.branch_id] || null) : null; });
     salesmen.sort((a, b) => (a.salesman_name || "").localeCompare(b.salesman_name || ""));
     res.json({ salesmen });
   } catch (err) { res.status(500).json({ error: err.message }); }
