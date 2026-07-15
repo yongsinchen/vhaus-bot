@@ -376,6 +376,73 @@ async function syncSharedProductSupplier(req, orgProductId, orgSupplierId) {
   }
 }
 
+// Reusable custom items (feedback item 4): when a salesman explicitly ticks
+// "Save as reusable" on a custom order line (item.save_as_reusable === true),
+// create a company-scoped product row from that line so it is immediately
+// pickable on future orders. Unlike POST /products and
+// /product-review-queue/create-and-link, this path is NOT admin-gated — it is
+// reachable from POST/PUT /sales-orders by any user who can create orders —
+// so the resulting row starts as review_status:'pending' (visible company-wide,
+// but not yet curated: no category/supplier/cost, no organization-master link)
+// until an admin approves it via POST /product-review-queue/approve-pending.
+//
+// Company-level kill switch: companies.custom_item_self_service_enabled
+// (migration 032, default true). When explicitly false, this is a no-op and
+// the item is left exactly as it would have been without the flag (custom,
+// unlinked, requires_product_review as usual).
+//
+// Dedup: relies on the existing (company_id, code, size, color, lower(name))
+// unique index (migration 018). On a 23505 collision — another line, another
+// order, or a concurrent request already created the same slot — this looks
+// up the existing row and links to that instead of erroring the order.
+//
+// Returns the product id to link the order item to, or null if the flag
+// wasn't set, self-service is disabled, or the item had no usable name.
+// Never throws for expected conditions; only rethrows unexpected DB errors so
+// the caller can log-and-continue rather than fail the whole order write.
+async function maybeCreateReusableProduct(companyId, userId, it) {
+  if (!companyId || it?.save_as_reusable !== true) return null;
+
+  const { data: comp } = await supabase.from("companies")
+    .select("custom_item_self_service_enabled").eq("id", companyId).maybeSingle();
+  if (comp && comp.custom_item_self_service_enabled === false) return null;
+
+  const name = (it.product_name || "").trim();
+  if (!name) return null;
+  const code = (it.product_code || name.substring(0, 20)).toUpperCase().replace(/\s+/g, "-").trim();
+  if (!code) return null;
+  const size = it.size || null;
+  const color = it.color || null;
+
+  const { data: product, error } = await supabase.from("products").insert({
+    company_id: companyId, code, name,
+    size, color, description: null,
+    supplier_id: null, category_id: null,
+    unit_cost: null, unit_price: it.unit_price ?? null,
+    is_standard: true, is_customizable: false, is_active: true,
+    organization_product_id: null,
+    review_status: "pending", created_by: userId || null,
+  }).select("id").single();
+  if (!error) return product.id;
+
+  if (error.code === "23505") {
+    // Link to the existing product occupying this unique slot — but NEVER a
+    // rejected one. A rejected product is intentionally inactive; the unique
+    // index (migration 018) has no WHERE clause so it still owns the slot, but
+    // resurrecting it would make a "reusable" item silently point at a dead,
+    // unpickable product. If the only collision is a rejected row, fall back to
+    // plain custom/unlinked (return null) instead.
+    let dupQ = supabase.from("products").select("id")
+      .eq("company_id", companyId).eq("code", code).ilike("name", name)
+      .neq("review_status", "rejected");
+    dupQ = size ? dupQ.eq("size", size) : dupQ.is("size", null);
+    dupQ = color ? dupQ.eq("color", color) : dupQ.is("color", null);
+    const { data: existing } = await dupQ.maybeSingle();
+    return existing ? existing.id : null;
+  }
+  throw error;
+}
+
 // Read-side resolution for GET /products: a shared product may have no
 // company-level supplier_id (e.g. it was propagated into this company without
 // one). In that case fall back to the org-master default supplier and resolve
@@ -8424,7 +8491,7 @@ app.get("/products", requireAuth, async (req, res) => {
       // Include all org master fields needed by composeProductView: the
       // price/cost fields are fetched so composeProductView can use them as
       // last-resort fallback (when company row has no price at all).
-      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, reorder_point, is_active, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name,organization_supplier_id), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, reorder_point, is_active, review_status, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name,organization_supplier_id), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
@@ -8723,7 +8790,31 @@ app.get("/product-review-queue", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req
       if (!groups[key].supplier_name && item.supplier_name) groups[key].supplier_name = item.supplier_name;
     }
     const queue = Object.values(groups).sort((a, b) => b.order_count - a.order_count);
-    res.json({ queue, total_items: (items || []).length, total_groups: queue.length });
+
+    // Reusable custom items (feedback item 4): products a salesman created
+    // via "save as reusable" on an order (review_status = 'pending', see
+    // maybeCreateReusableProduct) that still need admin curation. Uses the
+    // partial index from migration 031 (company_id, review_status) WHERE
+    // review_status = 'pending'. Additive — existing `queue` shape unchanged.
+    let pendingProducts = [];
+    if (cid) {
+      const { data: pending } = await supabase.from("products")
+        .select("id, code, name, size, color, unit_price, created_by, created_at")
+        .eq("company_id", cid).eq("review_status", "pending")
+        .order("created_at", { ascending: false });
+      pendingProducts = pending || [];
+      // Resolve creator ids to salesman/user names — the admin queue must not
+      // show raw UUIDs.
+      const creatorIds = [...new Set(pendingProducts.map(p => p.created_by).filter(Boolean))];
+      if (creatorIds.length > 0) {
+        const { data: creators } = await supabase.from("users").select("id, name, salesman_name").in("id", creatorIds);
+        const nameMap = {};
+        (creators || []).forEach(u => { nameMap[u.id] = u.salesman_name || u.name || null; });
+        pendingProducts.forEach(p => { p.created_by_name = p.created_by ? (nameMap[p.created_by] || null) : null; });
+      }
+    }
+
+    res.json({ queue, total_items: (items || []).length, total_groups: queue.length, pending_products: pendingProducts });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -8803,6 +8894,80 @@ app.post("/product-review-queue/dismiss", ...requirePerm(PERMS.PRODUCTS_EDIT), a
       .update({ requires_product_review: false })
       .in("id", item_ids);
     res.json({ ok: true, dismissed: item_ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST approve a pending reusable product (feedback item 4). Curates the row
+// (category/supplier/cost, all optional) and flips review_status to
+// 'approved'. When the company has organization sharing enabled, this also
+// resolves/creates the organization master and propagates the product to
+// catalogue-group siblings — the same sequence create-and-link runs — since
+// a pending product is deliberately kept OUT of org sharing until an admin
+// signs off on it.
+app.post("/product-review-queue/approve-pending", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { product_id, category_id, supplier_id, unit_cost } = req.body;
+    if (!product_id) return res.status(400).json({ error: "product_id required" });
+
+    const { data: product, error: findErr } = await supabase.from("products")
+      .select("id, code, name, size, color, unit_price, unit_cost")
+      .eq("id", product_id).eq("company_id", cid).eq("review_status", "pending").maybeSingle();
+    if (findErr) throw findErr;
+    if (!product) return res.status(404).json({ error: "Pending product not found" });
+
+    let orgProductId = null;
+    if (await isOrgSharingEnabledForCompany(req)) {
+      try {
+        const orgId = await getCatalogueGroupAwareOrgId(req);
+        if (!orgId) throw new Error("No organization found for this company");
+        const orgProduct = await orgIdentity.findOrCreateProduct({
+          organizationId: orgId, code: product.code, name: product.name, size: product.size, color: product.color,
+          baseCost: unit_cost ?? product.unit_cost, basePrice: product.unit_price,
+        });
+        orgProductId = orgProduct.id;
+      } catch (orgErr) {
+        console.error("[POST /product-review-queue/approve-pending] organization identity resolution failed:", orgErr.message);
+        return res.status(500).json({ error: "Could not resolve organization identity for this product: " + orgErr.message });
+      }
+    }
+
+    const patch = { review_status: "approved" };
+    if (category_id !== undefined) patch.category_id = category_id || null;
+    if (supplier_id !== undefined) patch.supplier_id = supplier_id || null;
+    if (unit_cost !== undefined) patch.unit_cost = unit_cost === null ? null : Number(unit_cost);
+    if (orgProductId) patch.organization_product_id = orgProductId;
+
+    const { data: updated, error: updErr } = await supabase.from("products")
+      .update(patch).eq("id", product_id).eq("company_id", cid).select().single();
+    if (updErr) throw updErr;
+
+    await propagateProductToSiblings(req, orgProductId, {
+      code: product.code, name: product.name, color: product.color, size: product.size,
+      is_standard: true, is_customizable: false,
+    });
+
+    res.json({ ok: true, product: updated });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST reject a pending reusable product. Keeps the row (order history still
+// points at it via sales_order_items.product_id) but deactivates it so it no
+// longer appears as a pickable product elsewhere.
+app.post("/product-review-queue/reject-pending", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { product_id } = req.body;
+    if (!product_id) return res.status(400).json({ error: "product_id required" });
+
+    const { data: updated, error } = await supabase.from("products")
+      .update({ review_status: "rejected", is_active: false })
+      .eq("id", product_id).eq("company_id", cid).eq("review_status", "pending")
+      .select().maybeSingle();
+    if (error) throw error;
+    if (!updated) return res.status(404).json({ error: "Pending product not found" });
+
+    res.json({ ok: true, product: updated });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -10062,25 +10227,44 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
       .select().single();
     if (orderErr) throw orderErr;
 
-    const itemRows = items.map(it => ({
-      order_id: order.id,
-      product_id: it.product_id || null,
-      product_code: it.product_code || null,
-      product_name: it.product_name || null,
-      size: it.size || null,
-      color: it.color || null,
-      is_custom: it.is_custom === true,
-      custom_dimensions: it.custom_dimensions || null,
-      custom_specs: it.custom_specs || null,
-      quantity: Number(it.quantity) || 1,
-      unit_price: it.unit_price ?? null,
-      unit_cost: it.unit_cost ?? null,
-      line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
-      attachment_url: it.attachment_url || null,
-      notes: it.notes || null,
-      requires_product_review: !it.product_id ? true : false,
-      linked_custom_item: it.linked_custom_item === true,
-    }));
+    const itemRows = [];
+    for (const it of items) {
+      let productId = it.product_id || null;
+      let linkedCustom = it.linked_custom_item === true;
+      let requiresReview = !productId;
+      // Salesman opted in to "save as reusable" on this custom line and it
+      // isn't already linked to a product — create (or dedup-link to) a
+      // pending product. Best-effort: a failure here must not fail order
+      // creation, the item just stays custom/unlinked as it would have
+      // without the flag.
+      if (!productId && it.save_as_reusable === true) {
+        try {
+          const reusableId = await maybeCreateReusableProduct(company_id, created_by, it);
+          if (reusableId) { productId = reusableId; linkedCustom = true; requiresReview = false; }
+        } catch (reusableErr) {
+          console.error("[POST /sales-orders] save_as_reusable product creation failed (non-fatal):", reusableErr.message);
+        }
+      }
+      itemRows.push({
+        order_id: order.id,
+        product_id: productId,
+        product_code: it.product_code || null,
+        product_name: it.product_name || null,
+        size: it.size || null,
+        color: it.color || null,
+        is_custom: it.is_custom === true,
+        custom_dimensions: it.custom_dimensions || null,
+        custom_specs: it.custom_specs || null,
+        quantity: Number(it.quantity) || 1,
+        unit_price: it.unit_price ?? null,
+        unit_cost: it.unit_cost ?? null,
+        line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
+        attachment_url: it.attachment_url || null,
+        notes: it.notes || null,
+        requires_product_review: requiresReview,
+        linked_custom_item: linkedCustom,
+      });
+    }
     const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
     if (itemsErr) throw itemsErr;
 
@@ -10197,19 +10381,35 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
 
     if (Array.isArray(items)) {
       await supabase.from("sales_order_items").delete().eq("order_id", id);
-      const itemRows = items.map(it => ({
-        order_id: id, product_id: it.product_id || null, product_code: it.product_code || null,
-        product_name: it.product_name || null, size: it.size || null, color: it.color || null,
-        is_custom: it.is_custom === true, custom_dimensions: it.custom_dimensions || null,
-        custom_specs: it.custom_specs || null,
-        quantity: Number(it.quantity) || 1, unit_price: it.unit_price ?? null, unit_cost: it.unit_cost ?? null,
-        line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
-        attachment_url: it.attachment_url || null, notes: it.notes || null,
-        requires_product_review: !it.product_id ? true : false,
-        // Item edits delete+reinsert rows — the linked-custom flag must
-        // round-trip through the form or linking history is lost on edit.
-        linked_custom_item: it.linked_custom_item === true,
-      }));
+      const itemRows = [];
+      for (const it of items) {
+        let productId = it.product_id || null;
+        let linkedCustom = it.linked_custom_item === true;
+        let requiresReview = !productId;
+        // Same opt-in "save as reusable" handling as POST /sales-orders —
+        // see maybeCreateReusableProduct. Best-effort; never fails the edit.
+        if (!productId && it.save_as_reusable === true) {
+          try {
+            const reusableId = await maybeCreateReusableProduct(company_id, req.user?.id || null, it);
+            if (reusableId) { productId = reusableId; linkedCustom = true; requiresReview = false; }
+          } catch (reusableErr) {
+            console.error("[PUT /sales-orders/:id] save_as_reusable product creation failed (non-fatal):", reusableErr.message);
+          }
+        }
+        itemRows.push({
+          order_id: id, product_id: productId, product_code: it.product_code || null,
+          product_name: it.product_name || null, size: it.size || null, color: it.color || null,
+          is_custom: it.is_custom === true, custom_dimensions: it.custom_dimensions || null,
+          custom_specs: it.custom_specs || null,
+          quantity: Number(it.quantity) || 1, unit_price: it.unit_price ?? null, unit_cost: it.unit_cost ?? null,
+          line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
+          attachment_url: it.attachment_url || null, notes: it.notes || null,
+          requires_product_review: requiresReview,
+          // Item edits delete+reinsert rows — the linked-custom flag must
+          // round-trip through the form or linking history is lost on edit.
+          linked_custom_item: linkedCustom,
+        });
+      }
       const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
       if (itemsErr) throw itemsErr;
     }
