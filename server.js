@@ -570,12 +570,35 @@ function normalizeCustomItemNames(items) {
 // product_id — and manual custom items) have no catalog authority to check
 // against: is_clearance defaults to false and the client-supplied unit_cost
 // is left as-is (custom items have no products row to spoof).
+// Also batch-resolves the supplier NAME for each product-linked line (Fix:
+// blank supplier on the Deliveries board / driver sheet). Root cause:
+// sales_order_items.supplier_name (migration 004) was never populated at
+// order creation/edit, so delivery-orders.snapshotFromSoi() — which mirrors
+// it onto delivery_order_items.supplier_name (migration 040) at DO creation
+// — always saw null. Resolved the same way as is_clearance/unit_cost: from
+// the current products/suppliers rows at write-time, never trusted from the
+// client. Custom/unlinked lines (no product_id) have no catalog authority to
+// check against, so supplier_name stays null for them.
 async function resolveProductLineDefaults(companyId, itemRows) {
   const productIds = [...new Set(itemRows.map(r => r.product_id).filter(Boolean))];
   if (productIds.length === 0) return new Map();
-  const { data } = await supabase.from("products").select("id, is_clearance, unit_cost")
+  const { data } = await supabase.from("products").select("id, is_clearance, unit_cost, supplier_id")
     .eq("company_id", companyId).in("id", productIds);
-  return new Map((data || []).map(p => [p.id, { is_clearance: !!p.is_clearance, unit_cost: p.unit_cost ?? null }]));
+  const rows = data || [];
+
+  const supplierIds = [...new Set(rows.map(p => p.supplier_id).filter(Boolean))];
+  const supplierNameById = new Map();
+  if (supplierIds.length > 0) {
+    const { data: suppliers } = await supabase.from("suppliers").select("id, name")
+      .eq("company_id", companyId).in("id", supplierIds);
+    for (const s of (suppliers || [])) supplierNameById.set(s.id, s.name || null);
+  }
+
+  return new Map(rows.map(p => [p.id, {
+    is_clearance: !!p.is_clearance,
+    unit_cost: p.unit_cost ?? null,
+    supplier_name: p.supplier_id ? (supplierNameById.get(p.supplier_id) || null) : null,
+  }]));
 }
 
 // Read-side resolution for GET /products: a shared product may have no
@@ -1853,6 +1876,30 @@ const createTrips = async (soNumber, svNumber, totalTrips, deliveryDate = null) 
   return error;
 };
 
+// ── Log a legacy delivery-date change to the unified admin feed ───
+// delivery_activity (migration 043) fills the gap left by legacy
+// orders/order_trips writes, which — unlike the newer Delivery Order (DO)
+// lifecycle logged via logDoEvent → delivery_order_events (migration 015)
+// — have never had any event trail. Shared by the Telegram bot's
+// applyRescheduleDate below and the web/API legacy reschedule endpoints
+// (PATCH /orders/:id/set-date, PATCH /order-trips/:id).
+// Best-effort / non-fatal: a logging failure must NEVER break scheduling,
+// so this swallows its own errors and never throws.
+const logDeliveryActivity = async ({
+  companyId, branchId = null, soNumber = null, orderId = null, tripNo = null,
+  action, fromDate = null, toDate = null, source, actorId = null, actorName = null, note = null,
+}) => {
+  if (!companyId || !action || !source) return; // required fields missing — skip rather than throw
+  try {
+    await supabase.from("delivery_activity").insert({
+      company_id: companyId, branch_id: branchId || null,
+      so_number: soNumber || null, order_id: orderId || null, trip_no: tripNo ?? null,
+      action, from_date: fromDate || null, to_date: toDate || null,
+      source, actor_id: actorId || null, actor_name: actorName || null, note: note || null,
+    });
+  } catch (e) { console.error("[delivery_activity] log failed (non-fatal):", e.message); }
+};
+
 // ── Apply a reschedule date ───────────────────────────────────────
 // Shared by the reschedule waiting_date step and the busy-date confirm step.
 // Keeps the 2-working-day / confirmed-route OM approval gate.
@@ -1868,9 +1915,15 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
   // silently applying. SOFT block: this only adds an approval step, it
   // never hard-rejects (matches the write-path behavior on the web/API side).
   let isBlockedDate = false;
+  // Hoisted (not just block-local) — reused below to log delivery_activity
+  // without a second lookup when this branch already ran.
+  let orderCompanyId = null;
+  let orderBranchId = null;
   if (!isTbc) {
-    const { data: ordForBlock } = await supabase.from("orders").select("company_id").eq("id", orderId).maybeSingle();
-    if (ordForBlock?.company_id) isBlockedDate = !!(await getBlockedDateReason(ordForBlock.company_id, newDate, null));
+    const { data: ordForBlock } = await supabase.from("orders").select("company_id, branch_id").eq("id", orderId).maybeSingle();
+    orderCompanyId = ordForBlock?.company_id || null;
+    orderBranchId = ordForBlock?.branch_id || null;
+    if (orderCompanyId) isBlockedDate = !!(await getBlockedDateReason(orderCompanyId, newDate, null));
   }
 
   // ── 2-working-day rule check ──────────────────────────────
@@ -1959,6 +2012,53 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
       loadLine + `\n` +
       `_Delivery schedule has been updated._`
     );
+  }
+
+  // Reaching here means the update succeeded — the error paths above
+  // return early via `return;`.
+  const salesmanName = from?.first_name
+    ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
+    : (from?.username || "Unknown");
+
+  // ── Log to the unified delivery_activity feed (migration 043) ─────
+  // Best-effort / non-fatal: never let a logging failure break scheduling.
+  try {
+    if (!orderCompanyId) {
+      // isTbc path skips the blocked-date lookup above, so company_id was
+      // never resolved — fetch it now (single cheap lookup by orderId).
+      const { data: ordForActivity } = await supabase.from("orders").select("company_id, branch_id").eq("id", orderId).maybeSingle();
+      orderCompanyId = ordForActivity?.company_id || null;
+      orderBranchId = ordForActivity?.branch_id || null;
+    }
+    let actorUserId = null;
+    if (from?.id) {
+      const tgUser = await getTelegramUser(from.id);
+      actorUserId = tgUser?.id || null;
+    }
+    await logDeliveryActivity({
+      companyId: orderCompanyId,
+      branchId: orderBranchId,
+      soNumber, orderId, tripNo: isTrip ? tripNo : null,
+      action: isTbc ? "set_tbc" : (currentDate ? "rescheduled" : "arranged"),
+      fromDate: currentDate || null, toDate: dbDate,
+      source: "bot", actorId: actorUserId, actorName: salesmanName,
+    });
+  } catch (e) { console.error("[applyRescheduleDate] delivery_activity log failed (non-fatal):", e.message); }
+
+  // FYI: notify the admin/ops group whenever a salesman arranges or
+  // reschedules a delivery via the bot (notify-only, no approval gate).
+  // Best-effort: a notify failure must not break the flow.
+  if (ADMIN_CHAT_ID) {
+    try {
+      await sendMessage(ADMIN_CHAT_ID,
+        `📦 *Delivery Arranged (bot)*\n\n` +
+        `👤 Salesman: ${salesmanName}\n` +
+        `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
+        (isTrip ? `🔄 Trip ${tripNo}\n` : "") +
+        `📅 ${currentDate ? fmtDate(currentDate) + " → " : ""}*${displayDate}*\n` +
+        (loadLine ? loadLine.trim() : "")
+      );
+    } catch (e) { console.error("[applyRescheduleDate] admin notify failed (non-fatal):", e.message); }
   }
 };
 
@@ -2657,6 +2757,11 @@ app.patch("/order-trips/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   if (trip_no !== undefined) updates.trip_no = trip_no;
   if (vehicle_id !== undefined) updates.vehicle_id = vehicle_id;
   if (remark !== undefined) updates.remark = remark;
+  // Prior scheduled_date/so_number/trip_no — needed for the delivery_activity
+  // feed entry below when the date is the field being changed.
+  const { data: beforeTrip } = scheduled_date !== undefined
+    ? await supabase.from("order_trips").select("scheduled_date, so_number, trip_no").eq("id", id).maybeSingle()
+    : { data: null };
   const { data, error } = await supabase
     .from("order_trips")
     .update(updates)
@@ -2664,6 +2769,23 @@ app.patch("/order-trips/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     .select()
     .single();
   if (error) return res.status(500).json({ error: error.message });
+  if (beforeTrip?.so_number) {
+    // order_trips has no company_id column — resolve via the parent order
+    // (order_trips.so_number → orders.so_number). Best-effort, non-fatal.
+    const { data: ord } = await supabase.from("orders")
+      .select("id, company_id, branch_id").eq("so_number", beforeTrip.so_number).maybeSingle();
+    if (ord?.company_id) {
+      await logDeliveryActivity({
+        companyId: ord.company_id, branchId: ord.branch_id || null,
+        soNumber: beforeTrip.so_number, orderId: ord.id,
+        tripNo: beforeTrip.trip_no ?? trip_no ?? null,
+        action: scheduled_date ? (beforeTrip.scheduled_date ? "rescheduled" : "arranged") : "set_tbc",
+        fromDate: beforeTrip.scheduled_date || null, toDate: scheduled_date || null,
+        source: "web", actorId: req.user?.id || null,
+        actorName: req.user?.name || req.user?.salesman_name || null,
+      });
+    }
+  }
   res.json(data);
 });
 
@@ -4161,10 +4283,24 @@ app.get("/services/unscheduled", requireAuth, async (req, res) => {
 app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
   const { delivery_date } = req.body;
+  // Fetch the prior date/company scope before overwriting — needed for the
+  // delivery_activity feed entry below (best-effort, non-fatal).
+  const { data: before } = await supabase.from("orders")
+    .select("delivery_date, so_number, company_id, branch_id").eq("id", id).maybeSingle();
   const { data, error } = await supabase.from("orders")
     .update({ delivery_date: delivery_date || null })
     .eq("id", id).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  if (before?.company_id) {
+    await logDeliveryActivity({
+      companyId: before.company_id, branchId: before.branch_id || null,
+      soNumber: before.so_number, orderId: Number(id), tripNo: null,
+      action: delivery_date ? (before.delivery_date ? "rescheduled" : "arranged") : "set_tbc",
+      fromDate: before.delivery_date || null, toDate: delivery_date || null,
+      source: "web", actorId: req.user?.id || null,
+      actorName: req.user?.name || req.user?.salesman_name || null,
+    }); // logDeliveryActivity swallows its own errors — never blocks this response
+  }
   res.json(data);
 });
 
@@ -6125,7 +6261,7 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       }
 
       const dbDate = isTbc ? null : newDate;
-      const { data: existingOrder } = await supabase.from("orders").select("remark").eq("id", orderId).single();
+      const { data: existingOrder } = await supabase.from("orders").select("remark, branch_id").eq("id", orderId).single();
       const updatedRemark = isTbc && existingOrder
         ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
         : existingOrder?.remark;
@@ -6139,6 +6275,18 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       if (isMultiTrip) {
         await supabase.from("order_trips").update({ scheduled_date: dbDate }).eq("so_number", soNumber).eq("trip_no", 1);
       }
+      // Log to the unified delivery_activity feed (best-effort, non-fatal).
+      // companyId/req.user are already resolved for this whole handler, so
+      // this is a cheap addition — unlike the Telegram bot flow, no extra
+      // lookup is needed here.
+      await logDeliveryActivity({
+        companyId, branchId: existingOrder?.branch_id || null,
+        soNumber, orderId, tripNo: isMultiTrip ? 1 : null,
+        action: isTbc ? "set_tbc" : (currentDate ? "rescheduled" : "arranged"),
+        fromDate: currentDate || null, toDate: dbDate,
+        source: "web", actorId: req.user?.id || null,
+        actorName: req.user?.salesman_name || req.user?.name || null,
+      });
       clearSession(key);
       return reply([
         `✅ SO ${soNumber}${customerName ? ` — ${customerName}` : ""} ${isTbc ? "set to TBC (no date)" : `scheduled for ${fmtDate(newDate)}`}.`,
@@ -8139,6 +8287,106 @@ app.post("/delivery-orders/:id/cancel", ...requirePerm(PERMS.DELIVERY_ORDER_CANC
       }
     }
     res.json({ ok: true, delivery_order_id: dord.id, status: "cancelled" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-activity — admin "Recent Delivery Updates" feed. Merges TWO
+// sources into one time-sorted feed:
+//   1. delivery_activity (migration 043) — legacy orders/order_trips date
+//      changes (salesman-via-Telegram-bot arrangements from
+//      applyRescheduleDate, plus the web reschedule endpoints PATCH
+//      /orders/:id/set-date and PATCH /order-trips/:id), which previously
+//      left no trail anywhere.
+//   2. delivery_order_events (migration 015) — the newer Delivery Order (DO)
+//      lifecycle log (logDoEvent), scoped to this company via its parent
+//      delivery_orders row (the event table itself carries no company_id).
+// Company-scoped via the authenticated active-company context
+// (getActiveCompanyId) — never a client-supplied company_id. Gated behind
+// DELIVERY_ORDER_VIEW, the same permission every other read-only
+// delivery-order endpoint in this file already uses (see migration 015
+// role matrix: MASTER/DIRECTOR all, MANAGER company, COMPANY_ADMIN branch,
+// SALESMAN own) — admins/dispatchers who can already see DOs can see this.
+app.get("/delivery-activity", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    if (!companyId) return res.json({ activity: [] });
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+    const { from, to } = req.query;
+    const fromTs = from ? `${from}T00:00:00.000Z` : null;
+    const toTs = to ? `${to}T23:59:59.999Z` : null;
+
+    // ── Source 1: delivery_activity (legacy orders/order_trips changes) ──
+    let q1 = supabase.from("delivery_activity")
+      .select("id, so_number, order_id, trip_no, action, from_date, to_date, source, actor_id, actor_name, created_at")
+      .eq("company_id", companyId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (fromTs) q1 = q1.gte("created_at", fromTs);
+    if (toTs) q1 = q1.lte("created_at", toTs);
+
+    // ── Source 2: delivery_order_events (DO lifecycle) — filtered via the
+    // parent delivery_orders row (!inner makes the nested-table filter work;
+    // same pattern already used elsewhere in this file, e.g. delivery_routes
+    // day-load lookups and sales_order_items company scoping).
+    let q2 = supabase.from("delivery_order_events")
+      .select("id, event_type, payload, actor_id, created_at, delivery_orders!inner(company_id, do_number, sales_orders(order_number, customer_name))")
+      .eq("delivery_orders.company_id", companyId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (fromTs) q2 = q2.gte("created_at", fromTs);
+    if (toTs) q2 = q2.lte("created_at", toTs);
+
+    const [{ data: activityRows, error: err1 }, { data: eventRows, error: err2 }] = await Promise.all([q1, q2]);
+    if (err1) throw err1;
+    if (err2) throw err2;
+
+    // ── Normalize both sources into one shape. Taking the top `limit` rows
+    // from each already-sorted-desc source before merging is sufficient to
+    // guarantee a correct merged top `limit` (standard k-way-merge property).
+    const fromActivity = (activityRows || []).map(r => ({
+      id: `da:${r.id}`,
+      source: r.source || "web",
+      action: r.action,
+      so_number: r.so_number || null,
+      customer_name: null,
+      trip_no: r.trip_no ?? null,
+      from_date: r.from_date || null,
+      to_date: r.to_date || null,
+      actor_id: r.actor_id || null,
+      actor_name: r.actor_name || null,
+      created_at: r.created_at,
+    }));
+
+    const fromEvents = (eventRows || []).map(r => ({
+      id: `doe:${r.id}`,
+      source: "do",
+      action: r.event_type,
+      so_number: r.delivery_orders?.sales_orders?.order_number || r.delivery_orders?.do_number || null,
+      customer_name: r.delivery_orders?.sales_orders?.customer_name || null,
+      trip_no: null,
+      from_date: r.payload?.from || null,
+      to_date: r.payload?.to || null,
+      actor_id: r.actor_id || null,
+      actor_name: null,
+      created_at: r.created_at,
+    }));
+
+    let merged = [...fromActivity, ...fromEvents];
+
+    // ── Resolve actor_name for rows that only carry actor_id (all DO-event
+    // rows, plus any delivery_activity row logged without a denormalized name).
+    const missingActorIds = [...new Set(merged.filter(r => !r.actor_name && r.actor_id).map(r => r.actor_id))];
+    if (missingActorIds.length) {
+      const { data: actorUsers } = await supabase.from("users").select("id, name, salesman_name").in("id", missingActorIds);
+      const actorMap = new Map((actorUsers || []).map(u => [u.id, u.name || u.salesman_name || null]));
+      merged = merged.map(r => r.actor_name ? r : { ...r, actor_name: actorMap.get(r.actor_id) || null });
+    }
+
+    merged.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    merged = merged.slice(0, limit).map(({ actor_id, ...rest }) => rest); // actor_id was only needed for name resolution
+
+    res.json({ activity: merged });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -11139,15 +11387,17 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         bundle_component_price: it.bundle_component_price ?? null,
       });
     }
-    // is_clearance AND unit_cost are resolved server-side from the products
-    // table for every product-linked line — never trust either from the
-    // client (see resolveProductLineDefaults). Custom/unlinked lines keep
-    // whatever unit_cost the client sent (no catalog authority to check).
+    // is_clearance, unit_cost AND supplier_name are resolved server-side from
+    // the products/suppliers tables for every product-linked line — never
+    // trust any of these from the client (see resolveProductLineDefaults).
+    // Custom/unlinked lines keep whatever unit_cost the client sent (no
+    // catalog authority to check) and get a null supplier_name.
     const productDefaults = await resolveProductLineDefaults(company_id, itemRows);
     for (const row of itemRows) {
       const d = row.product_id ? productDefaults.get(row.product_id) : null;
       row.is_clearance = d ? d.is_clearance : false;
       if (d) row.unit_cost = d.unit_cost;
+      row.supplier_name = d ? d.supplier_name : null;
     }
 
     const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
@@ -11309,15 +11559,18 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
           bundle_component_price: it.bundle_component_price ?? null,
         });
       }
-      // is_clearance AND unit_cost are resolved server-side from the products
-      // table for every product-linked line — never trust either from the
-      // client (see resolveProductLineDefaults). Custom/unlinked lines keep
-      // whatever unit_cost the client sent (no catalog authority to check).
+      // is_clearance, unit_cost AND supplier_name are resolved server-side
+      // from the products/suppliers tables for every product-linked line —
+      // never trust any of these from the client (see
+      // resolveProductLineDefaults). Custom/unlinked lines keep whatever
+      // unit_cost the client sent (no catalog authority to check) and get a
+      // null supplier_name.
       const productDefaults = await resolveProductLineDefaults(company_id, itemRows);
       for (const row of itemRows) {
         const d = row.product_id ? productDefaults.get(row.product_id) : null;
         row.is_clearance = d ? d.is_clearance : false;
         if (d) row.unit_cost = d.unit_cost;
+        row.supplier_name = d ? d.supplier_name : null;
       }
 
       const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
