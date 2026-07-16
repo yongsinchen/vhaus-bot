@@ -14,7 +14,9 @@ const { composeProductView, composeSupplierView } = require("./lib/product-view-
 const doLib = require("./lib/delivery-orders");
 const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
-const { getCommissionableAmount } = require("./lib/commission");
+const commissionLib = require("./lib/commission");
+const { getCommissionableAmount } = commissionLib;
+const crypto = require("crypto");
 
 const app = express();
 
@@ -288,6 +290,7 @@ async function propagateProductToSiblings(req, orgProductId, fields) {
         description: fields.description || null, color: fields.color || null, size,
         organization_category_id: fields.organization_category_id || null,
         is_standard: fields.is_standard !== false, is_customizable: fields.is_customizable === true,
+        is_clearance: fields.is_clearance === true,
         reorder_point: 0, is_active: true, organization_product_id: orgProductId,
       }));
     if (rows.length > 0) await supabase.from("products").insert(rows);
@@ -376,6 +379,22 @@ async function syncSharedProductSupplier(req, orgProductId, orgSupplierId) {
   }
 }
 
+// is_clearance is a per-company `products` column — organization_products
+// (the org master) has no such field, so unlike name/description/
+// is_customizable it can't propagate through update_org_product_master.
+// Instead, on edit, write it directly to every sibling company's product row
+// sharing this organization_product_id (mirrors syncSharedProductSupplier).
+// Best-effort — never throws (a propagation failure must not fail the
+// primary edit that already succeeded).
+async function syncClearanceFlagToSiblings(orgProductId, isClearance) {
+  if (!orgProductId || isClearance === undefined) return;
+  try {
+    await supabase.from("products").update({ is_clearance: isClearance === true }).eq("organization_product_id", orgProductId);
+  } catch (err) {
+    console.error("[syncClearanceFlagToSiblings] failed (non-fatal):", err.message);
+  }
+}
+
 // Reusable custom items (feedback item 4): when a salesman explicitly ticks
 // "Save as reusable" on a custom order line (item.save_as_reusable === true),
 // create a company-scoped product row from that line so it is immediately
@@ -441,6 +460,122 @@ async function maybeCreateReusableProduct(companyId, userId, it) {
     return existing ? existing.id : null;
   }
   throw error;
+}
+
+// ── Phase C: product bundles + clearance ────────────────────────────────
+
+// Expand any bundle line ({ bundle_id, quantity }) in a sales-order items[]
+// payload into its component lines BEFORE the normal per-item processing
+// loop in POST/PUT /sales-orders runs — so that loop never needs to know
+// about bundles: every entry it sees already looks like an ordinary catalog
+// item (product_id, unit_price, quantity, ...), just tagged with
+// bundle_id / bundle_instance_id / bundle_component_price. Non-bundle items
+// pass through unchanged (tagged with null bundle_* fields).
+//
+// Price allocation math itself lives in lib/commission.js
+// (explodeBundleComponents) so it's exercised by the unit tests without a
+// DB. This wrapper only does the DB lookups + tagging.
+//
+// Throws on an invalid/inactive/foreign bundle_id or a bundle with no
+// components — the caller (route handler) lets that reject the whole write
+// rather than silently dropping a line the customer asked to buy.
+async function expandBundleItems(companyId, items) {
+  const expanded = [];
+  for (const it of items) {
+    // Only a FRESH bundle placeholder — { bundle_id, no product_id } — gets
+    // exploded. A line that already has a product_id is either an ordinary
+    // item, or an already-exploded bundle component being re-saved (PUT
+    // sends its bundle_id/bundle_instance_id/bundle_component_price back) —
+    // either way it must pass through untouched. Hard-nulling those fields
+    // for every non-triggering item here previously wiped bundle linkage on
+    // every edit that didn't re-add the bundle from scratch.
+    const isFreshBundleTrigger = !!it.bundle_id && !it.product_id;
+    if (!isFreshBundleTrigger) {
+      expanded.push({
+        ...it,
+        bundle_id: it.bundle_id || null,
+        bundle_instance_id: it.bundle_instance_id || null,
+        bundle_component_price: it.bundle_component_price ?? null,
+      });
+      continue;
+    }
+    const { data: bundle } = await supabase.from("product_bundles").select("*")
+      .eq("id", it.bundle_id).eq("company_id", companyId).eq("is_active", true).maybeSingle();
+    if (!bundle) throw new Error(`Bundle ${it.bundle_id} not found or inactive`);
+    const { data: bundleItems } = await supabase.from("product_bundle_items")
+      .select("quantity, sort_order, products(id, code, name, unit_price, unit_cost)")
+      .eq("bundle_id", it.bundle_id).order("sort_order");
+    if (!bundleItems || bundleItems.length === 0) throw new Error(`Bundle ${bundle.code} has no components configured`);
+
+    const components = bundleItems.map(bi => ({
+      product_id: bi.products?.id || null,
+      product_code: bi.products?.code || null,
+      product_name: bi.products?.name || null,
+      quantity: bi.quantity,
+      unit_price: bi.products?.unit_price,
+      unit_cost: bi.products?.unit_cost,
+    }));
+    const exploded = commissionLib.explodeBundleComponents(bundle, components, it.quantity || 1);
+    const bundleInstanceId = crypto.randomUUID();
+    for (const comp of exploded) {
+      expanded.push({
+        product_id: comp.product_id,
+        product_code: comp.product_code,
+        product_name: comp.product_name,
+        size: null, color: null, is_custom: false,
+        custom_dimensions: null, custom_specs: null,
+        quantity: comp.quantity, unit_price: comp.unit_price, unit_cost: comp.unit_cost,
+        attachment_url: null, notes: it.notes || null,
+        bundle_id: it.bundle_id, bundle_instance_id: bundleInstanceId, bundle_component_price: comp.bundle_component_price,
+      });
+    }
+  }
+  return expanded;
+}
+
+// Fix #6: blank custom-item names. A custom line (is_custom:true) with no
+// product_name previously stored an empty string, rendering as a blank row
+// everywhere (order detail, pick list, delivery schedule, printouts). Require
+// SOME identifying text — name OR custom_dimensions OR notes — and, if the
+// name itself is blank but a description exists, synthesize a display name
+// server-side instead of writing blank. Mutates nothing; returns a new array
+// (callers already reassign expandedItems from this).
+// Throws Error with a user-facing message on a genuinely empty custom line —
+// callers catch this the same way they catch other synchronous validation
+// errors in this file (try/catch around the whole handler → 500). Called
+// before any DB writes so no partial order is created.
+function normalizeCustomItemNames(items) {
+  return (items || []).map((it, idx) => {
+    if (it.is_custom !== true) return it;
+    const name = (it.product_name || "").trim();
+    if (name) return { ...it, product_name: name };
+    const desc = (it.custom_dimensions || it.notes || it.custom_specs || "").toString().trim();
+    if (!desc) {
+      throw new Error(`Custom item #${idx + 1} needs a name, dimensions, or notes — all were blank`);
+    }
+    return { ...it, product_name: `Custom Item — ${desc.slice(0, 80)}` };
+  });
+}
+
+// Resolve is_clearance AND unit_cost for a batch of sales-order line items
+// directly from products — NEVER from client-supplied values. A client could
+// stale-cache or spoof either (is_clearance decides eligibility; unit_cost
+// directly drives the clearance margin/commission math — trusting a
+// client-supplied cost would let a client fabricate an artificially low cost
+// to inflate their own clearance commission). Both are re-resolved from the
+// current product row at write-time. One batch query for the whole
+// order/edit, not one per line.
+// Items with no product_id (custom lines — including unlinked bundle
+// components, which never happens since bundles always resolve a
+// product_id — and manual custom items) have no catalog authority to check
+// against: is_clearance defaults to false and the client-supplied unit_cost
+// is left as-is (custom items have no products row to spoof).
+async function resolveProductLineDefaults(companyId, itemRows) {
+  const productIds = [...new Set(itemRows.map(r => r.product_id).filter(Boolean))];
+  if (productIds.length === 0) return new Map();
+  const { data } = await supabase.from("products").select("id, is_clearance, unit_cost")
+    .eq("company_id", companyId).in("id", productIds);
+  return new Map((data || []).map(p => [p.id, { is_clearance: !!p.is_clearance, unit_cost: p.unit_cost ?? null }]));
 }
 
 // Read-side resolution for GET /products: a shared product may have no
@@ -675,6 +810,68 @@ const isWithinWorkingDays = (dateStr, n = 2) => {
   const blocked = getNextWorkingDays(n);
   return blocked.includes(dateStr);
 };
+
+// ── Blocked delivery dates (Fix #7, migration 042) ─────────────────
+// SOFT block only (QA decision): a blocked date never hard-stops scheduling.
+// Callers must send override_reason to schedule on a blocked date; the
+// reason returned here is shown to the user as the "why is this blocked"
+// message, and the caller-supplied override_reason is logged alongside it.
+// branch_id NULL rows are company-wide; a branch-specific row (if the caller
+// knows the branch) is checked in addition. Layers on top of the existing
+// Sunday-only auto-skip in getNextWorkingDays()/isWithinWorkingDays() —
+// those two are unchanged and keep governing "next working day" SUGGESTIONS;
+// this only governs the block-and-require-a-reason check at write time.
+async function getBlockedDateReason(companyId, dateStr, branchId) {
+  if (!companyId || !dateStr) return null;
+  const queries = [
+    supabase.from("delivery_blocked_dates").select("reason")
+      .eq("company_id", companyId).eq("blocked_date", dateStr).is("branch_id", null).maybeSingle(),
+  ];
+  if (branchId) {
+    queries.push(supabase.from("delivery_blocked_dates").select("reason")
+      .eq("company_id", companyId).eq("blocked_date", dateStr).eq("branch_id", branchId).maybeSingle());
+  }
+  const results = await Promise.all(queries);
+  const hit = results.find(r => r.data);
+  return hit ? (hit.data.reason || "This date is blocked for deliveries") : null;
+}
+
+// QA SEV-1 fix: the legacy (non-DO) "delivered" flip on a delivery_schedules
+// row only ever updated orders.status. sales_orders is the source of truth —
+// the NEXT sales order edit (PUT /sales-orders/:id -> syncSalesOrderToDelivery
+// -> deliveryStatusFromSO) recomputes orders.status FROM sales_orders.status,
+// so leaving sales_orders at its old status ("confirmed" etc.) silently
+// reverted the legacy order back to "Pending" on the very next SO edit.
+// Mirrors the guard complete_delivery_order (migration 016) already applies
+// on the DO path: never stomp a cancelled sales order. Company-scoped, keyed
+// by order_number = orders.so_number (the same join every other DO/SO
+// cross-reference in this file uses — there is no FK, sales_orders.order_number
+// is the shared key). Best-effort: a failure here must not fail the delivery
+// status update that already succeeded.
+async function syncLegacyDeliveredToSalesOrder(companyId, soNumber) {
+  if (!companyId || !soNumber) return;
+  try {
+    await supabase.from("sales_orders")
+      .update({ status: "delivered" })
+      .eq("company_id", companyId).eq("order_number", soNumber).neq("status", "cancelled");
+  } catch (e) {
+    console.error("[syncLegacyDeliveredToSalesOrder] failed (non-fatal):", e.message);
+  }
+}
+
+// QA SEV-2 fix: a schedule that's already out_for_delivery / arrived /
+// delivered must not be team-reassigned or deleted — both would
+// reset/orphan its Delivery Order (or silently drop tracking) mid-route.
+// The frontend already hides these actions once locked (isLocked), but that
+// is UX only — "never rely on frontend validation" — so the same check must
+// be enforced server-side. Case/format is inconsistent across writers
+// ("Out for Delivery" from the driver app's own literal vs lowercase
+// "arrived"/"delivered" elsewhere) — normalize before comparing so both
+// forms are caught.
+const LOCKED_SCHEDULE_STATUSES = new Set(["out_for_delivery", "arrived", "delivered"]);
+function isLockedScheduleStatus(status) {
+  return LOCKED_SCHEDULE_STATUSES.has(String(status || "").trim().toLowerCase().replace(/\s+/g, "_"));
+}
 
 // ── Pending reschedule approvals ─────────────────────────────────
 // Key: soNumber — stores pending approval details
@@ -1666,8 +1863,18 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
   const displayDate = isTbc ? "TBC (no date set)" : fmtDate(newDate);
   const loadLine = load ? `📊 That day: ${load.total} order${load.total === 1 ? "" : "s"} booked, ${load.unassigned} unassigned (before this one).\n` : "";
 
+  // Fix #7: a blocked date is at least as sensitive as the 2-working-day
+  // window — route it through the same OM-approval gate below rather than
+  // silently applying. SOFT block: this only adds an approval step, it
+  // never hard-rejects (matches the write-path behavior on the web/API side).
+  let isBlockedDate = false;
+  if (!isTbc) {
+    const { data: ordForBlock } = await supabase.from("orders").select("company_id").eq("id", orderId).maybeSingle();
+    if (ordForBlock?.company_id) isBlockedDate = !!(await getBlockedDateReason(ordForBlock.company_id, newDate, null));
+  }
+
   // ── 2-working-day rule check ──────────────────────────────
-  if (!isTbc && isWithinWorkingDays(newDate, 2)) {
+  if (!isTbc && (isWithinWorkingDays(newDate, 2) || isBlockedDate)) {
     // Check if date has a Confirmed route
     const { data: confirmedRoutes } = await supabase
       .from("delivery_routes")
@@ -4371,25 +4578,346 @@ app.delete("/commission-rules/:id", requireRole(["master", "manager"]), async (r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Product Bundles (Phase C) ───────────────────────────────────────────
+// A bundle carries its OWN price (package_price); adding one to a sales
+// order explodes it into normal sales_order_items rows server-side (see
+// expandBundleItems / explodeBundleComponents) — this CRUD only manages the
+// bundle DEFINITION (components + price + incentive), never order items.
+const BUNDLE_SELECT = `*, product_bundle_items(id, product_id, quantity, sort_order, products(id, code, name, unit_price, unit_cost, is_clearance))`;
+
+// Multi-company isolation guard: every component product_id a caller submits
+// for a bundle must actually belong to the active company — never trust the
+// client not to reference another company's product id. Returns an error
+// message (falsy = valid).
+async function validateBundleComponentProducts(companyId, items) {
+  const productIds = [...new Set(items.map(it => it.product_id))];
+  const { data: owned } = await supabase.from("products").select("id").eq("company_id", companyId).in("id", productIds);
+  const ownedIds = new Set((owned || []).map(p => p.id));
+  const missing = productIds.filter(id => !ownedIds.has(id));
+  if (missing.length > 0) return `One or more components are not valid products for this company: ${missing.join(", ")}`;
+  return null;
+}
+
+app.get("/product-bundles", requireAuth, async (req, res) => {
+  try {
+    const { active_only } = req.query;
+    const cid = getActiveCompanyId(req);
+    let q = supabase.from("product_bundles").select(BUNDLE_SELECT).order("name");
+    if (cid) q = q.eq("company_id", cid);
+    if (active_only === "true") q = q.eq("is_active", true);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ bundles: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/product-bundles/:id", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    let q = supabase.from("product_bundles").select(BUNDLE_SELECT).eq("id", req.params.id);
+    if (cid) q = q.eq("company_id", cid);
+    const { data, error } = await q.maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Bundle not found" });
+    res.json({ bundle: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/product-bundles", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { code, name, description, package_price, incentive_type, incentive_value, is_clearance, start_date, end_date, items } = req.body;
+    if (!code?.trim() || !name?.trim()) return res.status(400).json({ error: "code and name are required" });
+    if (package_price == null || Number(package_price) <= 0) return res.status(400).json({ error: "package_price must be greater than 0" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one component item is required" });
+    if (items.some(it => !it.product_id || !(Number(it.quantity) > 0))) {
+      return res.status(400).json({ error: "Every component item needs product_id and a quantity > 0" });
+    }
+    if (incentive_type && !["fixed", "percent"].includes(incentive_type)) {
+      return res.status(400).json({ error: "incentive_type must be 'fixed' or 'percent'" });
+    }
+    const componentErr = await validateBundleComponentProducts(cid, items);
+    if (componentErr) return res.status(400).json({ error: componentErr });
+
+    const { data: bundle, error } = await supabase.from("product_bundles").insert({
+      company_id: cid, code: code.trim(), name: name.trim(), description: description || null,
+      package_price: Number(package_price), incentive_type: incentive_type || "fixed",
+      incentive_value: Number(incentive_value) || 0, is_clearance: is_clearance === true,
+      start_date: start_date || null, end_date: end_date || null, is_active: true, created_by: req.user.id,
+    }).select().single();
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ error: `Bundle code "${code}" already exists` });
+      throw error;
+    }
+
+    const itemRows = items.map((it, i) => ({
+      bundle_id: bundle.id, company_id: cid, product_id: it.product_id,
+      quantity: Number(it.quantity), sort_order: it.sort_order ?? i,
+    }));
+    const { error: itemsErr } = await supabase.from("product_bundle_items").insert(itemRows);
+    if (itemsErr) {
+      // Roll back the header so a bad component list never leaves an empty bundle behind.
+      await supabase.from("product_bundles").delete().eq("id", bundle.id);
+      if (itemsErr.code === "23505") return res.status(409).json({ error: "Duplicate product in bundle components" });
+      throw itemsErr;
+    }
+
+    const { data: full } = await supabase.from("product_bundles").select(BUNDLE_SELECT).eq("id", bundle.id).single();
+    res.status(201).json({ bundle: full });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put("/product-bundles/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { code, name, description, package_price, incentive_type, incentive_value, is_clearance, start_date, end_date, is_active, items } = req.body;
+    if (incentive_type && !["fixed", "percent"].includes(incentive_type)) {
+      return res.status(400).json({ error: "incentive_type must be 'fixed' or 'percent'" });
+    }
+    const { data: existing } = await supabase.from("product_bundles").select("id").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
+    if (!existing) return res.status(404).json({ error: "Bundle not found" });
+
+    if (Array.isArray(items)) {
+      if (items.length === 0) return res.status(400).json({ error: "At least one component item is required" });
+      if (items.some(it => !it.product_id || !(Number(it.quantity) > 0))) {
+        return res.status(400).json({ error: "Every component item needs product_id and a quantity > 0" });
+      }
+      const componentErr = await validateBundleComponentProducts(cid, items);
+      if (componentErr) return res.status(400).json({ error: componentErr });
+    }
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (code !== undefined) updates.code = code.trim();
+    if (name !== undefined) updates.name = name.trim();
+    if (description !== undefined) updates.description = description || null;
+    if (package_price !== undefined) {
+      if (Number(package_price) <= 0) return res.status(400).json({ error: "package_price must be greater than 0" });
+      updates.package_price = Number(package_price);
+    }
+    if (incentive_type !== undefined) updates.incentive_type = incentive_type;
+    if (incentive_value !== undefined) updates.incentive_value = Number(incentive_value) || 0;
+    if (is_clearance !== undefined) updates.is_clearance = is_clearance === true;
+    if (start_date !== undefined) updates.start_date = start_date || null;
+    if (end_date !== undefined) updates.end_date = end_date || null;
+    if (is_active !== undefined) updates.is_active = is_active === true;
+
+    const { error } = await supabase.from("product_bundles").update(updates).eq("id", req.params.id).eq("company_id", cid);
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ error: `Bundle code "${code}" already exists` });
+      throw error;
+    }
+
+    if (Array.isArray(items)) {
+      // Validity (non-empty, product_id/quantity, company ownership) was
+      // already checked above, before any write.
+      await supabase.from("product_bundle_items").delete().eq("bundle_id", req.params.id);
+      const itemRows = items.map((it, i) => ({
+        bundle_id: req.params.id, company_id: cid, product_id: it.product_id,
+        quantity: Number(it.quantity), sort_order: it.sort_order ?? i,
+      }));
+      const { error: itemsErr } = await supabase.from("product_bundle_items").insert(itemRows);
+      if (itemsErr) {
+        if (itemsErr.code === "23505") return res.status(409).json({ error: "Duplicate product in bundle components" });
+        throw itemsErr;
+      }
+    }
+
+    const { data: full } = await supabase.from("product_bundles").select(BUNDLE_SELECT).eq("id", req.params.id).single();
+    res.json({ bundle: full });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Soft delete: bundles are referenced by historical sales_order_items
+// (bundle_id) and commission_line_breakdown rows, so a hard delete would
+// silently null out audit trail on past orders (ON DELETE SET NULL). Setting
+// is_active:false just removes it from future "add bundle" pickers.
+app.delete("/product-bundles/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { error } = await supabase.from("product_bundles").update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id).eq("company_id", cid);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Commission cache — avoids re-fetching rules/incentives/users per order
 let _commCache = { ts: 0, rules: null, incentives: null, users: null, monthlySales: {} };
 async function getCommCache(companyId) {
   const now = Date.now();
   if (_commCache.companyId === companyId && now - _commCache.ts < 30000) return _commCache;
-  const [rulesRes, incRes, usersRes] = await Promise.all([
+  const [rulesRes, incRes, usersRes, companyRes, bundlesRes, bundleItemsRes] = await Promise.all([
     supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("product_incentives").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("users").select("id, role, salesman_name, branch_id").eq("company_id", companyId).eq("is_active", true),
+    supabase.from("companies").select("clearance_commission_enabled").eq("id", companyId).maybeSingle(),
+    // Phase C — clearance/bundle kill switch data. Cheap (few bundles per
+    // company) and reused across every order recalculated in this 30s window.
+    supabase.from("product_bundles").select("*").eq("company_id", companyId).eq("is_active", true),
+    supabase.from("product_bundle_items").select("bundle_id, product_id, quantity").eq("company_id", companyId),
   ]);
   const today = new Date().toISOString().slice(0, 10);
+  const bundleItemsByBundle = new Map();
+  for (const bi of (bundleItemsRes.data || [])) {
+    if (!bundleItemsByBundle.has(bi.bundle_id)) bundleItemsByBundle.set(bi.bundle_id, []);
+    bundleItemsByBundle.get(bi.bundle_id).push(bi);
+  }
   _commCache = {
     ts: now, companyId,
     rules: rulesRes.data || [],
     incentives: (incRes.data || []).filter(inc => (!inc.start_date || inc.start_date <= today) && (!inc.end_date || inc.end_date >= today)),
     users: usersRes.data || [],
     monthlySales: {},
+    clearanceEnabled: !!companyRes.data?.clearance_commission_enabled,
+    bundles: bundlesRes.data || [],
+    bundleItemsByBundle,
   };
   return _commCache;
+}
+
+// Phase C — resolve the clearance/bundle context for one order from its
+// sales_orders/sales_order_items SOT rows. Returns null when there is
+// nothing to do (kill switch off, no matching SOT row — legacy/manual/
+// Telegram orders never have one, or the SOT order has no items), in which
+// case calculateCommission falls back to the pre-Phase-C flat calculation
+// completely unchanged.
+//
+// Returned shape:
+//   remainderSell      — non-clearance sell total, in the SAME commissionable
+//                         space as getCommissionableAmount(order) (see `scale`
+//                         below) — this replaces `net` as the base the normal
+//                         tier rate is applied to (no double-counting).
+//   clearanceLines[]    — { level, marginPct, sell, cost, weightRows[] }
+//                         one entry per clearance-eligible line or bundle
+//                         instance; weightRows are the sales_order_items rows
+//                         (one for a simple line, N for a blended bundle) used
+//                         to allocate this line's commission for reporting.
+//   packageIncentives[] — { bundle_id, amount } one per COMPLETE bundle
+//                         instance found, independent of clearance status.
+async function buildClearanceCommissionContext(order, companyId, cache, net) {
+  if (!cache.clearanceEnabled) return null;
+  const { data: sot } = await supabase.from("sales_orders").select("id, discount")
+    .eq("order_number", order.so_number).eq("company_id", companyId).maybeSingle();
+  if (!sot) return null;
+  const { data: soiRows } = await supabase.from("sales_order_items")
+    .select("id, product_id, product_code, product_name, quantity, unit_price, unit_cost, is_clearance, bundle_id, bundle_instance_id, bundle_component_price")
+    .eq("order_id", sot.id);
+  if (!soiRows || soiRows.length === 0) return null;
+
+  const withLineTotal = soiRows.map(r => ({ ...r, lineTotal: (Number(r.unit_price) || 0) * (Number(r.quantity) || 0) }));
+  const proratedSells = commissionLib.prorateDiscountAcrossLines(withLineTotal, sot.discount);
+  const rows = withLineTotal.map((r, i) => ({ ...r, proratedSell: proratedSells[i] }));
+
+  // Normalize the sales_order_items basis (GST-exclusive, post order-discount)
+  // into the SAME commissionable space `net` already uses (GST-inclusive for
+  // MY, GST-exclusive/1.09 for SG — see getCommissionableAmount). Derived
+  // empirically from the two totals rather than re-deriving GST/SG rules
+  // here, so clearance math always tracks whatever basis the rest of the
+  // commission system is using. Margin ratios are scale-invariant (sell and
+  // cost are scaled by the same factor), so classification is unaffected.
+  const soiSubtotalAfterDiscount = rows.reduce((s, r) => s + r.proratedSell, 0);
+  const scale = soiSubtotalAfterDiscount > 0 ? net / soiSubtotalAfterDiscount : 1;
+
+  const bundleGroups = new Map();
+  const simpleRows = [];
+  for (const r of rows) {
+    if (r.bundle_instance_id) {
+      if (!bundleGroups.has(r.bundle_instance_id)) bundleGroups.set(r.bundle_instance_id, []);
+      bundleGroups.get(r.bundle_instance_id).push(r);
+    } else {
+      simpleRows.push(r);
+    }
+  }
+
+  let remainderSell = 0;
+  const clearanceLines = [];
+  const packageIncentives = [];
+
+  const pushSimpleClearanceLine = (r, bundleId) => {
+    const sell = r.proratedSell * scale;
+    const cost = r.unit_cost != null ? Number(r.unit_cost) * (Number(r.quantity) || 0) * scale : null;
+    const { level, marginPct } = commissionLib.classifyClearanceMargin(sell, cost);
+    clearanceLines.push({
+      level, marginPct, sell, cost,
+      weightRows: [{ sales_order_item_id: r.id, product_code: r.product_code, product_name: r.product_name, bundle_id: bundleId, weight: r.proratedSell }],
+    });
+  };
+
+  for (const r of simpleRows) {
+    if (r.is_clearance) pushSimpleClearanceLine(r, null);
+    else remainderSell += r.proratedSell * scale;
+  }
+
+  for (const [, groupRows] of bundleGroups) {
+    const bundleId = groupRows[0].bundle_id;
+    const bundle = cache.bundles.find(b => b.id === bundleId);
+
+    // Package incentive is independent of clearance — granted for every
+    // COMPLETE bundle instance, whether or not the bundle is a clearance one.
+    // Scaled by setsOrdered (see computePackageIncentive) so splitting one
+    // multi-set purchase into several single-set "add bundle" actions never
+    // changes the total incentive paid.
+    if (bundle) {
+      const requiredItems = cache.bundleItemsByBundle.get(bundleId) || [];
+      const requiredIds = requiredItems.map(bi => bi.product_id);
+      const presentIds = groupRows.map(r => r.product_id);
+      if (requiredIds.length > 0 && commissionLib.isBundleInstanceComplete(requiredIds, presentIds)) {
+        // Estimate sets ordered from the ratio of actual component quantities
+        // to their required per-set quantities (matched components only —
+        // robust to a component not being in this bundle's required list).
+        const requiredQtyByProduct = new Map(requiredItems.map(bi => [bi.product_id, Number(bi.quantity) || 0]));
+        let actualQtyTotal = 0, requiredQtyTotal = 0;
+        for (const r of groupRows) {
+          const reqQty = requiredQtyByProduct.get(r.product_id) || 0;
+          if (reqQty > 0) { actualQtyTotal += Number(r.quantity) || 0; requiredQtyTotal += reqQty; }
+        }
+        const setsOrdered = requiredQtyTotal > 0 ? actualQtyTotal / requiredQtyTotal : 1;
+        const amt = commissionLib.computePackageIncentive(bundle, setsOrdered);
+        if (amt > 0) packageIncentives.push({ bundle_id: bundleId, amount: amt });
+      }
+    }
+
+    if (bundle && bundle.is_clearance) {
+      // BLENDED: classify ONCE at the aggregate, repeat the resulting level
+      // on every component row. Classification and the dollar payout MUST
+      // use the SAME sell/cost basis — aggSellRaw (the actual post-discount,
+      // pre-scale sell, same as pushSimpleClearanceLine) vs aggCost (Σ
+      // component cost for however many sets were ordered), NOT the catalog
+      // package_price — package_price is per-ONE-set and undiscounted, so
+      // comparing it against a multi-set/discounted aggCost silently
+      // misclassifies (underpays multi-set bundles, overpays bundles
+      // discounted below cost). `scale` is a ratio, so classifying pre-scale
+      // (raw) is equivalent to classifying post-scale — apply it only once,
+      // to the dollar amounts below.
+      let aggCost = 0, costMissing = false;
+      for (const r of groupRows) {
+        if (r.unit_cost == null) { costMissing = true; break; }
+        aggCost += Number(r.unit_cost) * (Number(r.quantity) || 0);
+      }
+      const aggSellRaw = groupRows.reduce((s, r) => s + r.proratedSell, 0);
+      const { level, marginPct } = costMissing
+        ? { level: commissionLib.CLEARANCE_LEVELS.UNQUALIFIED, marginPct: null }
+        : commissionLib.classifyClearanceMargin(aggSellRaw, aggCost);
+      clearanceLines.push({
+        level, marginPct, sell: aggSellRaw * scale, cost: costMissing ? null : aggCost * scale,
+        weightRows: groupRows.map(r => ({
+          sales_order_item_id: r.id, product_code: r.product_code, product_name: r.product_name,
+          bundle_id: bundleId, weight: r.bundle_component_price ?? r.proratedSell,
+        })),
+      });
+      // The whole instance is accounted for above — none of its rows fall
+      // into remainderSell (matches "no double-counting" at bundle granularity).
+    } else {
+      // Not a clearance bundle — components behave exactly like ordinary
+      // lines, each judged on its own product's is_clearance flag.
+      for (const r of groupRows) {
+        if (r.is_clearance) pushSimpleClearanceLine(r, bundleId);
+        else remainderSell += r.proratedSell * scale;
+      }
+    }
+  }
+
+  return { remainderSell, clearanceLines, packageIncentives, sotOrderId: sot.id };
 }
 
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
@@ -4412,7 +4940,9 @@ async function calculateCommission(orderId, companyId) {
   // Commission base: Singapore orders are commissioned on the GST-exclusive
   // amount (order_amount / 1.09); everyone else on the full amount. The
   // deposit gate above stays on gross — payments are made against the full
-  // invoice amount.
+  // invoice amount. Monthly tier-bracket matching (below) always uses this
+  // full `net`, regardless of clearance — only ITS APPLICATION splits
+  // between the non-clearance remainder and clearance-embedded amounts.
   const net = getCommissionableAmount(order);
   const channel = order.sales_channel || "branch";
 
@@ -4421,7 +4951,9 @@ async function calculateCommission(orderId, companyId) {
   if (rules.length === 0) rules = cache.rules.filter(r => r.channel === "branch");
   if (rules.length === 0) return;
 
-  // Product incentive total (no DB query — uses cached incentives)
+  // Product incentive total (no DB query — uses cached incentives). Unchanged
+  // by Phase C — still resolved from the legacy orders.items snapshot exactly
+  // as before; bundle package incentives are a separate, new pool.
   let productIncentiveTotal = 0;
   const orderItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
   if (Array.isArray(orderItems)) {
@@ -4437,64 +4969,166 @@ async function calculateCommission(orderId, companyId) {
     }
   }
 
+  // Phase C: resolve clearance/bundle context once for the whole order (not
+  // per salesman) — null when the company has the kill switch off, or there
+  // is no matching sales_orders row (legacy/manual/Telegram orders), or that
+  // order has no items. In every one of those cases behavior below is
+  // byte-for-byte identical to the pre-Phase-C calculation.
+  const clearanceCtx = await buildClearanceCommissionContext(order, companyId, cache, net);
+  const tierBase = clearanceCtx ? clearanceCtx.remainderSell : net;
+  const totalPackageIncentive = clearanceCtx ? clearanceCtx.packageIncentives.reduce((s, p) => s + p.amount, 0) : 0;
+
   // Find salesman users (no DB query — uses cached users)
   const salesmanNames = (order.salesman || "").split("/").map(s => s.trim()).filter(Boolean);
+  const n = salesmanNames.length || 1;
 
+  // Resolve every salesman's own matched tier rate FIRST (same lookup as
+  // before), so clearance-line splits can be computed once for the whole
+  // order (largest-remainder needs every salesman's ideal share at once to
+  // reconcile correctly) instead of drifting if computed independently per
+  // salesman in the loop below.
+  const resolved = [];
   for (const name of salesmanNames) {
     const salesUser = cache.users.find(u => u.salesman_name && u.salesman_name.toLowerCase() === name.toLowerCase());
-    if (!salesUser) continue;
+    let matchRule = null;
+    if (salesUser) {
+      const monthStart = new Date(order.created_at || new Date());
+      monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
+      const monthKey = `${salesUser.id}-${monthStart.toISOString().slice(0, 7)}`;
+      let monthlySales = cache.monthlySales[monthKey];
+      if (monthlySales === undefined) {
+        const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
+        const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman, country, address")
+          .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
+          .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
+        // Orders shared between multiple sales assistants count only this salesman's
+        // fractional share toward their own monthly cumulative sales (and therefore
+        // tier matching) — not the full order amount for every assistant on it.
+        // Singapore orders count GST-exclusive here too, so tier matching uses the
+        // same commissionable base as the commission itself.
+        monthlySales = (monthOrders || []).reduce((s, o) => {
+          const namesOnOrder = (o.salesman || "").split("/").map(nm => nm.trim()).filter(Boolean);
+          const commissionable = getCommissionableAmount(o);
+          const share = namesOnOrder.length > 0 ? commissionable / namesOnOrder.length : commissionable;
+          return s + share;
+        }, 0);
+        cache.monthlySales[monthKey] = monthlySales;
+      }
 
-    // Monthly cumulative sales — cache per salesman+month
-    const monthStart = new Date(order.created_at || new Date());
-    monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
-    const monthKey = `${salesUser.id}-${monthStart.toISOString().slice(0,7)}`;
-    let monthlySales = cache.monthlySales[monthKey];
-    if (monthlySales === undefined) {
-      const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
-      const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman, country, address")
-        .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
-        .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
-      // Orders shared between multiple sales assistants count only this salesman's
-      // fractional share toward their own monthly cumulative sales (and therefore
-      // tier matching) — not the full order amount for every assistant on it.
-      // Singapore orders count GST-exclusive here too, so tier matching uses the
-      // same commissionable base as the commission itself.
-      monthlySales = (monthOrders || []).reduce((s, o) => {
-        const namesOnOrder = (o.salesman || "").split("/").map(n => n.trim()).filter(Boolean);
-        const commissionable = getCommissionableAmount(o);
-        const share = namesOnOrder.length > 0 ? commissionable / namesOnOrder.length : commissionable;
-        return s + share;
-      }, 0);
-      cache.monthlySales[monthKey] = monthlySales;
+      // Find matching rule: per-salesman override first, then company tier
+      const personalRules = (rules || []).filter(r => r.role_name === "salesman" && r.user_id === salesUser.id);
+      const companyRules = (rules || []).filter(r => r.role_name === "salesman" && !r.user_id).sort((a, b) => (b.min_net || 0) - (a.min_net || 0));
+      const allSalesRules = personalRules.length > 0 ? personalRules : companyRules;
+      matchRule = allSalesRules.find(r => monthlySales >= (r.min_net || 0) && (!r.max_net || monthlySales <= r.max_net))
+        || allSalesRules[allSalesRules.length - 1]; // fallback to lowest tier
     }
+    resolved.push({ name, salesUser, matchRule });
+  }
 
-    // Find matching rule: per-salesman override first, then company tier
-    const personalRules = (rules || []).filter(r => r.role_name === "salesman" && r.user_id === salesUser.id);
-    const companyRules = (rules || []).filter(r => r.role_name === "salesman" && !r.user_id).sort((a, b) => (b.min_net || 0) - (a.min_net || 0));
-    const allSalesRules = personalRules.length > 0 ? personalRules : companyRules;
-    // Match tier by monthly cumulative sales
-    const matchRule = allSalesRules.find(r => monthlySales >= (r.min_net || 0) && (!r.max_net || monthlySales <= r.max_net))
-      || allSalesRules[allSalesRules.length - 1]; // fallback to lowest tier
-    if (!matchRule) continue;
+  // Precompute every clearance line's per-salesman split ONCE for the whole
+  // order (largest-remainder reconciles across `n`, not per iteration).
+  const salesmenForSplit = resolved.map(r => ({ ratePct: r.matchRule ? (r.matchRule.rate_pct || 0) : 0 }));
+  const lineSplits = clearanceCtx
+    ? clearanceCtx.clearanceLines.map(line => commissionLib.computeClearanceLineSplit({
+        level: line.level, sell: line.sell, cost: line.cost, salesmen: salesmenForSplit,
+      }))
+    : [];
+  const packageIncentiveShares = totalPackageIncentive > 0 ? commissionLib.splitEvenly(totalPackageIncentive, n) : new Array(n).fill(0);
+
+  for (let idx = 0; idx < resolved.length; idx++) {
+    const { salesUser, matchRule } = resolved[idx];
+    if (!salesUser || !matchRule) continue;
 
     const depositMet = depositPct >= (matchRule.deposit_gate_pct || 30);
-    const tierComm = net * ((matchRule.rate_pct || 0) / 100);
+    // Non-clearance portion: same formula as before, just fed `tierBase`
+    // (the non-clearance remainder when clearanceCtx exists, else the full
+    // `net` exactly as today — see buildClearanceCommissionContext).
+    const tierComm = tierBase * ((matchRule.rate_pct || 0) / 100);
     const incentiveAmt = productIncentiveTotal;
-    const totalComm = (tierComm + incentiveAmt) / salesmanNames.length; // split among shared salesmen
+    const tierCommissionAmt = tierComm / n;
+    const productIncentiveAmt = incentiveAmt / n;
 
-    const { data: existing } = await supabase.from("commissions").select("id").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
+    // Clearance portion: sum this salesman's share of every clearance line's
+    // tier-embedded + share-incentive amount.
+    let clearanceCommissionAmt = 0;
+    for (const split of lineSplits) clearanceCommissionAmt += (split.tierAmt[idx] || 0) + (split.shareAmt[idx] || 0);
+    clearanceCommissionAmt = commissionLib.round2(clearanceCommissionAmt);
+
+    const packageIncentiveAmt = packageIncentiveShares[idx] || 0;
+
+    const totalComm = commissionLib.round2(tierCommissionAmt + clearanceCommissionAmt + productIncentiveAmt + packageIncentiveAmt);
+
+    const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
+    // Never overwrite a paid commission — corrections go through
+    // commission_adjustments instead (see POST /commission-adjustments).
+    if (existing && (existing.status === "paid" || existing.paid_at)) continue;
+
     const commData = {
-      net_amount: net, rate_pct: matchRule.rate_pct, incentive_pct: incentiveAmt > 0 ? Math.round(incentiveAmt / net * 10000) / 100 : 0,
+      net_amount: tierBase, rate_pct: matchRule.rate_pct, incentive_pct: incentiveAmt > 0 ? Math.round(incentiveAmt / net * 10000) / 100 : 0,
       commission_amt: totalComm, deposit_met: depositMet,
       status: depositMet ? "eligible" : "pending",
       eligible_at: depositMet ? new Date().toISOString() : null,
       payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
+      tier_commission_amt: commissionLib.round2(tierCommissionAmt),
+      clearance_commission_amt: clearanceCommissionAmt,
+      product_incentive_amt: commissionLib.round2(productIncentiveAmt),
+      package_incentive_amt: commissionLib.round2(packageIncentiveAmt),
     };
-    if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
-    else await supabase.from("commissions").insert({ order_id: orderId, user_id: salesUser.id, role_name: "salesman", company_id: companyId, ...commData });
+    let commissionId;
+    if (existing) { await supabase.from("commissions").update(commData).eq("id", existing.id); commissionId = existing.id; }
+    else {
+      const { data: created } = await supabase.from("commissions")
+        .insert({ order_id: orderId, user_id: salesUser.id, role_name: "salesman", company_id: companyId, ...commData })
+        .select("id").single();
+      commissionId = created?.id;
+    }
+
+    // Rewrite this commission's line breakdown (delete+reinsert, same
+    // idempotent pattern as the commission row itself) — only meaningful
+    // when there IS a clearance context; otherwise leave no rows (no-op for
+    // every company with the kill switch off).
+    if (commissionId && clearanceCtx) {
+      await supabase.from("commission_line_breakdown").delete().eq("commission_id", commissionId);
+      const breakdownRows = [];
+      clearanceCtx.clearanceLines.forEach((line, lineIdx) => {
+        const split = lineSplits[lineIdx];
+        // Allocate this salesman's line-level tier/share amounts across the
+        // line's component rows by weight (for reporting only — see
+        // explodeBundleComponents/weightRows; a simple non-bundle line has a
+        // single weightRow so this trivially reproduces the line total).
+        const weights = line.weightRows.map(w => Number(w.weight) || 0);
+        const totalWeight = weights.reduce((s, w) => s + w, 0);
+        const tierIdeal = weights.map(w => (totalWeight > 0 ? (split.tierAmt[idx] || 0) * (w / totalWeight) : (split.tierAmt[idx] || 0) / weights.length));
+        const shareIdeal = weights.map(w => (totalWeight > 0 ? (split.shareAmt[idx] || 0) * (w / totalWeight) : (split.shareAmt[idx] || 0) / weights.length));
+        const perComponentTier = commissionLib.splitLargestRemainder(tierIdeal);
+        const perComponentShare = commissionLib.splitLargestRemainder(shareIdeal);
+        // One breakdown row per component, even when the line is unqualified
+        // (amounts all zero) — Finance can see WHY a clearance-flagged line
+        // paid nothing (margin_pct / clearance_level are still populated).
+        line.weightRows.forEach((wr, wrIdx) => {
+          breakdownRows.push({
+            commission_id: commissionId, company_id: companyId, order_id: orderId,
+            sales_order_item_id: wr.sales_order_item_id, product_code: wr.product_code, product_name: wr.product_name,
+            bundle_id: wr.bundle_id, is_clearance: true,
+            line_sell: commissionLib.round2(line.sell), line_cost: line.cost != null ? commissionLib.round2(line.cost) : null,
+            margin_pct: line.marginPct, clearance_level: line.level,
+            tier_commission_amt: perComponentTier[wrIdx] || 0, clearance_share_commission_amt: perComponentShare[wrIdx] || 0,
+          });
+        });
+      });
+      if (breakdownRows.length > 0) {
+        const { error: breakdownErr } = await supabase.from("commission_line_breakdown").insert(breakdownRows);
+        // Audit-only table — a failure here must not fail the commission
+        // calculation that already succeeded (commission_amt is already
+        // correct), but it must not fail SILENTLY either, or Finance loses
+        // the audit trail for this payout with no trace.
+        if (breakdownErr) console.error(`[calculateCommission] commission_line_breakdown insert failed for commission ${commissionId}:`, breakdownErr.message);
+      }
+    }
   }
 
-  // Branch manager override — 1% on all branch sales
+  // Branch manager override — 1% on all branch sales. Unaffected by Phase C:
+  // stays on the full `net` exactly as before (not itemized by clearance).
   const mgrRules = (rules || []).filter(r => r.role_name === "branch_manager" && !r.user_id);
   if (mgrRules.length > 0 && order.branch_id) {
     const { data: mgr } = await supabase.from("users").select("id")
@@ -4504,16 +5138,22 @@ async function calculateCommission(orderId, companyId) {
       const mgrRule = mgrRules[0];
       const depositMet = depositPct >= (mgrRule.deposit_gate_pct || 30);
       const overrideAmt = net * ((mgrRule.rate_pct || 0) / 100);
-      const { data: existing } = await supabase.from("commissions").select("id").eq("order_id", orderId).eq("user_id", mgr.id).maybeSingle();
-      const commData = {
-        net_amount: net, rate_pct: mgrRule.rate_pct, incentive_pct: 0,
-        commission_amt: overrideAmt, deposit_met: depositMet,
-        status: depositMet ? "eligible" : "pending",
-        eligible_at: depositMet ? new Date().toISOString() : null,
-        payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
-      };
-      if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
-      else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", company_id: companyId, ...commData });
+      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", mgr.id).maybeSingle();
+      if (existing && (existing.status === "paid" || existing.paid_at)) {
+        // Never overwrite a paid commission — corrections go through commission_adjustments.
+      } else {
+        const commData = {
+          net_amount: net, rate_pct: mgrRule.rate_pct, incentive_pct: 0,
+          commission_amt: overrideAmt, deposit_met: depositMet,
+          status: depositMet ? "eligible" : "pending",
+          eligible_at: depositMet ? new Date().toISOString() : null,
+          payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
+          tier_commission_amt: commissionLib.round2(overrideAmt),
+          clearance_commission_amt: 0, product_incentive_amt: 0, package_incentive_amt: 0,
+        };
+        if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
+        else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", company_id: companyId, ...commData });
+      }
     }
   }
 }
@@ -5457,7 +6097,11 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
 
         // OM approval rule for salesmen (managers can already change dates
         // freely in the web UI, so the chat doesn't gate them either).
-        if (!isManager && isWithinWorkingDays(newDate, 2)) {
+        // Fix #7: a blocked date routes through the same approval gate as
+        // the 2-working-day window (SOFT block — adds approval, never a
+        // hard reject).
+        const isBlockedDate = !!(await getBlockedDateReason(companyId, newDate, null));
+        if (!isManager && (isWithinWorkingDays(newDate, 2) || isBlockedDate)) {
           const { data: confirmedRoutes } = await supabase.from("delivery_routes")
             .select("id, lorry_plate, driver_name").eq("delivery_date", newDate).eq("status", "Confirmed");
           if (confirmedRoutes && confirmedRoutes.length > 0) {
@@ -6359,6 +7003,53 @@ app.delete("/delivery-teams/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE),
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Delivery Blocked Dates (Fix #7, migration 042) ────────────────
+// Company-configurable calendar of dates that SOFT-block delivery
+// scheduling — see getBlockedDateReason() above and its call sites in
+// POST /delivery-schedules and POST /sales-orders/:id/delivery-orders.
+// Gated on DELIVERY_EDIT (same permission as editing the schedule itself —
+// no new permission action needed for this).
+app.get("/delivery-blocked-dates", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ blocked_dates: [] });
+    const { from, to } = req.query;
+    let q = supabase.from("delivery_blocked_dates").select("*").eq("company_id", cid).order("blocked_date");
+    if (from) q = q.gte("blocked_date", from);
+    if (to) q = q.lte("blocked_date", to);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ blocked_dates: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/delivery-blocked-dates", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const { blocked_date, branch_id, reason } = req.body;
+    if (!blocked_date) return res.status(400).json({ error: "blocked_date required" });
+    const { data, error } = await supabase.from("delivery_blocked_dates")
+      .insert({ company_id: cid, branch_id: branch_id || null, blocked_date, reason: reason || null, created_by: req.user.id })
+      .select().single();
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ error: "This date is already blocked for the selected scope" });
+      throw error;
+    }
+    res.status(201).json({ blocked_date: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/delivery-blocked-dates/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    let dq = supabase.from("delivery_blocked_dates").delete().eq("id", req.params.id);
+    if (cid) dq = dq.eq("company_id", cid);
+    await dq;
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Delivery Schedules ──────────────────────────────────────────
 app.get("/delivery-schedules", requireAuth, async (req, res) => {
   try {
@@ -6383,7 +7074,7 @@ app.get("/delivery-schedules", requireAuth, async (req, res) => {
 
 app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (req, res) => {
   try {
-    const { order_id, team_id, scheduled_date, area, slot, sort_order, delivery_order_id } = req.body;
+    const { order_id, team_id, scheduled_date, area, slot, sort_order, delivery_order_id, override_reason } = req.body;
     const cid = getActiveCompanyId(req);
 
     // ── DO path (Phase 1): schedule a Delivery Order ──────────────
@@ -6397,13 +7088,21 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
       if (!allowed) return res.status(403).json({ error: "Permission denied: DELIVERY_ORDER_SCHEDULE" });
 
       const { data: dord } = await supabase.from("delivery_orders")
-        .select("id, status, order_id, do_number").eq("id", delivery_order_id).eq("company_id", cid).maybeSingle();
+        .select("id, status, order_id, do_number, sales_orders(branch_id)").eq("id", delivery_order_id).eq("company_id", cid).maybeSingle();
       if (!dord) return res.status(404).json({ error: "Delivery order not found" });
       // draft = first attempt; failed = re-attempt (Phase 5). Anything else is
       // already in flight or terminal.
       if (!["draft", "failed"].includes(dord.status)) {
         return res.status(409).json({ error: `Delivery order ${dord.do_number} is already ${dord.status}` });
       }
+
+      // Fix #7: SOFT block — require an override_reason to schedule on a
+      // blocked date; otherwise 400 with the configured block reason.
+      const blockReason = await getBlockedDateReason(cid, scheduled_date, dord.sales_orders?.branch_id || null);
+      if (blockReason && !(override_reason || "").trim()) {
+        return res.status(400).json({ error: blockReason, blocked_date: true });
+      }
+
       const isReattempt = dord.status === "failed";
       const { data: prevAttempts } = await supabase.from("delivery_schedules")
         .select("attempt_no").eq("delivery_order_id", dord.id).order("attempt_no", { ascending: false }).limit(1);
@@ -6422,11 +7121,23 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
         .update({ status: "scheduled", delivery_date: scheduled_date }).eq("id", dord.id);
       await logDoEvent(dord.id, isReattempt ? "rescheduled" : "scheduled",
         { scheduled_date, team_id: team_id || null, schedule_id: schedule.id, attempt_no: attemptNo }, req.user.id);
+      if (blockReason) {
+        await logDoEvent(dord.id, "blocked_date_override",
+          { scheduled_date, block_reason: blockReason, override_reason: override_reason.trim() }, req.user.id);
+      }
       return res.status(201).json({ schedule });
     }
 
     // ── Legacy whole-order path (unchanged) ───────────────────────
     if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
+
+    // Fix #7: SOFT block, same as the DO path above.
+    const { data: legacyOrderForBlock } = await supabase.from("orders").select("branch_id").eq("id", order_id).maybeSingle();
+    const legacyBlockReason = await getBlockedDateReason(cid, scheduled_date, legacyOrderForBlock?.branch_id || null);
+    if (legacyBlockReason && !(override_reason || "").trim()) {
+      return res.status(400).json({ error: legacyBlockReason, blocked_date: true });
+    }
+
     // If already scheduled for this date, update the team instead of blocking.
     // Only NULL-DO rows participate — a DO schedule must never be hijacked.
     let dupQ = supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date).is("delivery_order_id", null);
@@ -6437,8 +7148,10 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
       if (upErr) throw upErr;
       return res.json({ schedule: updated });
     }
+    const insertRow = { order_id, team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null, sort_order: sort_order || 0, status: "scheduled", is_ready: false, company_id: cid };
+    if (legacyBlockReason) insertRow.notes = `Scheduled on blocked date (${legacyBlockReason}): ${override_reason.trim()}`;
     const { data, error } = await supabase.from("delivery_schedules")
-      .insert({ order_id, team_id: team_id || null, scheduled_date, area: area || null, slot: slot || null, sort_order: sort_order || 0, status: "scheduled", is_ready: false, company_id: cid })
+      .insert(insertRow)
       .select().single();
     if (error) throw error;
     res.status(201).json({ schedule: data });
@@ -6448,19 +7161,33 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
 app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    // Validate record belongs to active company
-    if (cid) {
-      const { data: check } = await supabase.from("delivery_schedules").select("id").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
-      if (!check) return res.status(404).json({ error: "Schedule not found" });
-    }
+    // Validate record belongs to active company; also fetch its CURRENT
+    // status (pre-update) for the SEV-2 team-reassignment lock guard below —
+    // req.body.status is the caller's REQUESTED status, not what's actually
+    // stored, so the guard must read the DB row, not the request.
+    let checkQ = supabase.from("delivery_schedules").select("id, status").eq("id", req.params.id);
+    if (cid) checkQ = checkQ.eq("company_id", cid);
+    const { data: currentSchedule } = await checkQ.maybeSingle();
+    if (cid && !currentSchedule) return res.status(404).json({ error: "Schedule not found" });
     const { team_id, sort_order, status, slot, area, is_ready, notes } = req.body;
+
+    // QA SEV-2: block team reassignment once the schedule is already
+    // out_for_delivery/arrived/delivered — see isLockedScheduleStatus.
+    if (team_id !== undefined && currentSchedule && isLockedScheduleStatus(currentSchedule.status)) {
+      return res.status(400).json({ error: `Cannot reassign team — schedule is already ${currentSchedule.status}` });
+    }
 
     // Phase 2A: an admin marking a DO schedule "delivered" must go through
     // the same atomic completion RPC as the driver path — otherwise the
     // quantity ledger would be bypassed. Legacy (NULL DO) rows unaffected.
-    if (status === "delivered") {
+    // Fix #3: the admin dropdown sends Title-Case "Delivered" while the
+    // driver app sends lowercase "delivered" — normalize the comparison so
+    // BOTH reach the RPC (previously "Delivered" fell through to the
+    // generic branch below, silently skipping delivered_qty/order-status sync).
+    const statusLower = typeof status === "string" ? status.toLowerCase() : status;
+    if (statusLower === "delivered") {
       const { data: schedRow } = await supabase.from("delivery_schedules")
-        .select("id, delivery_order_id").eq("id", req.params.id).maybeSingle();
+        .select("id, delivery_order_id, order_id").eq("id", req.params.id).maybeSingle();
       if (schedRow?.delivery_order_id) {
         const { data: result, error: rpcErr } = await supabase.rpc("complete_delivery_order", {
           p_delivery_order_id: schedRow.delivery_order_id,
@@ -6485,9 +7212,18 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     if (area !== undefined) updates.area = area;
     if (is_ready !== undefined) updates.is_ready = is_ready;
     if (notes !== undefined) updates.notes = notes;
-    if (status === "delivered") updates.delivered_at = new Date().toISOString();
-    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select().single();
+    if (statusLower === "delivered") updates.delivered_at = new Date().toISOString();
+    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
     if (error) throw error;
+    // Fix #3: legacy schedules (no delivery_order_id) marked delivered by the
+    // dispatcher UI must sync orders.status the same way the driver endpoint
+    // (/driver/schedule/:id/status) already does — otherwise the order stays
+    // stuck at "Out for Delivery"/"Confirmed" even though it was delivered.
+    if (statusLower === "delivered" && data.orders?.id) {
+      await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
+      // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
+      await syncLegacyDeliveredToSalesOrder(cid, data.orders.so_number);
+    }
     res.json({ schedule: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6495,9 +7231,32 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
 app.delete("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
+    // Fix #4: look up the row before deleting it — if it carries a
+    // delivery_order_id, unassigning it must not orphan the DO. Reset the DO
+    // back to draft (mirrors POST /delivery-orders/:id/cancel's cleanup, minus
+    // the cancel) so it re-enters the unassigned pool and can be rescheduled
+    // (POST /delivery-schedules only accepts draft/failed DOs).
+    let selQ = supabase.from("delivery_schedules").select("id, delivery_order_id, status").eq("id", req.params.id);
+    if (cid) selQ = selQ.eq("company_id", cid);
+    const { data: existing } = await selQ.maybeSingle();
+    if (!existing) return res.json({ ok: true }); // already gone / not in this company — idempotent
+
+    // QA SEV-2: block deleting a schedule that's already out_for_delivery/
+    // arrived/delivered — see isLockedScheduleStatus. Deleting it would
+    // reset/orphan its Delivery Order mid-route and silently drop tracking
+    // on a legacy schedule that's already out on the road.
+    if (isLockedScheduleStatus(existing.status)) {
+      return res.status(400).json({ error: `Cannot delete — schedule is already ${existing.status}` });
+    }
+
     let dq = supabase.from("delivery_schedules").delete().eq("id", req.params.id);
     if (cid) dq = dq.eq("company_id", cid);
     await dq;
+
+    if (existing.delivery_order_id) {
+      await supabase.from("delivery_orders").update({ status: "draft" }).eq("id", existing.delivery_order_id);
+      await logDoEvent(existing.delivery_order_id, "unscheduled", { schedule_id: existing.id }, req.user.id);
+    }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6516,7 +7275,7 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
     // Source 1: delivery_schedules (new system). Phase 3: DO schedules pick
     // ONLY that shipment's items (product-matched), tagged with the DO number.
     const { data: schedules } = await supabase.from("delivery_schedules")
-      .select("*, orders(id, so_number, customer_name, address), delivery_orders(id, do_number, delivery_order_items(product_code, product_name, quantity, status))")
+      .select(`*, orders(id, so_number, customer_name, address), ${SELECTS.DO_MATCH_NESTED_SELECT}`)
       .gte("scheduled_date", startDate).lte("scheduled_date", endDate).in("status", ["scheduled", "picking"]);
     for (const sched of (schedules || [])) {
       if (!sched.orders?.id) continue;
@@ -6660,7 +7419,7 @@ app.get("/unified-loading-list", requireAuth, async (req, res) => {
   try {
     const { team_id, date } = req.query;
     if (!team_id && !date) return res.status(400).json({ error: "team_id or date required" });
-    let q = supabase.from("delivery_schedules").select("*, orders(id, so_number, customer_name), delivery_orders(id, do_number, delivery_order_items(product_code, product_name, quantity, status))");
+    let q = supabase.from("delivery_schedules").select(`*, orders(id, so_number, customer_name), ${SELECTS.DO_MATCH_NESTED_SELECT}`);
     if (team_id) q = q.eq("team_id", team_id);
     if (date) q = q.eq("scheduled_date", date);
     q = q.in("status", ["scheduled", "picking", "loading"]);
@@ -6972,6 +7731,8 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
     // the whole-order flip only ever happens on legacy schedules.
     if (status === "delivered" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
+      // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
+      await syncLegacyDeliveredToSalesOrder(getActiveCompanyId(req), data.orders.so_number);
     }
     if (status === "Out for Delivery" && data.orders?.id && !existing.delivery_order_id) {
       await supabase.from("orders").update({ status: "Out for Delivery" }).eq("id", data.orders.id);
@@ -7084,7 +7845,7 @@ function buildAllocationSummary(so, deliveryOrders, legacyOrder) {
 app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_CREATE), async (req, res) => {
   try {
     const companyId = getActiveCompanyId(req);
-    const { items, delivery_date, remark, override_arrival } = req.body;
+    const { items, delivery_date, remark, override_arrival, override_reason } = req.body;
 
     const ctx = await loadDoContext(req.params.id, companyId);
     if (!ctx) return res.status(404).json({ error: "Sales order not found" });
@@ -7103,6 +7864,16 @@ app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDE
       overrideAllowed = req.activeRoleKey === "MASTER"
         || (await permEngine.can(req.user.id, req.activeCompanyId, PERMS.DELIVERY_ORDER_OVERRIDE_ARRIVAL)).allowed;
       if (!overrideAllowed) return res.status(403).json({ error: "Permission denied: DELIVERY_ORDER_OVERRIDE_ARRIVAL" });
+    }
+
+    // Fix #7: SOFT block on the DO's own delivery_date, same rule as
+    // POST /delivery-schedules — require override_reason to proceed.
+    let blockReason = null;
+    if (delivery_date) {
+      blockReason = await getBlockedDateReason(companyId, delivery_date, so.branch_id || null);
+      if (blockReason && !(override_reason || "").trim()) {
+        return res.status(400).json({ error: blockReason, blocked_date: true });
+      }
     }
 
     const allocations = doLib.computeAllocations(so.sales_order_items || [], deliveryOrders);
@@ -7155,6 +7926,10 @@ app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDE
       items: itemRows.map(r => ({ sales_order_item_id: r.sales_order_item_id, product_name: r.product_name, quantity: r.quantity })),
       override_arrival: override_arrival === true,
     }, req.user.id);
+    if (blockReason) {
+      await logDoEvent(dord.id, "blocked_date_override",
+        { delivery_date, block_reason: blockReason, override_reason: override_reason.trim() }, req.user.id);
+    }
 
     res.status(201).json({ delivery_order: { ...dord, delivery_order_items: doItems } });
   } catch (err) { console.error("[POST delivery-orders]", err.message); res.status(500).json({ error: err.message }); }
@@ -7178,11 +7953,18 @@ app.get("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER
       }
     }
 
+    // Fix #2: same check POST /sales-orders/:id/delivery-orders uses to gate
+    // override_arrival — surfaced here so the frontend can authoritatively
+    // show/hide the override checkbox instead of guessing from role name.
+    const canOverrideArrival = req.activeRoleKey === "MASTER"
+      || (await permEngine.can(req.user.id, req.activeCompanyId, PERMS.DELIVERY_ORDER_OVERRIDE_ARRIVAL)).allowed;
+
     res.json({
       sales_order_id: so.id,
       order_number: so.order_number,
       delivery_orders: deliveryOrders.map(d => ({ ...d, events: eventsByDo[d.id] || [] })),
       items: buildAllocationSummary(so, deliveryOrders, legacyOrder),
+      can_override_arrival: canOverrideArrival,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -7196,7 +7978,7 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
     if (!companyId) return res.json({ delivery_orders: [] });
     const { status } = req.query;
     let q = supabase.from("delivery_orders")
-      .select("*, delivery_order_items(id, product_code, product_name, size, color, quantity, status), sales_orders(id, order_number, customer_name, customer_contact, customer_address, delivery_date, delivery_time_slot)")
+      .select(SELECTS.DELIVERY_ORDER_LIST_SELECT)
       .eq("company_id", companyId)
       .order("created_at", { ascending: false })
       .limit(500);
@@ -7205,8 +7987,64 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
       q = list.length > 1 ? q.in("status", list) : q.eq("status", list[0]);
     }
     const { data, error } = await q;
-    if (error) throw error;
+    if (error) {
+      // Defense-in-depth: DELIVERY_ORDER_LIST_SELECT references
+      // delivery_order_items.supplier_name (migration 040) — if that
+      // migration hasn't been applied yet in this environment, fall back to
+      // "*" instead of 500ing the whole unassigned-DO pool. Mirrors the same
+      // fallback GET /delivery-schedules already has.
+      let q2 = supabase.from("delivery_orders")
+        .select("*, delivery_order_items(*), sales_orders(id, order_number, customer_name, customer_contact, customer_address, delivery_date, delivery_time_slot)")
+        .eq("company_id", companyId)
+        .order("created_at", { ascending: false })
+        .limit(500);
+      if (status) {
+        const list = String(status).split(",").map(s => s.trim()).filter(Boolean);
+        q2 = list.length > 1 ? q2.in("status", list) : q2.eq("status", list[0]);
+      }
+      const { data: d2 } = await q2;
+      return res.json({ delivery_orders: d2 || [] });
+    }
     res.json({ delivery_orders: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-orders-by-month — Fix #5: the legacy Monthly Overview reads
+// only `orders` (one delivery_date per order), which misses Sales Orders
+// that were split into multiple Delivery Orders on different dates. This is
+// a lightweight, purpose-built feed of ACTIVE DOs (draft/scheduled/
+// out_for_delivery/arrived — same set lib/delivery-orders.js treats as
+// holding a quantity allocation) whose delivery_date falls in the requested
+// month, for the frontend to merge with legacy orders-without-active-DOs.
+// Company scope comes from the authenticated active-company context (same
+// as every other endpoint here) — NOT a client-supplied company_id, which
+// would let a caller read another company's schedule.
+app.get("/delivery-orders-by-month", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    if (!companyId) return res.json({ delivery_orders: [] });
+    const { month } = req.query;
+    if (!month || !/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: "month=YYYY-MM required" });
+    const [y, m] = month.split("-").map(Number);
+    const startDate = `${month}-01`;
+    const endDate = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10); // last calendar day of the month
+    const { data, error } = await supabase.from("delivery_orders")
+      .select("id, do_number, delivery_date, status, sales_orders(order_number, customer_name)")
+      .eq("company_id", companyId)
+      .in("status", doLib.ACTIVE_DO_STATUSES)
+      .gte("delivery_date", startDate)
+      .lte("delivery_date", endDate)
+      .order("delivery_date");
+    if (error) throw error;
+    const delivery_orders = (data || []).map(d => ({
+      id: d.id,
+      do_number: d.do_number,
+      delivery_date: d.delivery_date,
+      so_number: d.sales_orders?.order_number || null,
+      customer_name: d.sales_orders?.customer_name || null,
+      status: d.status,
+    }));
+    res.json({ delivery_orders });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -7251,6 +8089,18 @@ app.patch("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_EDIT), asy
 
     if (patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date) {
       await logDoEvent(dord.id, "rescheduled", { from: dord.delivery_date, to: patch.delivery_date }, req.user.id);
+
+      // Fix #8: reschedule cascade. Decision: a DO stays reschedulable UNTIL
+      // completed (the ["completed","cancelled"] guard above already blocks
+      // this endpoint once completed/cancelled) — so cascade the new date onto
+      // every non-terminal schedule attempt for this DO, however far along it
+      // is (scheduled, out_for_delivery, arrived). Terminal attempts
+      // (delivered/failed) are history and must not be rewritten.
+      const { error: cascadeErr } = await supabase.from("delivery_schedules")
+        .update({ scheduled_date: patch.delivery_date })
+        .eq("delivery_order_id", dord.id)
+        .not("status", "in", "(delivered,failed)");
+      if (cascadeErr) console.error("[PATCH delivery-orders reschedule cascade]", cascadeErr.message);
     }
     res.json({ delivery_order: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -8491,7 +9341,7 @@ app.get("/products", requireAuth, async (req, res) => {
       // Include all org master fields needed by composeProductView: the
       // price/cost fields are fetched so composeProductView can use them as
       // last-resort fallback (when company row has no price at all).
-      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, reorder_point, is_active, review_status, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name,organization_supplier_id), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, is_clearance, reorder_point, is_active, review_status, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name,organization_supplier_id), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
@@ -8535,7 +9385,7 @@ app.get("/products", requireAuth, async (req, res) => {
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, organization_product_id: explicitOrgProductId } = req.body;
+    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_clearance, organization_product_id: explicitOrgProductId } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
 
     // Normalize the incoming supplier reference into this company's supplier row
@@ -8567,7 +9417,7 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
     // product picks one kind of category depending on whether the active
     // company is in a catalogue group (see GET/POST /categories).
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, organization_product_id: orgProductId })
+      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, is_clearance: is_clearance === true, organization_product_id: orgProductId })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -8576,8 +9426,11 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
 
     // Auto-propagate into the other companies in the catalogue group so the org
     // master immediately shows scope = all companies (see helper for details).
+    // is_clearance propagates alongside the other shared identity fields —
+    // whether a product is a clearance item is a catalogue-group-wide fact,
+    // not a per-company one.
     await propagateProductToSiblings(req, orgProductId, {
-      code, name, description, color, size, organization_category_id, is_standard, is_customizable,
+      code, name, description, color, size, organization_category_id, is_standard, is_customizable, is_clearance,
     });
 
     // Supplier is a shared attribute for catalogue-group products: mirror it onto
@@ -8592,7 +9445,7 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
 app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active } = req.body;
+    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, is_clearance } = req.body;
 
     // Fetch current product to discover organization_product_id before update
     const { data: existing } = await supabase.from("products")
@@ -8604,7 +9457,7 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
     const { companySupplierId, orgSupplierId } = await resolveIncomingProductSupplier(cid, { supplier_id, org_supplier_id });
 
     const { data, error } = await supabase.from("products")
-      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active })
+      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active, is_clearance })
       .eq("id", req.params.id).eq("company_id", cid)
       .select("*, organization_products(id, code, name, brand, description, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, version)").single();
     if (error) {
@@ -8642,6 +9495,14 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
     // the shared product keeps the same supplier everywhere.
     if (existing.organization_product_id) {
       await syncSharedProductSupplier(req, existing.organization_product_id, orgSupplierId);
+    }
+
+    // is_clearance is a per-company products column (organization_products has
+    // no such field), so — unlike name/description above — it propagates by
+    // writing directly to every sibling company's row for this shared product,
+    // the same way syncSharedProductSupplier does for supplier_id.
+    if (existing.organization_product_id && is_clearance !== undefined) {
+      await syncClearanceFlagToSiblings(existing.organization_product_id, is_clearance);
     }
 
     res.json({ product: composeProductView(data) });
@@ -10187,7 +11048,17 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
 
-    const subtotal = items.reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+    // Explode any { bundle_id } lines into their component lines before
+    // anything else touches `items` — subtotal, GST, and the per-item loop
+    // below all need to see the exploded rows, not the bundle placeholder.
+    let expandedItems = await expandBundleItems(company_id, items);
+    try {
+      expandedItems = normalizeCustomItemNames(expandedItems);
+    } catch (nameErr) {
+      return res.status(400).json({ error: nameErr.message });
+    }
+
+    const subtotal = expandedItems.reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
 
     // E-invoice details are mandatory only for confirmed orders above RM10,000.
     // The amount alone decides — manual/legacy SO numbers add no requirement of
@@ -10228,7 +11099,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     if (orderErr) throw orderErr;
 
     const itemRows = [];
-    for (const it of items) {
+    for (const it of expandedItems) {
       let productId = it.product_id || null;
       let linkedCustom = it.linked_custom_item === true;
       let requiresReview = !productId;
@@ -10263,8 +11134,22 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         notes: it.notes || null,
         requires_product_review: requiresReview,
         linked_custom_item: linkedCustom,
+        bundle_id: it.bundle_id || null,
+        bundle_instance_id: it.bundle_instance_id || null,
+        bundle_component_price: it.bundle_component_price ?? null,
       });
     }
+    // is_clearance AND unit_cost are resolved server-side from the products
+    // table for every product-linked line — never trust either from the
+    // client (see resolveProductLineDefaults). Custom/unlinked lines keep
+    // whatever unit_cost the client sent (no catalog authority to check).
+    const productDefaults = await resolveProductLineDefaults(company_id, itemRows);
+    for (const row of itemRows) {
+      const d = row.product_id ? productDefaults.get(row.product_id) : null;
+      row.is_clearance = d ? d.is_clearance : false;
+      if (d) row.unit_cost = d.unit_cost;
+    }
+
     const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
     if (itemsErr) throw itemsErr;
 
@@ -10306,6 +11191,17 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       }
     }
 
+    // Explode any { bundle_id } lines before amendment detection / subtotal /
+    // the rebuild loop below all see them — same as POST /sales-orders.
+    let expandedItems = Array.isArray(items) ? await expandBundleItems(company_id, items) : null;
+    if (expandedItems) {
+      try {
+        expandedItems = normalizeCustomItemNames(expandedItems);
+      } catch (nameErr) {
+        return res.status(400).json({ error: nameErr.message });
+      }
+    }
+
     // Detect material amendments on confirmed/delivered orders → require re-approval
     let finalStatus = status;
     let amendmentNote = null;
@@ -10314,19 +11210,19 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const orderDateChanged = newOrderDate !== (existing.order_date || null);
     if (wasConfirmed) {
       const changes = [];
-      if (Array.isArray(items)) {
+      if (expandedItems) {
         const oldItems = existing.sales_order_items || [];
         // Check for new items
         const oldNames = new Set(oldItems.map(i => (i.product_name || "").toLowerCase()));
-        const newItems = items.filter(i => !oldNames.has((i.product_name || "").toLowerCase()));
+        const newItems = expandedItems.filter(i => !oldNames.has((i.product_name || "").toLowerCase()));
         if (newItems.length > 0) changes.push(`+${newItems.length} new item${newItems.length > 1 ? "s" : ""}: ${newItems.map(i => i.product_name || i.product_code).join(", ")}`);
         // Check for removed items
-        const newNames = new Set(items.map(i => (i.product_name || "").toLowerCase()));
+        const newNames = new Set(expandedItems.map(i => (i.product_name || "").toLowerCase()));
         const removed = oldItems.filter(i => !newNames.has((i.product_name || "").toLowerCase()));
         if (removed.length > 0) changes.push(`-${removed.length} removed: ${removed.map(i => i.product_name || i.product_code).join(", ")}`);
         // Check for price changes
         const oldPriceMap = new Map(oldItems.map(i => [(i.product_name || "").toLowerCase(), Number(i.unit_price) || 0]));
-        for (const ni of items) {
+        for (const ni of expandedItems) {
           const key = (ni.product_name || "").toLowerCase();
           const oldPrice = oldPriceMap.get(key);
           if (oldPrice !== undefined && oldPrice !== (Number(ni.unit_price) || 0)) {
@@ -10334,7 +11230,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
           }
         }
         // Check subtotal change
-        const newSubtotal = items.reduce((s, it) => s + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+        const newSubtotal = expandedItems.reduce((s, it) => s + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
         const oldSubtotal = Number(existing.subtotal) || 0;
         if (Math.abs(newSubtotal - oldSubtotal) > 0.01) {
           changes.push(`Total: RM${oldSubtotal.toFixed(2)} → RM${newSubtotal.toFixed(2)}`);
@@ -10350,11 +11246,11 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       }
     }
 
-    const subtotal = (items || []).reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
+    const subtotal = (expandedItems || []).reduce((sum, it) => sum + (Number(it.unit_price) || 0) * (Number(it.quantity) || 1), 0);
 
     // E-invoice rule on edits too: confirmed/delivered orders above RM10,000
     // must carry e-invoice details (same rule as POST; backend is source of truth).
-    const einvSubtotal = Array.isArray(items) ? subtotal : (Number(existing.subtotal) || 0);
+    const einvSubtotal = expandedItems ? subtotal : (Number(existing.subtotal) || 0);
     const einvTotal = einvSubtotal - (Number(discount) || 0) + (gst_waived ? 0 : (Number(gst_amount) || 0));
     if (["confirmed", "delivered"].includes(status) && einvTotal > 10000 && (!customer_id_no?.trim() || !customer_email?.trim())) {
       return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
@@ -10379,10 +11275,10 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { error: updErr } = await supabase.from("sales_orders").update(updateData).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
-    if (Array.isArray(items)) {
+    if (expandedItems) {
       await supabase.from("sales_order_items").delete().eq("order_id", id);
       const itemRows = [];
-      for (const it of items) {
+      for (const it of expandedItems) {
         let productId = it.product_id || null;
         let linkedCustom = it.linked_custom_item === true;
         let requiresReview = !productId;
@@ -10408,8 +11304,22 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
           // Item edits delete+reinsert rows — the linked-custom flag must
           // round-trip through the form or linking history is lost on edit.
           linked_custom_item: linkedCustom,
+          bundle_id: it.bundle_id || null,
+          bundle_instance_id: it.bundle_instance_id || null,
+          bundle_component_price: it.bundle_component_price ?? null,
         });
       }
+      // is_clearance AND unit_cost are resolved server-side from the products
+      // table for every product-linked line — never trust either from the
+      // client (see resolveProductLineDefaults). Custom/unlinked lines keep
+      // whatever unit_cost the client sent (no catalog authority to check).
+      const productDefaults = await resolveProductLineDefaults(company_id, itemRows);
+      for (const row of itemRows) {
+        const d = row.product_id ? productDefaults.get(row.product_id) : null;
+        row.is_clearance = d ? d.is_clearance : false;
+        if (d) row.unit_cost = d.unit_cost;
+      }
+
       const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
       if (itemsErr) throw itemsErr;
     }

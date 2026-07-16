@@ -7,6 +7,9 @@
  *
  * NOTE: SUPPLIER_DELIVERY_LIST_SELECT and DO_REVIEW_SELECT include columns
  * added by migration 022 — they are expected to FAIL until it is applied.
+ * DELIVERY_SCHEDULE_LIST_SELECT / DRIVER_SCHEDULE_SELECT / DELIVERY_ORDER_LIST_SELECT
+ * include delivery_order_items.supplier_name added by migration 040 —
+ * expected to FAIL until it is applied.
  *
  * Usage: node scripts/test-selects.js
  */
@@ -19,12 +22,13 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const CASES = [
   ["orders", SELECTS.ORDER_LIST_SELECT, false],
   ["orders", SELECTS.ORDER_MATCH_SELECT, false],
-  ["supplier_deliveries", SELECTS.SUPPLIER_DELIVERY_LIST_SELECT, true],   // needs migration 022
-  ["do_review", SELECTS.DO_REVIEW_SELECT, true],                          // needs migration 022
+  ["supplier_deliveries", SELECTS.SUPPLIER_DELIVERY_LIST_SELECT, "022"],
+  ["do_review", SELECTS.DO_REVIEW_SELECT, "022"],
   ["delivery_routes", SELECTS.DELIVERY_ROUTE_SELECT, false],
   ["delivery_route_orders", SELECTS.ROUTE_ORDERS_NESTED_SELECT, false],
-  ["delivery_schedules", SELECTS.DELIVERY_SCHEDULE_LIST_SELECT, false],
-  ["delivery_schedules", SELECTS.DRIVER_SCHEDULE_SELECT, false],
+  ["delivery_schedules", SELECTS.DELIVERY_SCHEDULE_LIST_SELECT, "040"],
+  ["delivery_schedules", SELECTS.DRIVER_SCHEDULE_SELECT, "040"],
+  ["delivery_orders", SELECTS.DELIVERY_ORDER_LIST_SELECT, "040"],
   ["commissions", SELECTS.COMMISSION_LIST_SELECT, false],
   ["commissions", `${SELECTS.COMMISSION_LIST_SELECT}, wrong_item_holds(hold_reason, status)`, false],
   // Frontend App.js ORDER_COLS (keep in sync with src/App.js)
@@ -35,13 +39,13 @@ const CASES = [
 
 (async () => {
   let pass = 0, fail = 0, pending = 0;
-  for (const [table, sel, needs022] of CASES) {
+  for (const [table, sel, pendingMigration] of CASES) {
     const { error } = await supabase.from(table).select(sel).limit(1);
     const label = `${table} :: ${sel.replace(/\s+/g, " ").slice(0, 70)}…`;
     if (!error) { console.log(`✅ ${label}`); pass++; }
-    else if (needs022) { console.log(`⏳ ${label}\n   pending migration 022: ${error.message}`); pending++; }
+    else if (pendingMigration) { console.log(`⏳ ${label}\n   pending migration ${pendingMigration}: ${error.message}`); pending++; }
     else { console.log(`❌ ${label}\n   ${error.message}`); fail++; }
   }
-  console.log(`\n${pass} passed, ${fail} failed, ${pending} pending migration 022`);
+  console.log(`\n${pass} passed, ${fail} failed, ${pending} pending migration`);
   process.exit(fail ? 1 : 0);
 })();
