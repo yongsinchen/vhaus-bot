@@ -8871,8 +8871,14 @@ app.patch("/spec-options/:id/approve", ...requirePerm(PERMS.PRODUCTS_EDIT), asyn
 app.get("/branches", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
+    // Optional ?company_id= lets the User form list another company's branches
+    // when assigning a branch (masters can target any company; everyone else is
+    // restricted to their active company). No param → active company as before.
+    const requested = req.query.company_id;
+    const isMaster = req.activeRoleKey === "MASTER" || req.user?.role === "master";
+    const targetCid = (requested && (isMaster || String(requested) === String(cid))) ? requested : cid;
     let query = supabase.from("branches").select("id, name, company_id").order("name");
-    if (cid) query = query.eq("company_id", cid);
+    if (targetCid) query = query.eq("company_id", targetCid);
     const { data, error } = await query;
     if (error) throw error;
     res.json({ branches: data || [] });
