@@ -4129,29 +4129,54 @@ app.get("/do-review", requireAuth, async (req, res) => {
   res.json(data || []);
 });
 
-// PATCH /do-review/:id/resolve — mark as resolved (admin linked manually)
+// PATCH /do-review/:id/resolve — reviewer manually links an unmatched supplier
+// DO line to an SO and/or a product (SKU), then resolves it.
+//   so_number (+ optional product_id) → stamp arrival on the matching order line
+//   product_id                        → record the linked SKU on the review row
 app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
   const { id } = req.params;
-  const { so_number, item_code, arrival_date } = req.body;
+  const { so_number, item_code, product_id, arrival_date } = req.body;
 
-  // If admin provides SO + item to link, update the order item
-  if (so_number && item_code) {
-    const date = arrival_date || new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
-    const { data: orders } = await supabase.from("orders").select("id, items").eq("so_number", so_number).in("status", ["Pending", "In Progress"]);
-    for (const order of (orders || [])) {
-      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-      const updated = items.map(oi => {
-        if (oi.itemCode === item_code || (oi.itemName && oi.itemName.toLowerCase().includes(item_code.toLowerCase()))) {
-          return { ...oi, arrivalDate: date };
-        }
-        return oi;
-      });
-      await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
-      await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
-    }
+  const update = { status: "Resolved", resolved_by: req.user?.id || null, resolved_at: new Date().toISOString() };
+  if (product_id) update.product_id = product_id;
+
+  // If a product SKU is linked, use its code as an extra key so the correct
+  // order line is stamped even when the supplier's raw code differed.
+  let productCode = null;
+  if (product_id) {
+    const { data: prod } = await supabase.from("products").select("code").eq("id", product_id).maybeSingle();
+    productCode = (prod?.code || "").toLowerCase().trim() || null;
   }
 
-  const { error } = await supabase.from("do_review").update({ status: "Resolved" }).eq("id", id);
+  // If the reviewer supplies an SO, stamp arrival on the matching order line.
+  if (so_number) {
+    const date = arrival_date || new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
+    const codeKey = (item_code || "").toLowerCase().trim();
+    const orders = await supplierDO.findCandidateOrders(so_number, getActiveCompanyId(req));
+    let stampedOrderId = null;
+    for (const order of (orders || [])) {
+      const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+      let stamped = false;
+      const updated = items.map(oi => {
+        const oiCode = (oi.itemCode || "").toLowerCase().trim();
+        const oiName = (oi.itemName || "").toLowerCase();
+        const hit = (codeKey && (oiCode === codeKey || oiName.includes(codeKey)))
+          || (productCode && (oiCode === productCode || oiName.includes(productCode)));
+        if (hit) { stamped = true; return { ...oi, arrivalDate: date }; }
+        return oi;
+      });
+      if (stamped) {
+        await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
+        await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
+        stampedOrderId = order.id;
+      }
+    }
+    update.so_number = so_number;
+    update.arrival_date = date;
+    if (stampedOrderId) update.matched_order_id = stampedOrderId;
+  }
+
+  const { error } = await supabase.from("do_review").update(update).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
   await autoAdvanceDOStatus(id);
   res.json({ success: true });
