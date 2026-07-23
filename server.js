@@ -3597,6 +3597,54 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /dashboard/branch-sales?month=YYYY-MM — per-branch total sales for the
+// active company in the given month. Master-only (the Overview branch
+// performance widget). Sales = sum of orders.order_amount for non-cancelled,
+// non-service orders whose order_date falls in the month; orders with no
+// branch are bucketed as "Unassigned". Aggregated in JS (the supabase client
+// has no GROUP BY) the same way the commission monthly-sales rollup is.
+app.get("/dashboard/branch-sales", requireAuth, async (req, res) => {
+  try {
+    const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
+    if (roleKey !== "master") return res.status(403).json({ error: "Master only" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ month: null, branches: [], total: 0 });
+
+    const month = /^\d{4}-\d{2}$/.test(req.query.month || "")
+      ? req.query.month
+      : new Date().toISOString().slice(0, 7);
+    const [y, m] = month.split("-").map(Number);
+    const start = `${month}-01`;
+    const nextMonth = m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
+
+    const [{ data: branchRows }, { data: orders }] = await Promise.all([
+      supabase.from("branches").select("id, name").eq("company_id", cid).order("name"),
+      supabase.from("orders").select("branch_id, order_amount, status, order_date")
+        .eq("company_id", cid)
+        .gte("order_date", start).lt("order_date", nextMonth)
+        .or("type.is.null,type.neq.Service")
+        .not("status", "in", '("Cancelled","cancelled")'),
+    ]);
+
+    const totals = {};
+    let unassigned = 0, grand = 0;
+    for (const o of (orders || [])) {
+      const amt = Number(o.order_amount) || 0;
+      grand += amt;
+      if (o.branch_id) totals[o.branch_id] = (totals[o.branch_id] || 0) + amt;
+      else unassigned += amt;
+    }
+    const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+    const branches = (branchRows || []).map(b => ({
+      branch_id: b.id, branch_name: b.name, total_sales: round2(totals[b.id] || 0),
+    }));
+    if (unassigned > 0) branches.push({ branch_id: null, branch_name: "Unassigned", total_sales: round2(unassigned) });
+    branches.sort((a, b) => b.total_sales - a.total_sales);
+
+    res.json({ month, branches, total: round2(grand) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /operations/pending-counts — head-count only, for the sidebar badge.
 // Lets the app show the Operations badge at startup without fetching the
 // full service_pending + do_review row sets (those load when the page opens).
