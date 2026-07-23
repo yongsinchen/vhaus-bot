@@ -4223,14 +4223,14 @@ app.get("/drivers", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, r
 });
 
 app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) => {
-  const { name, email, password, role, company_id, telegram_id, salesman_name } = req.body;
+  const { name, email, password, role, company_id, telegram_id, salesman_name, branch_id } = req.body;
   if (!name || !email || !password || !role) return res.status(400).json({ error: "Missing required fields." });
   const { data: authData, error: authErr } = await supabase.auth.admin.createUser({ email, password, email_confirm: true });
   if (authErr) return res.status(400).json({ success: false, error: authErr.message });
   const { error: profileErr } = await supabase.from("users").insert({
     id: authData.user.id, name, email, role,
     company_id: company_id || null, telegram_id: telegram_id || null,
-    salesman_name: salesman_name || null, is_active: true,
+    salesman_name: salesman_name || null, branch_id: branch_id || null, is_active: true,
   });
   if (profileErr) return res.status(500).json({ success: false, error: profileErr.message });
   res.json({ success: true, userId: authData.user.id });
@@ -4238,13 +4238,14 @@ app.post("/admin/users", requireRole(["master", "manager"]), async (req, res) =>
 
 app.patch("/admin/users/:id", requireRole(["master", "manager"]), async (req, res) => {
   const { id } = req.params;
-  const { name, role, company_id, telegram_id, salesman_name, is_active } = req.body;
+  const { name, role, company_id, telegram_id, salesman_name, branch_id, is_active } = req.body;
   const updates = {};
   if (name !== undefined) updates.name = name;
   if (role !== undefined) updates.role = role;
   if (company_id !== undefined) updates.company_id = company_id || null;
   if (telegram_id !== undefined) updates.telegram_id = telegram_id || null;
   if (salesman_name !== undefined) updates.salesman_name = salesman_name || null;
+  if (branch_id !== undefined) updates.branch_id = branch_id || null;
   if (is_active !== undefined) updates.is_active = is_active;
   if (Object.keys(updates).length === 0) return res.status(400).json({ success: false, error: "No fields to update." });
   const { data, error } = await supabase.from("users").update(updates).eq("id", id).select().single();
