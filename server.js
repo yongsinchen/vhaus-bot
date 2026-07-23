@@ -5293,6 +5293,22 @@ async function calculateCommission(orderId, companyId) {
       }
     }
   }
+
+  // Purge salesman commission rows for people no longer on this order (e.g.
+  // after a reassignment) so a removed salesman doesn't keep an orphaned,
+  // still-payable commission — the reported "wrong salesman on commission" bug
+  // where reassigning elynn -> Timi left elynn's row behind. Guards: never
+  // touch a paid row (corrections go through commission_adjustments), and only
+  // purge when at least one current salesman resolved, so an order whose
+  // salesman name simply doesn't match a user can't wipe its commissions.
+  const keepSalesmanIds = resolved.map(r => r.salesUser?.id).filter(Boolean);
+  if (keepSalesmanIds.length > 0) {
+    const { error: purgeErr } = await supabase.from("commissions").delete()
+      .eq("order_id", orderId).eq("role_name", "salesman")
+      .is("paid_at", null).neq("status", "paid")
+      .not("user_id", "in", `(${keepSalesmanIds.map(id => `"${id}"`).join(",")})`);
+    if (purgeErr) console.error(`[calculateCommission] stale salesman purge failed for order ${orderId}:`, purgeErr.message);
+  }
 }
 
 // Commissions are bucketed by the month AFTER the order's own month — e.g. an order
