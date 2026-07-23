@@ -5769,6 +5769,13 @@ app.get("/service-cases", requireAuth, async (req, res) => {
         const { data: o } = await supabase.from("orders").select("so_number, customer_name, address, contact, salesman").eq("id", svc.order_id).maybeSingle();
         if (o) svc._order = o;
       }
+      // Standalone service (no source SO): pull salesman + customer from its own
+      // inert delivery order, which carries the creator as salesman (bug 3).
+      // Null out so_number so the inert SV number isn't shown as an SO link.
+      if (!svc._order && svc.legacy_order_id) {
+        const { data: lo } = await supabase.from("orders").select("customer_name, address, contact, salesman").eq("id", svc.legacy_order_id).maybeSingle();
+        if (lo) svc._order = { so_number: null, ...lo };
+      }
       if (!svc._order && svc.customer_name) {
         svc._order = { so_number: null, customer_name: svc.customer_name, address: svc.customer_address, contact: svc.customer_phone, salesman: null };
       }
@@ -5798,13 +5805,20 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
     const { data: svc } = await sq.single();
     if (!svc) return res.status(404).json({ error: "Service not found" });
     // Load related data
+    // Source SO when linked; otherwise the inert legacy order (standalone
+    // service) which carries the customer details + creator salesman (bug 3/5).
+    const orderLookupId = svc.order_id || svc.legacy_order_id || null;
     const [legsRes, tripsRes, claimsRes, orderRes] = await Promise.all([
       supabase.from("service_legs").select("*").eq("service_id", svc.id).order("leg_order"),
       supabase.from("service_trips").select("*").eq("service_id", svc.id).order("trip_number"),
       supabase.from("service_part_claims").select("*").eq("service_id", svc.id).order("created_at"),
-      svc.order_id ? supabase.from("orders").select("so_number, customer_name, address, contact, items").eq("id", svc.order_id).single() : { data: null },
+      orderLookupId ? supabase.from("orders").select("so_number, customer_name, address, contact, salesman, items").eq("id", orderLookupId).single() : { data: null },
     ]);
-    res.json({ service: svc, legs: legsRes.data || [], trips: tripsRes.data || [], claims: claimsRes.data || [], order: orderRes.data });
+    // Don't surface the inert order's own SV number as if it were a source SO.
+    const orderData = orderRes.data
+      ? (svc.order_id ? orderRes.data : { ...orderRes.data, so_number: null })
+      : null;
+    res.json({ service: svc, legs: legsRes.data || [], trips: tripsRes.data || [], claims: claimsRes.data || [], order: orderData });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5858,6 +5872,18 @@ app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
     if (isTbc && result.order?.id) {
       await supabase.from("orders").update({ delivery_date: "TBC" }).eq("id", result.order.id);
       if (result.order) result.order.delivery_date = "TBC";
+    }
+
+    // Bug 3: a standalone service (no linked SO to inherit a salesman from)
+    // defaults its salesman to the creator, stored on the inert legacy order
+    // so the service list enrichment — which reads salesman off the order —
+    // can display it. Linked services keep inheriting the source SO's salesman.
+    if (!order_id && result.order?.id) {
+      const creatorSalesman = req.user.salesman_name || req.user.name || null;
+      if (creatorSalesman) {
+        await supabase.from("orders").update({ salesman: creatorSalesman }).eq("id", result.order.id);
+        result.order.salesman = creatorSalesman;
+      }
     }
 
     res.status(201).json({ service: result.service, legs: result.legs, order: result.order });
@@ -8051,6 +8077,21 @@ app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDE
       delivery_order_id: dord.id, sales_order_item_id: soi.id,
       ...doLib.snapshotFromSoi(soi), quantity, status: "pending",
     }));
+    // Bug 1: older sales_order_items were created before supplier_name was
+    // resolved at write-time, so their snapshot is null and the DO board shows
+    // a blank supplier. Re-resolve from the product for those lines so DOs cut
+    // from legacy orders still carry the supplier. Product-linked lines only —
+    // custom/unlinked lines have no catalog authority and stay null.
+    const needSupplier = check.normalized.filter(({ soi }) => !soi.supplier_name && soi.product_id);
+    if (needSupplier.length) {
+      const defs = await resolveProductLineDefaults(companyId, needSupplier.map(({ soi }) => ({ product_id: soi.product_id })));
+      check.normalized.forEach(({ soi }, idx) => {
+        if (!itemRows[idx].supplier_name && soi.product_id) {
+          const d = defs.get(soi.product_id);
+          if (d?.supplier_name) itemRows[idx].supplier_name = d.supplier_name;
+        }
+      });
+    }
     const { data: doItems, error: itemsErr } = await supabase.from("delivery_order_items").insert(itemRows).select();
     if (itemsErr) {
       // Don't leave a header row without items
