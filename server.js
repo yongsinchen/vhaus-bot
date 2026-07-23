@@ -4470,15 +4470,43 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
     const { data: phoneOrders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, created_at, type")
       .eq("company_id", customer.company_id).ilike("contact", `%${customer.phone || "NOMATCH"}%`).is("customer_id", null);
     const allOrders = [...(orders || []), ...(phoneOrders || [])];
-    // Load payments
+    // Load payments (the ledger — on-delivery collections, recorded payments).
     const { data: payments } = await supabase.from("payments").select("*")
       .or(`customer_id.eq.${customer.id}${allOrders.length > 0 ? `,order_id.in.(${allOrders.map(o => o.id).join(",")})` : ""}`)
       .order("paid_at", { ascending: false });
-    // Calculate totals
+
+    // Each order's upfront deposit lives on sales_orders (not the payments
+    // ledger), so surface it as a synthetic "Deposit" line — otherwise the
+    // customer's payment history omits the deposit. These have no payment id
+    // (they're edited on the order, not deletable here).
+    const soNumbers = [...new Set(allOrders.map(o => o.so_number).filter(Boolean))];
+    const depositLines = [];
+    if (soNumbers.length) {
+      const { data: sos } = await supabase.from("sales_orders")
+        .select("order_number, initial_deposit, deposit, created_at")
+        .eq("company_id", customer.company_id).in("order_number", soNumbers);
+      for (const so of (sos || [])) {
+        const dep = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
+        if (dep > 0) {
+          const ord = allOrders.find(o => o.so_number === so.order_number);
+          depositLines.push({
+            id: null, _deposit: true, amount: dep, payment_method: "Deposit",
+            reference_no: null, proof_url: null, order_id: ord?.id || null,
+            so_number: so.order_number, paid_at: so.created_at || ord?.created_at || null,
+          });
+        }
+      }
+    }
+    const allPayments = [...depositLines, ...(payments || [])]
+      .sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
+
+    // Totals. total_paid is derived from balances (the source of truth kept by
+    // recomputeOrderPaid = deposit + payments) so it always reconciles, rather
+    // than double-counting or missing the deposit lines above.
     const totalSpent = allOrders.reduce((s, o) => s + (Number(o.order_amount) || 0), 0);
     const totalBalance = allOrders.reduce((s, o) => s + Math.max(0, Number(o.balance) || 0), 0);
-    const totalPaid = (payments || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
-    res.json({ customer, orders: allOrders, payments: payments || [], summary: { total_spent: totalSpent, total_balance: totalBalance, total_paid: totalPaid, order_count: allOrders.length } });
+    const totalPaid = Math.max(0, totalSpent - totalBalance);
+    res.json({ customer, orders: allOrders, payments: allPayments, summary: { total_spent: totalSpent, total_balance: totalBalance, total_paid: totalPaid, order_count: allOrders.length } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4637,7 +4665,7 @@ app.get("/payments", requireAuth, async (req, res) => {
 // rolls back the linked sales order's paid/deposit total, and recalculates
 // commissions (which may drop back to "pending" if the deposit gate is no
 // longer met). Keeps the customer payment history and Orders screen in sync.
-app.delete("/payments/:id", requireRole(["master"]), async (req, res) => {
+app.delete("/payments/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     const { id } = req.params;
