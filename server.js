@@ -3559,7 +3559,7 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
     // 2. Ops badge counts — same as GET /operations/pending-counts
     let spQ = supabase.from("service_pending").select("id", { count: "exact", head: true }).eq("status", "Pending");
     let drQ = supabase.from("do_review").select("id", { count: "exact", head: true }).eq("status", "Pending");
-    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.eq("company_id", cid); }
+    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.or(`company_id.eq.${cid},company_id.is.null`); }
 
     // 3. Commission summary — only computed for salesmen (the only role whose
     //    dashboard shows the stat card); same math as GET /commission-summary
@@ -3653,7 +3653,7 @@ app.get("/operations/pending-counts", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     let spQ = supabase.from("service_pending").select("id", { count: "exact", head: true }).eq("status", "Pending");
     let drQ = supabase.from("do_review").select("id", { count: "exact", head: true }).eq("status", "Pending");
-    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.eq("company_id", cid); }
+    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.or(`company_id.eq.${cid},company_id.is.null`); }
     const [{ count: sp }, { count: dr }] = await Promise.all([spQ, drQ]);
     res.json({ service_pending: sp || 0, do_review: dr || 0 });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4119,7 +4119,11 @@ app.get("/permissions/effective", requireAuth, async (req, res) => {
 app.get("/do-review", requireAuth, async (req, res) => {
   const cid = getActiveCompanyId(req);
   let q = supabase.from("do_review").select(SELECTS.DO_REVIEW_SELECT).eq("status", "Pending").order("created_at", { ascending: false });
-  if (cid) q = q.eq("company_id", cid);
+  // Also surface unattributed rows: Telegram DO uploads whose uploader has no
+  // company_id land with company_id = NULL, and with matching disabled they
+  // often can't be tied to an SO either — without this they'd be invisible in
+  // every company's review queue and lost. Reviewers resolve them by hand.
+  if (cid) q = q.or(`company_id.eq.${cid},company_id.is.null`);
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -6076,7 +6080,9 @@ app.get("/supplier-deliveries", requireAuth, async (req, res) => {
   const { supplier, from_date, to_date, status, limit = 100 } = req.query;
   const cid = getActiveCompanyId(req);
   let query = supabase.from("supplier_deliveries").select(SELECTS.SUPPLIER_DELIVERY_LIST_SELECT).order("created_at", { ascending: false }).limit(parseInt(limit));
-  if (cid) query = query.eq("company_id", cid);
+  // Include unattributed Telegram uploads (company_id NULL) so a DO posted by a
+  // user with no company still appears for review — mirrors GET /do-review.
+  if (cid) query = query.or(`company_id.eq.${cid},company_id.is.null`);
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
   if (to_date) query = query.lte("do_date", to_date);
@@ -6137,7 +6143,9 @@ app.get("/supplier-dos", requireAuth, async (req, res) => {
   const { supplier, from_date, to_date, status, source, limit = 100 } = req.query;
   const cid = getActiveCompanyId(req);
   let query = supabase.from("supplier_deliveries").select(SELECTS.SUPPLIER_DELIVERY_LIST_SELECT).order("created_at", { ascending: false }).limit(parseInt(limit));
-  if (cid) query = query.eq("company_id", cid);
+  // Include unattributed Telegram uploads (company_id NULL) so a DO posted by a
+  // user with no company still appears for review — mirrors GET /do-review.
+  if (cid) query = query.or(`company_id.eq.${cid},company_id.is.null`);
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
   if (to_date) query = query.lte("do_date", to_date);
