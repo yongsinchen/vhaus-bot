@@ -11650,6 +11650,35 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
     }
 
+    // Deposit handling. Normally the Deposit field is the upfront deposit and
+    // recomputeOrderPaid derives the shown amount as initial_deposit + recorded
+    // payments. But once payments exist (e.g. balance collected on delivery),
+    // that override means a plain deposit edit "does nothing". So when payments
+    // exist, treat the field as the AUTHORITATIVE total paid: back out the
+    // payments into initial_deposit so recompute lands exactly on the entered
+    // amount. Changing money after payments are recorded is manager/admin only.
+    let depositForUpdate = Number(deposit) || 0;
+    let initialDepositForUpdate = depositForUpdate;
+    const depositProvided = deposit !== undefined && deposit !== null && deposit !== "";
+    if (depositProvided) {
+      const { data: legacyOrders } = await supabase.from("orders").select("id")
+        .eq("company_id", company_id).eq("so_number", existing.order_number).or("type.is.null,type.neq.Service");
+      const legIds = (legacyOrders || []).map(o => o.id);
+      let paymentsTotal = 0;
+      if (legIds.length) {
+        const { data: pays } = await supabase.from("payments").select("amount").in("order_id", legIds);
+        paymentsTotal = (pays || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      }
+      if (paymentsTotal > 0) {
+        const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
+        if (!MANAGE_ROLES.includes(roleKey)) {
+          return res.status(403).json({ error: "Only a manager can change the paid amount once payments have been recorded (e.g. collected on delivery)." });
+        }
+        // recompute yields min(total, initial_deposit + paymentsTotal) → entered.
+        initialDepositForUpdate = depositForUpdate - paymentsTotal;
+      }
+    }
+
     const updateData = {
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
       customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
@@ -11660,7 +11689,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
-      discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+      discount: Number(discount) || 0, deposit: depositForUpdate, initial_deposit: initialDepositForUpdate, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false, sales_channel: sales_channel || "branch",
     };
     if (amendmentNote) {
@@ -11783,6 +11812,13 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // deposit; recompute adds initial_deposit + payments so payments aren't lost).
     if (deliveryOrderId) {
       try { await recomputeOrderPaid(deliveryOrderId); } catch (e) { console.error("recomputeOrderPaid on order edit:", e.message); }
+      // recomputeOrderPaid rewrites sales_orders.deposit AFTER `full` was read,
+      // so reflect the final figure in the response (else the UI shows a value
+      // that reverts on reload).
+      try {
+        const { data: fresh } = await supabase.from("sales_orders").select("deposit").eq("id", id).maybeSingle();
+        if (fresh && full) full.deposit = fresh.deposit;
+      } catch {}
     }
     // Re-run the commission calc so an edited order date re-buckets the payout
     // month (order in June → payout July; back-dated to April → payout May), and
