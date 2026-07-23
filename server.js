@@ -11568,23 +11568,22 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
 
-    // Delivery Orders guard (Phase 1): item edits delete+reinsert every
-    // sales_order_items row, which would orphan the quantity allocations on
-    // any active DO. Block item changes while active DOs exist — header-only
-    // edits (dates, remark, deposit, …) stay allowed since they don't touch
-    // the item rows.
+    // Delivery Orders guard: a normal item edit delete+reinserts every
+    // sales_order_items row, which (FK ON DELETE SET NULL) would orphan the
+    // quantity allocations on any active DO. So while an active DO exists we
+    // allow AMOUNT-ONLY edits (quantity/price, applied in place so the DO's
+    // sales_order_item_id references survive) and forbid any change to the item
+    // SET (add / remove / product identity). Loaded here with their line items
+    // so the item-write block can enforce the rules and compute allocations.
+    let activeDos = [];
     if (Array.isArray(items)) {
-      const { data: activeDos } = await supabase.from("delivery_orders")
-        .select("id, do_number, status")
+      const { data } = await supabase.from("delivery_orders")
+        .select("id, do_number, status, delivery_order_items(id, sales_order_item_id, quantity, status)")
         .eq("sales_order_id", id)
         .in("status", doLib.ACTIVE_DO_STATUSES);
-      if (activeDos && activeDos.length > 0) {
-        return res.status(409).json({
-          error: "This sales order has active Delivery Orders. Cancel or complete the Delivery Orders before editing items.",
-          active_delivery_orders: activeDos,
-        });
-      }
+      activeDos = data || [];
     }
+    const hasActiveDo = activeDos.length > 0;
 
     // Explode any { bundle_id } lines before amendment detection / subtotal /
     // the rebuild loop below all see them — same as POST /sales-orders.
@@ -11670,7 +11669,61 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { error: updErr } = await supabase.from("sales_orders").update(updateData).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
-    if (expandedItems) {
+    if (expandedItems && hasActiveDo) {
+      // Amount-only edit while an active DO exists: update matching lines IN
+      // PLACE (never delete — that would SET NULL the DO's sales_order_item_id)
+      // and forbid any change to the item set. Only quantity + price change.
+      const existingItems = existing.sales_order_items || [];
+      const existingById = new Map(existingItems.map(i => [i.id, i]));
+
+      // The id set must match exactly — no added lines (missing/unknown id) and
+      // no removed lines.
+      const incomingIds = expandedItems.map(it => it.id).filter(Boolean);
+      const structuralChange =
+        expandedItems.some(it => !it.id || !existingById.has(it.id)) ||
+        new Set(incomingIds).size !== existingItems.length;
+      if (structuralChange) {
+        return res.status(409).json({
+          error: "This order has an active Delivery Order — you can adjust quantity or price, but items can't be added, removed, or changed. Cancel or complete the Delivery Order to change items.",
+          active_delivery_orders: activeDos.map(d => ({ id: d.id, do_number: d.do_number, status: d.status })),
+        });
+      }
+
+      // Product identity must be unchanged per line; quantity may not drop below
+      // what's already committed to (or delivered by) an active DO.
+      const norm = v => (v ?? "").toString().trim().toLowerCase();
+      const sameIdentity = (a, b) =>
+        (a.product_id || b.product_id)
+          ? String(a.product_id || "") === String(b.product_id || "")
+          : (norm(a.product_code) === norm(b.product_code) && norm(a.product_name) === norm(b.product_name)
+             && norm(a.size) === norm(b.size) && norm(a.color) === norm(b.color));
+      const allocations = doLib.computeAllocations(existingItems, activeDos);
+      for (const it of expandedItems) {
+        const ex = existingById.get(it.id);
+        if (!sameIdentity(ex, it)) {
+          return res.status(409).json({ error: `Cannot change the item on a line with an active Delivery Order (${ex.product_name || ex.product_code || "item"}). Only quantity and price can change.` });
+        }
+        const alloc = allocations.get(it.id) || { allocated_qty: 0, delivered_qty: 0 };
+        const floor = (Number(alloc.allocated_qty) || 0) + (Number(alloc.delivered_qty) || 0);
+        const newQty = Number(it.quantity) || 1;
+        if (newQty < floor) {
+          return res.status(409).json({ error: `Cannot reduce "${ex.product_name || ex.product_code || "item"}" to ${newQty} — ${floor} already committed to a Delivery Order.` });
+        }
+      }
+
+      // Apply in-place amount updates. Re-resolve is_clearance/unit_cost from the
+      // product (never trust the client), same authority as the rebuild path;
+      // identity fields are deliberately left untouched.
+      const priced = expandedItems.map(it => ({ id: it.id, product_id: existingById.get(it.id).product_id || null, quantity: Number(it.quantity) || 1, unit_price: it.unit_price ?? null }));
+      const defs = await resolveProductLineDefaults(company_id, priced);
+      for (const p of priced) {
+        const d = p.product_id ? defs.get(p.product_id) : null;
+        const patch = { quantity: p.quantity, unit_price: p.unit_price, line_total: (Number(p.unit_price) || 0) * p.quantity };
+        if (d) { patch.is_clearance = d.is_clearance; patch.unit_cost = d.unit_cost; }
+        const { error: upErr } = await supabase.from("sales_order_items").update(patch).eq("id", p.id);
+        if (upErr) throw upErr;
+      }
+    } else if (expandedItems) {
       await supabase.from("sales_order_items").delete().eq("order_id", id);
       const itemRows = [];
       for (const it of expandedItems) {
