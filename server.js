@@ -4585,13 +4585,38 @@ async function recomputeOrderPaid(orderId) {
   const initial = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
 
   // Sum every payment recorded against this SO (across its delivery orders).
+  // A single customer payment can be split across orders from DIFFERENT sales
+  // orders (payment_allocations). Credit this SO only the portion allocated to
+  // its own orders — summing the payment's whole amount by its single order_id
+  // would over-credit the first SO and leave the others' balance untouched.
   const { data: dOrders } = await supabase.from("orders")
     .select("id").eq("company_id", ord.company_id).eq("so_number", ord.so_number).or("type.is.null,type.neq.Service");
   const ids = (dOrders || []).map(o => o.id);
   let paidFromPayments = 0;
   if (ids.length) {
-    const { data: pays } = await supabase.from("payments").select("amount").in("order_id", ids);
-    paidFromPayments = (pays || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    // (a) Allocated portions pointing at this SO's orders — the exact share of
+    //     each (possibly cross-SO) split payment that belongs to this SO.
+    const { data: allocs } = await supabase.from("payment_allocations")
+      .select("amount").in("order_id", ids);
+    const allocatedSum = (allocs || []).reduce((s, a) => s + (Number(a.amount) || 0), 0);
+
+    // (b) Payments attached directly to this SO's orders that carry NO
+    //     allocation rows — their full amount belongs here (the common
+    //     single-order case: /payments/record without allocations, driver
+    //     collection, bank reconciliation). Payments that DO have allocation
+    //     rows are already counted in (a); exclude them to avoid double-counting.
+    const { data: directPays } = await supabase.from("payments")
+      .select("id, amount").in("order_id", ids);
+    let unallocatedSum = 0;
+    if (directPays && directPays.length) {
+      const { data: allocated } = await supabase.from("payment_allocations")
+        .select("payment_id").in("payment_id", directPays.map(p => p.id));
+      const allocatedPaymentIds = new Set((allocated || []).map(r => r.payment_id));
+      unallocatedSum = directPays
+        .filter(p => !allocatedPaymentIds.has(p.id))
+        .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    }
+    paidFromPayments = allocatedSum + unallocatedSum;
   }
 
   const paid = Math.max(0, Math.min(total, initial + paidFromPayments));
