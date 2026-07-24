@@ -5955,17 +5955,18 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
     // Source SO when linked; otherwise the inert legacy order (standalone
     // service) which carries the customer details + creator salesman (bug 3/5).
     const orderLookupId = svc.order_id || svc.legacy_order_id || null;
-    const [legsRes, tripsRes, claimsRes, orderRes] = await Promise.all([
+    const [legsRes, tripsRes, claimsRes, itemsRes, orderRes] = await Promise.all([
       supabase.from("service_legs").select("*").eq("service_id", svc.id).order("leg_order"),
       supabase.from("service_trips").select("*").eq("service_id", svc.id).order("trip_number"),
       supabase.from("service_part_claims").select("*").eq("service_id", svc.id).order("created_at"),
+      supabase.from("service_items").select("*").eq("service_id", svc.id).order("item_no"),
       orderLookupId ? supabase.from("orders").select("so_number, customer_name, address, contact, salesman, items").eq("id", orderLookupId).single() : { data: null },
     ]);
     // Don't surface the inert order's own SV number as if it were a source SO.
     const orderData = orderRes.data
       ? (svc.order_id ? orderRes.data : { ...orderRes.data, so_number: null })
       : null;
-    res.json({ service: svc, legs: legsRes.data || [], trips: tripsRes.data || [], claims: claimsRes.data || [], order: orderData });
+    res.json({ service: svc, legs: legsRes.data || [], trips: tripsRes.data || [], claims: claimsRes.data || [], items: itemsRes.data || [], order: orderData });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6033,7 +6034,17 @@ app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
       }
     }
 
-    res.status(201).json({ service: result.service, legs: result.legs, order: result.order });
+    // Line items (optional): each carries its own action + status. Stored on
+    // service_items and mirrored into the inert order's items JSON so they show
+    // on the delivery board / printed schedule. Non-fatal — a bad items payload
+    // must not sink an otherwise-created case.
+    let createdItems = [];
+    try {
+      createdItems = await insertServiceItems(result.service.id, companyId, req.body.items);
+      if (createdItems.length > 0) await syncServiceItemsToOrder(result.service.id);
+    } catch (e) { console.error("service items create error:", e.message); }
+
+    res.status(201).json({ service: result.service, legs: result.legs, order: result.order, items: createdItems });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6150,6 +6161,124 @@ app.patch("/service-part-claims/:id", requireRole(MANAGE_ROLES), async (req, res
     const { data, error } = await supabase.from("service_part_claims").update(updates).eq("id", req.params.id).select().single();
     if (error) throw error;
     res.json({ claim: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Service Items ─────────────────────────────────────────────────
+// A service case can hold many line items, each with its own action
+// (1=Assemble/Screw, 2=Service/Repair, 3=Claim) and status (pending/done).
+// Items are a checklist layered on the case; they do NOT drive leg/route
+// generation. They are mirrored into the inert Service order's items JSON so
+// they appear on the delivery board and the printed trip schedule (which read
+// orders.items). See migration 045_service_items.sql.
+const SERVICE_ITEM_ACTIONS = { 1: "Assemble", 2: "Service", 3: "Claim" };
+const cleanServiceItemStatus = s => (String(s || "").toLowerCase() === "done" ? "done" : "pending");
+const cleanServiceItemAction = a => ([1, 2, 3].includes(Number(a)) ? Number(a) : 2);
+
+// Rebuild the inert Service order's items JSON from the case's service_items,
+// so the delivery schedule / print shows one row per item. Best-effort: a sync
+// failure must not fail the item mutation that already succeeded.
+async function syncServiceItemsToOrder(serviceId) {
+  try {
+    const { data: svc } = await supabase.from("services")
+      .select("id, legacy_order_id").eq("id", serviceId).maybeSingle();
+    if (!svc?.legacy_order_id) return;
+    const { data: items } = await supabase.from("service_items")
+      .select("*").eq("service_id", serviceId).order("item_no");
+    const rows = (items || []).map(it => ({
+      itemName: it.description || "",
+      unit: it.quantity != null ? String(Number(it.quantity)) : "1",
+      action_type: it.action_type,
+      action_label: SERVICE_ITEM_ACTIONS[it.action_type] || "Service",
+      item_status: it.status || "pending",
+      notes: it.notes || null,
+      service_item: true,
+    }));
+    await supabase.from("orders").update({ items: JSON.stringify(rows) }).eq("id", svc.legacy_order_id);
+  } catch (e) { console.error("syncServiceItemsToOrder error:", e.message); }
+}
+
+// Insert a batch of items for a case; returns the created rows. Shared by
+// case creation (POST /service-cases) and the add-item endpoint below.
+async function insertServiceItems(serviceId, companyId, items) {
+  const list = (Array.isArray(items) ? items : []).filter(i => i && String(i.description || "").trim());
+  if (list.length === 0) return [];
+  // Continue numbering after any items the case already has.
+  const { data: existing } = await supabase.from("service_items")
+    .select("item_no").eq("service_id", serviceId).order("item_no", { ascending: false }).limit(1);
+  let next = (existing?.[0]?.item_no || 0) + 1;
+  const rows = list.map(i => ({
+    service_id: serviceId, company_id: companyId || null,
+    item_no: i.item_no != null ? Number(i.item_no) : next++,
+    description: String(i.description).trim(),
+    action_type: cleanServiceItemAction(i.action_type),
+    quantity: i.quantity != null && Number(i.quantity) > 0 ? Number(i.quantity) : 1,
+    status: cleanServiceItemStatus(i.status),
+    notes: i.notes || null,
+  }));
+  const { data, error } = await supabase.from("service_items").insert(rows).select();
+  if (error) throw error;
+  return data || [];
+}
+
+// Add one or more items to an existing service case.
+app.post("/service-cases/:id/items", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    let sq = supabase.from("services").select("id, company_id").eq("id", req.params.id);
+    if (cid) sq = sq.eq("company_id", cid);
+    const { data: svc } = await sq.maybeSingle();
+    if (!svc) return res.status(404).json({ error: "Service not found" });
+    // Accept either a single item body or { items: [...] }.
+    const payload = Array.isArray(req.body?.items) ? req.body.items : [req.body];
+    const created = await insertServiceItems(svc.id, svc.company_id || cid, payload);
+    if (created.length === 0) return res.status(400).json({ error: "description required" });
+    await syncServiceItemsToOrder(svc.id);
+    res.status(201).json({ items: created });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Update an item — description/action/qty/notes (manage) or mark done/pending
+// (also drivers/operations, mirroring service-legs so field staff can tick off
+// work on site).
+app.patch("/service-items/:id", requireRole([...MANAGE_ROLES, "driver", "operation"]), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    let iq = supabase.from("service_items").select("id, service_id, company_id").eq("id", req.params.id);
+    if (cid) iq = iq.eq("company_id", cid);
+    const { data: item } = await iq.maybeSingle();
+    if (!item) return res.status(404).json({ error: "Item not found" });
+
+    const { description, action_type, quantity, status, notes } = req.body || {};
+    const updates = { updated_at: new Date().toISOString() };
+    if (description !== undefined) {
+      if (!String(description).trim()) return res.status(400).json({ error: "description cannot be empty" });
+      updates.description = String(description).trim();
+    }
+    if (action_type !== undefined) updates.action_type = cleanServiceItemAction(action_type);
+    if (quantity !== undefined) updates.quantity = Number(quantity) > 0 ? Number(quantity) : 1;
+    if (status !== undefined) updates.status = cleanServiceItemStatus(status);
+    if (notes !== undefined) updates.notes = notes || null;
+
+    const { data, error } = await supabase.from("service_items").update(updates).eq("id", item.id).select().single();
+    if (error) throw error;
+    await syncServiceItemsToOrder(item.service_id);
+    res.json({ item: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Remove an item from a case.
+app.delete("/service-items/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    let iq = supabase.from("service_items").select("id, service_id, company_id").eq("id", req.params.id);
+    if (cid) iq = iq.eq("company_id", cid);
+    const { data: item } = await iq.maybeSingle();
+    if (!item) return res.status(404).json({ error: "Item not found" });
+    const { error } = await supabase.from("service_items").delete().eq("id", item.id);
+    if (error) throw error;
+    await syncServiceItemsToOrder(item.service_id);
+    res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
