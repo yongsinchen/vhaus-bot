@@ -6191,6 +6191,10 @@ async function syncServiceItemsToOrder(serviceId) {
       action_type: it.action_type,
       action_label: SERVICE_ITEM_ACTIONS[it.action_type] || "Service",
       item_status: it.status || "pending",
+      // Claim items (action 3) gate delivery readiness on this arrival date,
+      // exposed as `arrivalDate` so the schedule/print reuse the same field
+      // name as delivery-order items.
+      arrivalDate: it.arrival_date || null,
       notes: it.notes || null,
       service_item: true,
     }));
@@ -6214,6 +6218,8 @@ async function insertServiceItems(serviceId, companyId, items) {
     action_type: cleanServiceItemAction(i.action_type),
     quantity: i.quantity != null && Number(i.quantity) > 0 ? Number(i.quantity) : 1,
     status: cleanServiceItemStatus(i.status),
+    // Only Claim items use arrival; a blank/empty value stays NULL.
+    arrival_date: i.arrival_date || null,
     notes: i.notes || null,
   }));
   const { data, error } = await supabase.from("service_items").insert(rows).select();
@@ -6249,7 +6255,7 @@ app.patch("/service-items/:id", requireRole([...MANAGE_ROLES, "driver", "operati
     const { data: item } = await iq.maybeSingle();
     if (!item) return res.status(404).json({ error: "Item not found" });
 
-    const { description, action_type, quantity, status, notes } = req.body || {};
+    const { description, action_type, quantity, status, notes, arrival_date } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
     if (description !== undefined) {
       if (!String(description).trim()) return res.status(400).json({ error: "description cannot be empty" });
@@ -6258,6 +6264,7 @@ app.patch("/service-items/:id", requireRole([...MANAGE_ROLES, "driver", "operati
     if (action_type !== undefined) updates.action_type = cleanServiceItemAction(action_type);
     if (quantity !== undefined) updates.quantity = Number(quantity) > 0 ? Number(quantity) : 1;
     if (status !== undefined) updates.status = cleanServiceItemStatus(status);
+    if (arrival_date !== undefined) updates.arrival_date = arrival_date || null;
     if (notes !== undefined) updates.notes = notes || null;
 
     const { data, error } = await supabase.from("service_items").update(updates).eq("id", item.id).select().single();
