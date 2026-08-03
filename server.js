@@ -5557,15 +5557,19 @@ app.post("/sales-orders/resync-missing", requireRole(["master", "manager"]), asy
     if (dryRun) return res.json({ candidates: sos.length, missing: missing.length, missing_numbers: missing.map(s => s.order_number).slice(0, 200) });
 
     _commCache.ts = 0; await getCommCache(cid);
-    let synced = 0, commissioned = 0; const errors = [];
+    let synced = 0, commissioned = 0, failed = 0; const errors = [];
     for (const so of missing) {
       try {
         const orderId = await syncSalesOrderToDelivery(so, so.sales_order_items);
-        if (orderId) { try { await calculateCommission(orderId, cid); commissioned++; } catch (e) { /* commission is best-effort */ } }
+        // syncSalesOrderToDelivery swallows its own errors and returns null.
+        // A null id means the `orders` row was NOT created (e.g. an insert that
+        // failed) — report it as a failure, don't count it as synced.
+        if (!orderId) { failed++; errors.push({ order_number: so.order_number, error: "sync produced no order row (insert failed — check server logs)" }); continue; }
+        try { await calculateCommission(orderId, cid); commissioned++; } catch (e) { /* commission is best-effort */ }
         synced++;
-      } catch (e) { errors.push({ order_number: so.order_number, error: e.message }); }
+      } catch (e) { failed++; errors.push({ order_number: so.order_number, error: e.message }); }
     }
-    res.json({ candidates: sos.length, missing: missing.length, synced, commissioned, errors: errors.slice(0, 50) });
+    res.json({ candidates: sos.length, missing: missing.length, synced, commissioned, failed, errors: errors.slice(0, 50) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
