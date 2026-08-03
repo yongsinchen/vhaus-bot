@@ -5525,6 +5525,50 @@ app.post("/commissions/recalculate-all", requireRole(["master", "manager"]), asy
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Re-sync sales orders that never produced a legacy `orders` row.
+// Commission (and delivery scheduling, DO matching, etc.) all key off the
+// `orders` workhorse row, which is created by syncSalesOrderToDelivery. If a
+// confirmed/delivered/amended sales order has no matching `orders` row (an
+// early confirmation, an import, or a sync that errored), it is invisible to
+// commission and "Recalculate All" can't help it. This finds those gaps and
+// re-runs the REAL sync (no logic duplication), then calculates commission.
+app.post("/sales-orders/resync-missing", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company context required" });
+    const dryRun = String(req.query.dry_run || "") === "1";
+    // Set of order_numbers that already have an `orders` row (paginated).
+    const existing = new Set();
+    { let from = 0, page = 1000; while (true) {
+        const { data, error } = await supabase.from("orders").select("so_number").eq("company_id", cid).range(from, from + page - 1);
+        if (error) break;
+        (data || []).forEach(r => r.so_number && existing.add(r.so_number));
+        if (!data || data.length < page) break; from += page;
+    } }
+    // Candidate sales orders that SHOULD have a delivery row (not draft/cancelled).
+    let sos = []; { let from = 0, page = 500; while (true) {
+        const { data, error } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
+          .eq("company_id", cid).in("status", ["confirmed", "delivered", "amended"]).range(from, from + page - 1);
+        if (error) break;
+        sos = sos.concat(data || []);
+        if (!data || data.length < page) break; from += page;
+    } }
+    const missing = sos.filter(so => so.order_number && !existing.has(so.order_number));
+    if (dryRun) return res.json({ candidates: sos.length, missing: missing.length, missing_numbers: missing.map(s => s.order_number).slice(0, 200) });
+
+    _commCache.ts = 0; await getCommCache(cid);
+    let synced = 0, commissioned = 0; const errors = [];
+    for (const so of missing) {
+      try {
+        const orderId = await syncSalesOrderToDelivery(so, so.sales_order_items);
+        if (orderId) { try { await calculateCommission(orderId, cid); commissioned++; } catch (e) { /* commission is best-effort */ } }
+        synced++;
+      } catch (e) { errors.push({ order_number: so.order_number, error: e.message }); }
+    }
+    res.json({ candidates: sos.length, missing: missing.length, synced, commissioned, errors: errors.slice(0, 50) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Commission adjustments
 app.post("/commission-adjustments", requireRole(["master", "manager"]), async (req, res) => {
   try {
