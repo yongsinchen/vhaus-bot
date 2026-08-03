@@ -30,8 +30,9 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const ORDER = process.env.ORDER || process.argv[2];
-if (!ORDER) { console.error("Provide an order number:  ORDER=03234 node scripts/inspect-order-commission.js"); process.exit(1); }
+// Accept one OR many order numbers: ORDER="03171,03172" or as CLI args.
+const ORDERS = (process.env.ORDER || process.argv.slice(2).join(",")).split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+if (!ORDERS.length) { console.error("Provide order number(s):  ORDER=03234 node scripts/inspect-order-commission.js  (comma-separated for many)"); process.exit(1); }
 const GATE = Number(process.env.GATE || 30);
 
 function getPayoutMonth(orderDate) {
@@ -52,15 +53,16 @@ async function findOrders(num) {
   return [...found.values()];
 }
 
-(async () => {
-  console.log(`=== Inspecting order "${ORDER}" ===\n`);
-  const orders = await findOrders(ORDER);
+async function inspectOne(num) {
+  console.log(`\n=== Inspecting order "${num}" ===`);
+  const orders = await findOrders(num);
   if (!orders.length) {
-    console.log("NO ORDER ROW FOUND in the legacy `orders` table for that number.");
-    console.log("→ Commission is keyed off the `orders` row (via sales_orders.order_number = orders.so_number).");
-    console.log("  If the sales order exists but no `orders` row does, the sync (syncSalesOrderToDelivery) didn't run.");
-    return;
+    console.log("  NO ORDER ROW FOUND in the legacy `orders` table for that number.");
+    console.log("  → Commission is keyed off the `orders` row (sales_orders.order_number = orders.so_number).");
+    console.log("    If the sales order exists but no `orders` row does, the sync (syncSalesOrderToDelivery) didn't run.");
+    return { num, payout_month: null, verdict: "NO_ORDER_ROW" };
   }
+  let summary = { num, payout_month: null, verdict: "?" };
 
   for (const o of orders) {
     const gross = Number(o.order_amount) || 0;
@@ -89,18 +91,27 @@ async function findOrders(num) {
     }
 
     // Verdict
+    summary.payout_month = getPayoutMonth(commissionDate);
     console.log("  → VERDICT:");
-    if (o.type === "Service") { console.log("    Service order — never commissionable by design."); continue; }
-    if (!(gross > 0)) { console.log("    order_amount is 0 — skipped by commission calc."); continue; }
+    if (o.type === "Service") { console.log("    Service order — never commissionable by design."); summary.verdict = "SERVICE"; continue; }
+    if (!(gross > 0)) { console.log("    order_amount is 0 — skipped by commission calc."); summary.verdict = "ZERO_AMOUNT"; continue; }
     if (!comms || comms.length === 0) {
       const anyUnmatched = names.length === 0 || names.some(n => !known.has(n.toLowerCase()));
-      if (anyUnmatched) console.log(`    NO commission row AND salesman unmatched (${matchInfo.join(", ")}). Map the salesman to a users.salesman_name, then Recalculate All.`);
-      else console.log("    NO commission row, salesman matched. calculateCommission never ran on this order — click Recalculate All (fix now deployed) to generate it.");
+      if (anyUnmatched) { console.log(`    NO commission row AND salesman unmatched (${matchInfo.join(", ")}). Map the salesman to a users.salesman_name, then Recalculate All.`); summary.verdict = "SALESMAN_UNMATCHED"; }
+      else { console.log("    NO commission row, salesman matched. calculateCommission never ran on this order — click Recalculate All (fix now deployed) to generate it."); summary.verdict = "NO_COMMISSION_ROW"; }
       continue;
     }
     const shown = comms.find(c => ["eligible","held","paid"].includes(c.status));
-    if (comms.every(c => c.status === "pending")) console.log(`    Row exists but PENDING — deposit ${Math.round(depositPct*10)/10}% is below the ${GATE}% gate, so it has no payout_month and won't show as payable. It appears in the "pending" section, not the month payout.`);
-    else if (comms.every(c => c.status === "clawback")) console.log("    Row was CLAWED BACK (order cancelled/amended).");
-    else if (shown) console.log(`    Row is ${shown.status} for payout_month ${fmt(shown.payout_month)} — it shows in THAT month's payout. If you're looking at a different month, that's why.`);
+    if (comms.every(c => c.status === "pending")) { console.log(`    Row exists but PENDING — deposit ${Math.round(depositPct*10)/10}% is below the ${GATE}% gate, so it has no payout_month and won't show as payable. It appears in the "pending" section, not the month payout.`); summary.verdict = "PENDING_DEPOSIT_GATE"; }
+    else if (comms.every(c => c.status === "clawback")) { console.log("    Row was CLAWED BACK (order cancelled/amended)."); summary.verdict = "CLAWBACK"; }
+    else if (shown) { console.log(`    Row is ${shown.status} for payout_month ${fmt(shown.payout_month)} — it shows in THAT month's payout. If you're looking at a different month, that's why.`); summary.verdict = `${shown.status.toUpperCase()} in ${fmt(shown.payout_month)}`; summary.payout_month = shown.payout_month; }
   }
+  return summary;
+}
+
+(async () => {
+  const results = [];
+  for (const num of ORDERS) results.push(await inspectOne(num));
+  console.log(`\n\n================= SUMMARY (${results.length} order(s)) =================`);
+  for (const r of results) console.log(`  ${r.num.padEnd(16)}  payout_month=${fmt(r.payout_month).padEnd(12)}  ${r.verdict}`);
 })().catch(e => { console.error(e); process.exit(1); });
