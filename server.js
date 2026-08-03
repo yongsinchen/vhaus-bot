@@ -5497,17 +5497,31 @@ app.post("/commissions/recalculate/:orderId", requireRole(MANAGE_ROLES), async (
 // Bulk recalculate all orders for a company
 app.post("/commissions/recalculate-all", requireRole(["master", "manager"]), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     // Prime the cache once before processing all orders
     _commCache.ts = 0; // invalidate
-    await getCommCache(getActiveCompanyId(req));
-    const { data: orders } = await supabase.from("orders").select("id")
-      .eq("company_id", getActiveCompanyId(req)).gt("order_amount", 0)
-      .not("status", "in", '("Cancelled")').limit(500);
-    let calculated = 0;
-    for (const o of (orders || [])) {
-      try { await calculateCommission(o.id, getActiveCompanyId(req)); calculated++; } catch {}
+    await getCommCache(cid);
+    // Fetch EVERY qualifying order, paginated. Previously this was a single
+    // .limit(500) fetch, which silently skipped every order beyond the first
+    // 500 for a large company — so their commissions were never generated and
+    // they never appeared in any payout. Page through in blocks of 1000.
+    let orders = [], from = 0, page = 1000;
+    while (true) {
+      const { data, error } = await supabase.from("orders").select("id")
+        .eq("company_id", cid).gt("order_amount", 0)
+        .not("status", "in", '("Cancelled")')
+        .order("id", { ascending: true })
+        .range(from, from + page - 1);
+      if (error) break;
+      orders = orders.concat(data || []);
+      if (!data || data.length < page) break;
+      from += page;
     }
-    res.json({ calculated, total: (orders || []).length });
+    let calculated = 0;
+    for (const o of orders) {
+      try { await calculateCommission(o.id, cid); calculated++; } catch {}
+    }
+    res.json({ calculated, total: orders.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -11740,6 +11754,18 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", order.id).single();
     await attachLinkedProducts(full?.sales_order_items);
     await syncSalesOrderToDelivery(full, full.sales_order_items);
+    // An order created already CONFIRMED must get its commission row now.
+    // The status-flip path (PATCH /sales-orders/:id/status) calculates
+    // commission on later confirmation, but an order created straight into
+    // "confirmed" would otherwise have NO commission until it was next edited,
+    // scheduled, or paid — leaving it invisible in the payout. Mirror the
+    // confirm path here (row is pending until the deposit gate is met).
+    if (full?.status === "confirmed") {
+      try {
+        const { data: legacyOrder } = await supabase.from("orders").select("id").eq("so_number", full.order_number).maybeSingle();
+        if (legacyOrder) await calculateCommission(legacyOrder.id, getActiveCompanyId(req));
+      } catch (e) { console.error("commission calc on create:", e.message); }
+    }
     res.status(201).json({ order: full });
   } catch (err) { console.error("POST /sales-orders error:", err); res.status(500).json({ error: err.message }); }
 });
