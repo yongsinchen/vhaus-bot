@@ -8631,24 +8631,33 @@ app.patch("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_EDIT), asy
     if (customer_confirmed !== undefined) patch.customer_confirmed = customer_confirmed === true;
     if (Object.keys(patch).length === 0) return res.status(400).json({ error: "No updatable fields provided (Phase 1: delivery_date, remark, customer_confirmed)" });
 
+    const dateChanged = patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date;
+    // Rescheduling the delivery date UNASSIGNS the DO. Teams are per-date, so a
+    // stop can't stay on its old team when the date moves — the old team doesn't
+    // exist on the new date and the stop would vanish from the board. Instead we
+    // detach it from the team and return it to the unassigned pool for the new
+    // date (or TBC when the date is cleared): set it back to draft so it shows
+    // in that date's pool, ready to be assigned to a team running that day.
+    if (dateChanged && dord.status !== "draft") patch.status = "draft";
+
     const { data, error } = await supabase.from("delivery_orders")
       .update(patch).eq("id", dord.id).select("*, delivery_order_items(*)").single();
     if (error) throw error;
 
-    if (patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date) {
+    if (dateChanged) {
       await logDoEvent(dord.id, "rescheduled", { from: dord.delivery_date, to: patch.delivery_date }, req.user.id);
 
-      // Fix #8: reschedule cascade. Decision: a DO stays reschedulable UNTIL
-      // completed (the ["completed","cancelled"] guard above already blocks
-      // this endpoint once completed/cancelled) — so cascade the new date onto
-      // every non-terminal schedule attempt for this DO, however far along it
-      // is (scheduled, out_for_delivery, arrived). Terminal attempts
-      // (delivered/failed) are history and must not be rewritten.
-      const { error: cascadeErr } = await supabase.from("delivery_schedules")
-        .update({ scheduled_date: patch.delivery_date })
+      // Remove the team assignment: delete every non-terminal schedule attempt
+      // for this DO (the rows that pin it to a team on the old date). Terminal
+      // attempts (delivered/failed) are history and must not be touched. With no
+      // schedule row and status back to draft, the DO reappears in the pool for
+      // its new date — team unknown — instead of being stranded on a team that
+      // only exists on the old date.
+      const { error: unassignErr } = await supabase.from("delivery_schedules")
+        .delete()
         .eq("delivery_order_id", dord.id)
         .not("status", "in", "(delivered,failed)");
-      if (cascadeErr) console.error("[PATCH delivery-orders reschedule cascade]", cascadeErr.message);
+      if (unassignErr) console.error("[PATCH delivery-orders reschedule unassign]", unassignErr.message);
     }
     res.json({ delivery_order: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
