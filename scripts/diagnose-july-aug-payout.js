@@ -70,15 +70,20 @@ async function fetchAll(table, cols, applyFilters = q => q) {
 function fmt(v) { return v === null || v === undefined || v === "" ? "-" : String(v); }
 
 (async () => {
-  // 1. Resolve company
+  // 1. Resolve company. Match on a distinctive short token ("vhaus living"),
+  // and if that can't uniquely decide, list ALL companies so the user can pass CID.
   let cid = process.env.CID || null;
   if (!cid) {
-    const { data: comps } = await supabase.from("companies").select("id, name").ilike("name", `%${COMPANY_NAME.split("(")[0].trim()}%`);
-    console.log("=== Companies matched ===");
+    const shortName = COMPANY_NAME.replace(/\(.*?\)/g, "").replace(/sdn\.?\s*bhd\.?/ig, "").trim();
+    let { data: comps } = await supabase.from("companies").select("id, name").ilike("name", `%${shortName}%`);
+    if (!comps || comps.length === 0) { const all = await supabase.from("companies").select("id, name"); comps = all.data || []; }
+    console.log("=== Companies (pick the right id if resolution fails) ===");
     (comps || []).forEach(c => console.log(`  id=${c.id}  name=${c.name}`));
+    // Prefer an exact name match; else the "Vhaus Living" that is NOT the (PG) entity.
     const exact = (comps || []).find(c => (c.name || "").trim().toLowerCase() === COMPANY_NAME.trim().toLowerCase());
-    cid = exact ? exact.id : (comps && comps.length === 1 ? comps[0].id : null);
-    if (!cid) { console.error(`\nCould not uniquely resolve "${COMPANY_NAME}". Re-run with CID=<company_id>.`); process.exit(1); }
+    const nonPg = (comps || []).filter(c => /vhaus living/i.test(c.name || "") && !/\(pg\)|penang/i.test(c.name || ""));
+    cid = exact ? exact.id : (nonPg.length === 1 ? nonPg[0].id : null);
+    if (!cid) { console.error(`\nCould not uniquely resolve "${COMPANY_NAME}". Re-run with:  CID=<company_id> node scripts/diagnose-july-aug-payout.js`); return; }
   }
   console.log(`\nUsing company_id=${cid}  TARGET payout month=${TARGET}  deposit gate=${GATE}%\n`);
 
