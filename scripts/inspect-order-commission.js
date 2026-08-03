@@ -58,9 +58,25 @@ async function inspectOne(num) {
   const orders = await findOrders(num);
   if (!orders.length) {
     console.log("  NO ORDER ROW FOUND in the legacy `orders` table for that number.");
-    console.log("  → Commission is keyed off the `orders` row (sales_orders.order_number = orders.so_number).");
-    console.log("    If the sales order exists but no `orders` row does, the sync (syncSalesOrderToDelivery) didn't run.");
-    return { num, payout_month: null, verdict: "NO_ORDER_ROW" };
+    // Look in sales_orders to explain WHY there's no delivery/commission row.
+    let so = (await supabase.from("sales_orders").select("id, order_number, status, salesman_name, order_date, company_id").eq("order_number", num)).data || [];
+    let matchType = "exact";
+    if (!so.length) { so = (await supabase.from("sales_orders").select("id, order_number, status, salesman_name, order_date, company_id").ilike("order_number", `%${num}%`)).data || []; matchType = "partial"; }
+    if (so.length) {
+      console.log(`  Found in sales_orders (${matchType} match):`);
+      for (const s of so) console.log(`    order_number=${fmt(s.order_number)}  status=${fmt(s.status)}  salesman=${fmt(s.salesman_name)}  order_date=${fmt(s.order_date)}`);
+      const anyConfirmed = so.some(s => (s.status || "").toLowerCase() === "confirmed");
+      if (matchType === "partial") {
+        console.log("  → The number is part of a COMBINED sales order (e.g. two SOs merged). Commission is on the combined order_number, not this individual one.");
+        return { num, payout_month: null, verdict: `COMBINED_INTO:${so.map(s=>s.order_number).join("|")}` };
+      }
+      console.log(anyConfirmed
+        ? "  → SO is confirmed but never synced to a legacy `orders` row (sync failed). Re-save/confirm the SO to re-sync, then Recalculate All."
+        : "  → SO is NOT confirmed (draft/quotation). It won't sync to `orders` or earn commission until it's confirmed.");
+      return { num, payout_month: null, verdict: anyConfirmed ? "SO_NOT_SYNCED" : `SO_STATUS:${fmt(so[0].status)}` };
+    }
+    console.log("  → Not in sales_orders either (exact or partial). This order number doesn't exist as typed — check formatting or a combined number.");
+    return { num, payout_month: null, verdict: "NOT_FOUND_ANYWHERE" };
   }
   let summary = { num, payout_month: null, verdict: "?" };
 
