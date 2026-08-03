@@ -5259,15 +5259,25 @@ async function calculateCommission(orderId, companyId) {
     const salesUser = cache.users.find(u => u.salesman_name && u.salesman_name.toLowerCase() === name.toLowerCase());
     let matchRule = null;
     if (salesUser) {
-      const monthStart = new Date(order.created_at || new Date());
+      // Tier matching aggregates a salesman's sales by the order's BUSINESS
+      // month (order_date), matching how the payout month is bucketed
+      // (order_date || created_at). Using created_at here was wrong: it split a
+      // salesman's month across the dates rows happened to be inserted — most
+      // visibly when a batch of back-orders is synced later (the synced rows
+      // get today's created_at), which undercounted the month and dropped the
+      // salesman into a lower tier. orders.order_date is always populated by
+      // syncSalesOrderToDelivery, so order_date is the correct, stable basis.
+      const monthBasis = order.order_date || order.created_at || new Date();
+      const monthStart = new Date(monthBasis);
       monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
       const monthKey = `${salesUser.id}-${monthStart.toISOString().slice(0, 7)}`;
       let monthlySales = cache.monthlySales[monthKey];
       if (monthlySales === undefined) {
         const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
+        const dStart = monthStart.toISOString().slice(0, 10), dEnd = monthEnd.toISOString().slice(0, 10);
         const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman, country, address")
           .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
-          .gte("created_at", monthStart.toISOString()).lt("created_at", monthEnd.toISOString());
+          .gte("order_date", dStart).lt("order_date", dEnd);
         // Orders shared between multiple sales assistants count only this salesman's
         // fractional share toward their own monthly cumulative sales (and therefore
         // tier matching) — not the full order amount for every assistant on it.
