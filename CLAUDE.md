@@ -20,8 +20,8 @@ PulseOS is **two separate repositories**. Confirm which one you are editing befo
 
 | Repo | Path | Role | Contains |
 | :-- | :-- | :-- | :-- |
-| **vhaus-bot** | `C:\Users\USER\Desktop\vhaus-bot` (**this repo**) | **Backend + DB** | `server.js` (~555 KB Express), `lib/`, `migrations/`, `permission-engine.js`, `module-registry.js`, service files, `scripts/` |
-| **vhaus-delivery** | `C:\Users\USER\Desktop\vhaus-delivery` | **Frontend** | React app: `src/*.js` pages/components, `public/`, `build/` |
+| **vhaus-bot** | `C:\Users\austi\OneDrive\Desktop\VhausSYS\vhaus-bot` (**this repo**) | **Backend + DB** | `server.js` (~555 KB Express), `lib/`, `migrations/`, `permission-engine.js`, `module-registry.js`, service files, `scripts/` |
+| **vhaus-delivery** | `C:\Users\austi\OneDrive\Desktop\VhausSYS\vhaus-delivery` | **Frontend** | React app: `src/*.js` pages/components, `public/`, `build/` |
 
 - **Backend, database, and migration work happens here.** The Backend Lead and Database Architect operate in this repo.
 - **Do not edit frontend files from here.** The React UI lives in `vhaus-delivery/src/`. Coordinate contract changes with the Frontend UX Lead instead of touching UI.
