@@ -5354,12 +5354,25 @@ async function calculateCommission(orderId, companyId) {
 
     const packageIncentiveAmt = packageIncentiveShares[idx] || 0;
 
-    const totalComm = commissionLib.round2(tierCommissionAmt + clearanceCommissionAmt + productIncentiveAmt + packageIncentiveAmt);
-
-    const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
+    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at, product_incentive_waived").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
+    // Fail loudly rather than treating a failed read as "no commission exists" — that
+    // would fall through to the insert below and duplicate the row on a financial
+    // table. This is also the path that breaks if migration 050 was never applied.
+    if (existingErr) throw new Error(`could not read existing commission for order ${orderId} / user ${salesUser.id}: ${existingErr.message}`);
     // Never overwrite a paid commission — corrections go through
     // commission_adjustments instead (see POST /commission-adjustments).
     if (existing && (existing.status === "paid" || existing.paid_at)) continue;
+
+    // A manager/director/master can switch the product incentive off for a whole
+    // sales order (PATCH /commissions/order/:orderId/product-incentive). Eligibility
+    // is purely their decision — nothing derives it — so it is read back off the
+    // existing row and re-applied here. Without this, every recalculation would
+    // silently switch the incentive back on. The flag is deliberately absent from
+    // commData below so neither the insert nor the update can clobber it.
+    const incentiveWaived = !!existing?.product_incentive_waived;
+    const payableProductIncentive = incentiveWaived ? 0 : productIncentiveAmt;
+
+    const totalComm = commissionLib.round2(tierCommissionAmt + clearanceCommissionAmt + payableProductIncentive + packageIncentiveAmt);
 
     const commData = {
       role_name: empRole, // 'salesman' or 'part_time' — keeps update+insert+purge consistent
@@ -5516,6 +5529,68 @@ app.get("/commissions", requireAuth, async (req, res) => {
       return res.json({ commissions: d2 || [] });
     }
     res.json({ commissions: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Switch the product incentive on/off for an entire sales order.
+//   eligible: true  → the incentive counts towards commission (the default)
+//   eligible: false → it does not count, for every salesman on this order
+// Eligibility is a manager's decision, nothing more — there is no rule behind it.
+// COMMISSION_APPROVE is seeded for master/director/manager only (see
+// scripts/seed-permissions.js), which is exactly who may make this call. Finance,
+// who can add adjustments, deliberately cannot do this.
+app.patch("/commissions/order/:orderId/product-incentive", ...requirePerm(PERMS.COMMISSION_APPROVE), async (req, res) => {
+  try {
+    const { eligible } = req.body || {};
+    if (typeof eligible !== "boolean") return res.status(400).json({ error: "eligible must be true or false" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company context required" });
+    const waived = !eligible;
+
+    // Every commission on this order — a split order has one row per salesman, and
+    // an order-level decision must move all of them together. Company-scoped: the
+    // frontend filters for UX, the backend authorises.
+    const { data: comms, error: readErr } = await supabase.from("commissions")
+      .select("id, status, paid_at, commission_amt, product_incentive_amt, product_incentive_waived, user_id")
+      .eq("order_id", req.params.orderId).eq("company_id", cid);
+    if (readErr) return res.status(500).json({ error: readErr.message });
+    if (!comms?.length) return res.status(404).json({ error: "No commissions found for this order" });
+
+    const updated = [], skipped = [];
+    for (const c of comms) {
+      // Same rule as calculateCommission: a paid commission is never mutated —
+      // corrections after payment go through commission_adjustments.
+      if (c.status === "paid" || c.paid_at) { skipped.push({ id: c.id, reason: "already paid" }); continue; }
+      const incentive = Number(c.product_incentive_amt) || 0;
+      if (incentive === 0) { skipped.push({ id: c.id, reason: "no product incentive" }); continue; }
+      // Idempotent: re-sending the current state must not move the amount again.
+      if (!!c.product_incentive_waived === waived) { skipped.push({ id: c.id, reason: "already in that state" }); continue; }
+
+      // Apply the incentive as a DELTA rather than rebuilding commission_amt from its
+      // components. Rows created before the component columns existed can carry a
+      // correct commission_amt with zeroed tier/clearance/package parts, and
+      // recomputing from those would wipe the amount out.
+      const newAmt = commissionLib.round2(Number(c.commission_amt || 0) + (waived ? -incentive : incentive));
+      const { data: row, error: updErr } = await supabase.from("commissions").update({
+        product_incentive_waived: waived,
+        product_incentive_waived_by: waived ? req.user.id : null,
+        product_incentive_waived_at: waived ? new Date().toISOString() : null,
+        commission_amt: newAmt,
+        // incentive_pct is left alone — see calculateCommission. Whether the incentive
+        // is payable is carried by product_incentive_waived and commission_amt, so
+        // there is one source of truth and no second formula to keep in step.
+      }).eq("id", c.id).eq("company_id", cid).select().maybeSingle();
+      if (updErr) return res.status(500).json({ error: `commission ${c.id}: ${updErr.message}` });
+      updated.push(row);
+    }
+
+    // A change to a payable amount is never anonymous.
+    if (updated.length) {
+      permEngine.logEvent(cid, req.user.id, waived ? "commission.product_incentive_disabled" : "commission.product_incentive_enabled",
+        "orders", req.params.orderId, { commission_ids: updated.map(r => r.id), incentive_total: updated.reduce((s, r) => s + (Number(r.product_incentive_amt) || 0), 0) }, req);
+    }
+
+    res.json({ eligible, updated, skipped });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
