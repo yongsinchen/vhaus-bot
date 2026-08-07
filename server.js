@@ -5488,6 +5488,10 @@ function getPayoutMonth(orderDate) {
   return d.toISOString().slice(0, 10);
 }
 
+// Inverse of getPayoutMonth — see lib/commission.js. Lives there rather than here
+// so scripts/verify-commission-month-scope.js checks the same rule this serves.
+const getOrderMonthRange = commissionLib.getOrderMonthRange;
+
 // GET commissions list
 app.get("/commissions", requireAuth, async (req, res) => {
   try {
@@ -5512,10 +5516,38 @@ app.get("/commissions", requireAuth, async (req, res) => {
       if (cid) q2 = q2.eq("company_id", cid);
       if (user_id) q2 = q2.eq("user_id", user_id);
       if (status) q2 = q2.eq("status", status);
+      // Keep the month restriction on the degraded path too — without it a transient
+      // failure of the joined select silently returns every month's rows, which the
+      // caller cannot distinguish from a genuine month with a lot of commissions.
+      if (payout_month) q2 = q2.eq("payout_month", payout_month);
       const { data: d2 } = await q2;
       return res.json({ commissions: d2 || [] });
     }
-    res.json({ commissions: data || [] });
+    let rows = data || [];
+    // A payout batch is "commissions stamped with this payout_month" PLUS the pending
+    // ones for the same order month, which have no payout_month yet. /commission-payout
+    // composes the batch the same way; both must agree or the two tabs show different
+    // totals for the same month.
+    if (payout_month && (!status || status === "pending")) {
+      const orderRange = getOrderMonthRange(payout_month);
+      if (orderRange) {
+        let pq = supabase.from("commissions").select(`${SELECTS.COMMISSION_LIST_SELECT_ORDER_INNER}, wrong_item_holds(hold_reason, status)`)
+          .eq("status", "pending")
+          .gte("orders.order_date", orderRange.start).lte("orders.order_date", orderRange.end)
+          .order("created_at", { ascending: false }).limit(lim);
+        if (cid) pq = pq.eq("company_id", cid);
+        if (user_id) pq = pq.eq("user_id", user_id);
+        const { data: pendingRows, error: pendingErr } = await pq;
+        if (pendingErr) console.error("[GET /commissions] pending-by-order-date query failed:", pendingErr.message);
+        else if (pendingRows?.length) {
+          const seen = new Set(rows.map(r => r.id));
+          rows = rows.concat(pendingRows.filter(r => !seen.has(r.id)))
+            .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+            .slice(0, lim);
+        }
+      }
+    }
+    res.json({ commissions: rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5680,8 +5712,16 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     if (cid) eq = eq.eq("company_id", cid);
     if (user_id) eq = eq.eq("user_id", user_id);
     const { data: eligibleComms } = await eq;
-    let pq = supabase.from("commissions").select(SELECTS.COMMISSION_LIST_SELECT)
+    // Pending commissions belong to the same payout batch as the eligible ones, but
+    // they carry no payout_month (it is only stamped once the deposit gate is met),
+    // so they are scoped by their order's own date instead. Previously this query had
+    // no month filter at all and merged EVERY pending commission from every month into
+    // the response, inflating each user's total, order count, and Total Sales with
+    // accumulated history. Orders with a NULL order_date drop out of this filter.
+    const orderRange = getOrderMonthRange(month);
+    let pq = supabase.from("commissions").select(SELECTS.COMMISSION_LIST_SELECT_ORDER_INNER)
       .eq("status", "pending");
+    if (orderRange) pq = pq.gte("orders.order_date", orderRange.start).lte("orders.order_date", orderRange.end);
     if (user_id) pq = pq.eq("user_id", user_id);
     if (cid) pq = pq.eq("company_id", cid);
     const { data: pendingComms } = await pq;
