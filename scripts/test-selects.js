@@ -31,8 +31,6 @@ const CASES = [
   ["delivery_orders", SELECTS.DELIVERY_ORDER_LIST_SELECT, "040"],
   ["commissions", SELECTS.COMMISSION_LIST_SELECT, false],
   ["commissions", `${SELECTS.COMMISSION_LIST_SELECT}, wrong_item_holds(hold_reason, status)`, false],
-  ["commissions", SELECTS.COMMISSION_LIST_SELECT_ORDER_INNER, false],
-  ["commissions", `${SELECTS.COMMISSION_LIST_SELECT_ORDER_INNER}, wrong_item_holds(hold_reason, status)`, false],
   // Frontend App.js ORDER_COLS (keep in sync with src/App.js)
   ["orders", "id, created_at, so_number, customer_name, address, contact, order_date, salesman, order_amount, balance, delivery_date, time_slot, plate_no, type, service_note, sv_number, remark, status, items, photo_url, linked_so, company_id", false],
   // Frontend UserManagement companies
