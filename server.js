@@ -5202,8 +5202,13 @@ async function buildClearanceCommissionContext(order, companyId, cache, net) {
 
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
 async function calculateCommission(orderId, companyId) {
-  const { data: order } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type, country, address")
+  const { data: order, error: orderErr } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type, country, address, incentive_excluded_ids")
     .eq("id", orderId).single();
+  // A failed read must not look like "order not found" — that would return quietly
+  // and skip the commission entirely, with nothing to show it had happened. This is
+  // the path that breaks if migration 051 has not been applied, and a loud failure
+  // is far preferable to commissions silently ceasing to be calculated.
+  if (orderErr && orderErr.code !== "PGRST116") throw new Error(`could not read order ${orderId} for commission: ${orderErr.message}`);
   if (!order) return;
   // Service orders are logistics-only and financially inert — never commissionable.
   if (order.type === "Service") return;
@@ -5234,20 +5239,15 @@ async function calculateCommission(orderId, companyId) {
   // Product incentive total (no DB query — uses cached incentives). Unchanged
   // by Phase C — still resolved from the legacy orders.items snapshot exactly
   // as before; bundle package incentives are a separate, new pool.
-  let productIncentiveTotal = 0;
+  // Per-item matching lives in lib/commission.js so the UI's incentive list
+  // (GET /orders/:id/incentive-items) and this calculation can never disagree.
+  // A manager may switch individual incentives off for this order; excluded rows
+  // contribute nothing to the total. The decision lives on the ORDER, so it applies
+  // to every salesman on it and survives recalculation without any special handling
+  // here — this function simply reads the current exclusion list.
   const orderItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-  if (Array.isArray(orderItems)) {
-    for (const item of orderItems) {
-      const itemCode = (item.itemCode || "").toLowerCase();
-      const itemName = (item.itemName || "").toLowerCase();
-      const qty = Number(item.unit) || 1;
-      const match = cache.incentives.find(inc =>
-        (inc.product_code && itemCode.includes(inc.product_code.toLowerCase())) ||
-        (inc.product_name && itemName.includes(inc.product_name.toLowerCase()))
-      );
-      if (match) productIncentiveTotal += (Number(match.incentive_amount) || 0) * qty;
-    }
-  }
+  const incentiveRows = commissionLib.matchProductIncentives(orderItems, cache.incentives, order.incentive_excluded_ids || []);
+  const productIncentiveTotal = commissionLib.payableProductIncentiveTotal(incentiveRows);
 
   // Phase C: resolve clearance/bundle context once for the whole order (not
   // per salesman) — null when the company has the kill switch off, or there
@@ -5354,25 +5354,19 @@ async function calculateCommission(orderId, companyId) {
 
     const packageIncentiveAmt = packageIncentiveShares[idx] || 0;
 
-    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at, product_incentive_waived").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
+    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
     // Fail loudly rather than treating a failed read as "no commission exists" — that
-    // would fall through to the insert below and duplicate the row on a financial
-    // table. This is also the path that breaks if migration 050 was never applied.
+    // would fall through to the insert below and duplicate the row on a financial table.
     if (existingErr) throw new Error(`could not read existing commission for order ${orderId} / user ${salesUser.id}: ${existingErr.message}`);
     // Never overwrite a paid commission — corrections go through
     // commission_adjustments instead (see POST /commission-adjustments).
     if (existing && (existing.status === "paid" || existing.paid_at)) continue;
 
-    // A manager/director/master can switch the product incentive off for a whole
-    // sales order (PATCH /commissions/order/:orderId/product-incentive). Eligibility
-    // is purely their decision — nothing derives it — so it is read back off the
-    // existing row and re-applied here. Without this, every recalculation would
-    // silently switch the incentive back on. The flag is deliberately absent from
-    // commData below so neither the insert nor the update can clobber it.
-    const incentiveWaived = !!existing?.product_incentive_waived;
-    const payableProductIncentive = incentiveWaived ? 0 : productIncentiveAmt;
-
-    const totalComm = commissionLib.round2(tierCommissionAmt + clearanceCommissionAmt + payableProductIncentive + packageIncentiveAmt);
+    // Incentive eligibility is decided per item on the ORDER
+    // (orders.incentive_excluded_ids), and productIncentiveTotal above already
+    // reflects it — so nothing extra is needed per commission, and there is no
+    // second flag that could disagree with it.
+    const totalComm = commissionLib.round2(tierCommissionAmt + clearanceCommissionAmt + productIncentiveAmt + packageIncentiveAmt);
 
     const commData = {
       role_name: empRole, // 'salesman' or 'part_time' — keeps update+insert+purge consistent
@@ -5532,65 +5526,81 @@ app.get("/commissions", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Switch the product incentive on/off for an entire sales order.
-//   eligible: true  → the incentive counts towards commission (the default)
-//   eligible: false → it does not count, for every salesman on this order
-// Eligibility is a manager's decision, nothing more — there is no rule behind it.
-// COMMISSION_APPROVE is seeded for master/director/manager only (see
-// scripts/seed-permissions.js), which is exactly who may make this call. Finance,
-// who can add adjustments, deliberately cannot do this.
-app.patch("/commissions/order/:orderId/product-incentive", ...requirePerm(PERMS.COMMISSION_APPROVE), async (req, res) => {
+// Load an order (company-scoped) plus the product incentives its items earn.
+// Shared by the read and write handlers below so both see the same matching.
+async function loadOrderIncentiveItems(orderId, cid) {
+  const { data: order, error } = await supabase.from("orders")
+    .select("id, so_number, company_id, items, incentive_excluded_ids")
+    .eq("id", orderId).eq("company_id", cid).maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!order) return null;
+  const cache = await getCommCache(cid);
+  const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
+  return { order, rows: commissionLib.matchProductIncentives(items, cache.incentives, order.incentive_excluded_ids || []) };
+}
+
+// Which product incentives a sales order earns, and whether each is switched on.
+// One row per earning item, keyed on the product_incentives id — order items carry
+// no stable id of their own.
+app.get("/orders/:orderId/incentive-items", requireAuth, async (req, res) => {
   try {
-    const { eligible } = req.body || {};
-    if (typeof eligible !== "boolean") return res.status(400).json({ error: "eligible must be true or false" });
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company context required" });
-    const waived = !eligible;
+    const found = await loadOrderIncentiveItems(req.params.orderId, cid);
+    if (!found) return res.status(404).json({ error: "Order not found" });
+    res.json({ so_number: found.order.so_number, items: found.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-    // Every commission on this order — a split order has one row per salesman, and
-    // an order-level decision must move all of them together. Company-scoped: the
-    // frontend filters for UX, the backend authorises.
-    const { data: comms, error: readErr } = await supabase.from("commissions")
-      .select("id, status, paid_at, commission_amt, product_incentive_amt, product_incentive_waived, user_id")
-      .eq("order_id", req.params.orderId).eq("company_id", cid);
-    if (readErr) return res.status(500).json({ error: readErr.message });
-    if (!comms?.length) return res.status(404).json({ error: "No commissions found for this order" });
+// Switch ONE product incentive on/off for a sales order.
+//   excluded: true  → this item's incentive does not count towards commission
+//   excluded: false → it counts (the default)
+// Eligibility is a manager's decision, nothing more — there is no rule behind it.
+// COMMISSION_APPROVE is seeded for master/director/manager only (see
+// scripts/seed-permissions.js). Finance, who may add adjustments, deliberately cannot.
+//
+// The decision is stored on the ORDER, so it applies to every salesman on it. The
+// amounts are then rebuilt by calculateCommission rather than by arithmetic here —
+// splits, rounding and tier matching stay correct by construction instead of by a
+// second implementation of the same money math.
+app.patch("/orders/:orderId/incentive-items", ...requirePerm(PERMS.COMMISSION_APPROVE), async (req, res) => {
+  try {
+    const { incentive_id, excluded } = req.body || {};
+    if (!incentive_id) return res.status(400).json({ error: "incentive_id required" });
+    if (typeof excluded !== "boolean") return res.status(400).json({ error: "excluded must be true or false" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company context required" });
 
-    const updated = [], skipped = [];
-    for (const c of comms) {
-      // Same rule as calculateCommission: a paid commission is never mutated —
-      // corrections after payment go through commission_adjustments.
-      if (c.status === "paid" || c.paid_at) { skipped.push({ id: c.id, reason: "already paid" }); continue; }
-      const incentive = Number(c.product_incentive_amt) || 0;
-      if (incentive === 0) { skipped.push({ id: c.id, reason: "no product incentive" }); continue; }
-      // Idempotent: re-sending the current state must not move the amount again.
-      if (!!c.product_incentive_waived === waived) { skipped.push({ id: c.id, reason: "already in that state" }); continue; }
-
-      // Apply the incentive as a DELTA rather than rebuilding commission_amt from its
-      // components. Rows created before the component columns existed can carry a
-      // correct commission_amt with zeroed tier/clearance/package parts, and
-      // recomputing from those would wipe the amount out.
-      const newAmt = commissionLib.round2(Number(c.commission_amt || 0) + (waived ? -incentive : incentive));
-      const { data: row, error: updErr } = await supabase.from("commissions").update({
-        product_incentive_waived: waived,
-        product_incentive_waived_by: waived ? req.user.id : null,
-        product_incentive_waived_at: waived ? new Date().toISOString() : null,
-        commission_amt: newAmt,
-        // incentive_pct is left alone — see calculateCommission. Whether the incentive
-        // is payable is carried by product_incentive_waived and commission_amt, so
-        // there is one source of truth and no second formula to keep in step.
-      }).eq("id", c.id).eq("company_id", cid).select().maybeSingle();
-      if (updErr) return res.status(500).json({ error: `commission ${c.id}: ${updErr.message}` });
-      updated.push(row);
+    const found = await loadOrderIncentiveItems(req.params.orderId, cid);
+    if (!found) return res.status(404).json({ error: "Order not found" });
+    if (!found.rows.some(r => String(r.incentive_id) === String(incentive_id))) {
+      return res.status(400).json({ error: "This order does not earn that product incentive." });
     }
 
-    // A change to a payable amount is never anonymous.
-    if (updated.length) {
-      permEngine.logEvent(cid, req.user.id, waived ? "commission.product_incentive_disabled" : "commission.product_incentive_enabled",
-        "orders", req.params.orderId, { commission_ids: updated.map(r => r.id), incentive_total: updated.reduce((s, r) => s + (Number(r.product_incentive_amt) || 0), 0) }, req);
-    }
+    // A paid commission is never mutated — corrections after payment go through
+    // commission_adjustments. calculateCommission skips paid rows, but refusing here
+    // avoids leaving an exclusion recorded that the amounts do not reflect.
+    const { data: paid } = await supabase.from("commissions")
+      .select("id").eq("order_id", req.params.orderId).eq("company_id", cid)
+      .or("status.eq.paid,paid_at.not.is.null").limit(1);
+    if (paid?.length) return res.status(409).json({ error: "A commission on this order is already paid. Use an adjustment instead." });
 
-    res.json({ eligible, updated, skipped });
+    const current = new Set((found.order.incentive_excluded_ids || []).map(String));
+    if (excluded) current.add(String(incentive_id)); else current.delete(String(incentive_id));
+    const nextIds = [...current];
+
+    const { error: updErr } = await supabase.from("orders")
+      .update({ incentive_excluded_ids: nextIds }).eq("id", req.params.orderId).eq("company_id", cid);
+    if (updErr) return res.status(500).json({ error: updErr.message });
+
+    // Rebuild the commissions from the real calculation.
+    await calculateCommission(Number(req.params.orderId), cid);
+
+    permEngine.logEvent(cid, req.user.id, excluded ? "commission.incentive_item_excluded" : "commission.incentive_item_included",
+      "orders", req.params.orderId, { incentive_id, excluded_ids: nextIds }, req);
+
+    const after = await loadOrderIncentiveItems(req.params.orderId, cid);
+    res.json({ so_number: after?.order?.so_number, items: after?.rows || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

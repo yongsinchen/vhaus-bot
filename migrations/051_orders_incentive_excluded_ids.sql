@@ -1,0 +1,62 @@
+-- Migration 051: per-item product incentive eligibility on a sales order
+--
+-- A manager/director/master can switch an individual product incentive off for one
+-- sales order (PATCH /orders/:orderId/incentive-items, gated on COMMISSION_APPROVE).
+-- Eligibility is purely their decision — nothing derives it.
+--
+-- Holds product_incentives ids, NOT item indexes: order items carry no stable id, so
+-- a positional key would silently reattach to the wrong item as soon as the order is
+-- edited. Keying on the incentive also gives the UI its button label.
+--
+-- calculateCommission reads this list every time it runs and simply skips excluded
+-- incentives, so a decision survives "Recalculate All" with no extra bookkeeping and
+-- no second flag that could disagree with it. See matchProductIncentives in
+-- lib/commission.js — the same matching serves the calculation and the UI.
+--
+-- ⚠ NO FOREIGN KEY, deliberately — and do not add one.
+-- Migration 050's first version declared `REFERENCES users(id)`, which gave
+-- commissions a SECOND foreign key to users. PostgREST cannot resolve an embedded
+-- users(...) select when two relationships to the same table exist (PGRST201), and
+-- the whole Commission page returned no rows in production until the column was
+-- dropped. A JSONB array of ids stores the reference without declaring a
+-- relationship. The ids are validated against the order's matched incentives in the
+-- endpoint, not by the database.
+--
+-- Adding a NOT NULL column with a constant default does not rewrite the table on
+-- PostgreSQL 11+, so this is safe on the existing orders rows. Every order defaults
+-- to '[]' — nothing excluded — which is the pre-existing behaviour, so no commission
+-- amount changes as a result of this migration.
+--
+-- Rollback:
+--   ALTER TABLE orders DROP COLUMN incentive_excluded_ids;
+-- Do NOT drop while the current calculateCommission is deployed: it selects this
+-- column, and a failed read now throws rather than silently skipping the commission.
+-- Dropping also loses every exclusion, so incentives would be restored on the next
+-- recalculation.
+
+ALTER TABLE orders
+ADD COLUMN IF NOT EXISTS incentive_excluded_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- Verification — every existing order must default to an empty list:
+--
+--   SELECT incentive_excluded_ids = '[]'::jsonb AS empty, COUNT(*)
+--   FROM orders GROUP BY 1;
+--   -- expect: true | <all rows>
+--
+-- Confirm no new foreign key was created on orders towards users:
+--
+--   SELECT conname, pg_get_constraintdef(oid)
+--   FROM pg_constraint
+--   WHERE conrelid = 'orders'::regclass AND contype = 'f';
+--
+-- Orders with an incentive switched off:
+--
+--   SELECT id, so_number, incentive_excluded_ids
+--   FROM orders
+--   WHERE incentive_excluded_ids <> '[]'::jsonb;
+--
+-- NOTE: migration 050's product_incentive_waived columns are superseded by this and
+-- are no longer read. They are left in place rather than dropped — dropping columns
+-- on this schema has caused an outage before. Any order switched off through that
+-- older mechanism has its incentive restored by the next recalculation and must be
+-- re-excluded per item here.
