@@ -5736,7 +5736,13 @@ app.get("/delivery-commissions", requireAuth, async (req, res) => {
     const { status, payout_month } = req.query;
     const cid = getActiveCompanyId(req);
     const lim = Math.min(Number(req.query.limit) || 1000, 5000);
-    const isDriver = DRIVER_ROLES.includes(req.user.role);
+    // Only an ACTUAL driver is restricted to their own rows; managers, finance,
+    // company admins and master see everyone (mirrors the isSalesman check on
+    // /commissions). NOTE: DRIVER_ROLES must NOT be used here — it lists every
+    // role allowed to hit driver endpoints (master/manager/company_admin/
+    // operation included), so it would wrongly scope a master to their own
+    // (non-existent) driver commissions and show RM0.
+    const isDriver = (req.activeRoleKey || req.user.role || "").toLowerCase() === "driver";
     const driverUserId = isDriver ? req.user.id : req.query.user_id;
     let q = supabase.from("delivery_commissions")
       .select("*, driver:users!delivery_commissions_driver_user_id_fkey(name), orders(so_number)")
