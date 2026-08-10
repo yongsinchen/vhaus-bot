@@ -5495,6 +5495,121 @@ function getPayoutMonth(orderDate) {
   return d.toISOString().slice(0, 10);
 }
 
+// ══════════════════════════════════════════════════════════════════
+// Delivery (driver) commission — Phase 1
+//
+// A driver earns a flat % of the order amount for the delivery they
+// complete FIRST. Paid ONCE per sales order, no matter how many trips
+// the order is split into — the once-per-SO guard here plus the partial
+// unique index in migration 046 enforce that together. Reversible when
+// the order is cancelled/returned. Opt-in per company via
+// companies.driver_commission_rate (0 = off, migration 045).
+//
+// Deliberately NOT folded into calculateCommission()/`commissions`
+// (salesman): different trigger (delivery completion, not order
+// edit/payment), different lifecycle (reversible, no deposit gate), and
+// its own table — so this new money path can never corrupt the
+// battle-tested salesman calculation.
+// ══════════════════════════════════════════════════════════════════
+
+// Resolve the driver user for a delivery order via its schedule → team.
+// delivery_teams.driver_id is a real FK to users (see team CRUD above).
+// The most recent schedule attempt carrying a team is the one that just
+// completed. Returns null when no team/driver is linked (legacy or
+// unassigned) — in which case no commission is attributed.
+async function resolveDeliveryDriver(deliveryOrderId) {
+  const { data: sched } = await supabase.from("delivery_schedules")
+    .select("team_id, created_at, delivery_teams(driver_id)")
+    .eq("delivery_order_id", deliveryOrderId)
+    .not("team_id", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return sched?.delivery_teams?.driver_id || null;
+}
+
+// Compute + persist the driver commission for a JUST-COMPLETED delivery
+// order. Idempotent and safe to call on every completion: it no-ops when
+// the company's rate is 0, when a non-reversed commission already exists
+// for the sales order, when no driver is linked, or when the base amount
+// is non-positive. Callers already wrap this in try/catch (mirroring the
+// calculateCommission call sites), so it never blocks the completion.
+async function calculateDeliveryCommission(deliveryOrderId, companyId) {
+  const { data: doRow } = await supabase.from("delivery_orders")
+    .select("id, sales_order_id, order_id, company_id, status, completed_at")
+    .eq("id", deliveryOrderId).maybeSingle();
+  if (!doRow || doRow.status !== "completed") return;
+  const cid = companyId || doRow.company_id;
+  if (!cid) return;
+
+  // Opt-in per company (migration 045). 0 / missing => feature off, so
+  // every company that hasn't set a rate keeps today's behaviour exactly.
+  const { data: company } = await supabase.from("companies")
+    .select("driver_commission_rate").eq("id", cid).maybeSingle();
+  const rate = Number(company?.driver_commission_rate) || 0;
+  if (rate <= 0) return;
+
+  // Once-per-sales-order guard (JS half; the DB partial unique index is
+  // the authoritative half that also closes the concurrency race).
+  const { data: existing } = await supabase.from("delivery_commissions")
+    .select("id").eq("sales_order_id", doRow.sales_order_id)
+    .neq("status", "reversed").maybeSingle();
+  if (existing) return;
+
+  const driverUserId = await resolveDeliveryDriver(deliveryOrderId);
+  if (!driverUserId) return;
+
+  // Base amount + SG detection come from the legacy orders row — the same
+  // source and the same getCommissionableAmount() SG-GST rule the salesman
+  // calculateCommission() uses, so both commissions agree on the Singapore
+  // GST-exclusive base.
+  if (!doRow.order_id) return;
+  const { data: order } = await supabase.from("orders")
+    .select("id, order_amount, country, address, type, order_date, created_at")
+    .eq("id", doRow.order_id).maybeSingle();
+  if (!order || order.type === "Service") return;
+  const base = getCommissionableAmount(order);
+  if (!(base > 0)) return;
+
+  const amt = commissionLib.round2(base * (rate / 100));
+  const payoutMonth = getPayoutMonth(doRow.completed_at || order.order_date || order.created_at);
+
+  const { error: insErr } = await supabase.from("delivery_commissions").insert({
+    company_id: cid,
+    sales_order_id: doRow.sales_order_id,
+    order_id: doRow.order_id,
+    delivery_order_id: deliveryOrderId,
+    driver_user_id: driverUserId,
+    base_amount: commissionLib.round2(base),
+    rate_pct: rate,
+    commission_amt: amt,
+    status: "eligible",
+    payout_month: payoutMonth,
+  });
+  // 23505 = the partial unique index fired: a concurrent completion of a
+  // sibling DO on the same order already wrote the (single) commission.
+  // That is the correct once-per-order outcome, not an error to surface.
+  if (insErr && insErr.code !== "23505") {
+    console.error(`[calculateDeliveryCommission] insert failed for DO ${deliveryOrderId}:`, insErr.message);
+  }
+}
+
+// Reverse (claw back) the driver commission for a sales order — used when
+// the order is cancelled/returned. Only touches an UNPAID, still-eligible
+// row; a commission already marked paid is left for Finance to handle
+// (mirrors the salesman "never overwrite a paid commission" rule). After
+// reversal the partial unique index frees up, so a genuine re-delivery of
+// the same order can later earn a fresh commission.
+async function reverseDeliveryCommission(salesOrderId, reason) {
+  if (!salesOrderId) return;
+  const { error } = await supabase.from("delivery_commissions")
+    .update({ status: "reversed", reversed_at: new Date().toISOString(), reversal_reason: reason || null })
+    .eq("sales_order_id", salesOrderId)
+    .eq("status", "eligible")
+    .is("paid_at", null);
+  if (error) console.error(`[reverseDeliveryCommission] failed for SO ${salesOrderId}:`, error.message);
+}
+
 // GET commissions list
 app.get("/commissions", requireAuth, async (req, res) => {
   try {
@@ -5601,6 +5716,76 @@ app.patch("/orders/:orderId/incentive-items", ...requirePerm(PERMS.COMMISSION_AP
 
     const after = await loadOrderIncentiveItems(req.params.orderId, cid);
     res.json({ so_number: after?.order?.so_number, items: after?.rows || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET delivery (driver) commissions list — the driver payout report.
+// Same visibility model as /commissions: a driver sees only their OWN
+// rows (never trust a client-supplied user_id for that); managers/admins/
+// finance may optionally filter by driver via user_id. Company-scoped to
+// the active company. Optional filters: status, payout_month.
+app.get("/delivery-commissions", requireAuth, async (req, res) => {
+  try {
+    const { status, payout_month } = req.query;
+    const cid = getActiveCompanyId(req);
+    const lim = Math.min(Number(req.query.limit) || 1000, 5000);
+    const isDriver = DRIVER_ROLES.includes(req.user.role);
+    const driverUserId = isDriver ? req.user.id : req.query.user_id;
+    let q = supabase.from("delivery_commissions")
+      .select("*, driver:users!delivery_commissions_driver_user_id_fkey(name), orders(so_number)")
+      .order("created_at", { ascending: false }).limit(lim);
+    if (cid) q = q.eq("company_id", cid);
+    if (driverUserId) q = q.eq("driver_user_id", driverUserId);
+    if (status) q = q.eq("status", status);
+    if (payout_month) q = q.eq("payout_month", payout_month);
+    const { data, error } = await q;
+    if (error) {
+      // Fallback without joins (mirrors /commissions resilience) so a bad
+      // relationship name never blanks the report.
+      let q2 = supabase.from("delivery_commissions").select("*").order("created_at", { ascending: false }).limit(lim);
+      if (cid) q2 = q2.eq("company_id", cid);
+      if (driverUserId) q2 = q2.eq("driver_user_id", driverUserId);
+      if (status) q2 = q2.eq("status", status);
+      if (payout_month) q2 = q2.eq("payout_month", payout_month);
+      const { data: d2 } = await q2;
+      return res.json({ delivery_commissions: d2 || [] });
+    }
+    res.json({ delivery_commissions: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Driver (delivery) commission rate — per-company config ──────────
+// Powers the "Delivery Commission" settings control. Scoped to the
+// active company; 0 = feature off. GET is readable by any authenticated
+// user; PATCH is master/manager only (it changes how drivers are paid).
+app.get("/settings/driver-commission-rate", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const { data, error } = await supabase.from("companies")
+      .select("id, name, driver_commission_rate").eq("id", cid).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Company not found" });
+    res.json({ company_id: data.id, name: data.name, driver_commission_rate: Number(data.driver_commission_rate) || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/settings/driver-commission-rate", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const rate = Number(req.body?.driver_commission_rate);
+    // Business validation (server-side — never trust the client): a delivery
+    // incentive is a small % of order value; anything <0 or >100 is an error.
+    if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+      return res.status(400).json({ error: "driver_commission_rate must be a number between 0 and 100" });
+    }
+    const rounded = Math.round(rate * 1000) / 1000; // snap to NUMERIC(6,3)
+    const { data, error } = await supabase.from("companies")
+      .update({ driver_commission_rate: rounded }).eq("id", cid)
+      .select("id, name, driver_commission_rate").single();
+    if (error) throw error;
+    res.json({ company_id: data.id, name: data.name, driver_commission_rate: Number(data.driver_commission_rate) || 0 });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -7843,6 +8028,13 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
           if (msg.includes("wrong_company") || msg.includes("not_found")) return res.status(404).json({ error: "Delivery order not found" });
           throw rpcErr;
         }
+        // Driver commission: earned once, on the FIRST trip of the order to
+        // complete. No-op on a double-tap (already_completed) or when the
+        // company hasn't opted in. Non-fatal — never block completion.
+        if (!result?.already_completed) {
+          try { await calculateDeliveryCommission(schedRow.delivery_order_id, cid); }
+          catch (e) { console.error("delivery commission calc:", e.message); }
+        }
         const { data: fresh } = await supabase.from("delivery_schedules").select("*").eq("id", req.params.id).single();
         return res.json({ schedule: fresh, delivery_order: result });
       }
@@ -8346,6 +8538,13 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
         if (msg.includes("cancelled")) return res.status(400).json({ error: "Cannot complete a cancelled delivery order" });
         if (msg.includes("wrong_company") || msg.includes("not_found")) return res.status(404).json({ error: "Delivery order not found" });
         throw rpcErr;
+      }
+      // Driver commission: earned once, on the FIRST trip of the order to
+      // complete. No-op on a double-tap (already_completed) or when the
+      // company hasn't opted in. Non-fatal — never block completion.
+      if (!result?.already_completed) {
+        try { await calculateDeliveryCommission(existing.delivery_order_id, cid); }
+        catch (e) { console.error("delivery commission calc:", e.message); }
       }
       const { data: fresh } = await supabase.from("delivery_schedules")
         .select("*, orders(id, so_number, status)").eq("id", existing.id).single();
@@ -12266,6 +12465,9 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
           if (status === "cancelled") {
             // Clawback: set all commissions for this order to status "clawback"
             await supabase.from("commissions").update({ status: "clawback", commission_amt: 0 }).eq("order_id", legacyOrder.id);
+            // Driver (delivery) commission reverses on the same event —
+            // keyed on the sales order (data.id), unpaid rows only.
+            await reverseDeliveryCommission(data.id, cancel_reason || "sales order cancelled");
           } else {
             await calculateCommission(legacyOrder.id, getActiveCompanyId(req));
           }
