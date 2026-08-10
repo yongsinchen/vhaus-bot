@@ -5542,13 +5542,6 @@ async function calculateDeliveryCommission(deliveryOrderId, companyId) {
   const cid = companyId || doRow.company_id;
   if (!cid) return;
 
-  // Opt-in per company (migration 045). 0 / missing => feature off, so
-  // every company that hasn't set a rate keeps today's behaviour exactly.
-  const { data: company } = await supabase.from("companies")
-    .select("driver_commission_rate").eq("id", cid).maybeSingle();
-  const rate = Number(company?.driver_commission_rate) || 0;
-  if (rate <= 0) return;
-
   // Once-per-sales-order guard (JS half; the DB partial unique index is
   // the authoritative half that also closes the concurrency race).
   const { data: existing } = await supabase.from("delivery_commissions")
@@ -5558,6 +5551,20 @@ async function calculateDeliveryCommission(deliveryOrderId, companyId) {
 
   const driverUserId = await resolveDeliveryDriver(deliveryOrderId);
   if (!driverUserId) return;
+
+  // Rate: the driver's own override wins; NULL falls back to the per-company
+  // default (migrations 045 + 052). An explicit 0 on the driver means "this
+  // driver earns nothing" — deliberately distinct from NULL ("inherit the
+  // company rate"). An effective rate of 0 means the feature is off here.
+  const [{ data: company }, { data: driverUser }] = await Promise.all([
+    supabase.from("companies").select("driver_commission_rate").eq("id", cid).maybeSingle(),
+    supabase.from("users").select("driver_commission_rate").eq("id", driverUserId).maybeSingle(),
+  ]);
+  const override = driverUser?.driver_commission_rate;
+  const rate = (override === null || override === undefined)
+    ? (Number(company?.driver_commission_rate) || 0)
+    : Number(override);
+  if (!(rate > 0)) return;
 
   // Base amount + SG detection come from the legacy orders row — the same
   // source and the same getCommissionableAmount() SG-GST rule the salesman
@@ -5786,6 +5793,65 @@ app.patch("/settings/driver-commission-rate", requireRole(["master", "manager"])
       .select("id, name, driver_commission_rate").single();
     if (error) throw error;
     res.json({ company_id: data.id, name: data.name, driver_commission_rate: Number(data.driver_commission_rate) || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Per-driver commission rate overrides (migration 052) ────────────
+// GET returns the company default plus every driver with their override
+// (null = inherit) and their effective rate. "Drivers" = active role=driver
+// users in the company, plus anyone actually assigned as a delivery-team
+// driver (covers a manager who also drives).
+app.get("/driver-commission-rates", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const { data: company } = await supabase.from("companies").select("driver_commission_rate").eq("id", cid).maybeSingle();
+    const companyRate = Number(company?.driver_commission_rate) || 0;
+    const [{ data: roleDrivers }, { data: teams }] = await Promise.all([
+      supabase.from("users").select("id, name, driver_commission_rate").eq("company_id", cid).eq("role", "driver").eq("is_active", true),
+      supabase.from("delivery_teams").select("driver_id").eq("company_id", cid).not("driver_id", "is", null),
+    ]);
+    const byId = new Map();
+    for (const u of roleDrivers || []) byId.set(u.id, u);
+    const missing = [...new Set((teams || []).map(t => t.driver_id))].filter(id => !byId.has(id));
+    if (missing.length) {
+      const { data: extra } = await supabase.from("users").select("id, name, driver_commission_rate").in("id", missing);
+      for (const u of extra || []) byId.set(u.id, u);
+    }
+    const drivers = [...byId.values()].map(u => {
+      const ov = u.driver_commission_rate;
+      const rate = (ov === null || ov === undefined) ? null : Number(ov);
+      return { id: u.id, name: u.name, rate, effective: rate === null ? companyRate : rate };
+    }).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    res.json({ company_rate: companyRate, drivers });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH one driver's override. Body { driver_commission_rate: number|null } —
+// null (or "") clears the override so the driver inherits the company rate.
+// Master/manager only; enforces company isolation on the target user.
+app.patch("/driver-commission-rates/:userId", requireRole(["master", "manager"]), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    let rate = req.body?.driver_commission_rate;
+    if (rate === null || rate === "" || rate === undefined) {
+      rate = null;
+    } else {
+      rate = Number(rate);
+      if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+        return res.status(400).json({ error: "driver_commission_rate must be null or a number between 0 and 100" });
+      }
+      rate = Math.round(rate * 1000) / 1000;
+    }
+    const { data: u } = await supabase.from("users").select("id, company_id").eq("id", req.params.userId).maybeSingle();
+    if (!u || u.company_id !== cid) return res.status(404).json({ error: "Driver not found in this company" });
+    const { data, error } = await supabase.from("users")
+      .update({ driver_commission_rate: rate }).eq("id", req.params.userId)
+      .select("id, name, driver_commission_rate").single();
+    if (error) throw error;
+    const r = data.driver_commission_rate;
+    res.json({ id: data.id, name: data.name, rate: r === null || r === undefined ? null : Number(r) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
