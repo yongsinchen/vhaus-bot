@@ -5512,20 +5512,20 @@ function getPayoutMonth(orderDate) {
 // battle-tested salesman calculation.
 // ══════════════════════════════════════════════════════════════════
 
-// Resolve the driver user for a delivery order via its schedule → team.
-// delivery_teams.driver_id is a real FK to users (see team CRUD above).
-// The most recent schedule attempt carrying a team is the one that just
-// completed. Returns null when no team/driver is linked (legacy or
-// unassigned) — in which case no commission is attributed.
-async function resolveDeliveryDriver(deliveryOrderId) {
+// Resolve the delivery TEAM for a delivery order via its schedule — the
+// driver (delivery_teams.driver_id, a real FK to users) and the vehicle
+// plate. The most recent schedule attempt carrying a team is the one that
+// just completed. Returns nulls when no team is linked (legacy/unassigned).
+async function resolveDeliveryTeam(deliveryOrderId) {
   const { data: sched } = await supabase.from("delivery_schedules")
-    .select("team_id, created_at, delivery_teams(driver_id)")
+    .select("team_id, created_at, delivery_teams(driver_id, delivery_vehicles(vehicle_plate))")
     .eq("delivery_order_id", deliveryOrderId)
     .not("team_id", "is", null)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-  return sched?.delivery_teams?.driver_id || null;
+  const team = sched?.delivery_teams;
+  return { driverId: team?.driver_id || null, vehiclePlate: team?.delivery_vehicles?.vehicle_plate || null };
 }
 
 // Compute + persist the driver commission for a JUST-COMPLETED delivery
@@ -5542,29 +5542,49 @@ async function calculateDeliveryCommission(deliveryOrderId, companyId) {
   const cid = companyId || doRow.company_id;
   if (!cid) return;
 
-  // Once-per-sales-order guard (JS half; the DB partial unique index is
-  // the authoritative half that also closes the concurrency race).
-  const { data: existing } = await supabase.from("delivery_commissions")
-    .select("id").eq("sales_order_id", doRow.sales_order_id)
-    .neq("status", "reversed").maybeSingle();
-  if (existing) return;
+  // Resolve the first completed trip's team: driver + vehicle.
+  const { driverId, vehiclePlate } = await resolveDeliveryTeam(deliveryOrderId);
 
-  const driverUserId = await resolveDeliveryDriver(deliveryOrderId);
-  if (!driverUserId) return;
+  // Company default rate + a per-user effective-rate resolver (the user's own
+  // override wins; NULL inherits the company default; an explicit 0 = earns
+  // nothing — migrations 045 + 052).
+  const { data: company } = await supabase.from("companies").select("driver_commission_rate").eq("id", cid).maybeSingle();
+  const companyRate = Number(company?.driver_commission_rate) || 0;
+  const rateOf = async (uid) => {
+    if (!uid) return 0;
+    const { data: u } = await supabase.from("users").select("driver_commission_rate").eq("id", uid).maybeSingle();
+    const ov = u?.driver_commission_rate;
+    return (ov === null || ov === undefined) ? companyRate : (Number(ov) || 0);
+  };
 
-  // Rate: the driver's own override wins; NULL falls back to the per-company
-  // default (migrations 045 + 052). An explicit 0 on the driver means "this
-  // driver earns nothing" — deliberately distinct from NULL ("inherit the
-  // company rate"). An effective rate of 0 means the feature is off here.
-  const [{ data: company }, { data: driverUser }] = await Promise.all([
-    supabase.from("companies").select("driver_commission_rate").eq("id", cid).maybeSingle(),
-    supabase.from("users").select("driver_commission_rate").eq("id", driverUserId).maybeSingle(),
-  ]);
-  const override = driverUser?.driver_commission_rate;
-  const rate = (override === null || override === undefined)
-    ? (Number(company?.driver_commission_rate) || 0)
-    : Number(override);
-  if (!(rate > 0)) return;
+  // Build the set of earners for this delivery. A person can qualify twice
+  // (drove AND leads the vehicle) — dedup to ONE row at the HIGHER rate.
+  const earners = new Map(); // userId -> { rate, type }
+  const addEarner = (uid, rate, type) => {
+    if (!uid || !(rate > 0)) return;
+    const cur = earners.get(uid);
+    if (!cur || rate > cur.rate) earners.set(uid, { rate, type });
+  };
+
+  // Crew: the trip's driver (helper does not earn).
+  if (driverId) addEarner(driverId, await rateOf(driverId), "driver");
+
+  // Vehicle leader(s): anyone whose plate pattern is a substring of this
+  // trip's vehicle plate (case-insensitive, whitespace-normalised) — e.g.
+  // 'TBT 2331' matches "TBT 2331" and "TBT 2331 (DROP) / PKP 7328".
+  if (vehiclePlate) {
+    const norm = s => (s || "").toUpperCase().replace(/\s+/g, " ").trim();
+    const plateN = norm(vehiclePlate);
+    const { data: leaders } = await supabase.from("delivery_vehicle_leaders")
+      .select("plate_pattern, leader_user_id").eq("company_id", cid);
+    for (const L of leaders || []) {
+      if (plateN && norm(L.plate_pattern) && plateN.includes(norm(L.plate_pattern))) {
+        addEarner(L.leader_user_id, await rateOf(L.leader_user_id), "vehicle_leader");
+      }
+    }
+  }
+
+  if (earners.size === 0) return;
 
   // Base amount + SG detection come from the legacy orders row — the same
   // source and the same getCommissionableAmount() SG-GST rule the salesman
@@ -5578,26 +5598,33 @@ async function calculateDeliveryCommission(deliveryOrderId, companyId) {
   const base = getCommissionableAmount(order);
   if (!(base > 0)) return;
 
-  const amt = commissionLib.round2(base * (rate / 100));
   const payoutMonth = getPayoutMonth(doRow.completed_at || order.order_date || order.created_at);
 
-  const { error: insErr } = await supabase.from("delivery_commissions").insert({
-    company_id: cid,
-    sales_order_id: doRow.sales_order_id,
-    order_id: doRow.order_id,
-    delivery_order_id: deliveryOrderId,
-    driver_user_id: driverUserId,
-    base_amount: commissionLib.round2(base),
-    rate_pct: rate,
-    commission_amt: amt,
-    status: "eligible",
-    payout_month: payoutMonth,
-  });
-  // 23505 = the partial unique index fired: a concurrent completion of a
-  // sibling DO on the same order already wrote the (single) commission.
-  // That is the correct once-per-order outcome, not an error to surface.
-  if (insErr && insErr.code !== "23505") {
-    console.error(`[calculateDeliveryCommission] insert failed for DO ${deliveryOrderId}:`, insErr.message);
+  // One row per earner. Guard per (order, person): the DB partial unique
+  // index (sales_order_id, driver_user_id) is the authoritative half and
+  // also closes the concurrency race (23505 = a sibling completion already
+  // wrote this person's row — the correct once-per-order-per-person result).
+  for (const [uid, { rate, type }] of earners) {
+    const { data: existing } = await supabase.from("delivery_commissions")
+      .select("id").eq("sales_order_id", doRow.sales_order_id).eq("driver_user_id", uid)
+      .neq("status", "reversed").maybeSingle();
+    if (existing) continue;
+    const { error: insErr } = await supabase.from("delivery_commissions").insert({
+      company_id: cid,
+      sales_order_id: doRow.sales_order_id,
+      order_id: doRow.order_id,
+      delivery_order_id: deliveryOrderId,
+      driver_user_id: uid,
+      base_amount: commissionLib.round2(base),
+      rate_pct: rate,
+      commission_amt: commissionLib.round2(base * (rate / 100)),
+      status: "eligible",
+      payout_month: payoutMonth,
+      earner_type: type,
+    });
+    if (insErr && insErr.code !== "23505") {
+      console.error(`[calculateDeliveryCommission] insert failed for DO ${deliveryOrderId} user ${uid}:`, insErr.message);
+    }
   }
 }
 
