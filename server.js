@@ -4650,7 +4650,7 @@ async function recomputeOrderPaid(orderId) {
 // payment from customers in the field, so they must be able to record it.
 app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   try {
-    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations } = req.body;
+    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges } = req.body;
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
     const cid = getActiveCompanyId(req);
     // Create payment
@@ -4660,6 +4660,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       amount: Number(amount), payment_method: payment_method || "cash",
       reference_no: reference_no || null, recorded_by: req.user.id,
       proof_url: proof_url || null,
+      admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
       company_id: cid,
     }).select().single();
     if (error) throw error;
@@ -12189,7 +12190,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const company_id = getActiveCompanyId(req);
     const { id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel, order_date } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
@@ -12238,6 +12239,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+        admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
         country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
         subtotal, notes: notes || null, created_by, sales_channel: sales_channel || "branch",
       })
@@ -12327,7 +12329,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const company_id = getActiveCompanyId(req);
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs,
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel, order_date } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
@@ -12455,6 +12457,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: depositForUpdate, initial_deposit: initialDepositForUpdate, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+      admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false, sales_channel: sales_channel || "branch",
     };
     if (amendmentNote) {
