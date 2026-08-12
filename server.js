@@ -11879,7 +11879,38 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
 // ── Sales Order Routes ────────────────────────────────────────────
 
 // Generate a readable order number: SO + YYMMDD + 4-digit sequence for the day
-async function nextOrderNumber(company_id) {
+async function nextOrderNumber(company_id, branch_id) {
+  // Branch running number: each branch continues its OWN numeric series inside
+  // its configured band (branches.order_number_prefix — e.g. Alma "11" → 11xxx,
+  // Georgetown "3" → 3xxxx). Take the branch's highest number in the band and
+  // add 1; a branch with no prefix falls through to the dated SO number below.
+  if (branch_id) {
+    const { data: branch } = await supabase.from("branches")
+      .select("order_number_prefix").eq("id", branch_id).maybeSingle();
+    const prefix = (branch?.order_number_prefix || "").trim();
+    if (prefix) {
+      const { data: rows } = await supabase.from("sales_orders")
+        .select("order_number").eq("company_id", company_id).eq("branch_id", branch_id)
+        .like("order_number", `${prefix}%`);
+      const re = new RegExp(`^${prefix}\\d+$`);
+      let max = 0;
+      for (const r of rows || []) {
+        const s = String(r.order_number || "").trim();
+        if (re.test(s)) { const n = parseInt(s, 10); if (n > max) max = n; }
+      }
+      const base = Number(prefix.padEnd(5, "0")); // "11" → 11000, "3" → 30000
+      let next = Math.max(max, base - 1) + 1;
+      // Guarantee company-wide uniqueness — skip any number already taken.
+      for (let i = 0; i < 10000; i++) {
+        const { data: dup } = await supabase.from("sales_orders")
+          .select("id").eq("company_id", company_id).eq("order_number", String(next)).maybeSingle();
+        if (!dup) break;
+        next++;
+      }
+      return String(next);
+    }
+  }
+
   const now = new Date();
   const ymd = now.toISOString().slice(2, 10).replace(/-/g, "");
   const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
@@ -12191,6 +12222,17 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
 });
 
 // POST /sales-orders — create order with line items
+// Preview the next running number for a branch — powers the New Order form's
+// auto-fill (the salesman can still override it).
+app.get("/next-order-number", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const num = await nextOrderNumber(cid, req.query.branch_id || null);
+    res.json({ order_number: num });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/sales-orders", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
@@ -12228,7 +12270,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
       if (dup) return res.status(400).json({ error: `Order number "${customOrderNumber.trim()}" already exists` });
       order_number = customOrderNumber.trim();
     } else {
-      order_number = await nextOrderNumber(company_id);
+      order_number = await nextOrderNumber(company_id, branch_id);
     }
     const resolvedSalesman = salesman_names || salesman_name || name || null;
 
