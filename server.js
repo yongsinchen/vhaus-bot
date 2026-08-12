@@ -4595,7 +4595,7 @@ async function recomputeOrderPaid(orderId) {
   // Service orders are financially inert — never recompute paid/balance from them.
   if (ord.type === "Service") return;
   const { data: so } = await supabase.from("sales_orders")
-    .select("id, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit")
+    .select("id, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges")
     .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
   if (!so) return;
 
@@ -4613,6 +4613,7 @@ async function recomputeOrderPaid(orderId) {
     .select("id").eq("company_id", ord.company_id).eq("so_number", ord.so_number).or("type.is.null,type.neq.Service");
   const ids = (dOrders || []).map(o => o.id);
   let paidFromPayments = 0;
+  let adminPayments = 0; // instalment admin charges recorded on this SO's payments
   if (ids.length) {
     // (a) Allocated portions pointing at this SO's orders — the exact share of
     //     each (possibly cross-SO) split payment that belongs to this SO.
@@ -4626,7 +4627,8 @@ async function recomputeOrderPaid(orderId) {
     //     collection, bank reconciliation). Payments that DO have allocation
     //     rows are already counted in (a); exclude them to avoid double-counting.
     const { data: directPays } = await supabase.from("payments")
-      .select("id, amount").in("order_id", ids);
+      .select("id, amount, admin_charges").in("order_id", ids);
+    adminPayments = (directPays || []).reduce((s, p) => s + (Number(p.admin_charges) || 0), 0);
     let unallocatedSum = 0;
     if (directPays && directPays.length) {
       const { data: allocated } = await supabase.from("payment_allocations")
@@ -4639,8 +4641,13 @@ async function recomputeOrderPaid(orderId) {
     paidFromPayments = allocatedSum + unallocatedSum;
   }
 
-  const paid = Math.max(0, Math.min(total, initial + paidFromPayments));
-  const balance = Math.max(0, total - paid);
+  // Admin charges (instalment fee) add to what the customer owes — order-level
+  // (sales_orders.admin_charges) plus any recorded on this SO's payments. They
+  // raise the outstanding balance without touching order_amount (which drives
+  // commission / GST / e-invoice).
+  const totalWithAdmin = total + (Number(so.admin_charges) || 0) + adminPayments;
+  const paid = Math.max(0, Math.min(totalWithAdmin, initial + paidFromPayments));
+  const balance = Math.max(0, totalWithAdmin - paid);
   await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
   for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
 }
@@ -12053,7 +12060,7 @@ async function syncSalesOrderToDelivery(order, items) {
       order_date: order.order_date || (order.created_at || new Date().toISOString()).slice(0, 10),
       salesman: order.salesman_name || null,
       order_amount: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) + (!order.gst_waived ? (Number(order.gst_amount) || 0) : 0),
-      balance: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) + (!order.gst_waived ? (Number(order.gst_amount) || 0) : 0) - (Number(order.deposit) || 0),
+      balance: (Number(order.subtotal) || 0) - (Number(order.discount) || 0) + (!order.gst_waived ? (Number(order.gst_amount) || 0) : 0) + (Number(order.admin_charges) || 0) - (Number(order.deposit) || 0),
       delivery_date: order.delivery_date || null,
       time_slot: order.delivery_time_slot || null,
       type: order.delivery_type || "Delivery",
