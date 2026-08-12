@@ -11956,6 +11956,23 @@ function normalizeIc(v) {
   return (v || "").replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
+// A dummy/placeholder IC (e.g. "123456789012", "123456", "000000000000")
+// entered just to get past the e-invoice IC field. These must NEVER be used as
+// an identity key — doing so merges unrelated customers who happen to share the
+// same fake number (see the Tung Qiao Wen case). Passports / IDs containing
+// letters are never treated as placeholders.
+function isPlaceholderIc(v) {
+  const s = (v || "").replace(/[^a-zA-Z0-9]/g, "");
+  if (!s) return false;
+  if (/[a-zA-Z]/.test(s)) return false;    // has letters → real passport/ID
+  if (s.length < 6) return true;           // too short to be a real IC
+  if (/^(\d)\1+$/.test(s)) return true;    // all the same digit
+  const asc = "12345678901234567890";
+  const desc = "09876543210987654321";
+  if (asc.includes(s) || desc.includes(s)) return true; // clean ascending/descending run
+  return false;
+}
+
 // Digits-only phone — mirrors customers.phone_normalized (migration 027).
 function normalizePhone(v) {
   return (v || "").replace(/[^0-9]/g, "");
@@ -11968,6 +11985,9 @@ async function findOrCreateCustomerForOrder(order) {
     const phone = (order.customer_contact || "").trim();
     const ic = (order.customer_id_no || "").trim();
     const icNorm = normalizeIc(ic);
+    // A placeholder IC is NOT an identity — never match or store it, or unrelated
+    // customers sharing the same fake number get merged into one record.
+    const icUsable = !!icNorm && !isPlaceholderIc(ic);
     const email = (order.customer_email || "").trim();
     const address = order.customer_address || null;
     if (!name && !phone && !ic) return null;
@@ -11975,7 +11995,7 @@ async function findOrCreateCustomerForOrder(order) {
     // Identity match, strongest first: I/C (or passport) number, then phone.
     // I/C uniquely identifies a person even if the name is spelled differently.
     let existing = null;
-    if (icNorm) {
+    if (icUsable) {
       const { data } = await supabase.from("customers")
         .select("id, ic_number, email").eq("company_id", company_id).eq("ic_number_normalized", icNorm).limit(1);
       existing = (data && data[0]) || null;
@@ -11990,15 +12010,15 @@ async function findOrCreateCustomerForOrder(order) {
       // Backfill I/C and email onto an existing record that's missing them, so
       // later purchases can be matched by I/C.
       const patch = {};
-      if (ic && !existing.ic_number) patch.ic_number = ic;
+      if (ic && icUsable && !existing.ic_number) patch.ic_number = ic;
       if (email && !existing.email) patch.email = email;
       if (Object.keys(patch).length) await supabase.from("customers").update(patch).eq("id", existing.id);
       return existing.id;
     }
 
     const { data: created, error } = await supabase.from("customers").insert({
-      company_id, name: name || phone || ic, phone: phone || null,
-      email: email || null, ic_number: ic || null, address,
+      company_id, name: name || phone || null, phone: phone || null,
+      email: email || null, ic_number: icUsable ? ic : null, address,
     }).select("id").single();
     if (error) throw error;
     return created?.id || null;
