@@ -4686,8 +4686,9 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
 
 app.get("/payments", requireAuth, async (req, res) => {
   try {
-    const { customer_id, order_id, limit = 100 } = req.query;
+    const { customer_id, order_id, limit = 100, include_deposits } = req.query;
     const cid = getActiveCompanyId(req);
+    let payments = [];
     let q = supabase.from("payments").select("*, payment_allocations(order_id, amount)").order("paid_at", { ascending: false }).limit(Number(limit));
     if (cid) q = q.eq("company_id", cid);
     if (customer_id) q = q.eq("customer_id", customer_id);
@@ -4699,9 +4700,37 @@ app.get("/payments", requireAuth, async (req, res) => {
       if (customer_id) q2 = q2.eq("customer_id", customer_id);
       if (order_id) q2 = q2.eq("order_id", order_id);
       const { data: d2 } = await q2;
-      return res.json({ payments: d2 || [] });
+      payments = d2 || [];
+    } else {
+      payments = data || [];
     }
-    res.json({ payments: data || [] });
+
+    // Fold in each order's upfront deposit as a synthetic line so the Finance
+    // page captures deposits, not just ledger collections. These live on the
+    // sales order (not the payments table), carry no payment id, and are not
+    // deletable here. Company-wide only (deposits have no customer/order FK to
+    // filter on), so skip when a specific order/customer is requested.
+    if (include_deposits && cid && !order_id && !customer_id) {
+      const { data: sos } = await supabase.from("sales_orders")
+        .select("order_number, customer_name, initial_deposit, deposit, payment_method, payment_proofs, created_at")
+        .eq("company_id", cid).order("created_at", { ascending: false }).limit(2000);
+      const depositLines = [];
+      for (const so of (sos || [])) {
+        const dep = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
+        if (!(dep > 0)) continue;
+        let proofs = so.payment_proofs;
+        if (typeof proofs === "string") { try { proofs = JSON.parse(proofs || "[]"); } catch { proofs = []; } }
+        depositLines.push({
+          id: null, _deposit: true, amount: dep,
+          payment_method: so.payment_method || "Deposit",
+          reference_no: null, proof_url: Array.isArray(proofs) ? proofs.filter(Boolean).join(",") : null,
+          so_number: so.order_number, customer_name: so.customer_name,
+          order_id: null, paid_at: so.created_at,
+        });
+      }
+      payments = [...depositLines, ...payments].sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
+    }
+    res.json({ payments });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
