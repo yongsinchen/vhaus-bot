@@ -4496,15 +4496,22 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
     const depositLines = [];
     if (soNumbers.length) {
       const { data: sos } = await supabase.from("sales_orders")
-        .select("order_number, initial_deposit, deposit, created_at")
+        .select("order_number, initial_deposit, deposit, payment_method, payment_proofs, created_at")
         .eq("company_id", customer.company_id).in("order_number", soNumbers);
       for (const so of (sos || [])) {
         const dep = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
         if (dep > 0) {
           const ord = allOrders.find(o => o.so_number === so.order_number);
+          // Surface HOW the deposit was paid + its receipt(s) from the order:
+          // payment_proofs is a JSON array of URL strings, and the finance UI
+          // splits proof_url on commas into individual proof links.
+          let proofs = so.payment_proofs;
+          if (typeof proofs === "string") { try { proofs = JSON.parse(proofs || "[]"); } catch { proofs = []; } }
+          const proofUrl = Array.isArray(proofs) ? proofs.filter(Boolean).join(",") : null;
           depositLines.push({
-            id: null, _deposit: true, amount: dep, payment_method: "Deposit",
-            reference_no: null, proof_url: null, order_id: ord?.id || null,
+            id: null, _deposit: true, amount: dep,
+            payment_method: so.payment_method || "Deposit",
+            reference_no: null, proof_url: proofUrl || null, order_id: ord?.id || null,
             so_number: so.order_number, paid_at: so.created_at || ord?.created_at || null,
           });
         }
