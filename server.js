@@ -4689,11 +4689,20 @@ app.get("/payments", requireAuth, async (req, res) => {
     const { customer_id, order_id, limit = 100, include_deposits } = req.query;
     const cid = getActiveCompanyId(req);
     let payments = [];
-    let q = supabase.from("payments").select("*, payment_allocations(order_id, amount)").order("paid_at", { ascending: false }).limit(Number(limit));
+    // Join the customer (direct FK, else via the linked order) so each
+    // collected payment carries who paid + which SO — the Finance detail view
+    // shows the customer name and can pull their outstanding orders.
+    let q = supabase.from("payments").select("*, payment_allocations(order_id, amount), customers(id, name), orders(id, so_number, customer_name, customer_id)").order("paid_at", { ascending: false }).limit(Number(limit));
     if (cid) q = q.eq("company_id", cid);
     if (customer_id) q = q.eq("customer_id", customer_id);
     if (order_id) q = q.eq("order_id", order_id);
     const { data, error } = await q;
+    const normalize = (rows) => (rows || []).map(p => ({
+      ...p,
+      customer_name: p.customers?.name || p.orders?.customer_name || p.customer_name || null,
+      customer_id: p.customer_id || p.orders?.customer_id || null,
+      so_number: p.orders?.so_number || p.so_number || null,
+    }));
     if (error) {
       let q2 = supabase.from("payments").select("*").order("paid_at", { ascending: false }).limit(Number(limit));
       if (cid) q2 = q2.eq("company_id", cid);
@@ -4702,7 +4711,7 @@ app.get("/payments", requireAuth, async (req, res) => {
       const { data: d2 } = await q2;
       payments = d2 || [];
     } else {
-      payments = data || [];
+      payments = normalize(data);
     }
 
     // Fold in each order's upfront deposit as a synthetic line so the Finance
@@ -4714,6 +4723,15 @@ app.get("/payments", requireAuth, async (req, res) => {
       const { data: sos } = await supabase.from("sales_orders")
         .select("order_number, customer_name, initial_deposit, deposit, payment_method, payment_proofs, created_at")
         .eq("company_id", cid).order("created_at", { ascending: false }).limit(2000);
+      // Map each SO number → its legacy order's customer_id, so a deposit can
+      // link to the customer (sales_orders has no customer_id of its own).
+      const custBySo = {};
+      const soNums = (sos || []).map(s => s.order_number).filter(Boolean);
+      for (let i = 0; i < soNums.length; i += 300) {
+        const { data: legs } = await supabase.from("orders")
+          .select("so_number, customer_id").eq("company_id", cid).in("so_number", soNums.slice(i, i + 300));
+        for (const l of (legs || [])) if (l.customer_id) custBySo[l.so_number] = l.customer_id;
+      }
       const depositLines = [];
       for (const so of (sos || [])) {
         const dep = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
@@ -4725,6 +4743,7 @@ app.get("/payments", requireAuth, async (req, res) => {
           payment_method: so.payment_method || "Deposit",
           reference_no: null, proof_url: Array.isArray(proofs) ? proofs.filter(Boolean).join(",") : null,
           so_number: so.order_number, customer_name: so.customer_name,
+          customer_id: custBySo[so.order_number] || null,
           order_id: null, paid_at: so.created_at,
         });
       }
