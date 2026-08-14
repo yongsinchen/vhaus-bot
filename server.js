@@ -12239,7 +12239,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const company_id = getActiveCompanyId(req);
     const { id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges,
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges, einvoice_requested,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel, order_date } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
@@ -12260,8 +12260,8 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     // The amount alone decides — manual/legacy SO numbers add no requirement of
     // their own. Backend is the source of truth for this rule.
     const einvTotal = subtotal - (Number(discount) || 0) + (gst_waived ? 0 : (Number(gst_amount) || 0));
-    if (status === "confirmed" && einvTotal > 10000 && (!customer_id_no?.trim() || !customer_email?.trim())) {
-      return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
+    if (status === "confirmed" && (einvTotal > 10000 || einvoice_requested) && (!customer_id_no?.trim() || !customer_email?.trim())) {
+      return res.status(400).json({ error: "E-invoice details (I/C number and email) are required." });
     }
 
     let order_number;
@@ -12289,6 +12289,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         delivery_type: delivery_type || "Delivery", remark: remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
         admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
+        einvoice_requested: einvoice_requested === true,
         country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
         subtotal, notes: notes || null, created_by, sales_channel: sales_channel || "branch",
       })
@@ -12378,7 +12379,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const company_id = getActiveCompanyId(req);
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges,
+            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges, einvoice_requested,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel, order_date } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
@@ -12462,8 +12463,9 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // must carry e-invoice details (same rule as POST; backend is source of truth).
     const einvSubtotal = expandedItems ? subtotal : (Number(existing.subtotal) || 0);
     const einvTotal = einvSubtotal - (Number(discount) || 0) + (gst_waived ? 0 : (Number(gst_amount) || 0));
-    if (["confirmed", "delivered"].includes(status) && einvTotal > 10000 && (!customer_id_no?.trim() || !customer_email?.trim())) {
-      return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
+    const einvReqUpd = einvoice_requested !== undefined ? einvoice_requested : existing.einvoice_requested;
+    if (["confirmed", "delivered"].includes(status) && (einvTotal > 10000 || einvReqUpd) && (!customer_id_no?.trim() || !customer_email?.trim())) {
+      return res.status(400).json({ error: "E-invoice details (I/C number and email) are required." });
     }
 
     // Deposit handling. Normally the Deposit field is the upfront deposit and
@@ -12507,6 +12509,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       delivery_type: delivery_type || "Delivery", remark: remark || null,
       discount: Number(discount) || 0, deposit: depositForUpdate, initial_deposit: initialDepositForUpdate, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
+      einvoice_requested: einvoice_requested !== undefined ? einvoice_requested === true : existing.einvoice_requested,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false, sales_channel: sales_channel || "branch",
     };
     if (amendmentNote) {
@@ -12659,16 +12662,17 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
     // Only master/manager can re-confirm amended orders
     if (status === "confirmed") {
       const { data: existing } = await supabase.from("sales_orders")
-        .select("status, subtotal, discount, gst_amount, gst_waived, customer_id_no, customer_email")
+        .select("status, subtotal, discount, gst_amount, gst_waived, customer_id_no, customer_email, einvoice_requested")
         .eq("id", req.params.id).single();
       if (existing?.status === "amended" && !["master", "manager"].includes(req.user.role)) {
         return res.status(403).json({ error: "Only manager can re-confirm amended orders" });
       }
       // E-invoice rule also guards direct status flips (dropdown confirm,
-      // amended re-approval) — same RM10,000 threshold as POST/PUT.
+      // amended re-approval) — required when over RM10,000 OR the customer
+      // requested an e-invoice. Same rule as POST/PUT.
       const einvTotal = (Number(existing?.subtotal) || 0) - (Number(existing?.discount) || 0) + (existing?.gst_waived ? 0 : (Number(existing?.gst_amount) || 0));
-      if (einvTotal > 10000 && (!existing?.customer_id_no || !existing?.customer_email)) {
-        return res.status(400).json({ error: "E-invoice details are required for orders above RM10,000." });
+      if ((einvTotal > 10000 || existing?.einvoice_requested) && (!existing?.customer_id_no || !existing?.customer_email)) {
+        return res.status(400).json({ error: "E-invoice details (I/C number and email) are required." });
       }
     }
     // Cancel requires reason
