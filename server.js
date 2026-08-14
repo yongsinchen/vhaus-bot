@@ -130,7 +130,9 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
     res.status(500).json({ error: err.message });
   }
 };
-const MANAGE_ROLES = ["master", "manager", "company_admin"];
+// Fulfilment/admin management: catalogue, warehouse, purchasing, settings.
+// operation_manager = the ops half of the old "manager" role.
+const MANAGE_ROLES = ["master", "manager", "company_admin", "operation_manager"];
 
 // Derive active company_id — resolved by PermissionEngine in requireAuth
 function getActiveCompanyId(req) {
@@ -669,7 +671,11 @@ async function resolveProductSuppliersForView(companyId, rows) {
 // Normalize role keys to lowercase for API responses
 // DB stores UPPERCASE (MASTER, COMPANY_ADMIN). API returns lowercase (master, company_admin).
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
-const ORDER_ROLES = ["master", "manager", "company_admin", "salesman"];
+// Order + payment create/edit. sales_manager = the revenue half of the old
+// "manager" role.
+const ORDER_ROLES = ["master", "manager", "company_admin", "salesman", "sales_manager"];
+// Commission & product-incentive management — revenue-side managers only.
+const COMMISSION_ROLES = ["master", "manager", "sales_manager"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
 
 const requireAuth = async (req, res, next) => {
@@ -4829,7 +4835,7 @@ app.get("/product-incentives", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/product-incentives", requireRole(["master", "manager"]), async (req, res) => {
+app.post("/product-incentives", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     const { product_id, product_code, product_name, incentive_amount, start_date, end_date } = req.body;
     if (!incentive_amount || Number(incentive_amount) <= 0) return res.status(400).json({ error: "incentive_amount required" });
@@ -4844,7 +4850,7 @@ app.post("/product-incentives", requireRole(["master", "manager"]), async (req, 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/product-incentives/:id", requireRole(["master", "manager"]), async (req, res) => {
+app.put("/product-incentives/:id", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     const { incentive_amount, start_date, end_date, is_active } = req.body;
     const updates = {};
@@ -4858,7 +4864,7 @@ app.put("/product-incentives/:id", requireRole(["master", "manager"]), async (re
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/product-incentives/:id", requireRole(["master", "manager"]), async (req, res) => {
+app.delete("/product-incentives/:id", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     await supabase.from("product_incentives").delete().eq("id", req.params.id);
     res.json({ ok: true });
@@ -4878,7 +4884,7 @@ app.get("/commission-rules", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/commission-rules", requireRole(["master", "manager"]), async (req, res) => {
+app.post("/commission-rules", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     const { role_name, tier_name, min_net, max_net, rate_pct, incentive_pct, payout_day, deposit_gate_pct, channel, user_id } = req.body;
     if (!role_name || rate_pct == null) return res.status(400).json({ error: "role_name and rate_pct required" });
@@ -4895,7 +4901,7 @@ app.post("/commission-rules", requireRole(["master", "manager"]), async (req, re
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/commission-rules/:id", requireRole(["master", "manager"]), async (req, res) => {
+app.put("/commission-rules/:id", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     const { role_name, tier_name, min_net, max_net, rate_pct, incentive_pct, payout_day, deposit_gate_pct, is_active } = req.body;
     const updates = { updated_by: req.user.id, updated_at: new Date().toISOString() };
@@ -4914,7 +4920,7 @@ app.put("/commission-rules/:id", requireRole(["master", "manager"]), async (req,
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete("/commission-rules/:id", requireRole(["master", "manager"]), async (req, res) => {
+app.delete("/commission-rules/:id", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     await supabase.from("commission_rules").update({ is_active: false }).eq("id", req.params.id);
     res.json({ ok: true });
@@ -5962,7 +5968,7 @@ app.post("/commissions/recalculate/:orderId", requireRole(MANAGE_ROLES), async (
 });
 
 // Bulk recalculate all orders for a company
-app.post("/commissions/recalculate-all", requireRole(["master", "manager"]), async (req, res) => {
+app.post("/commissions/recalculate-all", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     // Prime the cache once before processing all orders
@@ -6041,7 +6047,7 @@ app.post("/sales-orders/resync-missing", requireRole(["master", "manager"]), asy
 });
 
 // Commission adjustments
-app.post("/commission-adjustments", requireRole(["master", "manager"]), async (req, res) => {
+app.post("/commission-adjustments", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
     const { commission_id, adjustment_type, delta_amt, reason, applied_to_payout } = req.body;
     if (!commission_id || !delta_amt) return res.status(400).json({ error: "commission_id and delta_amt required" });
@@ -8593,7 +8599,7 @@ app.patch("/package-labels/:id/load", ...requirePerm(PERMS.WAREHOUSE_LOAD), asyn
 });
 
 // ── Driver Endpoints ────────────────────────────────────────────
-const DRIVER_ROLES = ["master", "manager", "company_admin", "driver", "operation"];
+const DRIVER_ROLES = ["master", "manager", "company_admin", "driver", "operation", "operation_manager"];
 
 // GET /driver/my-route — today's route for the logged-in driver
 app.get("/driver/my-route", requireAuth, async (req, res) => {
