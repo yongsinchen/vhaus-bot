@@ -12087,6 +12087,7 @@ async function syncSalesOrderToDelivery(order, items) {
     const customer_id = existing?.customer_id || await findOrCreateCustomerForOrder(order);
     const row = {
       company_id: order.company_id,
+      branch_id: order.branch_id || null,
       so_number: order.order_number,
       customer_name: order.customer_name,
       customer_id,
