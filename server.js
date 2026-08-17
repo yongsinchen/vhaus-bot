@@ -5131,6 +5131,82 @@ app.delete("/commission-rules/:id", requireRole(COMMISSION_ROLES), async (req, r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Branch commission override earner (migration 059) ───────────────────
+// A specific person earns a flat override (their own per-person rate) on a
+// branch's legit sales. GET lists every branch with its assigned earner +
+// that earner's rate; PUT sets/clears the earner and (optionally) their rate.
+app.get("/branch-commission-overrides", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ branches: [] });
+    const [{ data: branches }, { data: users }] = await Promise.all([
+      supabase.from("branches").select("id, name, commission_override_user_id").eq("company_id", cid).order("name"),
+      supabase.from("users").select("id, name, salesman_name, override_commission_rate").eq("company_id", cid).eq("is_active", true).order("name"),
+    ]);
+    const userById = new Map((users || []).map(u => [u.id, u]));
+    res.json({
+      branches: (branches || []).map(b => {
+        const u = b.commission_override_user_id ? userById.get(b.commission_override_user_id) : null;
+        return {
+          branch_id: b.id, branch_name: b.name,
+          override_user_id: b.commission_override_user_id || null,
+          override_user_name: u ? (u.name || u.salesman_name || null) : null,
+          override_rate_pct: u && u.override_commission_rate != null ? Number(u.override_commission_rate) : null,
+        };
+      }),
+      users: (users || []).map(u => ({ id: u.id, name: u.name || u.salesman_name || "—", override_rate_pct: u.override_commission_rate != null ? Number(u.override_commission_rate) : null })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /branch-commission-overrides/:branchId  Body: { user_id, rate_pct }
+// user_id null/"" clears the branch's override earner. rate_pct (when a
+// user_id is given) sets that person's per-person override rate.
+app.put("/branch-commission-overrides/:branchId", requireRole(COMMISSION_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { branchId } = req.params;
+    const { user_id, rate_pct } = req.body || {};
+
+    // Company-isolation: the branch must belong to the active company.
+    const { data: branch } = await supabase.from("branches").select("id, commission_override_user_id").eq("id", branchId).eq("company_id", cid).maybeSingle();
+    if (!branch) return res.status(404).json({ error: "Branch not found" });
+
+    const prevUserId = branch.commission_override_user_id || null;
+
+    if (!user_id) {
+      // Clear the earner for this branch.
+      await supabase.from("branches").update({ commission_override_user_id: null }).eq("id", branchId).eq("company_id", cid);
+    } else {
+      // The earner must be a user in this company.
+      const { data: u } = await supabase.from("users").select("id, company_id").eq("id", user_id).maybeSingle();
+      if (!u || u.company_id !== cid) return res.status(400).json({ error: "Override earner must be a user in this company" });
+      if (rate_pct !== undefined && rate_pct !== null && rate_pct !== "") {
+        const r = Number(rate_pct);
+        if (!Number.isFinite(r) || r < 0 || r > 100) return res.status(400).json({ error: "rate_pct must be a number between 0 and 100" });
+        await supabase.from("users").update({ override_commission_rate: Math.round(r * 1000) / 1000 }).eq("id", user_id);
+      }
+      await supabase.from("branches").update({ commission_override_user_id: user_id }).eq("id", branchId).eq("company_id", cid);
+    }
+
+    // Reassignment cleanup: if a different person used to earn this branch's
+    // override, drop their unpaid override rows for this branch's orders so a
+    // replaced earner doesn't keep collecting. Paid rows are never touched.
+    if (prevUserId && prevUserId !== user_id) {
+      const { data: brOrders } = await supabase.from("orders").select("id").eq("company_id", cid).eq("branch_id", branchId);
+      const ids = (brOrders || []).map(o => o.id);
+      if (ids.length) {
+        await supabase.from("commissions").delete()
+          .eq("user_id", prevUserId).eq("role_name", "branch_override").in("order_id", ids)
+          .is("paid_at", null).neq("status", "paid");
+      }
+    }
+
+    _commCache.ts = 0; // invalidate so calculateCommission picks up the change
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Product Bundles (Phase C) ───────────────────────────────────────────
 // A bundle carries its OWN price (package_price); adding one to a sales
 // order explodes it into normal sales_order_items rows server-side (see
@@ -5299,17 +5375,23 @@ let _commCache = { ts: 0, rules: null, incentives: null, users: null, monthlySal
 async function getCommCache(companyId) {
   const now = Date.now();
   if (_commCache.companyId === companyId && now - _commCache.ts < 30000) return _commCache;
-  const [rulesRes, incRes, usersRes, companyRes, bundlesRes, bundleItemsRes] = await Promise.all([
+  const [rulesRes, incRes, usersRes, companyRes, bundlesRes, bundleItemsRes, branchesRes] = await Promise.all([
     supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("product_incentives").select("*").eq("company_id", companyId).eq("is_active", true),
-    supabase.from("users").select("id, role, salesman_name, branch_id").eq("company_id", companyId).eq("is_active", true),
+    supabase.from("users").select("id, role, salesman_name, branch_id, override_commission_rate").eq("company_id", companyId).eq("is_active", true),
     supabase.from("companies").select("clearance_commission_enabled").eq("id", companyId).maybeSingle(),
     // Phase C — clearance/bundle kill switch data. Cheap (few bundles per
     // company) and reused across every order recalculated in this 30s window.
     supabase.from("product_bundles").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("product_bundle_items").select("bundle_id, product_id, quantity").eq("company_id", companyId),
+    // Per-branch commission override earner (migration 059).
+    supabase.from("branches").select("id, commission_override_user_id").eq("company_id", companyId),
   ]);
   const today = new Date().toISOString().slice(0, 10);
+  const branchOverrides = {};
+  for (const b of (branchesRes.data || [])) {
+    if (b.commission_override_user_id) branchOverrides[b.id] = b.commission_override_user_id;
+  }
   const bundleItemsByBundle = new Map();
   for (const bi of (bundleItemsRes.data || [])) {
     if (!bundleItemsByBundle.has(bi.bundle_id)) bundleItemsByBundle.set(bi.bundle_id, []);
@@ -5324,6 +5406,7 @@ async function getCommCache(companyId) {
     clearanceEnabled: !!companyRes.data?.clearance_commission_enabled,
     bundles: bundlesRes.data || [],
     bundleItemsByBundle,
+    branchOverrides,
   };
   return _commCache;
 }
@@ -5745,6 +5828,47 @@ async function calculateCommission(orderId, companyId, opts = {}) {
         if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
         else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", company_id: companyId, ...commData });
       }
+    }
+  }
+
+  // ── Branch override earner (migration 059) ──────────────────────
+  // A specific person assigned to this order's branch earns a flat override —
+  // their OWN per-person rate — on the branch's legit sales (each deposit-paid
+  // order's commissionable amount), on the same deposit gate as every other
+  // commission. Kept separate from the branch-manager 1% override above.
+  const overrideUserId = order.branch_id ? cache.branchOverrides?.[order.branch_id] : null;
+  if (overrideUserId) {
+    // The commissions table holds one row per (order, user); if the override
+    // earner is also a salesman OR the branch manager on THIS order, skip the
+    // override so it can't overwrite their existing commission row. (An
+    // override earner is normally a distinct senior person.)
+    const isSalesmanHere = resolved.some(r => r.salesUser?.id === overrideUserId);
+    const ovUser = cache.users.find(u => u.id === overrideUserId);
+    const ovRate = ovUser && ovUser.override_commission_rate != null ? Number(ovUser.override_commission_rate) : 0;
+    if (ovUser && ovRate > 0 && !isSalesmanHere) {
+      const depositMet = depositPct >= 30; // same default deposit gate as salesman/manager
+      const overrideAmt = commissionLib.round2(net * (ovRate / 100));
+      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", ovUser.id).maybeSingle();
+      // Never overwrite a paid commission — corrections go through commission_adjustments.
+      if (!(existing && (existing.status === "paid" || existing.paid_at))) {
+        const commData = {
+          net_amount: net, rate_pct: ovRate, incentive_pct: 0,
+          commission_amt: overrideAmt, deposit_met: depositMet,
+          status: depositMet ? "eligible" : "pending",
+          eligible_at: depositMet ? new Date().toISOString() : null,
+          payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
+          tier_commission_amt: overrideAmt,
+          clearance_commission_amt: 0, product_incentive_amt: 0, package_incentive_amt: 0,
+        };
+        if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
+        else await supabase.from("commissions").insert({ order_id: orderId, user_id: ovUser.id, role_name: "branch_override", company_id: companyId, ...commData });
+      }
+    } else if (ovUser && (ovRate <= 0 || isSalesmanHere)) {
+      // Earner no longer qualifies for an override on this order (rate cleared,
+      // or they're the salesman here) — drop any stale, unpaid override row.
+      await supabase.from("commissions").delete()
+        .eq("order_id", orderId).eq("user_id", ovUser.id).eq("role_name", "branch_override")
+        .is("paid_at", null).neq("status", "paid");
     }
   }
 
