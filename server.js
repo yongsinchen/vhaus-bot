@@ -3638,16 +3638,35 @@ app.get("/dashboard/branch-sales", requireAuth, async (req, res) => {
 
     const [{ data: branchRows }, { data: orders }] = await Promise.all([
       supabase.from("branches").select("id, name").eq("company_id", cid).order("name"),
-      supabase.from("orders").select("branch_id, order_amount, status, order_date")
+      supabase.from("orders").select("branch_id, order_amount, status, order_date, so_number")
         .eq("company_id", cid)
         .gte("order_date", start).lt("order_date", nextMonth)
         .or("type.is.null,type.neq.Service")
         .not("status", "in", '("Cancelled","cancelled")'),
     ]);
 
+    // "Legit sale" gate: an order counts toward sales only once a deposit has
+    // been paid (deposit > 0 on its sales_orders row). Orders can now be
+    // confirmed with zero deposit and printed, but they are NOT a sale until
+    // the customer pays. Legacy/manual orders with no matching sales_orders
+    // row keep counting (null-safe) — the gate applies only where we have an
+    // authoritative deposit figure to check.
+    const soNumbers = [...new Set((orders || []).map(o => o.so_number).filter(Boolean))];
+    const depositBySo = new Map();
+    if (soNumbers.length) {
+      const { data: soRows } = await supabase.from("sales_orders")
+        .select("order_number, deposit").eq("company_id", cid).in("order_number", soNumbers);
+      for (const s of (soRows || [])) depositBySo.set(s.order_number, Number(s.deposit) || 0);
+    }
+    const countsAsSale = (o) => {
+      if (!o.so_number || !depositBySo.has(o.so_number)) return true; // legacy/unmatched → unchanged
+      return depositBySo.get(o.so_number) > 0;
+    };
+
     const totals = {};
     let unassigned = 0, grand = 0;
     for (const o of (orders || [])) {
+      if (!countsAsSale(o)) continue;
       const amt = Number(o.order_amount) || 0;
       grand += amt;
       if (o.branch_id) totals[o.branch_id] = (totals[o.branch_id] || 0) + amt;
@@ -4820,9 +4839,13 @@ async function recomputeOrderPaid(orderId) {
 // payment from customers in the field, so they must be able to record it.
 app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   try {
-    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges } = req.body;
+    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind } = req.body;
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
     const cid = getActiveCompanyId(req);
+    // "deposit" vs "balance" is descriptive only — the money math is identical
+    // (recomputeOrderPaid derives paid/balance from the full ledger). Reject
+    // anything else so the column stays clean; unspecified stays NULL (legacy).
+    const paymentKind = kind === "deposit" || kind === "balance" ? kind : null;
     // Create payment
     const { data: payment, error } = await supabase.from("payments").insert({
       order_id: order_id || (allocations?.[0]?.order_id) || null,
@@ -4831,6 +4854,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       reference_no: reference_no || null, recorded_by: req.user.id,
       proof_url: proof_url || null,
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
+      kind: paymentKind,
       company_id: cid,
     }).select().single();
     if (error) throw error;
