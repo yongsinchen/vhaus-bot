@@ -3054,6 +3054,16 @@ app.post("/delivery/routes/:routeId/orders", requireRole(MANAGE_ROLES), async (r
     return res.status(403).json({ error: "Route is Confirmed or locked. Unlock to Pending first." });
   }
 
+  // Operations gate: an order still awaiting its deposit cannot be routed.
+  if (order_id) {
+    const { data: legacyOrd } = await supabase.from("orders").select("company_id, so_number").eq("id", order_id).maybeSingle();
+    if (legacyOrd?.so_number) {
+      const { data: soChk } = await supabase.from("sales_orders").select("status")
+        .eq("company_id", legacyOrd.company_id).eq("order_number", legacyOrd.so_number).maybeSingle();
+      if (soChk?.status === "pending_deposit") return res.status(400).json({ error: "Record a deposit to confirm this order before adding it to a route." });
+    }
+  }
+
   const { data, error } = await supabase
     .from("delivery_route_orders")
     .insert({ route_id: routeId, order_id, sequence_no: sequence_no || 1,
@@ -4777,7 +4787,7 @@ async function recomputeOrderPaid(orderId) {
   // Service orders are financially inert — never recompute paid/balance from them.
   if (ord.type === "Service") return;
   const { data: so } = await supabase.from("sales_orders")
-    .select("id, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges")
+    .select("id, status, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges")
     .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
   if (!so) return;
 
@@ -4832,6 +4842,19 @@ async function recomputeOrderPaid(orderId) {
   const balance = Math.max(0, totalWithAdmin - paid);
   await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
   for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
+
+  // Auto-confirm: a "pending_deposit" order becomes a real, confirmed sale the
+  // moment any deposit lands. Forward-only — never revert a confirmed/delivered
+  // order if its paid amount later drops back to zero (refund / edit). This is
+  // the single choke point every payment path flows through, so recording a
+  // deposit anywhere (customer screen, driver collection, reconciliation) flips
+  // the order and (re)calculates commission.
+  if (so.status === "pending_deposit" && paid > 0) {
+    await supabase.from("sales_orders").update({ status: "confirmed" }).eq("id", so.id);
+    for (const id of ids) await supabase.from("orders").update({ status: deliveryStatusFromSO("confirmed") }).eq("id", id);
+    try { for (const id of ids) await calculateCommission(id, ord.company_id); }
+    catch (e) { console.error("[recomputeOrderPaid] auto-confirm commission:", e.message); }
+  }
 }
 
 // ── Cross-Order Payments ────────────────────────────────────────
@@ -8314,7 +8337,13 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
     if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
 
     // Fix #7: SOFT block, same as the DO path above.
-    const { data: legacyOrderForBlock } = await supabase.from("orders").select("branch_id").eq("id", order_id).maybeSingle();
+    const { data: legacyOrderForBlock } = await supabase.from("orders").select("branch_id, so_number").eq("id", order_id).maybeSingle();
+    // Operations gate: an order still awaiting its deposit cannot be scheduled.
+    if (legacyOrderForBlock?.so_number) {
+      const { data: soChk } = await supabase.from("sales_orders").select("status")
+        .eq("company_id", cid).eq("order_number", legacyOrderForBlock.so_number).maybeSingle();
+      if (soChk?.status === "pending_deposit") return res.status(400).json({ error: "Record a deposit to confirm this order before scheduling delivery." });
+    }
     const legacyBlockReason = await getBlockedDateReason(cid, scheduled_date, legacyOrderForBlock?.branch_id || null);
     if (legacyBlockReason && !(override_reason || "").trim()) {
       return res.status(400).json({ error: legacyBlockReason, blocked_date: true });
@@ -9048,6 +9077,9 @@ app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDE
     const { so, deliveryOrders, legacyOrder } = ctx;
 
     if (so.status === "cancelled") return res.status(400).json({ error: "Cannot create a Delivery Order for a cancelled sales order" });
+    // Operations gate: an order awaiting its deposit is not yet a committed sale
+    // and cannot be delivered. Recording the deposit auto-confirms it.
+    if (so.status === "pending_deposit") return res.status(400).json({ error: "Record a deposit to confirm this order before creating a Delivery Order." });
     // Telegram multi-trip orders keep their existing flow until Phase 2 absorption —
     // one delivery system per order, never both.
     if (legacyOrder?.is_multi_trip) {
@@ -12460,8 +12492,17 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     // The amount alone decides — manual/legacy SO numbers add no requirement of
     // their own. Backend is the source of truth for this rule.
     const einvTotal = subtotal - (Number(discount) || 0) + (gst_waived ? 0 : (Number(gst_amount) || 0));
-    if (status === "confirmed" && (einvTotal > 10000 || einvoice_requested) && (!customer_id_no?.trim() || !customer_email?.trim())) {
+    // "confirmed" and "pending_deposit" are both committing statuses and carry
+    // the same e-invoice obligation — a pending-deposit order auto-confirms the
+    // moment a deposit lands, so it must already hold the details.
+    if ((status === "confirmed" || status === "pending_deposit") && (einvTotal > 10000 || einvoice_requested) && (!customer_id_no?.trim() || !customer_email?.trim())) {
       return res.status(400).json({ error: "E-invoice details (I/C number and email) are required." });
+    }
+    // An order can only be created straight into "confirmed" if it already
+    // carries a deposit. Without one it must start as "pending_deposit" and get
+    // confirmed later when the deposit is recorded (rule enforced everywhere).
+    if (status === "confirmed" && (Number(deposit) || 0) <= 0) {
+      return res.status(400).json({ error: "A deposit is required to confirm an order. Save it as Pending Deposit and record the deposit to confirm." });
     }
 
     let order_number;
@@ -12664,7 +12705,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const einvSubtotal = expandedItems ? subtotal : (Number(existing.subtotal) || 0);
     const einvTotal = einvSubtotal - (Number(discount) || 0) + (gst_waived ? 0 : (Number(gst_amount) || 0));
     const einvReqUpd = einvoice_requested !== undefined ? einvoice_requested : existing.einvoice_requested;
-    if (["confirmed", "delivered"].includes(status) && (einvTotal > 10000 || einvReqUpd) && (!customer_id_no?.trim() || !customer_email?.trim())) {
+    if (["confirmed", "delivered", "pending_deposit"].includes(status) && (einvTotal > 10000 || einvReqUpd) && (!customer_id_no?.trim() || !customer_email?.trim())) {
       return res.status(400).json({ error: "E-invoice details (I/C number and email) are required." });
     }
 
@@ -12695,6 +12736,13 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         // recompute yields min(total, initial_deposit + paymentsTotal) → entered.
         initialDepositForUpdate = depositForUpdate - paymentsTotal;
       }
+    }
+
+    // Confirming requires a deposit (same rule as POST). Effective paid = the
+    // deposit field when provided, else what's already on the order.
+    const effectiveDeposit = depositProvided ? depositForUpdate : (Number(existing.deposit) || 0);
+    if (finalStatus === "confirmed" && effectiveDeposit <= 0) {
+      return res.status(400).json({ error: "A deposit is required to confirm an order. Record the deposit to confirm it." });
     }
 
     const updateData = {
@@ -12859,10 +12907,10 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { status, cancel_reason } = req.body;
-    // Only master/manager can re-confirm amended orders
-    if (status === "confirmed") {
+    // Both committing statuses share the amended-reconfirm and e-invoice guards.
+    if (status === "confirmed" || status === "pending_deposit") {
       const { data: existing } = await supabase.from("sales_orders")
-        .select("status, subtotal, discount, gst_amount, gst_waived, customer_id_no, customer_email, einvoice_requested")
+        .select("status, subtotal, discount, gst_amount, gst_waived, customer_id_no, customer_email, einvoice_requested, deposit")
         .eq("id", req.params.id).single();
       if (existing?.status === "amended" && !["master", "manager"].includes(req.user.role)) {
         return res.status(403).json({ error: "Only manager can re-confirm amended orders" });
@@ -12873,6 +12921,12 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
       const einvTotal = (Number(existing?.subtotal) || 0) - (Number(existing?.discount) || 0) + (existing?.gst_waived ? 0 : (Number(existing?.gst_amount) || 0));
       if ((einvTotal > 10000 || existing?.einvoice_requested) && (!existing?.customer_id_no || !existing?.customer_email)) {
         return res.status(400).json({ error: "E-invoice details (I/C number and email) are required." });
+      }
+      // An order can only be confirmed once a deposit exists. Normally the
+      // deposit auto-confirms it (recomputeOrderPaid); this blocks a manual/
+      // dropdown confirm on an unpaid order.
+      if (status === "confirmed" && (Number(existing?.deposit) || 0) <= 0) {
+        return res.status(400).json({ error: "A deposit is required to confirm an order. Record the deposit to confirm it." });
       }
     }
     // Cancel requires reason
