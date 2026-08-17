@@ -7233,69 +7233,48 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
           ].join("\n"), ["YES", ...alternatives.map(l => chipDate(l.date)), "cancel"]);
         }
 
-        // OM approval rule for salesmen (managers can already change dates
-        // freely in the web UI, so the chat doesn't gate them either).
-        // Fix #7: a blocked date routes through the same approval gate as
-        // the 2-working-day window (SOFT block — adds approval, never a
-        // hard reject).
-        const isBlockedDate = !!(await getBlockedDateReason(companyId, newDate, null));
-        if (!isManager && (isWithinWorkingDays(newDate, 2) || isBlockedDate)) {
-          const { data: confirmedRoutes } = await supabase.from("delivery_routes")
-            .select("id, lorry_plate, driver_name").eq("delivery_date", newDate).eq("status", "Confirmed");
-          if (confirmedRoutes && confirmedRoutes.length > 0) {
-            const salesmanName = req.user.salesman_name || req.user.name || "Web user";
-            pendingApprovals.set(soNumber, {
-              isTrip: false, orderId, newDate, soNumber, customerName, salesmanName, salesmanChatId: null,
-            });
-            clearSession(key);
-            const routeInfo = confirmedRoutes.map(r => `${r.lorry_plate || ""} ${r.driver_name || ""}`.trim()).join(", ");
-            await sendMessage(OPERATION_MANAGER_ID,
-              `🔔 *Reschedule Approval Needed* _(from web chat)_\n\n` +
-              `👤 Salesman: ${salesmanName}\n` +
-              `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
-              `📅 Requested date: *${fmtDate(newDate)}*\n\n` +
-              `⚠️ This date already has a Confirmed route: ${routeInfo}\n\n` +
-              `Reply:\n✅ /approve ${soNumber} — to approve\n❌ /reject ${soNumber} — to reject`
-            ).catch(e => console.error("assistant OM notify:", e.message));
-            return reply(`⚠️ ${fmtDate(newDate)} is within the next 2 working days and already has a confirmed lorry route.\n\nYour request for SO ${soNumber} was sent to the Operation Manager for approval. The date will change once approved.`);
-          }
-        }
+        // (Scheduling a date now always routes through the delivery-date
+        // approval queue below — chat never applies the date directly.)
       }
 
-      const dbDate = isTbc ? null : newDate;
       const { data: existingOrder } = await supabase.from("orders").select("remark, branch_id").eq("id", orderId).single();
-      const updatedRemark = isTbc && existingOrder
-        ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
-        : existingOrder?.remark;
-      const { error } = await supabase.from("orders").update({
-        delivery_date: dbDate,
-        ...(isTbc && { remark: updatedRemark }),
-      }).eq("id", orderId);
-      if (error) return reply(`❌ Failed to update: ${error.message}`);
-      // Multi-trip orders: keep trip 1 in step with the order's delivery date
-      // (same behaviour as the Telegram trip-1 reschedule).
-      if (isMultiTrip) {
-        await supabase.from("order_trips").update({ scheduled_date: dbDate }).eq("so_number", soNumber).eq("trip_no", 1);
+
+      // Clearing a date (TBC) applies directly — it's a de-schedule, not a
+      // booking that needs approval.
+      if (isTbc) {
+        const updatedRemark = existingOrder
+          ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
+          : null;
+        const { error } = await supabase.from("orders").update({ delivery_date: null, remark: updatedRemark }).eq("id", orderId);
+        if (error) return reply(`❌ Failed to update: ${error.message}`);
+        if (isMultiTrip) await supabase.from("order_trips").update({ scheduled_date: null }).eq("so_number", soNumber).eq("trip_no", 1);
+        await logDeliveryActivity({
+          companyId, branchId: existingOrder?.branch_id || null, soNumber, orderId, tripNo: isMultiTrip ? 1 : null,
+          action: "set_tbc", fromDate: currentDate || null, toDate: null, source: "web",
+          actorId: req.user?.id || null, actorName: req.user?.salesman_name || req.user?.name || null,
+        });
+        clearSession(key);
+        return reply(`✅ SO ${soNumber}${customerName ? ` — ${customerName}` : ""} set to TBC (no date).`, ["best date"]);
       }
-      // Log to the unified delivery_activity feed (best-effort, non-fatal).
-      // companyId/req.user are already resolved for this whole handler, so
-      // this is a cheap addition — unlike the Telegram bot flow, no extra
-      // lookup is needed here.
-      await logDeliveryActivity({
-        companyId, branchId: existingOrder?.branch_id || null,
-        soNumber, orderId, tripNo: isMultiTrip ? 1 : null,
-        action: isTbc ? "set_tbc" : (currentDate ? "rescheduled" : "arranged"),
-        fromDate: currentDate || null, toDate: dbDate,
-        source: "web", actorId: req.user?.id || null,
-        actorName: req.user?.salesman_name || req.user?.name || null,
+
+      // An actual date does NOT move the order — it creates a pending request
+      // in the Delivery Dates tab for a PIC (incl. Master) to approve.
+      const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", companyId).eq("order_number", soNumber).maybeSingle();
+      await supabase.from("delivery_date_requests")
+        .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
+        .eq("order_id", orderId).in("status", ["pending", "needs_reschedule"]);
+      const { error: reqErr } = await supabase.from("delivery_date_requests").insert({
+        company_id: companyId, branch_id: existingOrder?.branch_id || null, order_id: orderId,
+        sales_order_id: soRow?.id || null, so_number: soNumber, customer_name: customerName || null,
+        requested_date: newDate, remark: null, status: "pending",
+        requested_by: req.user.id, requested_by_name: req.user.salesman_name || req.user.name || null, requested_via: "chat",
       });
+      if (reqErr) return reply(`❌ Failed to send request: ${reqErr.message}`);
       clearSession(key);
       return reply([
-        `✅ SO ${soNumber}${customerName ? ` — ${customerName}` : ""} ${isTbc ? "set to TBC (no date)" : `scheduled for ${fmtDate(newDate)}`}.`,
-        `Old date: ${fmtDate(currentDate)}`,
-        load ? `That day: ${load.total} order${load.total === 1 ? "" : "s"} booked, ${load.unassigned} unassigned (before this one).` : null,
-        isMultiTrip ? "Note: this is a multi-trip order — trip 1 was updated; manage other trips via the delivery schedule." : null,
-      ].filter(Boolean).join("\n"), ["best date"]);
+        `📅 Request sent for approval — SO ${soNumber}${customerName ? ` — ${customerName}` : ""} for ${fmtDate(newDate)}.`,
+        `The order has NOT moved yet — it moves once approved in the *Delivery Dates* tab.`,
+      ].join("\n"), ["best date"]);
     };
 
     // Look up an SO and open a scheduling session. Replies + returns null on
