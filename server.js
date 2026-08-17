@@ -4175,19 +4175,22 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
     let stampedOrderId = null;
     for (const order of (orders || [])) {
       const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-      let stamped = false;
-      const updated = items.map(oi => {
-        const oiCode = (oi.itemCode || "").toLowerCase().trim();
-        const oiName = (oi.itemName || "").toLowerCase();
+      // Stamp only the FIRST matching line — one DO line arrives one order line,
+      // never every line sharing the code (see supplier-do auto-match).
+      let hitIdx = -1;
+      for (let i = 0; i < items.length; i++) {
+        const oiCode = (items[i].itemCode || "").toLowerCase().trim();
+        const oiName = (items[i].itemName || "").toLowerCase();
         const hit = (codeKey && (oiCode === codeKey || oiName.includes(codeKey)))
           || (productCode && (oiCode === productCode || oiName.includes(productCode)));
-        if (hit) { stamped = true; return { ...oi, arrivalDate: date }; }
-        return oi;
-      });
-      if (stamped) {
-        await supabase.from("orders").update({ items: JSON.stringify(updated) }).eq("id", order.id);
+        if (hit && !items[i].arrivalDate) { hitIdx = i; break; }
+      }
+      if (hitIdx >= 0) {
+        items[hitIdx] = { ...items[hitIdx], arrivalDate: date };
+        await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", order.id);
         await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
         stampedOrderId = order.id;
+        break; // one DO line → one order line
       }
     }
     update.so_number = so_number;
@@ -12114,17 +12117,24 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
     if (typeof jsonItems === "string") { try { jsonItems = JSON.parse(jsonItems || "[]"); } catch { jsonItems = []; } }
     if (!Array.isArray(jsonItems)) jsonItems = [];
 
-    // Match a JSON item to an SO item: code exact (ci), or the composite JSON
-    // itemName ("name size color") equals/prefixes the SO item's product_name.
+    // Pair each SO item to a legacy JSON item 1:1, CONSUMING each JSON line so
+    // one arrival can't bleed onto every SO line that shares a code/name. When
+    // an SO has two identical lines (same product split into rows), stamping
+    // ONE supplier-DO line must mark exactly ONE of them arrived — not both.
+    // Match: code exact (ci), or the composite JSON itemName ("name size
+    // color") equals/prefixes the SO item's product_name.
+    const usedJson = new Set();
     const findArrival = (soi) => {
       const code = (soi.product_code || "").trim().toLowerCase();
       const name = (soi.product_name || "").trim().toLowerCase();
-      for (const ji of jsonItems) {
+      for (let k = 0; k < jsonItems.length; k++) {
+        if (usedJson.has(k)) continue;
+        const ji = jsonItems[k];
         const jCode = (ji.itemCode || "").trim().toLowerCase();
         const jName = (ji.itemName || "").trim().toLowerCase();
         const codeHit = code && jCode && code === jCode;
         const nameHit = name && jName && (jName === name || jName.startsWith(name + " "));
-        if (codeHit || nameHit) return ji.arrivalDate || null;
+        if (codeHit || nameHit) { usedJson.add(k); return ji.arrivalDate || null; }
       }
       return null;
     };
