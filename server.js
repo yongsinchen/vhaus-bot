@@ -4896,7 +4896,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
     // Recompute paid/deposit + balance from the ledger, then recalc commissions.
     for (const oid of affectedOrders) {
       try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
-      try { await calculateCommission(oid, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc error:", e.message); }
+      try { await calculateCommission(oid, getActiveCompanyId(req), { cascade: false }); } catch (e) { console.error("commission recalc error:", e.message); }
     }
     res.json({ payment });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5019,7 +5019,7 @@ app.delete("/payments/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     // balance from the remaining ledger and re-bucket commissions.
     for (const oid of affectedOrders) {
       try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
-      try { await calculateCommission(oid, cid); } catch (e) { console.error("commission recalc error:", e.message); }
+      try { await calculateCommission(oid, cid, { cascade: false }); } catch (e) { console.error("commission recalc error:", e.message); }
     }
 
     res.json({ ok: true, reversed_orders: affectedOrders.size });
@@ -5474,7 +5474,14 @@ async function buildClearanceCommissionContext(order, companyId, cache, net) {
 }
 
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
-async function calculateCommission(orderId, companyId) {
+// opts.cascade (default true): after computing THIS order, recompute the
+// salesman's other orders in the same business month so a newly-reached tier
+// applies to all of them (retroactive whole-month tiering). Sibling recomputes
+// pass cascade:false so the fan-out is exactly one level deep. Bulk callers
+// (recalculate-all / import) and pure-payment recalcs pass cascade:false too —
+// they either already visit every order or don't change the month total.
+async function calculateCommission(orderId, companyId, opts = {}) {
+  const cascade = opts.cascade !== false;
   const { data: order, error: orderErr } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type, country, address, incentive_excluded_ids")
     .eq("id", orderId).single();
   // A failed read must not look like "order not found" — that would return quietly
@@ -5505,6 +5512,11 @@ async function calculateCommission(orderId, companyId) {
   const channel = order.sales_channel || "branch";
 
   const cache = await getCommCache(companyId);
+  // Tier matching reads monthlySales, which the cache holds for up to 30s — a
+  // window in which a new order can land and make it stale. On a top-level
+  // (cascading) calc, drop those cached month totals so THIS order and every
+  // sibling it re-tiers below all match against current data.
+  if (cascade) cache.monthlySales = {};
   let rules = cache.rules.filter(r => r.channel === channel);
   if (rules.length === 0) rules = cache.rules.filter(r => r.channel === "branch");
   if (rules.length === 0) return;
@@ -5753,6 +5765,32 @@ async function calculateCommission(orderId, companyId) {
       .is("paid_at", null).neq("status", "paid")
       .not("user_id", "in", `(${keepSalesmanIds.map(id => `"${id}"`).join(",")})`);
     if (purgeErr) console.error(`[calculateCommission] stale salesman purge failed for order ${orderId}:`, purgeErr.message);
+  }
+
+  // ── Retroactive whole-month re-tiering ──────────────────────────
+  // A salesman's tier is set by their WHOLE month's cumulative sales, but each
+  // order's commission is computed when THAT order is confirmed — using the
+  // month total at that moment. Orders confirmed earlier (before the month
+  // crossed a tier threshold) would otherwise keep their old, lower tier. So
+  // after computing this order, recompute every sibling in the same business
+  // month for each of its salesmen, lifting them all to the current tier.
+  // cascade:false on the sibling calls fans this out exactly one level.
+  if (cascade) {
+    const monthBasis = order.order_date || order.created_at || new Date();
+    const ms = new Date(monthBasis); ms.setDate(1); ms.setHours(0, 0, 0, 0);
+    const me = new Date(ms); me.setMonth(me.getMonth() + 1);
+    const dStart = ms.toISOString().slice(0, 10), dEnd = me.toISOString().slice(0, 10);
+    const siblingIds = new Set();
+    for (const name of salesmanNames) {
+      const { data: sibs } = await supabase.from("orders").select("id")
+        .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
+        .gte("order_date", dStart).lt("order_date", dEnd);
+      for (const s of (sibs || [])) if (Number(s.id) !== Number(orderId)) siblingIds.add(s.id);
+    }
+    for (const sid of siblingIds) {
+      try { await calculateCommission(sid, companyId, { cascade: false }); }
+      catch (e) { console.error(`[calculateCommission] sibling re-tier failed for order ${sid}:`, e.message); }
+    }
   }
 }
 
@@ -6196,7 +6234,7 @@ app.post("/commissions/recalculate-all", requireRole(COMMISSION_ROLES), async (r
     }
     let calculated = 0;
     for (const o of orders) {
-      try { await calculateCommission(o.id, cid); calculated++; } catch {}
+      try { await calculateCommission(o.id, cid, { cascade: false }); calculated++; } catch {}
     }
     res.json({ calculated, total: orders.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -6242,7 +6280,7 @@ app.post("/sales-orders/resync-missing", requireRole(["master", "manager"]), asy
         // A null id means the `orders` row was NOT created (e.g. an insert that
         // failed) — report it as a failure, don't count it as synced.
         if (!orderId) { failed++; errors.push({ order_number: so.order_number, error: "sync produced no order row (insert failed — check server logs)" }); continue; }
-        try { await calculateCommission(orderId, cid); commissioned++; } catch (e) { /* commission is best-effort */ }
+        try { await calculateCommission(orderId, cid, { cascade: false }); commissioned++; } catch (e) { /* commission is best-effort */ }
         synced++;
       } catch (e) { failed++; errors.push({ order_number: so.order_number, error: e.message }); }
     }
@@ -9002,7 +9040,7 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
     });
     // Recompute paid/deposit + balance from the ledger (payment now recorded).
     try { await recomputeOrderPaid(sched.order_id); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
-    try { await calculateCommission(sched.order_id, getActiveCompanyId(req)); } catch (e) { console.error("commission recalc:", e.message); }
+    try { await calculateCommission(sched.order_id, getActiveCompanyId(req), { cascade: false }); } catch (e) { console.error("commission recalc:", e.message); }
     const { data: updatedOrder } = await supabase.from("orders").select("balance").eq("id", sched.order_id).single();
     res.json({ ok: true, new_balance: Number(updatedOrder?.balance) || 0 });
   } catch (err) { res.status(500).json({ error: err.message }); }
