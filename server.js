@@ -5722,7 +5722,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
 
     const packageIncentiveAmt = packageIncentiveShares[idx] || 0;
 
-    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).maybeSingle();
+    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).in("role_name", ["salesman", "part_time"]).maybeSingle();
     // Fail loudly rather than treating a failed read as "no commission exists" — that
     // would fall through to the insert below and duplicate the row on a financial table.
     if (existingErr) throw new Error(`could not read existing commission for order ${orderId} / user ${salesUser.id}: ${existingErr.message}`);
@@ -5812,7 +5812,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
       const mgrRule = mgrRules[0];
       const depositMet = depositPct >= (mgrRule.deposit_gate_pct || 30);
       const overrideAmt = net * ((mgrRule.rate_pct || 0) / 100);
-      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", mgr.id).maybeSingle();
+      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", mgr.id).eq("role_name", "branch_manager").maybeSingle();
       if (existing && (existing.status === "paid" || existing.paid_at)) {
         // Never overwrite a paid commission — corrections go through commission_adjustments.
       } else {
@@ -5838,17 +5838,15 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // commission. Kept separate from the branch-manager 1% override above.
   const overrideUserId = order.branch_id ? cache.branchOverrides?.[order.branch_id] : null;
   if (overrideUserId) {
-    // The commissions table holds one row per (order, user); if the override
-    // earner is also a salesman OR the branch manager on THIS order, skip the
-    // override so it can't overwrite their existing commission row. (An
-    // override earner is normally a distinct senior person.)
-    const isSalesmanHere = resolved.some(r => r.salesUser?.id === overrideUserId);
+    // The override earner earns on EVERY order in their branch — including
+    // orders they sold themselves (they keep their salesman commission AND get
+    // the override; the two are separate rows, one per role — migration 060).
     const ovUser = cache.users.find(u => u.id === overrideUserId);
     const ovRate = ovUser && ovUser.override_commission_rate != null ? Number(ovUser.override_commission_rate) : 0;
-    if (ovUser && ovRate > 0 && !isSalesmanHere) {
+    if (ovUser && ovRate > 0) {
       const depositMet = depositPct >= 30; // same default deposit gate as salesman/manager
       const overrideAmt = commissionLib.round2(net * (ovRate / 100));
-      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", ovUser.id).maybeSingle();
+      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", ovUser.id).eq("role_name", "branch_override").maybeSingle();
       // Never overwrite a paid commission — corrections go through commission_adjustments.
       if (!(existing && (existing.status === "paid" || existing.paid_at))) {
         const commData = {
@@ -5863,9 +5861,8 @@ async function calculateCommission(orderId, companyId, opts = {}) {
         if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
         else await supabase.from("commissions").insert({ order_id: orderId, user_id: ovUser.id, role_name: "branch_override", company_id: companyId, ...commData });
       }
-    } else if (ovUser && (ovRate <= 0 || isSalesmanHere)) {
-      // Earner no longer qualifies for an override on this order (rate cleared,
-      // or they're the salesman here) — drop any stale, unpaid override row.
+    } else if (ovUser && ovRate <= 0) {
+      // Rate cleared — drop any stale, unpaid override row.
       await supabase.from("commissions").delete()
         .eq("order_id", orderId).eq("user_id", ovUser.id).eq("role_name", "branch_override")
         .is("paid_at", null).neq("status", "paid");
