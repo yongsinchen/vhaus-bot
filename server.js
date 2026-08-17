@@ -7210,10 +7210,27 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
 
     const session = getSession(key);
 
+    // Pull a free-text remark (the salesman's justification for the PIC) out
+    // of a message like "11741 move to sunday, customer very annoying" or
+    // "15/7 because customer is overseas". Returns null when there's none.
+    const extractRemark = (raw) => {
+      if (!raw) return null;
+      let m = raw.match(/\b(?:remark|note|reason)\s*[:\-]\s*(.+)$/i);
+      if (m) return m[1].trim();
+      m = raw.match(/\bbecause\s+(.+)$/i);
+      if (m) return m[1].trim();
+      const ci = raw.indexOf(",");
+      if (ci !== -1) {
+        const after = raw.slice(ci + 1).trim();
+        if (after) return after;
+      }
+      return null;
+    };
+
     // Process a chosen date for a scheduling session: busy-day gate, OM
     // approval rule, then apply. `step` distinguishes first ask vs confirm.
     const processDate = async (data, step, newDate) => {
-      const { soNumber, orderId, currentDate, customerName, isMultiTrip } = data;
+      const { soNumber, orderId, currentDate, customerName, isMultiTrip, remark } = data;
       const isTbc = newDate === "TBC";
       let load = null;
 
@@ -7266,15 +7283,16 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       const { error: reqErr } = await supabase.from("delivery_date_requests").insert({
         company_id: companyId, branch_id: existingOrder?.branch_id || null, order_id: orderId,
         sales_order_id: soRow?.id || null, so_number: soNumber, customer_name: customerName || null,
-        requested_date: newDate, remark: null, status: "pending",
+        requested_date: newDate, remark: remark || null, status: "pending",
         requested_by: req.user.id, requested_by_name: req.user.salesman_name || req.user.name || null, requested_via: "chat",
       });
       if (reqErr) return reply(`❌ Failed to send request: ${reqErr.message}`);
       clearSession(key);
       return reply([
         `📅 Request sent for approval — SO ${soNumber}${customerName ? ` — ${customerName}` : ""} for ${fmtDate(newDate)}.`,
+        remark ? `📝 Remark: "${remark}"` : null,
         `The order has NOT moved yet — it moves once approved in the *Delivery Dates* tab.`,
-      ].join("\n"), ["best date"]);
+      ].filter(Boolean).join("\n"), ["best date"]);
     };
 
     // Look up an SO and open a scheduling session. Replies + returns null on
@@ -7315,7 +7333,9 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       if (session.step === "confirm_busy" && ["yes", "confirm", "ok"].includes(lower)) {
         newDate = session.data.pendingDate;
       } else {
-        newDate = parseDateInput(text);
+        // Allow "sunday, customer very annoying" — parse the date from the
+        // part before any remark.
+        newDate = parseDateInput(text) || parseDateInput(text.split(/[,;]/)[0]);
         if (!newDate) {
           return reply(session.step === "confirm_busy"
             ? `Reply YES to keep ${fmtDate(session.data.pendingDate)}, send a different date, or "cancel".`
@@ -7323,7 +7343,9 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
             session.step === "confirm_busy" ? ["YES", "cancel"] : ["cancel"]);
         }
       }
-      return processDate(session.data, session.step, newDate);
+      const sessRemark = extractRemark(text);
+      const sessData = sessRemark ? { ...session.data, remark: sessRemark } : session.data;
+      return processDate(sessData, session.step, newDate);
     }
 
     // Day load: "load 15/7" or a bare date
@@ -7365,8 +7387,12 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       if (!intent.so_number) return reply("Which SO number do you want to schedule?");
       const data = await beginSchedule(intent.so_number);
       if (!data) return;
-      if (intent.date) return processDate(data, "waiting_date", intent.date);
-      return askForDate(data);
+      const remark = extractRemark(text);
+      const withRemark = { ...data, remark };
+      // Preserve the remark across the follow-up date prompt / busy-day confirm.
+      if (remark) setSession(key, "web_schedule", "waiting_date", withRemark);
+      if (intent.date) return processDate(withRemark, "waiting_date", intent.date);
+      return askForDate(withRemark);
     }
     if (intent.intent === "help") { clearSession(key); return reply(HELP, ["best date"]); }
 
