@@ -4401,6 +4401,160 @@ app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) =>
   res.json(data);
 });
 
+// ══════════════════════════════════════════════════════════════════
+// Delivery-date approval requests (migration 057)
+//
+// Salesmen request a delivery date + remark for an existing order; a PIC
+// (Master / Operation Manager / Company Admin) approves, proposes alternative
+// dates, or rejects. Only on approval does the date land on the order (it then
+// enters the unassigned pool). Picking a proposed alternative auto-approves.
+// ══════════════════════════════════════════════════════════════════
+const DATE_APPROVER_ROLES = ["master", "manager", "operation_manager", "company_admin"];
+const isDateApprover = (req) => DATE_APPROVER_ROLES.includes((req.activeRoleKey || req.user.role || "").toLowerCase());
+
+// Apply an approved request's date to the order (legacy + sales_orders) — same
+// effect as PATCH /orders/:id/set-date, so it enters the unassigned pool.
+async function applyRequestDeliveryDate(reqRow, actor) {
+  if (reqRow.order_id) {
+    const { data: before } = await supabase.from("orders")
+      .select("delivery_date, so_number, company_id, branch_id").eq("id", reqRow.order_id).maybeSingle();
+    await supabase.from("orders").update({ delivery_date: reqRow.requested_date }).eq("id", reqRow.order_id);
+    if (before?.company_id) {
+      try {
+        await logDeliveryActivity({
+          companyId: before.company_id, branchId: before.branch_id || null, soNumber: before.so_number,
+          orderId: Number(reqRow.order_id), tripNo: null,
+          action: before.delivery_date ? "rescheduled" : "arranged",
+          fromDate: before.delivery_date || null, toDate: reqRow.requested_date,
+          source: "web", actorId: actor?.id || null, actorName: actor?.name || null,
+        });
+      } catch {}
+    }
+  }
+  if (reqRow.sales_order_id) {
+    await supabase.from("sales_orders").update({ delivery_date: reqRow.requested_date }).eq("id", reqRow.sales_order_id);
+  }
+}
+
+// POST /delivery-date-requests — salesman requests a date for an existing order.
+app.post("/delivery-date-requests", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { order_id, so_number, requested_date, remark } = req.body || {};
+    if (!requested_date) return res.status(400).json({ error: "requested_date is required" });
+    let ordQ = supabase.from("orders").select("id, so_number, customer_name, company_id, branch_id").limit(1);
+    if (order_id) ordQ = ordQ.eq("id", order_id);
+    else if (so_number) ordQ = ordQ.eq("so_number", so_number);
+    else return res.status(400).json({ error: "order_id or so_number is required" });
+    if (cid) ordQ = ordQ.eq("company_id", cid);
+    const { data: ords } = await ordQ;
+    const ord = ords?.[0];
+    if (!ord) return res.status(404).json({ error: "Order not found" });
+    const { data: so } = await supabase.from("sales_orders").select("id").eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
+    // One open request per order — supersede any existing open one.
+    await supabase.from("delivery_date_requests")
+      .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
+      .eq("order_id", ord.id).in("status", ["pending", "needs_reschedule"]);
+    const { data: created, error } = await supabase.from("delivery_date_requests").insert({
+      company_id: ord.company_id, branch_id: ord.branch_id || null, order_id: ord.id,
+      sales_order_id: so?.id || null, so_number: ord.so_number, customer_name: ord.customer_name,
+      requested_date, remark: remark || null, status: "pending",
+      requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null, requested_via: "web",
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ request: created });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-date-requests — PIC sees the company queue; salesmen see their own.
+app.get("/delivery-date-requests", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { status } = req.query;
+    let q = supabase.from("delivery_date_requests").select("*").order("created_at", { ascending: false }).limit(500);
+    if (cid) q = q.eq("company_id", cid);
+    if (!isDateApprover(req)) q = q.eq("requested_by", req.user.id);
+    if (status) q = q.eq("status", status);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ requests: data || [], is_approver: isDateApprover(req) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /delivery-date-requests/:id/approve — PIC approves; date lands on order.
+app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) => {
+  try {
+    if (!isDateApprover(req)) return res.status(403).json({ error: "Not allowed to approve delivery dates" });
+    const cid = getActiveCompanyId(req);
+    const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
+    if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
+    if (!["pending", "needs_reschedule"].includes(r.status)) return res.status(400).json({ error: `Request is already ${r.status}` });
+    await applyRequestDeliveryDate(r, req.user);
+    const { data, error } = await supabase.from("delivery_date_requests").update({
+      status: "approved", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
+      reviewed_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
+    }).eq("id", r.id).select().single();
+    if (error) throw error;
+    res.json({ request: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /delivery-date-requests/:id/propose — PIC proposes alternative dates.
+app.patch("/delivery-date-requests/:id/propose", requireAuth, async (req, res) => {
+  try {
+    if (!isDateApprover(req)) return res.status(403).json({ error: "Not allowed" });
+    const cid = getActiveCompanyId(req);
+    const alts = (req.body?.alternative_dates || []).filter(Boolean);
+    if (alts.length === 0) return res.status(400).json({ error: "Provide at least one alternative date" });
+    const { data: r } = await supabase.from("delivery_date_requests").select("company_id").eq("id", req.params.id).maybeSingle();
+    if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
+    const { data, error } = await supabase.from("delivery_date_requests").update({
+      status: "needs_reschedule", alternative_dates: alts, decision_note: req.body?.note || null,
+      reviewed_by: req.user.id, reviewed_by_name: req.user.name || null, reviewed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ request: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /delivery-date-requests/:id/reject — PIC rejects.
+app.patch("/delivery-date-requests/:id/reject", requireAuth, async (req, res) => {
+  try {
+    if (!isDateApprover(req)) return res.status(403).json({ error: "Not allowed" });
+    const cid = getActiveCompanyId(req);
+    const { data: r } = await supabase.from("delivery_date_requests").select("company_id").eq("id", req.params.id).maybeSingle();
+    if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
+    const { data, error } = await supabase.from("delivery_date_requests").update({
+      status: "rejected", decision_note: req.body?.note || null,
+      reviewed_by: req.user.id, reviewed_by_name: req.user.name || null, reviewed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ request: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /delivery-date-requests/:id/pick — salesman picks a proposed alternative;
+// it's pre-vetted by the PIC, so it auto-approves and applies.
+app.patch("/delivery-date-requests/:id/pick", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const picked = req.body?.requested_date;
+    const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
+    if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
+    if (r.requested_by !== req.user.id) return res.status(403).json({ error: "Not your request" });
+    if (r.status !== "needs_reschedule") return res.status(400).json({ error: "No alternatives to pick from" });
+    const alts = Array.isArray(r.alternative_dates) ? r.alternative_dates : [];
+    if (!alts.includes(picked)) return res.status(400).json({ error: "Pick one of the proposed dates" });
+    await applyRequestDeliveryDate({ ...r, requested_date: picked }, req.user);
+    const { data, error } = await supabase.from("delivery_date_requests").update({
+      status: "approved", requested_date: picked, reviewed_at: new Date().toISOString(),
+      decision_note: (r.decision_note ? r.decision_note + " · " : "") + "Salesman picked a proposed date", updated_at: new Date().toISOString(),
+    }).eq("id", r.id).select().single();
+    if (error) throw error;
+    res.json({ request: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /orders — legacy orders for linking (e.g. the Service create "Link to
 // Order" search). Company-scoped, excludes Service orders, optional ?search=
 // on so_number/customer_name. Returns the bigint id services.order_id expects.
