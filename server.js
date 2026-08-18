@@ -4200,22 +4200,27 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
   if (so_number) {
     const date = arrival_date || new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
     const codeKey = (item_code || "").toLowerCase().trim();
+    // How many units this DO line delivered — accumulated onto the order line so
+    // a partial delivery (1 of 2) leaves the line partially arrived.
+    const { data: reviewRow } = await supabase.from("do_review").select("quantity").eq("id", id).maybeSingle();
+    const doQty = supplierDO.parseQty(reviewRow?.quantity);
     const orders = await supplierDO.findCandidateOrders(so_number, getActiveCompanyId(req));
     let stampedOrderId = null;
     for (const order of (orders || [])) {
       const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-      // Stamp only the FIRST matching line — one DO line arrives one order line,
-      // never every line sharing the code (see supplier-do auto-match).
+      // Stamp only the FIRST matching line that still needs units — one DO line
+      // arrives one order line, never every line sharing the code (see
+      // supplier-do auto-match). A fully arrived line is skipped.
       let hitIdx = -1;
       for (let i = 0; i < items.length; i++) {
         const oiCode = (items[i].itemCode || "").toLowerCase().trim();
         const oiName = (items[i].itemName || "").toLowerCase();
         const hit = (codeKey && (oiCode === codeKey || oiName.includes(codeKey)))
           || (productCode && (oiCode === productCode || oiName.includes(productCode)));
-        if (hit && !items[i].arrivalDate) { hitIdx = i; break; }
+        if (hit && !supplierDO.isFullyArrived(items[i])) { hitIdx = i; break; }
       }
       if (hitIdx >= 0) {
-        items[hitIdx] = { ...items[hitIdx], arrivalDate: date };
+        items[hitIdx] = supplierDO.applyArrivalToItem(items[hitIdx], doQty, date);
         await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", order.id);
         await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
         stampedOrderId = order.id;
@@ -12261,11 +12266,18 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
     if (!order) return res.status(404).json({ error: "Order not found" });
     const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
     if (!Array.isArray(items)) return res.status(400).json({ error: "No items" });
-    // Find item by index or code
+    // Find item by index or code. Manually setting a date marks the whole line
+    // arrived (arrivedQty = ordered); clearing it resets received to zero. This
+    // keeps the manual control an all-or-nothing override of the DO-driven
+    // partial quantity.
+    const stamp = (it) => {
+      if (arrival_date) { it.arrivalDate = arrival_date; it.arrivedQty = supplierDO.orderedQtyOf(it); }
+      else { it.arrivalDate = ""; it.arrivedQty = 0; }
+    };
     let updated = false;
     items.forEach((it, i) => {
-      if (item_index !== undefined && i === item_index) { it.arrivalDate = arrival_date || ""; updated = true; }
-      else if (item_code && (it.itemCode === item_code || it.itemName === item_code)) { it.arrivalDate = arrival_date || ""; updated = true; }
+      if (item_index !== undefined && i === item_index) { stamp(it); updated = true; }
+      else if (item_code && (it.itemCode === item_code || it.itemName === item_code)) { stamp(it); updated = true; }
     });
     if (!updated) return res.status(404).json({ error: "Item not found" });
     await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", req.params.id);
