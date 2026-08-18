@@ -6891,7 +6891,7 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
 app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date, service_date, schedule_tbc } = req.body;
-    if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange)" });
+    if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange, 4=delivery)" });
     const svcType = Number(service_type);
     const companyId = getActiveCompanyId(req);
     // The schedule date the delivery route reads lives on orders.delivery_date
