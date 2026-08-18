@@ -12689,6 +12689,13 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     }
     const resolvedSalesman = salesman_names || salesman_name || name || null;
 
+    // An upfront deposit entered at order creation lives on the order (not the
+    // payments ledger), so it must be assigned an Official Receipt number here
+    // from the same per-company sequence — otherwise its receipt line shows no
+    // OR number. Zero-deposit orders stay NULL until a deposit is collected.
+    const depositAtCreate = Number(deposit) || 0;
+    const depositOrNumber = depositAtCreate > 0 ? await nextOrNumber(company_id) : null;
+
     const { data: order, error: orderErr } = await supabase
       .from("sales_orders")
       .insert({
@@ -12702,7 +12709,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         order_date: order_date || getMalaysiaDate(),
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
         delivery_type: delivery_type || "Delivery", remark: remark || null,
-        discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+        discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, deposit_or_number: depositOrNumber, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
         admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
         einvoice_requested: einvoice_requested === true,
         country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false,
@@ -12919,6 +12926,15 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "A deposit is required to confirm an order. Record the deposit to confirm it." });
     }
 
+    // If this edit gives the order an upfront deposit and it never received an
+    // Official Receipt number (legacy row, or created before this deposit
+    // existed), assign one now from the per-company sequence. Never renumber an
+    // order that already has one.
+    let depositOrNumberUpd = existing.deposit_or_number || null;
+    if (!depositOrNumberUpd && initialDepositForUpdate > 0) {
+      depositOrNumberUpd = await nextOrNumber(company_id);
+    }
+
     const updateData = {
       customer_name, customer_contact: customer_contact || null, customer_address: customer_address || null,
       customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
@@ -12929,7 +12945,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null,
-      discount: Number(discount) || 0, deposit: depositForUpdate, initial_deposit: initialDepositForUpdate, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+      discount: Number(discount) || 0, deposit: depositForUpdate, initial_deposit: initialDepositForUpdate, deposit_or_number: depositOrNumberUpd, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
       einvoice_requested: einvoice_requested !== undefined ? einvoice_requested === true : existing.einvoice_requested,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false, sales_channel: sales_channel || "branch",
