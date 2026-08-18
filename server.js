@@ -13179,6 +13179,19 @@ app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
     if (existing && ["confirmed", "delivered"].includes(existing.status)) {
       return res.status(400).json({ error: "Cannot delete a " + existing.status + " order. Cancel it first." });
     }
+    // Unwind the delivery chain first — delivery_orders.sales_order_id has no
+    // ON DELETE CASCADE, so the sales-order delete fails while any DO points at
+    // it. delivery_order_items/_events cascade on DO delete, but delivery_
+    // schedules and package_labels reference the DO with no cascade, so detach
+    // those before removing the DOs.
+    const { data: childDos } = await supabase.from("delivery_orders").select("id").eq("sales_order_id", req.params.id);
+    const doIds = (childDos || []).map(d => d.id);
+    if (doIds.length) {
+      await supabase.from("package_labels").update({ delivery_order_id: null }).in("delivery_order_id", doIds);
+      await supabase.from("delivery_schedules").update({ delivery_order_id: null }).in("delivery_order_id", doIds);
+      const { error: doErr } = await supabase.from("delivery_orders").delete().in("id", doIds);
+      if (doErr) throw doErr;
+    }
     const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", company_id);
     if (error) throw error;
     if (existing?.order_number) {
