@@ -4501,7 +4501,17 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
     if (status) q = q.eq("status", status);
     const { data, error } = await q;
     if (error) throw error;
-    res.json({ requests: data || [], is_approver: isDateApprover(req) });
+    // Flag which requests' orders already have a Delivery Order, so the approver
+    // can tell "approved" (date agreed) from "approved but no DO created yet".
+    const soIds = [...new Set((data || []).map(r => r.sales_order_id).filter(Boolean))];
+    let withDo = new Set();
+    if (soIds.length) {
+      const { data: dos } = await supabase.from("delivery_orders")
+        .select("sales_order_id").in("sales_order_id", soIds).neq("status", "cancelled");
+      withDo = new Set((dos || []).map(d => d.sales_order_id));
+    }
+    const requests = (data || []).map(r => ({ ...r, has_delivery_order: r.sales_order_id ? withDo.has(r.sales_order_id) : false }));
+    res.json({ requests, is_approver: isDateApprover(req) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
