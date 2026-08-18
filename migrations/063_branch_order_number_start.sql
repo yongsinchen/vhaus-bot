@@ -22,6 +22,10 @@
 -- Seeds are scoped to the exact PG branch ids — no other company is touched.
 -- ══════════════════════════════════════════════════════════════════
 
+-- Self-contained: ensure BOTH band columns exist even if migration 055 never
+-- ran in this environment (a null prefix is exactly why new orders fall back to
+-- the dated SO number instead of a branch running number).
+ALTER TABLE branches ADD COLUMN IF NOT EXISTS order_number_prefix TEXT;
 ALTER TABLE branches ADD COLUMN IF NOT EXISTS order_number_start INTEGER;
 
 -- Alma Branch (PG): 1xxxx band (prefix widened "11" → "1", start 10000).
