@@ -4449,25 +4449,12 @@ app.patch("/orders/:id/set-date", requireRole(MANAGE_ROLES), async (req, res) =>
 const DATE_APPROVER_ROLES = ["master", "manager", "operation_manager", "company_admin"];
 const isDateApprover = (req) => DATE_APPROVER_ROLES.includes((req.activeRoleKey || req.user.role || "").toLowerCase());
 
-// Apply an approved request's date to the order (legacy + sales_orders) — same
-// effect as PATCH /orders/:id/set-date, so it enters the unassigned pool.
-async function applyRequestDeliveryDate(reqRow, actor) {
-  if (reqRow.order_id) {
-    const { data: before } = await supabase.from("orders")
-      .select("delivery_date, so_number, company_id, branch_id").eq("id", reqRow.order_id).maybeSingle();
-    await supabase.from("orders").update({ delivery_date: reqRow.requested_date }).eq("id", reqRow.order_id);
-    if (before?.company_id) {
-      try {
-        await logDeliveryActivity({
-          companyId: before.company_id, branchId: before.branch_id || null, soNumber: before.so_number,
-          orderId: Number(reqRow.order_id), tripNo: null,
-          action: before.delivery_date ? "rescheduled" : "arranged",
-          fromDate: before.delivery_date || null, toDate: reqRow.requested_date,
-          source: "web", actorId: actor?.id || null, actorName: actor?.name || null,
-        });
-      } catch {}
-    }
-  }
+// Record an agreed delivery date on the sales order when a request is approved
+// or a salesman picks a proposed date. It deliberately does NOT stamp the
+// legacy orders.delivery_date — that would push the order into the delivery
+// pool (schedule it) immediately. The order stays pending until a Delivery
+// Order is created; the DO is what arranges the actual delivery.
+async function applyRequestDeliveryDate(reqRow /* actor unused */) {
   if (reqRow.sales_order_id) {
     await supabase.from("sales_orders").update({ delivery_date: reqRow.requested_date }).eq("id", reqRow.sales_order_id);
   }
@@ -4514,7 +4501,17 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
     if (status) q = q.eq("status", status);
     const { data, error } = await q;
     if (error) throw error;
-    res.json({ requests: data || [], is_approver: isDateApprover(req) });
+    // Flag which requests' orders already have a Delivery Order, so the approver
+    // can tell "approved" (date agreed) from "approved but no DO created yet".
+    const soIds = [...new Set((data || []).map(r => r.sales_order_id).filter(Boolean))];
+    let withDo = new Set();
+    if (soIds.length) {
+      const { data: dos } = await supabase.from("delivery_orders")
+        .select("sales_order_id").in("sales_order_id", soIds).neq("status", "cancelled");
+      withDo = new Set((dos || []).map(d => d.sales_order_id));
+    }
+    const requests = (data || []).map(r => ({ ...r, has_delivery_order: r.sales_order_id ? withDo.has(r.sales_order_id) : false }));
+    res.json({ requests, is_approver: isDateApprover(req) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4526,7 +4523,9 @@ app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) =
     const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
     if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
     if (!["pending", "needs_reschedule"].includes(r.status)) return res.status(400).json({ error: `Request is already ${r.status}` });
-    await applyRequestDeliveryDate(r, req.user);
+    // Records the agreed date but leaves the order pending for a Delivery Order
+    // (does not schedule it). Same for the salesman "pick" path below.
+    await applyRequestDeliveryDate(r);
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "approved", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
       reviewed_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
@@ -4582,7 +4581,7 @@ app.patch("/delivery-date-requests/:id/pick", requireAuth, async (req, res) => {
     if (r.status !== "needs_reschedule") return res.status(400).json({ error: "No alternatives to pick from" });
     const alts = Array.isArray(r.alternative_dates) ? r.alternative_dates : [];
     if (!alts.includes(picked)) return res.status(400).json({ error: "Pick one of the proposed dates" });
-    await applyRequestDeliveryDate({ ...r, requested_date: picked }, req.user);
+    await applyRequestDeliveryDate({ ...r, requested_date: picked });
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "approved", requested_date: picked, reviewed_at: new Date().toISOString(),
       decision_note: (r.decision_note ? r.decision_note + " · " : "") + "Salesman picked a proposed date", updated_at: new Date().toISOString(),
