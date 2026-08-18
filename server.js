@@ -12291,12 +12291,15 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
 // Generate a readable order number: SO + YYMMDD + 4-digit sequence for the day
 async function nextOrderNumber(company_id, branch_id) {
   // Branch running number: each branch continues its OWN numeric series inside
-  // its configured band (branches.order_number_prefix — e.g. Alma "11" → 11xxx,
-  // Georgetown "3" → 3xxxx). Take the branch's highest number in the band and
+  // its configured band. `order_number_prefix` is the leading-digit band filter
+  // (e.g. Alma "1" → 1xxxx, Georgetown "3" → 3xxxxx). The band's first number is
+  // `order_number_start` when set (lets a branch use a wider band than the
+  // prefix implies, e.g. Georgetown 300000); otherwise it falls back to the
+  // prefix padded to 5 digits. Take the branch's highest number in the band and
   // add 1; a branch with no prefix falls through to the dated SO number below.
   if (branch_id) {
     const { data: branch } = await supabase.from("branches")
-      .select("order_number_prefix").eq("id", branch_id).maybeSingle();
+      .select("order_number_prefix, order_number_start").eq("id", branch_id).maybeSingle();
     const prefix = (branch?.order_number_prefix || "").trim();
     if (prefix) {
       const { data: rows } = await supabase.from("sales_orders")
@@ -12308,7 +12311,10 @@ async function nextOrderNumber(company_id, branch_id) {
         const s = String(r.order_number || "").trim();
         if (re.test(s)) { const n = parseInt(s, 10); if (n > max) max = n; }
       }
-      const base = Number(prefix.padEnd(5, "0")); // "11" → 11000, "3" → 30000
+      // Explicit start wins (supports 6-digit bands); else pad prefix to 5.
+      const base = branch?.order_number_start != null
+        ? Number(branch.order_number_start)
+        : Number(prefix.padEnd(5, "0")); // "11" → 11000, "3" → 30000
       let next = Math.max(max, base - 1) + 1;
       // Guarantee company-wide uniqueness — skip any number already taken.
       for (let i = 0; i < 10000; i++) {
