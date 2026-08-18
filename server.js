@@ -4954,7 +4954,7 @@ app.get("/payments", requireAuth, async (req, res) => {
     // filter on), so skip when a specific order/customer is requested.
     if (include_deposits && cid && !order_id && !customer_id) {
       const { data: sos } = await supabase.from("sales_orders")
-        .select("order_number, customer_name, initial_deposit, deposit, payment_method, payment_proofs, created_at")
+        .select("order_number, customer_name, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
         .eq("company_id", cid).order("created_at", { ascending: false }).limit(2000);
       // Map each SO number → its legacy order's customer_id, so a deposit can
       // link to the customer (sales_orders has no customer_id of its own).
@@ -4977,7 +4977,7 @@ app.get("/payments", requireAuth, async (req, res) => {
           reference_no: null, proof_url: Array.isArray(proofs) ? proofs.filter(Boolean).join(",") : null,
           so_number: so.order_number, customer_name: so.customer_name,
           customer_id: custBySo[so.order_number] || null,
-          order_id: null, paid_at: so.created_at,
+          order_id: null, paid_at: so.created_at, or_number: so.deposit_or_number || null,
         });
       }
       payments = [...depositLines, ...payments].sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
