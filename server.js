@@ -2918,7 +2918,17 @@ app.get("/delivery/unassigned", requireAuth, async (req, res) => {
   const { data: newAssigned } = await supabase
     .from("delivery_schedules").select("order_id").eq("scheduled_date", date);
   for (const s of (newAssigned || [])) assignedIds.add(s.order_id);
-  res.json((orders || []).filter(o => !assignedIds.has(o.id)));
+  const filtered = (orders || []).filter(o => !assignedIds.has(o.id));
+  // Attach the sales_orders.id (matched by order number) so the schedule board
+  // can open the Create Delivery Order flow directly from a pool order.
+  const nums = [...new Set(filtered.map(o => o.so_number).filter(Boolean))];
+  let soMap = new Map();
+  if (nums.length && cid) {
+    const { data: sos } = await supabase.from("sales_orders")
+      .select("id, order_number").eq("company_id", cid).in("order_number", nums);
+    soMap = new Map((sos || []).map(s => [s.order_number, s.id]));
+  }
+  res.json(filtered.map(o => ({ ...o, sales_order_id: soMap.get(o.so_number) || null })));
 }); 
 
 // POST /delivery/routes — with duplicate vehicle validation
