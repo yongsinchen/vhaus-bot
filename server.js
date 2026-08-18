@@ -4526,7 +4526,14 @@ app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) =
     const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
     if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
     if (!["pending", "needs_reschedule"].includes(r.status)) return res.status(400).json({ error: `Request is already ${r.status}` });
-    await applyRequestDeliveryDate(r, req.user);
+    // Record the agreed date on the sales order for reference, but DO NOT stamp
+    // the legacy orders.delivery_date — that pushes the order into the delivery
+    // pool (i.e. schedules it) the moment it's approved. The order must stay
+    // pending until a Delivery Order is created (the approver does this from the
+    // popup right after approving), so only the DO arranges the actual delivery.
+    if (r.sales_order_id) {
+      await supabase.from("sales_orders").update({ delivery_date: r.requested_date }).eq("id", r.sales_order_id);
+    }
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "approved", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
       reviewed_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
