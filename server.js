@@ -4688,7 +4688,7 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
     const depositLines = [];
     if (soNumbers.length) {
       const { data: sos } = await supabase.from("sales_orders")
-        .select("order_number, initial_deposit, deposit, payment_method, payment_proofs, created_at")
+        .select("order_number, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
         .eq("company_id", customer.company_id).in("order_number", soNumbers);
       for (const so of (sos || [])) {
         const dep = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
@@ -4705,6 +4705,7 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
             payment_method: so.payment_method || "Deposit",
             reference_no: null, proof_url: proofUrl || null, order_id: ord?.id || null,
             so_number: so.order_number, paid_at: so.created_at || ord?.created_at || null,
+            or_number: so.deposit_or_number || null,
           });
         }
       }
@@ -4860,6 +4861,17 @@ async function recomputeOrderPaid(orderId) {
 // ── Cross-Order Payments ────────────────────────────────────────
 // ORDER_ROLES (not MANAGE_ROLES): salesmen create the orders and collect
 // payment from customers in the field, so they must be able to record it.
+// Next Official Receipt number for a company: 1 + the highest OR number in
+// use, counting both recorded payments and order-upfront-deposit numbers so a
+// single per-company sequence is shared.
+async function nextOrNumber(companyId) {
+  const [{ data: p }, { data: s }] = await Promise.all([
+    supabase.from("payments").select("or_number").eq("company_id", companyId).not("or_number", "is", null).order("or_number", { ascending: false }).limit(1).maybeSingle(),
+    supabase.from("sales_orders").select("deposit_or_number").eq("company_id", companyId).not("deposit_or_number", "is", null).order("deposit_or_number", { ascending: false }).limit(1).maybeSingle(),
+  ]);
+  return Math.max(Number(p?.or_number) || 0, Number(s?.deposit_or_number) || 0) + 1;
+}
+
 app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   try {
     const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind } = req.body;
@@ -4869,6 +4881,9 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
     // (recomputeOrderPaid derives paid/balance from the full ledger). Reject
     // anything else so the column stays clean; unspecified stays NULL (legacy).
     const paymentKind = kind === "deposit" || kind === "balance" ? kind : null;
+    // Next Official Receipt number for this company — the running max across
+    // both recorded payments and order-upfront-deposit numbers, +1.
+    const orNumber = await nextOrNumber(cid);
     // Create payment
     const { data: payment, error } = await supabase.from("payments").insert({
       order_id: order_id || (allocations?.[0]?.order_id) || null,
@@ -4877,7 +4892,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       reference_no: reference_no || null, recorded_by: req.user.id,
       proof_url: proof_url || null,
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
-      kind: paymentKind,
+      kind: paymentKind, or_number: orNumber,
       company_id: cid,
     }).select().single();
     if (error) throw error;
