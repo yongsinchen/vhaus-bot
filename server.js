@@ -4521,10 +4521,29 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
       const { data: ords } = await supabase.from("orders").select("id, delivery_date").in("id", legacyOrderIds);
       for (const o of (ords || [])) legacyDate.set(o.id, o.delivery_date || null);
     }
+    // Availability of each requested date so the approver can judge it without
+    // leaving the page: how many deliveries are already booked that day (load),
+    // how many are still unassigned, team count, and any blocked-date reason.
+    // Computed once per distinct date, only for still-actionable requests.
+    const actionableDates = [...new Set((data || [])
+      .filter(r => ["pending", "needs_reschedule"].includes(r.status) && r.requested_date)
+      .map(r => r.requested_date))];
+    const loadByDate = new Map();
+    await Promise.all(actionableDates.map(async ds => {
+      const [load, blocked] = await Promise.all([
+        getDayLoad(ds, cid),
+        cid ? getBlockedDateReason(cid, ds, null) : Promise.resolve(null),
+      ]);
+      loadByDate.set(ds, {
+        total: load.total, unassigned: load.unassigned, teams: load.teams,
+        busy_threshold: BUSY_DAY_THRESHOLD, blocked_reason: blocked || null,
+      });
+    }));
     const requests = (data || []).map(r => ({
       ...r,
       has_delivery_order: r.sales_order_id ? withDo.has(r.sales_order_id) : false,
       current_delivery_date: r.sales_order_id ? (soDate.get(r.sales_order_id) || null) : (legacyDate.get(r.order_id) || null),
+      requested_date_load: r.requested_date ? (loadByDate.get(r.requested_date) || null) : null,
     }));
     res.json({ requests, is_approver: isDateApprover(req) });
   } catch (err) { res.status(500).json({ error: err.message }); }
