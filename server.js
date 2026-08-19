@@ -5203,18 +5203,22 @@ app.get("/branch-commission-overrides", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.json({ branches: [] });
     const [{ data: branches }, { data: users }] = await Promise.all([
-      supabase.from("branches").select("id, name, commission_override_user_id").eq("company_id", cid).order("name"),
+      supabase.from("branches").select("id, name, commission_override_user_id, commission_override_rate").eq("company_id", cid).order("name"),
       supabase.from("users").select("id, name, salesman_name, override_commission_rate").eq("company_id", cid).eq("is_active", true).order("name"),
     ]);
     const userById = new Map((users || []).map(u => [u.id, u]));
     res.json({
       branches: (branches || []).map(b => {
         const u = b.commission_override_user_id ? userById.get(b.commission_override_user_id) : null;
+        // Rate is per-branch now; fall back to the earner's legacy user rate
+        // for branches not yet backfilled.
+        const rate = b.commission_override_rate != null ? Number(b.commission_override_rate)
+          : (u && u.override_commission_rate != null ? Number(u.override_commission_rate) : null);
         return {
           branch_id: b.id, branch_name: b.name,
           override_user_id: b.commission_override_user_id || null,
           override_user_name: u ? (u.name || u.salesman_name || null) : null,
-          override_rate_pct: u && u.override_commission_rate != null ? Number(u.override_commission_rate) : null,
+          override_rate_pct: rate,
         };
       }),
       users: (users || []).map(u => ({ id: u.id, name: u.name || u.salesman_name || "—", override_rate_pct: u.override_commission_rate != null ? Number(u.override_commission_rate) : null })),
@@ -5238,18 +5242,21 @@ app.put("/branch-commission-overrides/:branchId", requireRole(COMMISSION_ROLES),
     const prevUserId = branch.commission_override_user_id || null;
 
     if (!user_id) {
-      // Clear the earner for this branch.
-      await supabase.from("branches").update({ commission_override_user_id: null }).eq("id", branchId).eq("company_id", cid);
+      // Clear the earner and rate for this branch.
+      await supabase.from("branches").update({ commission_override_user_id: null, commission_override_rate: null }).eq("id", branchId).eq("company_id", cid);
     } else {
       // The earner must be a user in this company.
       const { data: u } = await supabase.from("users").select("id, company_id").eq("id", user_id).maybeSingle();
       if (!u || u.company_id !== cid) return res.status(400).json({ error: "Override earner must be a user in this company" });
+      const update = { commission_override_user_id: user_id };
+      // The rate is stored PER BRANCH now, so the same person can earn a
+      // different override on each of their branches.
       if (rate_pct !== undefined && rate_pct !== null && rate_pct !== "") {
         const r = Number(rate_pct);
         if (!Number.isFinite(r) || r < 0 || r > 100) return res.status(400).json({ error: "rate_pct must be a number between 0 and 100" });
-        await supabase.from("users").update({ override_commission_rate: Math.round(r * 1000) / 1000 }).eq("id", user_id);
+        update.commission_override_rate = Math.round(r * 1000) / 1000;
       }
-      await supabase.from("branches").update({ commission_override_user_id: user_id }).eq("id", branchId).eq("company_id", cid);
+      await supabase.from("branches").update(update).eq("id", branchId).eq("company_id", cid);
     }
 
     // Reassignment cleanup: if a different person used to earn this branch's
@@ -5447,13 +5454,15 @@ async function getCommCache(companyId) {
     // company) and reused across every order recalculated in this 30s window.
     supabase.from("product_bundles").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("product_bundle_items").select("bundle_id, product_id, quantity").eq("company_id", companyId),
-    // Per-branch commission override earner (migration 059).
-    supabase.from("branches").select("id, commission_override_user_id").eq("company_id", companyId),
+    // Per-branch commission override earner + per-branch rate (migrations 059, 064).
+    supabase.from("branches").select("id, commission_override_user_id, commission_override_rate").eq("company_id", companyId),
   ]);
   const today = new Date().toISOString().slice(0, 10);
+  // branch_id -> { userId, rate }. rate may be null (fall back to the user's
+  // legacy rate at compute time, for branches not yet backfilled).
   const branchOverrides = {};
   for (const b of (branchesRes.data || [])) {
-    if (b.commission_override_user_id) branchOverrides[b.id] = b.commission_override_user_id;
+    if (b.commission_override_user_id) branchOverrides[b.id] = { userId: b.commission_override_user_id, rate: b.commission_override_rate != null ? Number(b.commission_override_rate) : null };
   }
   const bundleItemsByBundle = new Map();
   for (const bi of (bundleItemsRes.data || [])) {
@@ -5874,13 +5883,18 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // their OWN per-person rate — on the branch's legit sales (each deposit-paid
   // order's commissionable amount), on the same deposit gate as every other
   // commission. Kept separate from the branch-manager 1% override above.
-  const overrideUserId = order.branch_id ? cache.branchOverrides?.[order.branch_id] : null;
+  const ovEntry = order.branch_id ? cache.branchOverrides?.[order.branch_id] : null;
+  const overrideUserId = ovEntry?.userId || null;
   if (overrideUserId) {
     // The override earner earns on EVERY order in their branch — including
     // orders they sold themselves (they keep their salesman commission AND get
     // the override; the two are separate rows, one per role — migration 060).
     const ovUser = cache.users.find(u => u.id === overrideUserId);
-    const ovRate = ovUser && ovUser.override_commission_rate != null ? Number(ovUser.override_commission_rate) : 0;
+    // Rate is PER BRANCH (migration 064): the same person can earn a different
+    // override on each branch. Fall back to the earner's legacy user rate only
+    // when the branch has no rate set yet.
+    const ovRate = ovEntry.rate != null ? Number(ovEntry.rate)
+      : (ovUser && ovUser.override_commission_rate != null ? Number(ovUser.override_commission_rate) : 0);
     if (ovUser && ovRate > 0) {
       const depositMet = depositPct >= 30; // same default deposit gate as salesman/manager
       const overrideAmt = commissionLib.round2(net * (ovRate / 100));
