@@ -5864,35 +5864,10 @@ async function calculateCommission(orderId, companyId, opts = {}) {
     }
   }
 
-  // Branch manager override — 1% on all branch sales. Unaffected by Phase C:
-  // stays on the full `net` exactly as before (not itemized by clearance).
-  const mgrRules = (rules || []).filter(r => r.role_name === "branch_manager" && !r.user_id);
-  if (mgrRules.length > 0 && order.branch_id) {
-    const { data: mgr } = await supabase.from("users").select("id")
-      .eq("company_id", companyId).eq("branch_id", order.branch_id)
-      .in("role", ["manager", "branch_manager"]).eq("is_active", true).limit(1).maybeSingle();
-    if (mgr) {
-      const mgrRule = mgrRules[0];
-      const depositMet = depositPct >= (mgrRule.deposit_gate_pct || 30);
-      const overrideAmt = net * ((mgrRule.rate_pct || 0) / 100);
-      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", mgr.id).eq("role_name", "branch_manager").maybeSingle();
-      if (existing && (existing.status === "paid" || existing.paid_at)) {
-        // Never overwrite a paid commission — corrections go through commission_adjustments.
-      } else {
-        const commData = {
-          net_amount: net, rate_pct: mgrRule.rate_pct, incentive_pct: 0,
-          commission_amt: overrideAmt, deposit_met: depositMet,
-          status: depositMet ? "eligible" : "pending",
-          eligible_at: depositMet ? new Date().toISOString() : null,
-          payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
-          tier_commission_amt: commissionLib.round2(overrideAmt),
-          clearance_commission_amt: 0, product_incentive_amt: 0, package_incentive_amt: 0,
-        };
-        if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
-        else await supabase.from("commissions").insert({ order_id: orderId, user_id: mgr.id, role_name: "branch_manager", company_id: companyId, ...commData });
-      }
-    }
-  }
+  // Branch-manager 1% override REMOVED — the branch override earner below is
+  // now the only override, so the two no longer stack. Existing unpaid
+  // branch_manager commission rows should be cleaned out separately (paid rows
+  // are kept for audit). No new branch_manager override rows are created here.
 
   // ── Branch override earner (migration 059) ──────────────────────
   // A specific person assigned to this order's branch earns a flat override —
