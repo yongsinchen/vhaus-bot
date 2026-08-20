@@ -3775,9 +3775,16 @@ app.get("/branch-performance", requireAuth, async (req, res) => {
       if (soDep && soDep.status === "pending_deposit") pendingDeposit++;
       if (legit) {
         totalSales += amt; legitCount++;
-        const sm = (o.salesman || "—").trim() || "—";
-        if (!bySalesman[sm]) bySalesman[sm] = { name: sm, orders: 0, sales: 0 };
-        bySalesman[sm].orders++; bySalesman[sm].sales += amt;
+        // Split orders carry a "/"-separated salesman string (same as the
+        // commission engine). Divide the amount equally so a 3-way split
+        // credits each person a third, not the whole amount three times.
+        const names = (o.salesman || "").split("/").map(s => s.trim()).filter(Boolean);
+        const list = names.length ? names : ["—"];
+        const share = amt / list.length;
+        for (const nm of list) {
+          if (!bySalesman[nm]) bySalesman[nm] = { name: nm, orders: 0, sales: 0 };
+          bySalesman[nm].orders++; bySalesman[nm].sales += share;
+        }
       }
       return {
         so_number: o.so_number, order_date: o.order_date, customer_name: o.customer_name,
