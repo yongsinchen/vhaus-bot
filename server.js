@@ -682,12 +682,11 @@ async function resolveProductSuppliersForView(companyId, rows) {
 function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
 // Order + payment create/edit. sales_manager = the revenue half of the old
 // "manager" role.
-const ORDER_ROLES = ["master", "manager", "company_admin", "salesman", "sales_manager"];
-// Who may COLLECT a customer payment (POST /payments/record). Everyone who can
-// create orders, plus the Branch Operation Admin — an ops role that sees all
-// orders/customers and collects payment + requests delivery, but does NOT
-// create or edit orders (so it is deliberately kept OUT of ORDER_ROLES).
-const PAYMENT_COLLECT_ROLES = [...ORDER_ROLES, "branch_operation_admin"];
+// Order + payment create/edit. branch_operation_admin is an ops role that sees
+// ALL orders/customers (not own-scoped like a salesman) and can create/edit
+// orders, collect payment, and request delivery — but NOT delete orders (delete
+// is restricted to master/manager/company_admin on its own endpoint).
+const ORDER_ROLES = ["master", "manager", "company_admin", "salesman", "sales_manager", "branch_operation_admin"];
 // Commission & product-incentive management — revenue-side managers only.
 const COMMISSION_ROLES = ["master", "manager", "sales_manager"];
 // Employment roles that earn a per-salesman commission row. The stored role is
@@ -5068,7 +5067,7 @@ async function nextOrNumber(companyId) {
   return Math.max(Number(p?.or_number) || 0, Number(s?.deposit_or_number) || 0) + 1;
 }
 
-app.post("/payments/record", requireRole(PAYMENT_COLLECT_ROLES), async (req, res) => {
+app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   try {
     const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind } = req.body;
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
