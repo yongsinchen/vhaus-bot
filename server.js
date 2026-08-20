@@ -4855,24 +4855,25 @@ async function recomputeOrderPaid(orderId) {
   const ids = (dOrders || []).map(o => o.id);
   let paidFromPayments = 0;
   let adminPayments = 0; // instalment admin charges recorded on this SO's payments
-  // Only APPROVED payments count toward paid/balance (migration 065). A pending
-  // (awaiting Finance) or rejected payment never reduces the balance or drives
-  // confirmation/commission. Legacy null status is treated as approved.
-  const isApproved = (s) => s == null || s === "approved";
+  // Payments count as soon as they're recorded (migration 065: "count now,
+  // Finance verifies later"). Only a REJECTED payment is backed out — it never
+  // reduces the balance or drives confirmation/commission. Pending + approved
+  // both count; legacy null status counts too.
+  const isCounted = (s) => s !== "rejected";
   if (ids.length) {
     // (a) Allocated portions pointing at this SO's orders — the exact share of
-    //     each (possibly cross-SO) split payment that belongs to this SO, but
-    //     only where the parent payment is approved.
+    //     each (possibly cross-SO) split payment that belongs to this SO,
+    //     excluding any whose parent payment was rejected.
     const { data: allocs } = await supabase.from("payment_allocations")
       .select("amount, payment_id").in("order_id", ids);
     const allocPayIds = [...new Set((allocs || []).map(a => a.payment_id).filter(Boolean))];
-    let approvedAlloc = new Set();
+    let rejectedAlloc = new Set();
     if (allocPayIds.length) {
       const { data: ap } = await supabase.from("payments").select("id, approval_status").in("id", allocPayIds);
-      approvedAlloc = new Set((ap || []).filter(p => isApproved(p.approval_status)).map(p => p.id));
+      rejectedAlloc = new Set((ap || []).filter(p => !isCounted(p.approval_status)).map(p => p.id));
     }
     const allocatedSum = (allocs || [])
-      .filter(a => a.payment_id == null || approvedAlloc.has(a.payment_id))
+      .filter(a => a.payment_id == null || !rejectedAlloc.has(a.payment_id))
       .reduce((s, a) => s + (Number(a.amount) || 0), 0);
 
     // (b) Payments attached directly to this SO's orders that carry NO
@@ -4883,7 +4884,7 @@ async function recomputeOrderPaid(orderId) {
     //     Only approved payments count.
     const { data: directPaysAll } = await supabase.from("payments")
       .select("id, amount, admin_charges, approval_status").in("order_id", ids);
-    const directPays = (directPaysAll || []).filter(p => isApproved(p.approval_status));
+    const directPays = (directPaysAll || []).filter(p => isCounted(p.approval_status));
     adminPayments = directPays.reduce((s, p) => s + (Number(p.admin_charges) || 0), 0);
     let unallocatedSum = 0;
     if (directPays.length) {
