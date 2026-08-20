@@ -4753,7 +4753,7 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
             payment_method: so.payment_method || "Deposit",
             reference_no: null, proof_url: proofUrl || null, order_id: ord?.id || null,
             so_number: so.order_number, paid_at: so.created_at || ord?.created_at || null,
-            or_number: so.deposit_or_number || null,
+            or_number: so.deposit_or_number || null, approval_status: "approved",
           });
         }
       }
@@ -4855,23 +4855,38 @@ async function recomputeOrderPaid(orderId) {
   const ids = (dOrders || []).map(o => o.id);
   let paidFromPayments = 0;
   let adminPayments = 0; // instalment admin charges recorded on this SO's payments
+  // Only APPROVED payments count toward paid/balance (migration 065). A pending
+  // (awaiting Finance) or rejected payment never reduces the balance or drives
+  // confirmation/commission. Legacy null status is treated as approved.
+  const isApproved = (s) => s == null || s === "approved";
   if (ids.length) {
     // (a) Allocated portions pointing at this SO's orders — the exact share of
-    //     each (possibly cross-SO) split payment that belongs to this SO.
+    //     each (possibly cross-SO) split payment that belongs to this SO, but
+    //     only where the parent payment is approved.
     const { data: allocs } = await supabase.from("payment_allocations")
-      .select("amount").in("order_id", ids);
-    const allocatedSum = (allocs || []).reduce((s, a) => s + (Number(a.amount) || 0), 0);
+      .select("amount, payment_id").in("order_id", ids);
+    const allocPayIds = [...new Set((allocs || []).map(a => a.payment_id).filter(Boolean))];
+    let approvedAlloc = new Set();
+    if (allocPayIds.length) {
+      const { data: ap } = await supabase.from("payments").select("id, approval_status").in("id", allocPayIds);
+      approvedAlloc = new Set((ap || []).filter(p => isApproved(p.approval_status)).map(p => p.id));
+    }
+    const allocatedSum = (allocs || [])
+      .filter(a => a.payment_id == null || approvedAlloc.has(a.payment_id))
+      .reduce((s, a) => s + (Number(a.amount) || 0), 0);
 
     // (b) Payments attached directly to this SO's orders that carry NO
     //     allocation rows — their full amount belongs here (the common
     //     single-order case: /payments/record without allocations, driver
     //     collection, bank reconciliation). Payments that DO have allocation
     //     rows are already counted in (a); exclude them to avoid double-counting.
-    const { data: directPays } = await supabase.from("payments")
-      .select("id, amount, admin_charges").in("order_id", ids);
-    adminPayments = (directPays || []).reduce((s, p) => s + (Number(p.admin_charges) || 0), 0);
+    //     Only approved payments count.
+    const { data: directPaysAll } = await supabase.from("payments")
+      .select("id, amount, admin_charges, approval_status").in("order_id", ids);
+    const directPays = (directPaysAll || []).filter(p => isApproved(p.approval_status));
+    adminPayments = directPays.reduce((s, p) => s + (Number(p.admin_charges) || 0), 0);
     let unallocatedSum = 0;
-    if (directPays && directPays.length) {
+    if (directPays.length) {
       const { data: allocated } = await supabase.from("payment_allocations")
         .select("payment_id").in("payment_id", directPays.map(p => p.id));
       const allocatedPaymentIds = new Set((allocated || []).map(r => r.payment_id));
@@ -4929,10 +4944,9 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
     // (recomputeOrderPaid derives paid/balance from the full ledger). Reject
     // anything else so the column stays clean; unspecified stays NULL (legacy).
     const paymentKind = kind === "deposit" || kind === "balance" ? kind : null;
-    // Next Official Receipt number for this company — the running max across
-    // both recorded payments and order-upfront-deposit numbers, +1.
-    const orNumber = await nextOrNumber(cid);
-    // Create payment
+    // The payment starts PENDING Finance approval (migration 065). The Official
+    // Receipt number is NOT assigned yet — it's minted when Finance approves, so
+    // OR numbers only exist for verified money and stay gap-free.
     const { data: payment, error } = await supabase.from("payments").insert({
       order_id: order_id || (allocations?.[0]?.order_id) || null,
       customer_id: customer_id || null,
@@ -4940,7 +4954,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       reference_no: reference_no || null, recorded_by: req.user.id,
       proof_url: proof_url || null,
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
-      kind: paymentKind, or_number: orNumber,
+      kind: paymentKind, or_number: null, approval_status: "pending",
       company_id: cid,
     }).select().single();
     if (error) throw error;
@@ -4965,9 +4979,66 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Finance approval of collected payments (migration 065). Only these roles may
+// approve/reject; the salesman who recorded it cannot self-approve.
+const FINANCE_APPROVE_ROLES = ["master", "finance"];
+
+// Orders touched by a payment = its own order_id plus every allocation target.
+async function paymentAffectedOrders(payment) {
+  const set = new Set();
+  if (payment.order_id) set.add(payment.order_id);
+  const { data: allocs } = await supabase.from("payment_allocations").select("order_id").eq("payment_id", payment.id);
+  for (const a of (allocs || [])) if (a.order_id) set.add(a.order_id);
+  return [...set];
+}
+async function reprocessPaymentOrders(payment, companyId) {
+  for (const oid of await paymentAffectedOrders(payment)) {
+    try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
+    try { await calculateCommission(oid, companyId, { cascade: false }); } catch (e) { console.error("commission recalc error:", e.message); }
+  }
+}
+
+// PATCH /payments/:id/approve — Finance approves; the money now counts, the
+// order (re)computes paid/balance + commission, and an OR number is minted.
+app.patch("/payments/:id/approve", requireRole(FINANCE_APPROVE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { data: payment } = await supabase.from("payments").select("*").eq("id", req.params.id).maybeSingle();
+    if (!payment || (cid && payment.company_id !== cid)) return res.status(404).json({ error: "Payment not found" });
+    if (payment.approval_status === "approved") return res.status(400).json({ error: "Payment is already approved" });
+    const orNumber = payment.or_number != null ? payment.or_number : await nextOrNumber(payment.company_id || cid);
+    const { data: updated, error } = await supabase.from("payments").update({
+      approval_status: "approved", approved_by: req.user.id, approved_at: new Date().toISOString(),
+      approval_note: req.body?.note || null, or_number: orNumber,
+    }).eq("id", payment.id).select().single();
+    if (error) throw error;
+    await reprocessPaymentOrders(updated, payment.company_id || cid);
+    res.json({ payment: updated });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /payments/:id/reject — Finance rejects; the row is kept (marked
+// rejected) for audit and excluded from every total. Orders recompute so the
+// balance reflects that this money never counted.
+app.patch("/payments/:id/reject", requireRole(FINANCE_APPROVE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { data: payment } = await supabase.from("payments").select("*").eq("id", req.params.id).maybeSingle();
+    if (!payment || (cid && payment.company_id !== cid)) return res.status(404).json({ error: "Payment not found" });
+    if (payment.approval_status === "rejected") return res.status(400).json({ error: "Payment is already rejected" });
+    const { data: updated, error } = await supabase.from("payments").update({
+      approval_status: "rejected", approved_by: req.user.id, approved_at: new Date().toISOString(),
+      approval_note: req.body?.note || null,
+    }).eq("id", payment.id).select().single();
+    if (error) throw error;
+    await reprocessPaymentOrders(updated, payment.company_id || cid);
+    res.json({ payment: updated });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get("/payments", requireAuth, async (req, res) => {
   try {
-    const { customer_id, order_id, limit = 100, include_deposits } = req.query;
+    const { customer_id, order_id, limit = 100, include_deposits, approval_status } = req.query;
     const cid = getActiveCompanyId(req);
     let payments = [];
     // Join the customer (direct FK, else via the linked order) so each
@@ -4977,6 +5048,7 @@ app.get("/payments", requireAuth, async (req, res) => {
     if (cid) q = q.eq("company_id", cid);
     if (customer_id) q = q.eq("customer_id", customer_id);
     if (order_id) q = q.eq("order_id", order_id);
+    if (approval_status) q = q.eq("approval_status", approval_status);
     const { data, error } = await q;
     const normalize = (rows) => (rows || []).map(p => ({
       ...p,
@@ -5026,6 +5098,9 @@ app.get("/payments", requireAuth, async (req, res) => {
           so_number: so.order_number, customer_name: so.customer_name,
           customer_id: custBySo[so.order_number] || null,
           order_id: null, paid_at: so.created_at, or_number: so.deposit_or_number || null,
+          // Upfront order deposits live on the order, not the ledger — outside
+          // the payment-approval flow, so treat them as already approved.
+          approval_status: "approved",
         });
       }
       payments = [...depositLines, ...payments].sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
