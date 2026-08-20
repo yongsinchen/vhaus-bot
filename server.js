@@ -4981,7 +4981,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
 
 // Finance approval of collected payments (migration 065). Only these roles may
 // approve/reject; the salesman who recorded it cannot self-approve.
-const FINANCE_APPROVE_ROLES = ["master", "manager", "company_admin", "finance"];
+const FINANCE_APPROVE_ROLES = ["master", "finance"];
 
 // Orders touched by a payment = its own order_id plus every allocation target.
 async function paymentAffectedOrders(payment) {
