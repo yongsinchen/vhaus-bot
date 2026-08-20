@@ -73,14 +73,17 @@ const supplierDO = createSupplierDOService({
 });
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
-// "Part-time" is a salesman-equivalent role. It stays a distinct STORED role
-// (users.role = 'part_time') for reporting and labeling, but for authorization
+// "Part-time" and "short-term part-time" are salesman-equivalent roles. Each
+// stays a distinct STORED role (users.role = 'part_time' / 'short_term_part_time')
+// for reporting, commission-rate scoping, and labeling, but for authorization
 // and every role-based decision it is treated exactly as a salesman. Aliasing
 // here — at the single auth-resolution point — means all downstream logic
 // (ORDER_ROLES, own-orders filters, commission, the permission engine) applies
 // the salesman rules without duplicating the alias across dozens of call sites.
+// The frontend narrows short-term part-time further (order-create + own
+// commission only); the backend deliberately grants the same salesman ACCESS.
 const normalizeUserRole = (profile) => {
-  if (profile && profile.role === "part_time") profile.role = "salesman";
+  if (profile && (profile.role === "part_time" || profile.role === "short_term_part_time")) profile.role = "salesman";
   return profile;
 };
 
@@ -676,6 +679,13 @@ function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
 const ORDER_ROLES = ["master", "manager", "company_admin", "salesman", "sales_manager"];
 // Commission & product-incentive management — revenue-side managers only.
 const COMMISSION_ROLES = ["master", "manager", "sales_manager"];
+// Employment roles that earn a per-salesman commission row. The stored role is
+// kept distinct for rate scoping + labeling (a salesman, a part-timer, and a
+// short-term part-timer can each carry their own tier rules) even though all
+// three share salesman ACCESS via normalizeUserRole. Used everywhere the
+// commission engine reads/writes/purges a salesman-side row so update, insert,
+// and purge always target the same set.
+const SALES_COMMISSION_ROLES = ["salesman", "part_time", "short_term_part_time"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
 
 const requireAuth = async (req, res, next) => {
@@ -5465,6 +5475,73 @@ app.put("/branch-commission-overrides/:branchId", requireRole(COMMISSION_ROLES),
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Director override (migration 066) ───────────────────────────────────
+// A single person earns a company-wide override on EVERY legit order across
+// ALL branches, at one flexible rate. Stored on the company row, separate
+// from the per-branch override earner (they stack).
+app.get("/director-commission-override", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ director_user_id: null, director_rate_pct: null, users: [] });
+    const [{ data: company }, { data: users }] = await Promise.all([
+      supabase.from("companies").select("commission_director_user_id, commission_director_rate").eq("id", cid).maybeSingle(),
+      supabase.from("users").select("id, name, salesman_name").eq("company_id", cid).eq("is_active", true).order("name"),
+    ]);
+    const uid = company?.commission_director_user_id || null;
+    const u = uid ? (users || []).find(x => x.id === uid) : null;
+    res.json({
+      director_user_id: uid,
+      director_user_name: u ? (u.name || u.salesman_name || null) : null,
+      director_rate_pct: company?.commission_director_rate != null ? Number(company.commission_director_rate) : null,
+      users: (users || []).map(x => ({ id: x.id, name: x.name || x.salesman_name || "—" })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /director-commission-override  Body: { user_id, rate_pct }
+// user_id null/"" clears the director override. rate_pct sets the flexible %.
+app.put("/director-commission-override", requireRole(COMMISSION_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const { user_id, rate_pct } = req.body || {};
+
+    const { data: company } = await supabase.from("companies").select("commission_director_user_id").eq("id", cid).maybeSingle();
+    if (!company) return res.status(404).json({ error: "Company not found" });
+    const prevUserId = company.commission_director_user_id || null;
+
+    if (!user_id) {
+      await supabase.from("companies").update({ commission_director_user_id: null, commission_director_rate: null }).eq("id", cid);
+    } else {
+      const { data: u } = await supabase.from("users").select("id, company_id").eq("id", user_id).maybeSingle();
+      if (!u || u.company_id !== cid) return res.status(400).json({ error: "Director must be a user in this company" });
+      const update = { commission_director_user_id: user_id };
+      if (rate_pct !== undefined && rate_pct !== null && rate_pct !== "") {
+        const r = Number(rate_pct);
+        if (!Number.isFinite(r) || r < 0 || r > 100) return res.status(400).json({ error: "rate_pct must be a number between 0 and 100" });
+        update.commission_director_rate = Math.round(r * 1000) / 1000;
+      }
+      await supabase.from("companies").update(update).eq("id", cid);
+    }
+
+    // Reassignment cleanup: if a different person used to be director, drop
+    // their unpaid director_override rows for this company's orders so a
+    // replaced director doesn't keep collecting. Paid rows are never touched.
+    if (prevUserId && prevUserId !== user_id) {
+      const { data: coOrders } = await supabase.from("orders").select("id").eq("company_id", cid);
+      const ids = (coOrders || []).map(o => o.id);
+      if (ids.length) {
+        await supabase.from("commissions").delete()
+          .eq("user_id", prevUserId).eq("role_name", "director_override").in("order_id", ids)
+          .is("paid_at", null).neq("status", "paid");
+      }
+    }
+
+    _commCache.ts = 0; // invalidate so calculateCommission picks up the change
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Product Bundles (Phase C) ───────────────────────────────────────────
 // A bundle carries its OWN price (package_price); adding one to a sales
 // order explodes it into normal sales_order_items rows server-side (see
@@ -5637,7 +5714,7 @@ async function getCommCache(companyId) {
     supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("product_incentives").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("users").select("id, role, salesman_name, branch_id, override_commission_rate").eq("company_id", companyId).eq("is_active", true),
-    supabase.from("companies").select("clearance_commission_enabled").eq("id", companyId).maybeSingle(),
+    supabase.from("companies").select("clearance_commission_enabled, commission_director_user_id, commission_director_rate").eq("id", companyId).maybeSingle(),
     // Phase C — clearance/bundle kill switch data. Cheap (few bundles per
     // company) and reused across every order recalculated in this 30s window.
     supabase.from("product_bundles").select("*").eq("company_id", companyId).eq("is_active", true),
@@ -5667,6 +5744,10 @@ async function getCommCache(companyId) {
     bundles: bundlesRes.data || [],
     bundleItemsByBundle,
     branchOverrides,
+    // Company-wide director override (migration 066): one earner, all branches.
+    director: companyRes.data?.commission_director_user_id
+      ? { userId: companyRes.data.commission_director_user_id, rate: companyRes.data.commission_director_rate != null ? Number(companyRes.data.commission_director_rate) : 0 }
+      : null,
   };
   return _commCache;
 }
@@ -5899,13 +5980,13 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   for (const name of salesmanNames) {
     const salesUser = cache.users.find(u => u.salesman_name && u.salesman_name.toLowerCase() === name.toLowerCase());
     let matchRule = null;
-    // Part-time salesmen are commissioned by their OWN rules (role_name
-    // 'part_time'); everyone else uses the standard 'salesman' rules. This reads
-    // the user's stored account role, so it is deliberately independent of the
-    // auth-layer part_time→salesman alias: a part-timer keeps salesman ACCESS
-    // but earns a distinct commission rate. Falls back to 'salesman' when the
-    // name doesn't resolve to a user.
-    let empRole = salesUser && salesUser.role === "part_time" ? "part_time" : "salesman";
+    // Part-time and short-term part-time salesmen are commissioned by their OWN
+    // rules (role_name 'part_time' / 'short_term_part_time'); everyone else uses
+    // the standard 'salesman' rules. This reads the user's stored account role,
+    // so it is deliberately independent of the auth-layer →salesman alias: those
+    // roles keep salesman ACCESS but earn a distinct commission rate. Falls back
+    // to 'salesman' when the name doesn't resolve to a user.
+    let empRole = salesUser && SALES_COMMISSION_ROLES.includes(salesUser.role) ? salesUser.role : "salesman";
     if (salesUser) {
       // Tier matching aggregates a salesman's sales by the order's BUSINESS
       // month (order_date), matching how the payout month is bucketed
@@ -5982,7 +6063,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
 
     const packageIncentiveAmt = packageIncentiveShares[idx] || 0;
 
-    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).in("role_name", ["salesman", "part_time"]).maybeSingle();
+    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).in("role_name", SALES_COMMISSION_ROLES).maybeSingle();
     // Fail loudly rather than treating a failed read as "no commission exists" — that
     // would fall through to the insert below and duplicate the row on a financial table.
     if (existingErr) throw new Error(`could not read existing commission for order ${orderId} / user ${salesUser.id}: ${existingErr.message}`);
@@ -5997,7 +6078,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
     const totalComm = commissionLib.round2(tierCommissionAmt + clearanceCommissionAmt + productIncentiveAmt + packageIncentiveAmt);
 
     const commData = {
-      role_name: empRole, // 'salesman' or 'part_time' — keeps update+insert+purge consistent
+      role_name: empRole, // salesman / part_time / short_term_part_time — keeps update+insert+purge consistent
       net_amount: tierBase, rate_pct: matchRule.rate_pct, incentive_pct: incentiveAmt > 0 ? Math.round(incentiveAmt / net * 10000) / 100 : 0,
       commission_amt: totalComm, deposit_met: depositMet,
       status: depositMet ? "eligible" : "pending",
@@ -6109,6 +6190,38 @@ async function calculateCommission(orderId, companyId, opts = {}) {
     }
   }
 
+  // ── Director override earner (migration 066) ────────────────────
+  // One person earns a company-wide override on EVERY legit order across ALL
+  // branches, at a single flexible rate. A separate row (role_name
+  // 'director_override') so it stacks with salesman + branch_override.
+  const dir = cache.director;
+  if (dir?.userId) {
+    const dirUser = cache.users.find(u => u.id === dir.userId);
+    const dirRate = Number(dir.rate) || 0;
+    if (dirUser && dirRate > 0) {
+      const depositMet = depositPct >= 30;
+      const dirAmt = commissionLib.round2(net * (dirRate / 100));
+      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", dirUser.id).eq("role_name", "director_override").maybeSingle();
+      if (!(existing && (existing.status === "paid" || existing.paid_at))) {
+        const commData = {
+          net_amount: net, rate_pct: dirRate, incentive_pct: 0,
+          commission_amt: dirAmt, deposit_met: depositMet,
+          status: depositMet ? "eligible" : "pending",
+          eligible_at: depositMet ? new Date().toISOString() : null,
+          payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
+          tier_commission_amt: dirAmt,
+          clearance_commission_amt: 0, product_incentive_amt: 0, package_incentive_amt: 0,
+        };
+        if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
+        else await supabase.from("commissions").insert({ order_id: orderId, user_id: dirUser.id, role_name: "director_override", company_id: companyId, ...commData });
+      }
+    } else if (dirUser && dirRate <= 0) {
+      await supabase.from("commissions").delete()
+        .eq("order_id", orderId).eq("user_id", dirUser.id).eq("role_name", "director_override")
+        .is("paid_at", null).neq("status", "paid");
+    }
+  }
+
   // Purge salesman commission rows for people no longer on this order (e.g.
   // after a reassignment) so a removed salesman doesn't keep an orphaned,
   // still-payable commission — the reported "wrong salesman on commission" bug
@@ -6118,11 +6231,12 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // salesman name simply doesn't match a user can't wipe its commissions.
   const keepSalesmanIds = resolved.map(r => r.salesUser?.id).filter(Boolean);
   if (keepSalesmanIds.length > 0) {
-    // Purge both salesman and part_time rows — a person's role can change
-    // (salesman ↔ part_time) between recalcs, so target both categories or a
-    // stale row under the old role_name would survive and double-pay.
+    // Purge every salesman-side role_name — a person's role can change
+    // (salesman ↔ part_time ↔ short_term_part_time) between recalcs, so target
+    // all categories or a stale row under the old role_name would survive and
+    // double-pay.
     const { error: purgeErr } = await supabase.from("commissions").delete()
-      .eq("order_id", orderId).in("role_name", ["salesman", "part_time"])
+      .eq("order_id", orderId).in("role_name", SALES_COMMISSION_ROLES)
       .is("paid_at", null).neq("status", "paid")
       .not("user_id", "in", `(${keepSalesmanIds.map(id => `"${id}"`).join(",")})`);
     if (purgeErr) console.error(`[calculateCommission] stale salesman purge failed for order ${orderId}:`, purgeErr.message);
