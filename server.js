@@ -3703,6 +3703,109 @@ app.get("/dashboard/branch-sales", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /branch-performance?branch_id=&from=&to= — branch performance for the
+// Performance page. Master can view any branch (or gets the full branch list to
+// pick from); a branch manager is locked to their own branch. Returns summary
+// metrics, a per-salesman breakdown, and the order rows (for the Excel export).
+app.get("/branch-performance", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
+    const isMaster = roleKey === "master";
+    const allowed = ["master", "manager", "company_admin", "branch_manager"];
+    if (!allowed.includes(roleKey)) return res.status(403).json({ error: "Not allowed to view branch performance" });
+
+    const { data: branchRows } = await supabase.from("branches").select("id, name").eq("company_id", cid).order("name");
+    // Selectable branches: master → all; anyone else → only their own.
+    const ownBranch = req.user.branch_id || null;
+    const selectable = isMaster ? (branchRows || []) : (branchRows || []).filter(b => b.id === ownBranch);
+    // Which branch to report on. Non-master is forced to their own branch.
+    let branchId = req.query.branch_id || (isMaster ? (selectable[0]?.id || null) : ownBranch);
+    if (!isMaster) branchId = ownBranch;
+    if (!branchId) return res.status(400).json({ error: "No branch to report on" });
+    if (!isMaster && branchId !== ownBranch) return res.status(403).json({ error: "You can only view your own branch" });
+    const branch = (branchRows || []).find(b => b.id === branchId) || { id: branchId, name: "Branch" };
+
+    const today = new Date().toISOString().slice(0, 10);
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || "") ? req.query.from : today.slice(0, 8) + "01";
+    const to = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || "") ? req.query.to : today;
+
+    // Branch orders in the period (legacy workhorse rows; exclude service/cancelled).
+    const { data: orders } = await supabase.from("orders")
+      .select("id, so_number, order_amount, balance, status, order_date, customer_name, salesman, contact")
+      .eq("company_id", cid).eq("branch_id", branchId)
+      .gte("order_date", from).lte("order_date", to)
+      .or("type.is.null,type.neq.Service")
+      .not("status", "in", '("Cancelled","cancelled")');
+    const list = orders || [];
+
+    // Deposit per SO for the "legit sale" gate + status.
+    const soNumbers = [...new Set(list.map(o => o.so_number).filter(Boolean))];
+    const depBySo = new Map();
+    if (soNumbers.length) {
+      for (let i = 0; i < soNumbers.length; i += 300) {
+        const { data: soRows } = await supabase.from("sales_orders")
+          .select("order_number, deposit, status").eq("company_id", cid).in("order_number", soNumbers.slice(i, i + 300));
+        for (const s of (soRows || [])) depBySo.set(s.order_number, { deposit: Number(s.deposit) || 0, status: s.status });
+      }
+    }
+    const isLegit = (o) => { const d = o.so_number ? depBySo.get(o.so_number) : null; return d ? d.deposit > 0 : true; };
+    const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+
+    // Collections in the period: non-rejected payments against this branch's orders.
+    let collected = 0;
+    const orderIds = list.map(o => o.id);
+    for (let i = 0; i < orderIds.length; i += 300) {
+      const { data: pays } = await supabase.from("payments")
+        .select("amount, approval_status, paid_at").in("order_id", orderIds.slice(i, i + 300))
+        .gte("paid_at", from).lte("paid_at", to + "T23:59:59");
+      for (const p of (pays || [])) if ((p.approval_status || "approved") !== "rejected") collected += Number(p.amount) || 0;
+    }
+
+    // Aggregate metrics + per-salesman breakdown (legit orders only for sales).
+    let totalSales = 0, legitCount = 0, pendingDeposit = 0, outstanding = 0;
+    const bySalesman = {};
+    const rows = list.map(o => {
+      const legit = isLegit(o);
+      const amt = Number(o.order_amount) || 0;
+      const bal = Number(o.balance) || 0;
+      outstanding += bal;
+      const soDep = o.so_number ? depBySo.get(o.so_number) : null;
+      if (soDep && soDep.status === "pending_deposit") pendingDeposit++;
+      if (legit) {
+        totalSales += amt; legitCount++;
+        const sm = (o.salesman || "—").trim() || "—";
+        if (!bySalesman[sm]) bySalesman[sm] = { name: sm, orders: 0, sales: 0 };
+        bySalesman[sm].orders++; bySalesman[sm].sales += amt;
+      }
+      return {
+        so_number: o.so_number, order_date: o.order_date, customer_name: o.customer_name,
+        salesman: o.salesman, status: o.status, order_amount: amt,
+        deposit: soDep ? soDep.deposit : null, balance: bal, legit,
+      };
+    });
+    const salesmen = Object.values(bySalesman).map(s => ({ ...s, sales: round2(s.sales) })).sort((a, b) => b.sales - a.sales);
+
+    res.json({
+      branch: { id: branch.id, name: branch.name },
+      branches: selectable.map(b => ({ id: b.id, name: b.name })),
+      is_master: isMaster,
+      period: { from, to },
+      metrics: {
+        total_sales: round2(totalSales),
+        legit_order_count: legitCount,
+        total_order_count: list.length,
+        pending_deposit_count: pendingDeposit,
+        collected: round2(collected),
+        outstanding: round2(outstanding),
+      },
+      salesmen,
+      orders: rows.sort((a, b) => String(b.order_date || "").localeCompare(String(a.order_date || ""))),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /operations/pending-counts — head-count only, for the sidebar badge.
 // Lets the app show the Operations badge at startup without fetching the
 // full service_pending + do_review row sets (those load when the page opens).
