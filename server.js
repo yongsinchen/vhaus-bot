@@ -5465,6 +5465,73 @@ app.put("/branch-commission-overrides/:branchId", requireRole(COMMISSION_ROLES),
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Director override (migration 066) ───────────────────────────────────
+// A single person earns a company-wide override on EVERY legit order across
+// ALL branches, at one flexible rate. Stored on the company row, separate
+// from the per-branch override earner (they stack).
+app.get("/director-commission-override", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ director_user_id: null, director_rate_pct: null, users: [] });
+    const [{ data: company }, { data: users }] = await Promise.all([
+      supabase.from("companies").select("commission_director_user_id, commission_director_rate").eq("id", cid).maybeSingle(),
+      supabase.from("users").select("id, name, salesman_name").eq("company_id", cid).eq("is_active", true).order("name"),
+    ]);
+    const uid = company?.commission_director_user_id || null;
+    const u = uid ? (users || []).find(x => x.id === uid) : null;
+    res.json({
+      director_user_id: uid,
+      director_user_name: u ? (u.name || u.salesman_name || null) : null,
+      director_rate_pct: company?.commission_director_rate != null ? Number(company.commission_director_rate) : null,
+      users: (users || []).map(x => ({ id: x.id, name: x.name || x.salesman_name || "—" })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /director-commission-override  Body: { user_id, rate_pct }
+// user_id null/"" clears the director override. rate_pct sets the flexible %.
+app.put("/director-commission-override", requireRole(COMMISSION_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "No active company" });
+    const { user_id, rate_pct } = req.body || {};
+
+    const { data: company } = await supabase.from("companies").select("commission_director_user_id").eq("id", cid).maybeSingle();
+    if (!company) return res.status(404).json({ error: "Company not found" });
+    const prevUserId = company.commission_director_user_id || null;
+
+    if (!user_id) {
+      await supabase.from("companies").update({ commission_director_user_id: null, commission_director_rate: null }).eq("id", cid);
+    } else {
+      const { data: u } = await supabase.from("users").select("id, company_id").eq("id", user_id).maybeSingle();
+      if (!u || u.company_id !== cid) return res.status(400).json({ error: "Director must be a user in this company" });
+      const update = { commission_director_user_id: user_id };
+      if (rate_pct !== undefined && rate_pct !== null && rate_pct !== "") {
+        const r = Number(rate_pct);
+        if (!Number.isFinite(r) || r < 0 || r > 100) return res.status(400).json({ error: "rate_pct must be a number between 0 and 100" });
+        update.commission_director_rate = Math.round(r * 1000) / 1000;
+      }
+      await supabase.from("companies").update(update).eq("id", cid);
+    }
+
+    // Reassignment cleanup: if a different person used to be director, drop
+    // their unpaid director_override rows for this company's orders so a
+    // replaced director doesn't keep collecting. Paid rows are never touched.
+    if (prevUserId && prevUserId !== user_id) {
+      const { data: coOrders } = await supabase.from("orders").select("id").eq("company_id", cid);
+      const ids = (coOrders || []).map(o => o.id);
+      if (ids.length) {
+        await supabase.from("commissions").delete()
+          .eq("user_id", prevUserId).eq("role_name", "director_override").in("order_id", ids)
+          .is("paid_at", null).neq("status", "paid");
+      }
+    }
+
+    _commCache.ts = 0; // invalidate so calculateCommission picks up the change
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Product Bundles (Phase C) ───────────────────────────────────────────
 // A bundle carries its OWN price (package_price); adding one to a sales
 // order explodes it into normal sales_order_items rows server-side (see
@@ -5637,7 +5704,7 @@ async function getCommCache(companyId) {
     supabase.from("commission_rules").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("product_incentives").select("*").eq("company_id", companyId).eq("is_active", true),
     supabase.from("users").select("id, role, salesman_name, branch_id, override_commission_rate").eq("company_id", companyId).eq("is_active", true),
-    supabase.from("companies").select("clearance_commission_enabled").eq("id", companyId).maybeSingle(),
+    supabase.from("companies").select("clearance_commission_enabled, commission_director_user_id, commission_director_rate").eq("id", companyId).maybeSingle(),
     // Phase C — clearance/bundle kill switch data. Cheap (few bundles per
     // company) and reused across every order recalculated in this 30s window.
     supabase.from("product_bundles").select("*").eq("company_id", companyId).eq("is_active", true),
@@ -5667,6 +5734,10 @@ async function getCommCache(companyId) {
     bundles: bundlesRes.data || [],
     bundleItemsByBundle,
     branchOverrides,
+    // Company-wide director override (migration 066): one earner, all branches.
+    director: companyRes.data?.commission_director_user_id
+      ? { userId: companyRes.data.commission_director_user_id, rate: companyRes.data.commission_director_rate != null ? Number(companyRes.data.commission_director_rate) : 0 }
+      : null,
   };
   return _commCache;
 }
@@ -6105,6 +6176,38 @@ async function calculateCommission(orderId, companyId, opts = {}) {
       // Rate cleared — drop any stale, unpaid override row.
       await supabase.from("commissions").delete()
         .eq("order_id", orderId).eq("user_id", ovUser.id).eq("role_name", "branch_override")
+        .is("paid_at", null).neq("status", "paid");
+    }
+  }
+
+  // ── Director override earner (migration 066) ────────────────────
+  // One person earns a company-wide override on EVERY legit order across ALL
+  // branches, at a single flexible rate. A separate row (role_name
+  // 'director_override') so it stacks with salesman + branch_override.
+  const dir = cache.director;
+  if (dir?.userId) {
+    const dirUser = cache.users.find(u => u.id === dir.userId);
+    const dirRate = Number(dir.rate) || 0;
+    if (dirUser && dirRate > 0) {
+      const depositMet = depositPct >= 30;
+      const dirAmt = commissionLib.round2(net * (dirRate / 100));
+      const { data: existing } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", dirUser.id).eq("role_name", "director_override").maybeSingle();
+      if (!(existing && (existing.status === "paid" || existing.paid_at))) {
+        const commData = {
+          net_amount: net, rate_pct: dirRate, incentive_pct: 0,
+          commission_amt: dirAmt, deposit_met: depositMet,
+          status: depositMet ? "eligible" : "pending",
+          eligible_at: depositMet ? new Date().toISOString() : null,
+          payout_month: depositMet ? getPayoutMonth(commissionDate) : null,
+          tier_commission_amt: dirAmt,
+          clearance_commission_amt: 0, product_incentive_amt: 0, package_incentive_amt: 0,
+        };
+        if (existing) await supabase.from("commissions").update(commData).eq("id", existing.id);
+        else await supabase.from("commissions").insert({ order_id: orderId, user_id: dirUser.id, role_name: "director_override", company_id: companyId, ...commData });
+      }
+    } else if (dirUser && dirRate <= 0) {
+      await supabase.from("commissions").delete()
+        .eq("order_id", orderId).eq("user_id", dirUser.id).eq("role_name", "director_override")
         .is("paid_at", null).neq("status", "paid");
     }
   }
