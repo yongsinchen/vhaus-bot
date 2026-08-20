@@ -7188,13 +7188,20 @@ app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
 
 app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { status, description, assigned_to, due_date, delivery_date, service_date, schedule_tbc } = req.body;
+    const { status, description, assigned_to, due_date, delivery_date, service_date, schedule_tbc,
+            customer_name, customer_phone, customer_address, service_type, priority } = req.body;
     const updates = {};
     if (status !== undefined) updates.status = status;
-    if (description !== undefined) updates.description = description;
+    if (description !== undefined) { updates.description = description; updates.issue_description = description; }
     if (assigned_to !== undefined) updates.assigned_to = assigned_to;
     if (status === "closed") updates.closed_at = new Date().toISOString();
     if (service_date !== undefined) updates.service_date = service_date || null;
+    // Editable header fields (added so a created service case can be corrected).
+    if (customer_name !== undefined) updates.customer_name = customer_name || null;
+    if (customer_phone !== undefined) updates.customer_phone = customer_phone || null;
+    if (customer_address !== undefined) updates.customer_address = customer_address || null;
+    if (service_type !== undefined && [1, 2, 3, 4].includes(Number(service_type))) updates.service_type = Number(service_type);
+    if (priority !== undefined) updates.priority = priority || "normal";
 
     const tbcProvided = schedule_tbc !== undefined;
     const isTbc = schedule_tbc === true || schedule_tbc === "true";
@@ -7219,6 +7226,10 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
       if (orderDeliveryDate !== undefined) orderPatch.delivery_date = orderDeliveryDate;
       if (status === "cancelled") orderPatch.status = "Cancelled";
       else if (["closed", "resolved", "completed"].includes(status)) orderPatch.status = "Delivered";
+      // Keep the legacy order's customer fields in step with header edits.
+      if (customer_name !== undefined) orderPatch.customer_name = customer_name || null;
+      if (customer_phone !== undefined) orderPatch.contact = customer_phone || null;
+      if (customer_address !== undefined) orderPatch.address = customer_address || null;
       if (Object.keys(orderPatch).length > 0) await supabase.from("orders").update(orderPatch).eq("id", data.legacy_order_id);
     }
     res.json({ service: data });
