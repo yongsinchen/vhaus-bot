@@ -83,7 +83,13 @@ const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject resched
 // The frontend narrows short-term part-time further (order-create + own
 // commission only); the backend deliberately grants the same salesman ACCESS.
 const normalizeUserRole = (profile) => {
-  if (profile && (profile.role === "part_time" || profile.role === "short_term_part_time")) profile.role = "salesman";
+  if (!profile) return profile;
+  // Preserve the TRUE stored role before aliasing so downstream consumers (and
+  // the frontend, via /auth/profile) can still tell a short-term part-timer
+  // from a full salesman for UI narrowing. base_role is the un-aliased role for
+  // every user; role is what all authorization decisions use.
+  if (profile.base_role === undefined) profile.base_role = profile.role;
+  if (profile.role === "part_time" || profile.role === "short_term_part_time") profile.role = "salesman";
   return profile;
 };
 
@@ -4213,6 +4219,7 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
 
     res.json({
       ...user,
+      base_role: user.role,          // TRUE stored role (un-aliased) for UI narrowing (short_term_part_time vs salesman)
       companies: company,           // backward compat
       availableCompanies,            // backward compat format
       activeCompanyId,               // backward compat
