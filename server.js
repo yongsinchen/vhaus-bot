@@ -73,14 +73,17 @@ const supplierDO = createSupplierDOService({
 });
 const OPERATION_MANAGER_ID = "1725894161"; // Only OM can approve/reject reschedule requests
 
-// "Part-time" is a salesman-equivalent role. It stays a distinct STORED role
-// (users.role = 'part_time') for reporting and labeling, but for authorization
+// "Part-time" and "short-term part-time" are salesman-equivalent roles. Each
+// stays a distinct STORED role (users.role = 'part_time' / 'short_term_part_time')
+// for reporting, commission-rate scoping, and labeling, but for authorization
 // and every role-based decision it is treated exactly as a salesman. Aliasing
 // here — at the single auth-resolution point — means all downstream logic
 // (ORDER_ROLES, own-orders filters, commission, the permission engine) applies
 // the salesman rules without duplicating the alias across dozens of call sites.
+// The frontend narrows short-term part-time further (order-create + own
+// commission only); the backend deliberately grants the same salesman ACCESS.
 const normalizeUserRole = (profile) => {
-  if (profile && profile.role === "part_time") profile.role = "salesman";
+  if (profile && (profile.role === "part_time" || profile.role === "short_term_part_time")) profile.role = "salesman";
   return profile;
 };
 
@@ -676,6 +679,13 @@ function normalizeRoleKey(key) { return key ? key.toLowerCase() : null; }
 const ORDER_ROLES = ["master", "manager", "company_admin", "salesman", "sales_manager"];
 // Commission & product-incentive management — revenue-side managers only.
 const COMMISSION_ROLES = ["master", "manager", "sales_manager"];
+// Employment roles that earn a per-salesman commission row. The stored role is
+// kept distinct for rate scoping + labeling (a salesman, a part-timer, and a
+// short-term part-timer can each carry their own tier rules) even though all
+// three share salesman ACCESS via normalizeUserRole. Used everywhere the
+// commission engine reads/writes/purges a salesman-side row so update, insert,
+// and purge always target the same set.
+const SALES_COMMISSION_ROLES = ["salesman", "part_time", "short_term_part_time"];
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
 
 const requireAuth = async (req, res, next) => {
@@ -5970,13 +5980,13 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   for (const name of salesmanNames) {
     const salesUser = cache.users.find(u => u.salesman_name && u.salesman_name.toLowerCase() === name.toLowerCase());
     let matchRule = null;
-    // Part-time salesmen are commissioned by their OWN rules (role_name
-    // 'part_time'); everyone else uses the standard 'salesman' rules. This reads
-    // the user's stored account role, so it is deliberately independent of the
-    // auth-layer part_time→salesman alias: a part-timer keeps salesman ACCESS
-    // but earns a distinct commission rate. Falls back to 'salesman' when the
-    // name doesn't resolve to a user.
-    let empRole = salesUser && salesUser.role === "part_time" ? "part_time" : "salesman";
+    // Part-time and short-term part-time salesmen are commissioned by their OWN
+    // rules (role_name 'part_time' / 'short_term_part_time'); everyone else uses
+    // the standard 'salesman' rules. This reads the user's stored account role,
+    // so it is deliberately independent of the auth-layer →salesman alias: those
+    // roles keep salesman ACCESS but earn a distinct commission rate. Falls back
+    // to 'salesman' when the name doesn't resolve to a user.
+    let empRole = salesUser && SALES_COMMISSION_ROLES.includes(salesUser.role) ? salesUser.role : "salesman";
     if (salesUser) {
       // Tier matching aggregates a salesman's sales by the order's BUSINESS
       // month (order_date), matching how the payout month is bucketed
@@ -6053,7 +6063,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
 
     const packageIncentiveAmt = packageIncentiveShares[idx] || 0;
 
-    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).in("role_name", ["salesman", "part_time"]).maybeSingle();
+    const { data: existing, error: existingErr } = await supabase.from("commissions").select("id, status, paid_at").eq("order_id", orderId).eq("user_id", salesUser.id).in("role_name", SALES_COMMISSION_ROLES).maybeSingle();
     // Fail loudly rather than treating a failed read as "no commission exists" — that
     // would fall through to the insert below and duplicate the row on a financial table.
     if (existingErr) throw new Error(`could not read existing commission for order ${orderId} / user ${salesUser.id}: ${existingErr.message}`);
@@ -6068,7 +6078,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
     const totalComm = commissionLib.round2(tierCommissionAmt + clearanceCommissionAmt + productIncentiveAmt + packageIncentiveAmt);
 
     const commData = {
-      role_name: empRole, // 'salesman' or 'part_time' — keeps update+insert+purge consistent
+      role_name: empRole, // salesman / part_time / short_term_part_time — keeps update+insert+purge consistent
       net_amount: tierBase, rate_pct: matchRule.rate_pct, incentive_pct: incentiveAmt > 0 ? Math.round(incentiveAmt / net * 10000) / 100 : 0,
       commission_amt: totalComm, deposit_met: depositMet,
       status: depositMet ? "eligible" : "pending",
@@ -6221,11 +6231,12 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // salesman name simply doesn't match a user can't wipe its commissions.
   const keepSalesmanIds = resolved.map(r => r.salesUser?.id).filter(Boolean);
   if (keepSalesmanIds.length > 0) {
-    // Purge both salesman and part_time rows — a person's role can change
-    // (salesman ↔ part_time) between recalcs, so target both categories or a
-    // stale row under the old role_name would survive and double-pay.
+    // Purge every salesman-side role_name — a person's role can change
+    // (salesman ↔ part_time ↔ short_term_part_time) between recalcs, so target
+    // all categories or a stale row under the old role_name would survive and
+    // double-pay.
     const { error: purgeErr } = await supabase.from("commissions").delete()
-      .eq("order_id", orderId).in("role_name", ["salesman", "part_time"])
+      .eq("order_id", orderId).in("role_name", SALES_COMMISSION_ROLES)
       .is("paid_at", null).neq("status", "paid")
       .not("user_id", "in", `(${keepSalesmanIds.map(id => `"${id}"`).join(",")})`);
     if (purgeErr) console.error(`[calculateCommission] stale salesman purge failed for order ${orderId}:`, purgeErr.message);
