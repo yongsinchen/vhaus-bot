@@ -3712,19 +3712,19 @@ app.get("/branch-performance", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "No active company" });
     const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
-    const isMaster = roleKey === "master";
-    const allowed = ["master", "manager", "company_admin", "branch_manager"];
+    const allowed = ["master", "manager", "branch_manager"];
     if (!allowed.includes(roleKey)) return res.status(403).json({ error: "Not allowed to view branch performance" });
+    // Master + manager can view any branch; a branch manager only their own.
+    const canViewAll = roleKey === "master" || roleKey === "manager";
 
     const { data: branchRows } = await supabase.from("branches").select("id, name").eq("company_id", cid).order("name");
-    // Selectable branches: master → all; anyone else → only their own.
     const ownBranch = req.user.branch_id || null;
-    const selectable = isMaster ? (branchRows || []) : (branchRows || []).filter(b => b.id === ownBranch);
-    // Which branch to report on. Non-master is forced to their own branch.
-    let branchId = req.query.branch_id || (isMaster ? (selectable[0]?.id || null) : ownBranch);
-    if (!isMaster) branchId = ownBranch;
+    const selectable = canViewAll ? (branchRows || []) : (branchRows || []).filter(b => b.id === ownBranch);
+    // Which branch to report on. A branch manager is forced to their own branch.
+    let branchId = req.query.branch_id || (canViewAll ? (selectable[0]?.id || null) : ownBranch);
+    if (!canViewAll) branchId = ownBranch;
     if (!branchId) return res.status(400).json({ error: "No branch to report on" });
-    if (!isMaster && branchId !== ownBranch) return res.status(403).json({ error: "You can only view your own branch" });
+    if (!canViewAll && branchId !== ownBranch) return res.status(403).json({ error: "You can only view your own branch" });
     const branch = (branchRows || []).find(b => b.id === branchId) || { id: branchId, name: "Branch" };
 
     const today = new Date().toISOString().slice(0, 10);
@@ -3790,7 +3790,7 @@ app.get("/branch-performance", requireAuth, async (req, res) => {
     res.json({
       branch: { id: branch.id, name: branch.name },
       branches: selectable.map(b => ({ id: b.id, name: b.name })),
-      is_master: isMaster,
+      is_master: canViewAll,
       period: { from, to },
       metrics: {
         total_sales: round2(totalSales),
