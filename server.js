@@ -4945,8 +4945,10 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
     // anything else so the column stays clean; unspecified stays NULL (legacy).
     const paymentKind = kind === "deposit" || kind === "balance" ? kind : null;
     // The payment starts PENDING Finance approval (migration 065). The Official
-    // Receipt number is NOT assigned yet — it's minted when Finance approves, so
-    // OR numbers only exist for verified money and stay gap-free.
+    // Receipt number IS assigned now so the salesman can print the OR at
+    // collection; approval only governs whether the money counts toward
+    // balance/commission, not whether a receipt exists.
+    const orNumber = await nextOrNumber(cid);
     const { data: payment, error } = await supabase.from("payments").insert({
       order_id: order_id || (allocations?.[0]?.order_id) || null,
       customer_id: customer_id || null,
@@ -4954,7 +4956,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
       reference_no: reference_no || null, recorded_by: req.user.id,
       proof_url: proof_url || null,
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
-      kind: paymentKind, or_number: null, approval_status: "pending",
+      kind: paymentKind, or_number: orNumber, approval_status: "pending",
       company_id: cid,
     }).select().single();
     if (error) throw error;
