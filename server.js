@@ -12772,13 +12772,13 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
     const company_id = getActiveCompanyId(req);
     const { role, salesman_name } = req.user;
-    const { status, search, salesman, date_from, date_to, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
+    const { status, search, salesman, date_from, date_to, branch_id, month, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
     const lim = Math.min(Number(limit) || 50, 100);
     const pg = Math.max(Number(page) || 1, 1);
     const ascending = sort_order === "asc";
 
     // Lightweight columns — NO items, payment_proofs, customer_signature
-    const listCols = "id, company_id, order_number, customer_name, customer_contact, customer_id_type, customer_id_no, customer_email, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark";
+    const listCols = "id, company_id, order_number, customer_name, customer_contact, customer_id_type, customer_id_no, customer_email, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, order_date, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark";
 
     // Build count query + data query in parallel
     let countQ = supabase.from("sales_orders").select("id", { count: "exact", head: true }).eq("company_id", company_id);
@@ -12786,6 +12786,15 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
 
     // Apply filters to both queries
     if (status) { countQ = countQ.eq("status", status); dataQ = dataQ.eq("status", status); }
+    if (branch_id) { countQ = countQ.eq("branch_id", branch_id); dataQ = dataQ.eq("branch_id", branch_id); }
+    if (/^\d{4}-\d{2}$/.test(month || "")) {
+      // Filter by ORDER date month (order_date is TEXT YYYY-MM-DD; string range works).
+      const [y, mm] = month.split("-").map(Number);
+      const start = `${month}-01`;
+      const next = mm === 12 ? `${y + 1}-01-01` : `${y}-${String(mm + 1).padStart(2, "0")}-01`;
+      countQ = countQ.gte("order_date", start).lt("order_date", next);
+      dataQ = dataQ.gte("order_date", start).lt("order_date", next);
+    }
     if (search) {
       const filter = `order_number.ilike.%${search}%,customer_name.ilike.%${search}%,customer_contact.ilike.%${search}%`;
       countQ = countQ.or(filter); dataQ = dataQ.or(filter);
