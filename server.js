@@ -7194,6 +7194,18 @@ app.get("/service-cases", requireAuth, async (req, res) => {
         if (u) svc._assigned = u;
       }
     }
+    // Attach each case's legs + items (with arrival dates) so the list rows can
+    // show leg status and item arrival at a glance — batched to avoid N+1.
+    const svcIds = (data || []).map(s => s.id);
+    if (svcIds.length) {
+      const [{ data: allLegs }, { data: allItems }] = await Promise.all([
+        supabase.from("service_legs").select("id, service_id, leg_order, from_location, to_location, status, scheduled_at").in("service_id", svcIds).order("leg_order"),
+        supabase.from("service_items").select("id, service_id, item_no, description, action_type, status, arrival_date").in("service_id", svcIds).order("item_no"),
+      ]);
+      const legsBy = {}; for (const l of (allLegs || [])) (legsBy[l.service_id] ||= []).push(l);
+      const itemsBy = {}; for (const it of (allItems || [])) (itemsBy[it.service_id] ||= []).push(it);
+      for (const svc of (data || [])) { svc._legs = legsBy[svc.id] || []; svc._items = itemsBy[svc.id] || []; }
+    }
     // Salesman role: only show services linked to their orders
     let result = data || [];
     if (req.user.role === "salesman" && req.user.salesman_name) {
