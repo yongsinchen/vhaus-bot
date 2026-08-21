@@ -7353,6 +7353,18 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     else if (newDate !== undefined) { updates.due_date = newDate || null; orderDeliveryDate = newDate || null; }
     else if (tbcProvided) { updates.due_date = null; orderDeliveryDate = null; } // TBC toggled off, no date → unscheduled
 
+    // Auto status transition on (un)scheduling — only when the caller didn't set
+    // status explicitly. Setting a concrete date moves an 'open' case to
+    // 'scheduled' (so it leaves the Open tab for the Scheduled list); clearing
+    // the date (blank or TBC) moves a still-'scheduled' case back to 'open'.
+    // Cases already further along (in_progress / resolved / closed) are left as-is.
+    if (status === undefined && (newDate !== undefined || tbcProvided)) {
+      const { data: cur } = await supabase.from("services").select("status").eq("id", req.params.id).maybeSingle();
+      const hasRealDate = !isTbc && newDate !== undefined && !!newDate;
+      if (hasRealDate && cur?.status === "open") updates.status = "scheduled";
+      else if (!hasRealDate && cur?.status === "scheduled") updates.status = "open";
+    }
+
     const { data, error } = await supabase.from("services").update(updates).eq("id", req.params.id).select().single();
     if (error) throw error;
 
