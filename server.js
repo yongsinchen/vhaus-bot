@@ -7199,7 +7199,7 @@ app.get("/service-cases", requireAuth, async (req, res) => {
     const svcIds = (data || []).map(s => s.id);
     if (svcIds.length) {
       const [{ data: allLegs }, { data: allItems }] = await Promise.all([
-        supabase.from("service_legs").select("id, service_id, leg_order, from_location, to_location, status, scheduled_at").in("service_id", svcIds).order("leg_order"),
+        supabase.from("service_legs").select("id, service_id, leg_order, from_location, to_location, status, scheduled_at, scheduled_date").in("service_id", svcIds).order("leg_order"),
         supabase.from("service_items").select("id, service_id, item_no, description, action_type, status, arrival_date").in("service_id", svcIds).order("item_no"),
       ]);
       const legsBy = {}; for (const l of (allLegs || [])) (legsBy[l.service_id] ||= []).push(l);
@@ -7248,7 +7248,7 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
 app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date, service_date, schedule_tbc } = req.body;
-    if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange, 4=delivery)" });
+    if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange, 4=delivery missing item, 5=delivery)" });
     const svcType = Number(service_type);
     const companyId = getActiveCompanyId(req);
     // The schedule date the delivery route reads lives on orders.delivery_date
@@ -7337,7 +7337,7 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     if (customer_name !== undefined) updates.customer_name = customer_name || null;
     if (customer_phone !== undefined) updates.customer_phone = customer_phone || null;
     if (customer_address !== undefined) updates.customer_address = customer_address || null;
-    if (service_type !== undefined && [1, 2, 3, 4].includes(Number(service_type))) updates.service_type = Number(service_type);
+    if (service_type !== undefined && [1, 2, 3, 4, 5].includes(Number(service_type))) updates.service_type = Number(service_type);
     if (priority !== undefined) updates.priority = priority || "normal";
 
     const tbcProvided = schedule_tbc !== undefined;
