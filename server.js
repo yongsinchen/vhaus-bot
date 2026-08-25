@@ -12679,29 +12679,44 @@ async function nextOrderNumber(company_id, branch_id) {
   // add 1; a branch with no prefix falls through to the dated SO number below.
   if (branch_id) {
     const { data: branch } = await supabase.from("branches")
-      .select("order_number_prefix, order_number_start").eq("id", branch_id).maybeSingle();
+      .select("order_number_prefix, order_number_start, order_number_next").eq("id", branch_id).maybeSingle();
     const prefix = (branch?.order_number_prefix || "").trim();
     if (prefix) {
-      const { data: rows } = await supabase.from("sales_orders")
-        .select("order_number").eq("company_id", company_id).eq("branch_id", branch_id)
-        .like("order_number", `${prefix}%`);
-      const re = new RegExp(`^${prefix}\\d+$`);
-      let max = 0;
-      for (const r of rows || []) {
-        const s = String(r.order_number || "").trim();
-        if (re.test(s)) { const n = parseInt(s, 10); if (n > max) max = n; }
+      let next;
+      if (branch?.order_number_next != null) {
+        // Anchored series: continue from the pinned "next" value, filling upward
+        // and skipping any number already taken (so it climbs past a higher
+        // legacy block without duplicating a real order). Ignores max() on
+        // purpose — this is how a branch resumes a LOWER series while a higher
+        // block exists. See migration 070.
+        next = Number(branch.order_number_next);
+      } else {
+        const { data: rows } = await supabase.from("sales_orders")
+          .select("order_number").eq("company_id", company_id).eq("branch_id", branch_id)
+          .like("order_number", `${prefix}%`);
+        const re = new RegExp(`^${prefix}\\d+$`);
+        let max = 0;
+        for (const r of rows || []) {
+          const s = String(r.order_number || "").trim();
+          if (re.test(s)) { const n = parseInt(s, 10); if (n > max) max = n; }
+        }
+        // Explicit start wins (supports 6-digit bands); else pad prefix to 5.
+        const base = branch?.order_number_start != null
+          ? Number(branch.order_number_start)
+          : Number(prefix.padEnd(5, "0")); // "11" → 11000, "3" → 30000
+        next = Math.max(max, base - 1) + 1;
       }
-      // Explicit start wins (supports 6-digit bands); else pad prefix to 5.
-      const base = branch?.order_number_start != null
-        ? Number(branch.order_number_start)
-        : Number(prefix.padEnd(5, "0")); // "11" → 11000, "3" → 30000
-      let next = Math.max(max, base - 1) + 1;
       // Guarantee company-wide uniqueness — skip any number already taken.
       for (let i = 0; i < 10000; i++) {
         const { data: dup } = await supabase.from("sales_orders")
           .select("id").eq("company_id", company_id).eq("order_number", String(next)).maybeSingle();
         if (!dup) break;
         next++;
+      }
+      // Advance the anchor so the next call starts near the right place (keeps
+      // the skip-loop O(1) instead of rescanning from the anchor every time).
+      if (branch?.order_number_next != null) {
+        await supabase.from("branches").update({ order_number_next: next + 1 }).eq("id", branch_id);
       }
       return String(next);
     }
