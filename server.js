@@ -11434,8 +11434,11 @@ app.get("/products", requireAuth, async (req, res) => {
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
     // Token search: every whitespace-separated token must match code, name,
-    // size, color or the supplier name — see lib/product-search.js.
-    query = await productSearch.applyProductSearch(query, { supabase, companyId: cid, search });
+    // size, color or the supplier name — see lib/product-search.js. Resolve the
+    // filters first, then apply them; awaiting anything that returns the query
+    // builder would execute it here and break every filter chained below.
+    const searchFilters = await productSearch.buildProductSearchFilters({ supabase, companyId: cid, search });
+    query = productSearch.applyFilters(query, searchFilters);
     if (supplier_id) query = query.eq("supplier_id", supplier_id);
     // org_supplier_id: filter by org master — resolve to this company's supplier row(s)
     // first, then filter products by those ids. Used by catalogue-group companies whose

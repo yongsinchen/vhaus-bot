@@ -24,9 +24,19 @@ function check(label, actual, expected) {
 }
 
 // Records every .or() applied, so we can assert the AND-of-OR-groups shape.
+//
+// Deliberately THENABLE, like a real PostgrestFilterBuilder: that is what makes
+// `await`ing anything which returns a builder execute the query early. A fake
+// without .then() silently passes code that breaks in production.
 function fakeQuery() {
   const ors = [];
-  const q = { ors, or(f) { ors.push(f); return q; } };
+  const q = {
+    ors,
+    executed: false,
+    or(f) { ors.push(f); return q; },
+    eq() { return q; },
+    then(res, rej) { q.executed = true; return Promise.resolve({ data: [], error: null }).then(res, rej); },
+  };
   return q;
 }
 
@@ -51,6 +61,18 @@ function fakeSupabase(supplierRows = [], orgSupplierRows = []) {
       return b;
     },
   };
+}
+
+// Exactly what GET /products does: resolve filters (async, hits the DB for
+// supplier names), then chain them onto the builder (sync).
+//
+// Returns the builder WRAPPED in an object. Returning it bare would put this
+// helper straight back into the bug it exists to guard against — an async
+// function resolving to a thenable builder executes the query and yields a
+// response instead. Callers use `.query`.
+async function runSearch({ supabase, companyId, search }) {
+  const filters = await PS.buildProductSearchFilters({ supabase, companyId, search });
+  return { query: PS.applyFilters(fakeQuery(), filters) };
 }
 
 console.log("\ntokenizeSearch");
@@ -78,29 +100,48 @@ check("custom column list",
   "code.ilike.%x%,name.ilike.%x%");
 
 (async () => {
-  console.log("\napplyProductSearch — one OR group per token (AND-combined by PostgREST)");
+  console.log("\nproduct search — one OR group per token (AND-combined by PostgREST)");
 
-  let q = await PS.applyProductSearch(fakeQuery(), { supabase: fakeSupabase(), companyId: "c1", search: "ta207" });
+  let q = (await runSearch({ supabase: fakeSupabase(), companyId: "c1", search: "ta207" })).query;
   check("'ta207' → 1 group", q.ors.length, 1);
   check("'ta207' group", q.ors[0], "code.ilike.%ta207%,name.ilike.%ta207%,size.ilike.%ta207%,color.ilike.%ta207%");
 
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: fakeSupabase(), companyId: "c1", search: "ta207 divan" });
+  q = (await runSearch({ supabase: fakeSupabase(), companyId: "c1", search: "ta207 divan" })).query;
   check("'ta207 divan' → 2 groups", q.ors.length, 2);
   check("'ta207 divan' second group", q.ors[1], "code.ilike.%divan%,name.ilike.%divan%,size.ilike.%divan%,color.ilike.%divan%");
 
-  const reversed = await PS.applyProductSearch(fakeQuery(), { supabase: fakeSupabase(), companyId: "c1", search: "divan ta207" });
+  const reversed = (await runSearch({ supabase: fakeSupabase(), companyId: "c1", search: "divan ta207" })).query;
   check("token order does not change the group set", [...reversed.ors].sort(), [...q.ors].sort());
 
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: fakeSupabase(), companyId: "c1", search: "ta207 divan queen" });
+  q = (await runSearch({ supabase: fakeSupabase(), companyId: "c1", search: "ta207 divan queen" })).query;
   check("'ta207 divan queen' → 3 groups", q.ors.length, 3);
   check("queen group present",
     q.ors.includes("code.ilike.%queen%,name.ilike.%queen%,size.ilike.%queen%,color.ilike.%queen%"), true);
 
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: fakeSupabase(), companyId: "c1", search: "divanta207" });
+  q = (await runSearch({ supabase: fakeSupabase(), companyId: "c1", search: "divanta207" })).query;
   check("run-on query → 1 literal group", q.ors, ["code.ilike.%divanta207%,name.ilike.%divanta207%,size.ilike.%divanta207%,color.ilike.%divanta207%"]);
 
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: fakeSupabase(), companyId: "c1", search: "" });
+  q = (await runSearch({ supabase: fakeSupabase(), companyId: "c1", search: "" })).query;
   check("empty search adds no filter", q.ors, []);
+
+  // ── Regression: the order item picker went blank ──────────────────────────
+  // The search step must never execute the query or hand back anything but a
+  // builder. It used to be an async function returning the builder, and since a
+  // PostgrestFilterBuilder is thenable, awaiting it fired the query and returned
+  // a response object — so the very next `.eq("is_active", true)` in the route
+  // threw and the picker showed "no item found".
+  console.log("\nregression — search must not execute the query or lose the builder");
+  for (const [label, search] of [["empty search", ""], ["one token", "ta207"], ["three tokens", "ta207 divan queen"]]) {
+    const built = (await runSearch({ supabase: fakeSupabase(), companyId: "c1", search })).query;
+    check(`${label}: query not executed`, built.executed, false);
+    check(`${label}: still a chainable builder`, typeof built.eq === "function" && typeof built.or === "function", true);
+    // The route chains is_active / supplier_id / category_id after the search;
+    // this is the exact call that used to throw.
+    check(`${label}: route can still chain .eq() afterwards`, built.eq("is_active", true) === built, true);
+  }
+  check("buildProductSearchFilters returns plain strings, never a builder",
+    (await PS.buildProductSearchFilters({ supabase: fakeSupabase(), companyId: "c1", search: "ta207 divan" }))
+      .every(f => typeof f === "string"), true);
 
   console.log("\ntokenMatcher — in-memory bucketing mirrors ilike");
   check("plain substring, case-insensitive", PS.tokenMatcher("taf").test("TAF Furniture"), true);
@@ -111,11 +152,11 @@ check("custom column list",
   check("regex specials treated literally", PS.tokenMatcher("a.c").test("abc"), false);
   check("regex specials matched literally", PS.tokenMatcher("a.c").test("a.c"), true);
 
-  console.log("\napplyProductSearch — supplier token");
+  console.log("\nproduct search — supplier token");
   const sb = fakeSupabase(
     [{ id: "sup-1", name: "TAF Furniture", organization_supplier_id: "org-1" }],
     [{ id: "org-1", name: "TAF Furniture Sdn Bhd" }]);
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: sb, companyId: "c1", search: "taf ta207" });
+  q = (await runSearch({ supabase: sb, companyId: "c1", search: "taf ta207" })).query;
   check("supplier ids fold into that token's OR group",
     q.ors[0], "code.ilike.%taf%,name.ilike.%taf%,size.ilike.%taf%,color.ilike.%taf%,supplier_id.in.(sup-1)");
   check("the non-supplier token keeps a plain column group",
@@ -131,24 +172,24 @@ check("custom column list",
   const mixed = fakeSupabase(
     [{ id: "sup-taf", name: "TAF Furniture", organization_supplier_id: null },
      { id: "sup-good", name: "Goodnite", organization_supplier_id: null }], []);
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: mixed, companyId: "c1", search: "taf" });
+  q = (await runSearch({ supabase: mixed, companyId: "c1", search: "taf" })).query;
   check("over-broad fetch is bucketed back down to the matching row",
     q.ors[0], "code.ilike.%taf%,name.ilike.%taf%,size.ilike.%taf%,color.ilike.%taf%,supplier_id.in.(sup-taf)");
 
   const viaOrg = fakeSupabase(
     [{ id: "sup-1", name: "Local Row", organization_supplier_id: "org-1" }],
     [{ id: "org-1", name: "TAF Furniture Sdn Bhd" }]);
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: viaOrg, companyId: "c1", search: "taf" });
+  q = (await runSearch({ supabase: viaOrg, companyId: "c1", search: "taf" })).query;
   check("matches a propagated row whose org master name matches",
     q.ors[0].endsWith("supplier_id.in.(sup-1)"), true);
 
   const noOrg = fakeSupabase([{ id: "sup-1", name: "TAF", organization_supplier_id: null }], []);
-  await PS.applyProductSearch(fakeQuery(), { supabase: noOrg, companyId: "c1", search: "taf" });
+  await runSearch({ supabase: noOrg, companyId: "c1", search: "taf" });
   check("no org supplier match → name-only supplier filter",
     noOrg.calls.find(c => c.table === "suppliers").or, "name.ilike.%taf%");
 
   const shortTok = fakeSupabase([{ id: "sup-1", name: "A Supplier", organization_supplier_id: null }], []);
-  q = await PS.applyProductSearch(fakeQuery(), { supabase: shortTok, companyId: "c1", search: "a" });
+  q = (await runSearch({ supabase: shortTok, companyId: "c1", search: "a" })).query;
   check("1-char token skips supplier resolution entirely", shortTok.calls.length, 0);
   check("1-char token still filters on columns",
     q.ors, ["code.ilike.%a%,name.ilike.%a%,size.ilike.%a%,color.ilike.%a%"]);
