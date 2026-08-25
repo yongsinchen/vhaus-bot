@@ -3183,6 +3183,7 @@ Use this exact structure:
 {
 "doNumber": "",
 "supplier": "",
+"billTo": "",
 "doDate": "YYYY-MM-DD",
 "supplierReference": "",
 "items": [
@@ -3212,6 +3213,15 @@ supplier
   * KING KOIL
   * SONNO
   * XYZ FURNITURE SDN BHD
+
+billTo
+
+* The "Bill To" / "Sold To" / "Deliver To" / "Customer" company on the DO — this
+  is OUR company that the supplier is billing (NOT the supplier).
+* It is usually a "V Haus" / "Vhaus" / "Mattressco" style Sdn Bhd, e.g.
+  "V HAUS LIVING (PG) SDN BHD", "VHAUS LIVING SDN BHD", "MATTRESSCO SDN BHD".
+* Return the full recipient company name exactly as printed. Empty string if
+  you truly cannot find a bill-to / deliver-to company.
 
 doNumber
 
@@ -7665,6 +7675,25 @@ app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, re
 // Plus list/detail reads over supplier_deliveries + do_review.
 const SUPPLIER_DO_ROLES = ["master", "manager", "company_admin", "salesman"];
 
+// Normalize a company name for bill-to matching: lowercase, strip punctuation
+// and the Sdn Bhd suffix, collapse spacing — so "V HAUS LIVING (PG) SDN BHD"
+// and "Vhaus Living (PG) Sdn Bhd" both squash to "vhauslivingpg".
+const squashCoName = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "").replace(/sdnbhd|sdn|bhd/g, "");
+// Resolve a supplier DO's extracted "Bill To" text to one of the user's
+// accessible companies. Requires the company's full squashed name to appear in
+// the bill-to text and prefers the LONGEST match, so "vhauslivingpg" resolves to
+// "Vhaus Living (PG)" rather than plain "Vhaus Living". Returns null if unsure.
+const matchBillToCompany = (billTo, companies) => {
+  const t = squashCoName(billTo);
+  if (t.length < 4) return null;
+  let best = null, bestLen = 0;
+  for (const c of companies || []) {
+    const cn = squashCoName(c.companyName || c.name);
+    if (cn.length >= 4 && t.includes(cn) && cn.length > bestLen) { bestLen = cn.length; best = c; }
+  }
+  return best ? { companyId: best.companyId || best.id, companyName: best.companyName || best.name } : null;
+};
+
 // GET /supplier-dos — company-scoped list
 app.get("/supplier-dos", requireAuth, async (req, res) => {
   const { supplier, from_date, to_date, status, source, limit = 100 } = req.query;
@@ -7702,14 +7731,26 @@ app.post("/supplier-dos/upload", requireRole(SUPPLIER_DO_ROLES), upload.single("
     }
 
     const cid = getActiveCompanyId(req);
+    // Resolve which of OUR companies this DO is billed to (from the OCR "Bill To")
+    // and attribute the DO there instead of the uploader's active company. Match
+    // only among companies this user can access; fall back to the active company.
+    let companies = [];
+    try {
+      const eng = await permEngine.getUserCompanies(req.user.id);
+      companies = (eng || []).map(c => ({ companyId: c.companyId || c.id, companyName: c.companyName || c.name }));
+    } catch { /* fall back to active company only */ }
+    const billMatch = matchBillToCompany(doData.billTo, companies);
+    const targetCid = billMatch?.companyId || cid;
+
     const photoUrl = await supplierDO.storeDOPhoto(base64Image, doData.supplier);
-    const items = await supplierDO.previewMatch({ items: doData.items, companyId: cid });
+    // Match items against the RESOLVED company's sales orders.
+    const items = await supplierDO.previewMatch({ items: doData.items, companyId: targetCid });
 
     // Non-blocking duplicate warning — the confirm step enforces it
     let duplicateOf = null;
     if (doData.doNumber) {
       let dupQ = supabase.from("supplier_deliveries").select("id, do_number, supplier, created_at").eq("do_number", doData.doNumber).limit(1);
-      if (cid) dupQ = dupQ.eq("company_id", cid);
+      if (targetCid) dupQ = dupQ.eq("company_id", targetCid);
       const { data: existing } = await dupQ;
       if (existing?.length) duplicateOf = existing[0];
     }
@@ -7718,7 +7759,11 @@ app.post("/supplier-dos/upload", requireRole(SUPPLIER_DO_ROLES), upload.single("
       header: {
         do_number: doData.doNumber || "", supplier: doData.supplier || "",
         do_date: doData.doDate || "", supplier_reference: doData.supplierReference || "",
+        bill_to: doData.billTo || "",
+        company_id: targetCid || "",
+        bill_to_company_name: billMatch?.companyName || "",
       },
+      companies, // accessible companies, so the user can confirm/override the bill-to
       photo_url: photoUrl, items, duplicate_of: duplicateOf,
     });
   } catch (err) { console.error("supplier-dos/upload error:", err); res.status(500).json({ error: err.message }); }
@@ -7742,6 +7787,22 @@ app.post("/supplier-dos", requireRole(SUPPLIER_DO_ROLES), async (req, res) => {
     const { header = {}, photo_url = null, items, allow_duplicate = false } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items array required" });
 
+    // Bill-to company: the confirmed company this DO belongs to. Validate it is
+    // one the user can actually access before trusting the client value; else
+    // fall back to the active company.
+    const activeCid = getActiveCompanyId(req);
+    let targetCid = activeCid;
+    const requestedCid = header.company_id || req.body.company_id || null;
+    if (requestedCid && requestedCid !== activeCid) {
+      try {
+        const eng = await permEngine.getUserCompanies(req.user.id);
+        const ok = (eng || []).some(c => (c.companyId || c.id) === requestedCid);
+        if (ok) targetCid = requestedCid;
+      } catch { /* keep active company */ }
+    } else if (requestedCid) {
+      targetCid = requestedCid;
+    }
+
     let outcome;
     try {
       outcome = await supplierDO.processSupplierDOUpload({
@@ -7754,7 +7815,7 @@ app.post("/supplier-dos", requireRole(SUPPLIER_DO_ROLES), async (req, res) => {
           items,
         },
         uploadedBy: req.user?.id || null,
-        companyId: getActiveCompanyId(req),
+        companyId: targetCid,
         branchId: req.body.branch_id || null,
         photoUrl: photo_url,
         rejectDuplicate: !allow_duplicate,
