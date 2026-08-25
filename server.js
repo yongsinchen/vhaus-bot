@@ -12692,6 +12692,18 @@ async function nextOrderNumber(company_id, branch_id) {
       .select("order_number_prefix, order_number_start, order_number_next").eq("id", branch_id).maybeSingle();
     const prefix = (branch?.order_number_prefix || "").trim();
     if (prefix) {
+      // Always read the band's existing numbers — needed for the highest value
+      // AND the display width, so a zero-padded band (e.g. Mutiara Rini "03278")
+      // keeps its leading zeros instead of collapsing to "3279".
+      const { data: rows } = await supabase.from("sales_orders")
+        .select("order_number").eq("company_id", company_id).eq("branch_id", branch_id)
+        .like("order_number", `${prefix}%`);
+      const re = new RegExp(`^${prefix}\\d+$`);
+      let max = 0, width = 0;
+      for (const r of rows || []) {
+        const s = String(r.order_number || "").trim();
+        if (re.test(s)) { const n = parseInt(s, 10); if (n > max) max = n; if (s.length > width) width = s.length; }
+      }
       let next;
       if (branch?.order_number_next != null) {
         // Anchored series: continue from the pinned "next" value, filling upward
@@ -12701,25 +12713,19 @@ async function nextOrderNumber(company_id, branch_id) {
         // block exists. See migration 070.
         next = Number(branch.order_number_next);
       } else {
-        const { data: rows } = await supabase.from("sales_orders")
-          .select("order_number").eq("company_id", company_id).eq("branch_id", branch_id)
-          .like("order_number", `${prefix}%`);
-        const re = new RegExp(`^${prefix}\\d+$`);
-        let max = 0;
-        for (const r of rows || []) {
-          const s = String(r.order_number || "").trim();
-          if (re.test(s)) { const n = parseInt(s, 10); if (n > max) max = n; }
-        }
         // Explicit start wins (supports 6-digit bands); else pad prefix to 5.
         const base = branch?.order_number_start != null
           ? Number(branch.order_number_start)
           : Number(prefix.padEnd(5, "0")); // "11" → 11000, "3" → 30000
         next = Math.max(max, base - 1) + 1;
       }
+      // Zero-pad to the band's established width (never truncates a longer
+      // number). Preserves leading-zero formats like "03279".
+      const fmt = (n) => String(n).padStart(width, "0");
       // Guarantee company-wide uniqueness — skip any number already taken.
       for (let i = 0; i < 10000; i++) {
         const { data: dup } = await supabase.from("sales_orders")
-          .select("id").eq("company_id", company_id).eq("order_number", String(next)).maybeSingle();
+          .select("id").eq("company_id", company_id).eq("order_number", fmt(next)).maybeSingle();
         if (!dup) break;
         next++;
       }
@@ -12728,7 +12734,7 @@ async function nextOrderNumber(company_id, branch_id) {
       if (branch?.order_number_next != null) {
         await supabase.from("branches").update({ order_number_next: next + 1 }).eq("id", branch_id);
       }
-      return String(next);
+      return fmt(next);
     }
   }
 
