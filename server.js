@@ -7293,83 +7293,168 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Create a full service case (services + legs + inert order + items), the exact
+// flow POST /service-cases uses. Extracted so the service-request approval path
+// can create an identical case on approval. `actorUser` is the creator whose
+// name seeds a standalone service's salesman. Throws on failure.
+async function createServiceCaseFull({ companyId, actorUser, body }) {
+  const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date, service_date, schedule_tbc } = body;
+  const svcType = Number(service_type);
+  const isTbc = schedule_tbc === true || schedule_tbc === "true";
+  const scheduleDate = isTbc ? null : (delivery_date || due_date || null);
+
+  let custName = customer_name, custPhone = customer_phone, custAddr = customer_address, sourceSoNumber = null;
+  if (order_id) {
+    const { data: o } = await supabase.from("orders")
+      .select("id, so_number, customer_name, contact, address")
+      .eq("id", order_id).maybeSingle();
+    if (o) {
+      sourceSoNumber = o.so_number || null;
+      if (!custName) { custName = o.customer_name; custPhone = o.contact; custAddr = o.address; }
+    }
+  }
+
+  const { data: result, error } = await supabase.rpc("create_service_case", {
+    p_company_id: companyId, p_service_type: svcType, p_created_by: actorUser.id,
+    p_order_id: order_id || null, p_description: description || null,
+    p_assigned_to: assigned_to || null,
+    p_customer_name: custName || null, p_customer_phone: custPhone || null, p_customer_address: custAddr || null,
+    p_priority: priority || "normal", p_schedule_date: scheduleDate,
+    p_source_so_number: sourceSoNumber,
+  });
+  if (error) throw error;
+
+  const svcPatch = {};
+  if (service_date) svcPatch.service_date = service_date;
+  if (isTbc) svcPatch.schedule_tbc = true;
+  if (Object.keys(svcPatch).length) {
+    const { data: upd } = await supabase.from("services").update(svcPatch).eq("id", result.service.id).select().single();
+    if (upd) result.service = upd;
+  }
+  if (isTbc && result.order?.id) {
+    await supabase.from("orders").update({ delivery_date: "TBC" }).eq("id", result.order.id);
+    if (result.order) result.order.delivery_date = "TBC";
+  }
+  if (!order_id && result.order?.id) {
+    const creatorSalesman = actorUser.salesman_name || actorUser.name || null;
+    if (creatorSalesman) {
+      await supabase.from("orders").update({ salesman: creatorSalesman }).eq("id", result.order.id);
+      result.order.salesman = creatorSalesman;
+    }
+  }
+  let createdItems = [];
+  try {
+    createdItems = await insertServiceItems(result.service.id, companyId, body.items);
+    if (createdItems.length > 0) await syncServiceItemsToOrder(result.service.id);
+  } catch (e) { console.error("service items create error:", e.message); }
+  return { service: result.service, legs: result.legs, order: result.order, items: createdItems };
+}
+
 app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
-    const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date, service_date, schedule_tbc } = req.body;
+    const { service_type } = req.body;
     if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange, 4=delivery missing item, 5=delivery)" });
-    const svcType = Number(service_type);
     const companyId = getActiveCompanyId(req);
-    // The schedule date the delivery route reads lives on orders.delivery_date
-    // (a TEXT column compared as a string by GET /delivery/unassigned). Accept
-    // whichever field the client sends and keep the same value everywhere.
-    // TBC = deliberately unscheduled: create undated, then stamp the legacy order
-    // delivery_date = 'TBC' so it stays OUT of the unassigned pool.
-    const isTbc = schedule_tbc === true || schedule_tbc === "true";
-    const scheduleDate = isTbc ? null : (delivery_date || due_date || null);
-
-    // Auto-fill customer info + source SO number from the linked order.
-    let custName = customer_name, custPhone = customer_phone, custAddr = customer_address, sourceSoNumber = null;
-    if (order_id) {
-      const { data: o } = await supabase.from("orders")
-        .select("id, so_number, customer_name, contact, address")
-        .eq("id", order_id).maybeSingle();
-      if (o) {
-        sourceSoNumber = o.so_number || null;
-        if (!custName) { custName = o.customer_name; custPhone = o.contact; custAddr = o.address; }
-      }
-    }
-
-    // Atomic: services + legs + inert legacy order + link, all-or-nothing (RPC).
-    const { data: result, error } = await supabase.rpc("create_service_case", {
-      p_company_id: companyId, p_service_type: svcType, p_created_by: req.user.id,
-      p_order_id: order_id || null, p_description: description || null,
-      p_assigned_to: assigned_to || null,
-      p_customer_name: custName || null, p_customer_phone: custPhone || null, p_customer_address: custAddr || null,
-      p_priority: priority || "normal", p_schedule_date: scheduleDate,
-      p_source_so_number: sourceSoNumber,
-    });
-    if (error) throw error;
-
-    // Persist the extra fields the RPC doesn't take (keeps the RPC untouched):
-    // service_date (creation date) and schedule_tbc. For TBC, stamp the linked
-    // legacy order delivery_date = 'TBC' so it stays out of the unassigned pool.
-    const svcPatch = {};
-    if (service_date) svcPatch.service_date = service_date;
-    if (isTbc) svcPatch.schedule_tbc = true;
-    if (Object.keys(svcPatch).length) {
-      const { data: upd } = await supabase.from("services").update(svcPatch).eq("id", result.service.id).select().single();
-      if (upd) result.service = upd;
-    }
-    if (isTbc && result.order?.id) {
-      await supabase.from("orders").update({ delivery_date: "TBC" }).eq("id", result.order.id);
-      if (result.order) result.order.delivery_date = "TBC";
-    }
-
-    // Bug 3: a standalone service (no linked SO to inherit a salesman from)
-    // defaults its salesman to the creator, stored on the inert legacy order
-    // so the service list enrichment — which reads salesman off the order —
-    // can display it. Linked services keep inheriting the source SO's salesman.
-    if (!order_id && result.order?.id) {
-      const creatorSalesman = req.user.salesman_name || req.user.name || null;
-      if (creatorSalesman) {
-        await supabase.from("orders").update({ salesman: creatorSalesman }).eq("id", result.order.id);
-        result.order.salesman = creatorSalesman;
-      }
-    }
-
-    // Line items (optional): each carries its own action + status. Stored on
-    // service_items and mirrored into the inert order's items JSON so they show
-    // on the delivery board / printed schedule. Non-fatal — a bad items payload
-    // must not sink an otherwise-created case.
-    let createdItems = [];
-    try {
-      createdItems = await insertServiceItems(result.service.id, companyId, req.body.items);
-      if (createdItems.length > 0) await syncServiceItemsToOrder(result.service.id);
-    } catch (e) { console.error("service items create error:", e.message); }
-
-    res.status(201).json({ service: result.service, legs: result.legs, order: result.order, items: createdItems });
+    const result = await createServiceCaseFull({ companyId, actorUser: req.user, body: req.body });
+    return res.status(201).json(result);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// ══════════════════════════════════════════════════════════════════
+// Service approval requests (migration 071) — salesmen submit; a PIC
+// (same set as delivery-date approvers) approves/rejects. Nothing takes
+// effect until approval, when the real service case is created.
+// ══════════════════════════════════════════════════════════════════
+// POST /service-requests — salesman (or anyone order-capable) submits a request.
+app.post("/service-requests", requireRole(ORDER_ROLES), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const { order_id, service_type, description, customer_name, customer_phone, customer_address,
+            service_date, delivery_date, schedule_tbc, items } = req.body || {};
+    if (!service_type) return res.status(400).json({ error: "service_type required" });
+    // Pull the source SO number + customer defaults from the linked order.
+    let soNumber = null, cName = customer_name, cPhone = customer_phone, cAddr = customer_address;
+    if (order_id) {
+      const { data: o } = await supabase.from("orders").select("so_number, customer_name, contact, address").eq("id", order_id).maybeSingle();
+      if (o) { soNumber = o.so_number || null; if (!cName) { cName = o.customer_name; cPhone = o.contact; cAddr = o.address; } }
+    }
+    const { data, error } = await supabase.from("service_requests").insert({
+      company_id: companyId, branch_id: req.user.branch_id || null,
+      status: "pending", service_type: Number(service_type),
+      order_id: order_id || null, so_number: soNumber,
+      customer_name: cName || null, customer_phone: cPhone || null, customer_address: cAddr || null,
+      description: description || null,
+      service_date: service_date || null, delivery_date: delivery_date || null,
+      schedule_tbc: schedule_tbc === true || schedule_tbc === "true",
+      items: Array.isArray(items) ? items : [],
+      requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null,
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ request: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /service-requests — approvers see the company queue; salesmen see their own.
+app.get("/service-requests", requireAuth, async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    const approver = isDateApprover(req);
+    let q = supabase.from("service_requests").select("*").order("created_at", { ascending: false }).limit(300);
+    if (companyId) q = q.eq("company_id", companyId);
+    if (!approver) q = q.eq("requested_by", req.user.id); // salesman: own requests only
+    if (req.query.status) q = q.eq("status", req.query.status);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ requests: data || [], is_approver: approver });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /service-requests/:id/approve — PIC approves; creates the real case.
+app.patch("/service-requests/:id/approve", requireRole(DATE_APPROVER_ROLES), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    let rq = supabase.from("service_requests").select("*").eq("id", req.params.id);
+    if (companyId) rq = rq.eq("company_id", companyId);
+    const { data: reqRow } = await rq.maybeSingle();
+    if (!reqRow) return res.status(404).json({ error: "Request not found" });
+    if (reqRow.status !== "pending") return res.status(409).json({ error: `Request already ${reqRow.status}` });
+
+    // Create the real service case, attributing it to the original requester.
+    const actorUser = { id: reqRow.requested_by || req.user.id, salesman_name: reqRow.requested_by_name, name: reqRow.requested_by_name };
+    const body = {
+      order_id: reqRow.order_id || null, service_type: reqRow.service_type,
+      description: reqRow.description,
+      customer_name: reqRow.customer_name, customer_phone: reqRow.customer_phone, customer_address: reqRow.customer_address,
+      service_date: reqRow.service_date, delivery_date: reqRow.delivery_date, schedule_tbc: reqRow.schedule_tbc,
+      items: reqRow.items || [],
+    };
+    const result = await createServiceCaseFull({ companyId: reqRow.company_id || companyId, actorUser, body });
+
+    const { data: updated } = await supabase.from("service_requests").update({
+      status: "approved", decided_by: req.user.id, decided_at: new Date().toISOString(),
+      created_service_id: result.service.id, updated_at: new Date().toISOString(),
+    }).eq("id", reqRow.id).select().single();
+    res.json({ request: updated, service: result.service });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /service-requests/:id/reject — PIC rejects with an optional note.
+app.patch("/service-requests/:id/reject", requireRole(DATE_APPROVER_ROLES), async (req, res) => {
+  try {
+    const companyId = getActiveCompanyId(req);
+    let rq = supabase.from("service_requests").select("id, status").eq("id", req.params.id);
+    if (companyId) rq = rq.eq("company_id", companyId);
+    const { data: reqRow } = await rq.maybeSingle();
+    if (!reqRow) return res.status(404).json({ error: "Request not found" });
+    if (reqRow.status !== "pending") return res.status(409).json({ error: `Request already ${reqRow.status}` });
+    const { data: updated } = await supabase.from("service_requests").update({
+      status: "rejected", decision_note: (req.body?.note || "").trim() || null,
+      decided_by: req.user.id, decided_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    }).eq("id", reqRow.id).select().single();
+    res.json({ request: updated });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
