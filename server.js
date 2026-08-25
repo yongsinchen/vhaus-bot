@@ -3556,6 +3556,29 @@ const handleDOPhoto = async (chatId, base64Image, fromTelegramId = null) => {
     } catch {}
   }
 
+  // Attribute the DO to the company it is billed to (from OCR), when
+  // recognisable — same rule as the webapp upload. Match among companies in the
+  // uploader's organization (or all companies if the uploader has none), and
+  // fall back to the uploader's own company / the order-match post-step.
+  if (doData.billTo) {
+    try {
+      let orgCompanies = [];
+      if (companyId) {
+        const { data: co } = await supabase.from("companies").select("organization_id").eq("id", companyId).maybeSingle();
+        if (co?.organization_id) {
+          const { data: cos } = await supabase.from("companies").select("id, name").eq("organization_id", co.organization_id);
+          orgCompanies = cos || [];
+        }
+      }
+      if (orgCompanies.length === 0) {
+        const { data: cos } = await supabase.from("companies").select("id, name");
+        orgCompanies = cos || [];
+      }
+      const billMatch = matchBillToCompany(doData.billTo, orgCompanies);
+      if (billMatch?.companyId) companyId = billMatch.companyId;
+    } catch { /* keep the uploader's company */ }
+  }
+
   const doPhotoUrl = await supplierDO.storeDOPhoto(base64Image, doData.supplier);
 
   let arrivalDate, results;
