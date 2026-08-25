@@ -1773,15 +1773,30 @@ Rules:
   }
 };
 
+// Resolve a user-typed SO token to an order, tolerating split orders whose
+// so_number stores several space-separated numbers (e.g. "60490 60491") — so a
+// customer can look up "60490" or "60491" and still reach that order. Tries an
+// exact match first, then a contains-match verified against the whitespace parts
+// (so "60490" never matches "604900").
+const findOrderBySoToken = async (soToken, { companyId = null, select = "*", types = null } = {}) => {
+  const t = String(soToken || "").trim();
+  if (!t) return null;
+  const base = () => {
+    let q = supabase.from("orders").select(select);
+    if (companyId) q = q.eq("company_id", companyId);
+    if (types) q = q.in("type", types);
+    return q;
+  };
+  let { data } = await base().eq("so_number", t).limit(1);
+  if (data && data[0]) return data[0];
+  ({ data } = await base().ilike("so_number", `%${t}%`).limit(20));
+  return (data || []).find(o => String(o.so_number || "").split(/\s+/).includes(t)) || null;
+};
+
 // Order status lookup ("where is SO 31006") shared by both channels.
 // Returns null when the SO is not found.
 const buildOrderStatusReply = async (soToken, companyId = null) => {
-  let q = supabase.from("orders")
-    .select("id, so_number, customer_name, status, delivery_date, time_slot, balance, items, type, salesman")
-    .eq("so_number", String(soToken).trim()).limit(1);
-  if (companyId) q = q.eq("company_id", companyId);
-  const { data: found } = await q;
-  const o = found?.[0];
+  const o = await findOrderBySoToken(soToken, { companyId, select: "id, so_number, customer_name, status, delivery_date, time_slot, balance, items, type, salesman" });
   if (!o) return null;
   let items = [];
   try { items = typeof o.items === "string" ? JSON.parse(o.items || "[]") : (o.items || []); } catch { items = []; }
@@ -7907,12 +7922,7 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
     // Look up an SO and open a scheduling session. Replies + returns null on
     // failure; returns the session data when ready for a date.
     const beginSchedule = async (soToken) => {
-      let q = supabase.from("orders")
-        .select("id, so_number, customer_name, delivery_date, type, status, is_multi_trip")
-        .eq("so_number", String(soToken).trim()).in("type", ["Delivery", "Service"]).limit(1);
-      if (companyId) q = q.eq("company_id", companyId);
-      const { data: found } = await q;
-      const order = found?.[0];
+      const order = await findOrderBySoToken(soToken, { companyId, select: "id, so_number, customer_name, delivery_date, type, status, is_multi_trip", types: ["Delivery", "Service"] });
       if (!order) { reply(`SO ${soToken} not found. Check the number and try again, or type "help".`); return null; }
       if (["Delivered", "Cancelled"].includes(order.status)) { reply(`SO ${order.so_number} is already ${order.status} — it can't be rescheduled.`); return null; }
       const data = {
