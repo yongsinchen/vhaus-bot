@@ -4655,9 +4655,31 @@ const isDateApprover = (req) => DATE_APPROVER_ROLES.includes((req.activeRoleKey 
 // legacy orders.delivery_date — that would push the order into the delivery
 // pool (schedule it) immediately. The order stays pending until a Delivery
 // Order is created; the DO is what arranges the actual delivery.
-async function applyRequestDeliveryDate(reqRow /* actor unused */) {
-  if (reqRow.sales_order_id) {
-    await supabase.from("sales_orders").update({ delivery_date: reqRow.requested_date }).eq("id", reqRow.sales_order_id);
+async function applyRequestDeliveryDate(reqRow, actorId = null) {
+  if (!reqRow.sales_order_id) return;
+  const newDate = reqRow.requested_date;
+  await supabase.from("sales_orders").update({ delivery_date: newDate }).eq("id", reqRow.sales_order_id);
+
+  // Keep an already-created Delivery Order in sync with the newly approved
+  // date. Without this, approving a new date only moves the sales_order while
+  // an existing DO (and its schedule) stays stuck on the old day. A DO that is
+  // already out for delivery / arrived / delivered is locked (route-locking
+  // rules) and left untouched; only its non-dispatched schedules move.
+  const { data: dos } = await supabase.from("delivery_orders")
+    .select("id, status").eq("sales_order_id", reqRow.sales_order_id).neq("status", "cancelled");
+  for (const dord of (dos || [])) {
+    if (isLockedScheduleStatus(dord.status)) continue; // dispatched/delivered — do not move
+    await supabase.from("delivery_orders").update({ delivery_date: newDate }).eq("id", dord.id);
+    // Move only the still-active schedule(s); failed/dispatched/delivered rows
+    // are history and stay on their original date.
+    const { data: scheds } = await supabase.from("delivery_schedules")
+      .select("id, status").eq("delivery_order_id", dord.id);
+    for (const s of (scheds || [])) {
+      if (String(s.status || "").trim().toLowerCase() !== "scheduled") continue;
+      await supabase.from("delivery_schedules").update({ scheduled_date: newDate }).eq("id", s.id);
+    }
+    await logDoEvent(dord.id, "rescheduled",
+      { scheduled_date: newDate, via: "delivery_date_request_approval" }, actorId);
   }
 }
 
@@ -4760,7 +4782,7 @@ app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) =
     if (!["pending", "needs_reschedule"].includes(r.status)) return res.status(400).json({ error: `Request is already ${r.status}` });
     // Records the agreed date but leaves the order pending for a Delivery Order
     // (does not schedule it). Same for the salesman "pick" path below.
-    await applyRequestDeliveryDate(r);
+    await applyRequestDeliveryDate(r, req.user.id);
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "approved", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
       reviewed_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
@@ -4816,7 +4838,7 @@ app.patch("/delivery-date-requests/:id/pick", requireAuth, async (req, res) => {
     if (r.status !== "needs_reschedule") return res.status(400).json({ error: "No alternatives to pick from" });
     const alts = Array.isArray(r.alternative_dates) ? r.alternative_dates : [];
     if (!alts.includes(picked)) return res.status(400).json({ error: "Pick one of the proposed dates" });
-    await applyRequestDeliveryDate({ ...r, requested_date: picked });
+    await applyRequestDeliveryDate({ ...r, requested_date: picked }, req.user.id);
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "approved", requested_date: picked, reviewed_at: new Date().toISOString(),
       decision_note: (r.decision_note ? r.decision_note + " · " : "") + "Salesman picked a proposed date", updated_at: new Date().toISOString(),
