@@ -7488,19 +7488,30 @@ app.patch("/service-requests/:id/approve", requireRole(DATE_APPROVER_ROLES), asy
     if (!reqRow) return res.status(404).json({ error: "Request not found" });
     if (reqRow.status !== "pending") return res.status(409).json({ error: `Request already ${reqRow.status}` });
 
+    // The approver may propose a different schedule date at approval time
+    // (send delivery_date in the body). Empty string => schedule TBC.
+    const hasDateOverride = req.body?.delivery_date !== undefined;
+    const chosenDeliveryDate = hasDateOverride ? (req.body.delivery_date || null) : reqRow.delivery_date;
+    const chosenScheduleTbc = hasDateOverride ? !req.body.delivery_date : reqRow.schedule_tbc;
+    const chosenServiceDate = req.body?.service_date !== undefined ? (req.body.service_date || null) : reqRow.service_date;
+
     // Create the real service case, attributing it to the original requester.
     const actorUser = { id: reqRow.requested_by || req.user.id, salesman_name: reqRow.requested_by_name, name: reqRow.requested_by_name };
     const body = {
       order_id: reqRow.order_id || null, service_type: reqRow.service_type,
       description: reqRow.description,
       customer_name: reqRow.customer_name, customer_phone: reqRow.customer_phone, customer_address: reqRow.customer_address,
-      service_date: reqRow.service_date, delivery_date: reqRow.delivery_date, schedule_tbc: reqRow.schedule_tbc,
+      service_date: chosenServiceDate, delivery_date: chosenDeliveryDate, schedule_tbc: chosenScheduleTbc,
       items: reqRow.items || [],
     };
     const result = await createServiceCaseFull({ companyId: reqRow.company_id || companyId, actorUser, body });
 
     const { data: updated } = await supabase.from("service_requests").update({
       status: "approved", decided_by: req.user.id, decided_at: new Date().toISOString(),
+      // Record the date the approver actually scheduled (may differ from the
+      // salesman's requested date).
+      delivery_date: chosenDeliveryDate, schedule_tbc: chosenScheduleTbc, service_date: chosenServiceDate,
+      decision_note: (req.body?.note || "").trim() || null,
       created_service_id: result.service.id, updated_at: new Date().toISOString(),
     }).eq("id", reqRow.id).select().single();
     res.json({ request: updated, service: result.service });
