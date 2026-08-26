@@ -9293,7 +9293,7 @@ app.delete("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async
     // back to draft (mirrors POST /delivery-orders/:id/cancel's cleanup, minus
     // the cancel) so it re-enters the unassigned pool and can be rescheduled
     // (POST /delivery-schedules only accepts draft/failed DOs).
-    let selQ = supabase.from("delivery_schedules").select("id, delivery_order_id, status").eq("id", req.params.id);
+    let selQ = supabase.from("delivery_schedules").select("id, delivery_order_id, status, order_id, scheduled_date").eq("id", req.params.id);
     if (cid) selQ = selQ.eq("company_id", cid);
     const { data: existing } = await selQ.maybeSingle();
     if (!existing) return res.json({ ok: true }); // already gone / not in this company — idempotent
@@ -9313,6 +9313,13 @@ app.delete("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async
     if (existing.delivery_order_id) {
       await supabase.from("delivery_orders").update({ status: "draft" }).eq("id", existing.delivery_order_id);
       await logDoEvent(existing.delivery_order_id, "unscheduled", { schedule_id: existing.id }, req.user.id);
+    } else if (existing.order_id && existing.scheduled_date) {
+      // Legacy order: the unassigned pool is keyed on orders.delivery_date, so
+      // snap it to the date this stop was scheduled on. Without this, an order
+      // whose delivery_date had drifted from its scheduled day returns to a
+      // DIFFERENT date's pool (or none) instead of the board you're viewing.
+      try { await supabase.from("orders").update({ delivery_date: existing.scheduled_date }).eq("id", existing.order_id); }
+      catch (e) { console.error("[unassign] order delivery_date snap (non-fatal):", e.message); }
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
