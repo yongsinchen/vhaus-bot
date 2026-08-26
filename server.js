@@ -922,6 +922,26 @@ async function syncLegacyDeliveredToSalesOrder(companyId, soNumber) {
   }
 }
 
+// When a Service case's inert legacy order is delivered on the route, resolve
+// the case too — the mirror of the leg-driven auto-resolve in
+// PATCH /service-legs. Called wherever a legacy order flips to "Delivered".
+// Also closes any still-open legs so the case is internally consistent (a
+// resolved case with pending legs would be re-opened by the leg-update guard).
+// Idempotent and best-effort: never fails the delivery update that succeeded.
+async function resolveServiceOnDelivery(orderId) {
+  if (!orderId) return;
+  try {
+    const { data: svc } = await supabase.from("services")
+      .select("id, status").eq("legacy_order_id", orderId).maybeSingle();
+    if (!svc || svc.status === "resolved") return;
+    await supabase.from("services").update({ status: "resolved" }).eq("id", svc.id);
+    await supabase.from("service_legs").update({ status: "completed" })
+      .eq("service_id", svc.id).neq("status", "completed");
+  } catch (e) {
+    console.error("[resolveServiceOnDelivery] failed (non-fatal):", e.message);
+  }
+}
+
 // QA SEV-2 fix: a schedule that's already out_for_delivery / arrived /
 // delivered must not be team-reassigned or deleted — both would
 // reset/orphan its Delivery Order (or silently drop tracking) mid-route.
@@ -9235,6 +9255,8 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
       // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
       await syncLegacyDeliveredToSalesOrder(cid, data.orders.so_number);
+      // If this order is a Service case's inert order, resolve the case too.
+      await resolveServiceOnDelivery(data.orders.id);
     }
     res.json({ schedule: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -9752,6 +9774,8 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
       // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
       await syncLegacyDeliveredToSalesOrder(getActiveCompanyId(req), data.orders.so_number);
+      // If this order is a Service case's inert order, resolve the case too.
+      await resolveServiceOnDelivery(data.orders.id);
     }
     if (status === "Out for Delivery" && data.orders?.id && !existing.delivery_order_id) {
       await supabase.from("orders").update({ status: "Out for Delivery" }).eq("id", data.orders.id);
