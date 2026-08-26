@@ -7558,16 +7558,28 @@ app.patch("/service-legs/:id", requireRole([...MANAGE_ROLES, "driver", "operatio
     if (status === "completed") updates.completed_at = new Date().toISOString();
     const { data, error } = await supabase.from("service_legs").update(updates).eq("id", req.params.id).select().single();
     if (error) throw error;
-    // Auto-advance service status
+    // Auto-advance service status.
     const { data: allLegs } = await supabase.from("service_legs").select("status").eq("service_id", data.service_id);
-    const allDone = (allLegs || []).every(l => l.status === "completed");
+    // Guard: an EMPTY array must NOT count as "all done" ([].every === true),
+    // which would resolve a case that has no completed work.
+    const allDone = (allLegs || []).length > 0 && allLegs.every(l => l.status === "completed");
     if (allDone) {
       // Resolve the case and mark the linked legacy order done so it leaves the
       // delivery route (unassigned excludes Delivered).
       const { data: svc } = await supabase.from("services").update({ status: "resolved" }).eq("id", data.service_id).select("legacy_order_id").single();
       if (svc?.legacy_order_id) await supabase.from("orders").update({ status: "Delivered" }).eq("id", svc.legacy_order_id);
-    } else if (status === "in_progress") {
-      await supabase.from("services").update({ status: "in_progress" }).eq("id", data.service_id);
+    } else {
+      // Not all legs are complete. If the case was previously resolved (e.g. a
+      // completed leg was reverted to pending), re-open it and return its inert
+      // order to the delivery pool so it shows on the board again.
+      const { data: svc } = await supabase.from("services").select("id, status, legacy_order_id, due_date").eq("id", data.service_id).maybeSingle();
+      if (svc?.status === "resolved") {
+        const reopened = status === "in_progress" ? "in_progress" : (svc.due_date ? "scheduled" : "open");
+        await supabase.from("services").update({ status: reopened }).eq("id", svc.id);
+        if (svc.legacy_order_id) await supabase.from("orders").update({ status: "Pending" }).eq("id", svc.legacy_order_id);
+      } else if (status === "in_progress") {
+        await supabase.from("services").update({ status: "in_progress" }).eq("id", data.service_id);
+      }
     }
     res.json({ leg: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
