@@ -3699,6 +3699,14 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
       return count || 0;
     })() : Promise.resolve(0);
 
+    // Order amendment approvals — master/manager only.
+    const amendReqPromise = ["master", "manager"].includes(roleKey) ? (async () => {
+      let q = supabase.from("order_amendments").select("id", { count: "exact", head: true }).eq("status", "pending");
+      if (cid) q = q.eq("company_id", cid);
+      const { count } = await q;
+      return count || 0;
+    })() : Promise.resolve(0);
+
     // 3. Commission summary — only computed for salesmen (the only role whose
     //    dashboard shows the stat card); same math as GET /commission-summary
     const month = `${new Date().toISOString().slice(0, 7)}-01`;
@@ -3726,10 +3734,10 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
       return { payout_month: month, total };
     })() : Promise.resolve(null);
 
-    const [{ data: services }, { count: sp }, { count: dr }, commission, deliveryReq] = await Promise.all([svcQ, spQ, drQ, commissionPromise, deliveryReqPromise]);
+    const [{ data: services }, { count: sp }, { count: dr }, commission, deliveryReq, amendReq] = await Promise.all([svcQ, spQ, drQ, commissionPromise, deliveryReqPromise, amendReqPromise]);
     res.json({
       services: services || [],
-      pending_counts: { service_pending: sp || 0, do_review: dr || 0, delivery_requests: deliveryReq || 0 },
+      pending_counts: { service_pending: sp || 0, do_review: dr || 0, delivery_requests: deliveryReq || 0, order_amendments: amendReq || 0 },
       commission_summary: commission,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -13521,14 +13529,17 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       }
     }
 
-    // Detect material amendments on confirmed/delivered orders → require re-approval
+    // Detect amendments on confirmed/delivered orders → require manager
+    // re-approval. Any change (not just material ones) is recorded before/after
+    // and sent to the amendment approval queue (migration 073).
     let finalStatus = status;
     let amendmentNote = null;
+    let amendmentChanges = [];
     const wasConfirmed = ["confirmed", "delivered"].includes(existing.status);
     const newOrderDate = order_date !== undefined ? (order_date || null) : (existing.order_date || null);
     const orderDateChanged = newOrderDate !== (existing.order_date || null);
     if (wasConfirmed) {
-      const changes = [];
+      const changes = amendmentChanges;
       if (expandedItems) {
         const oldItems = existing.sales_order_items || [];
         // Check for new items
@@ -13559,6 +13570,33 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       // delivery date drives scheduling) — flag them for manager re-approval.
       if (orderDateChanged) changes.push(`Order date: ${existing.order_date || "-"} → ${newOrderDate || "-"}`);
       if ((delivery_date || null) !== (existing.delivery_date || null)) changes.push(`Delivery date: ${existing.delivery_date || "-"} → ${delivery_date || "-"}`);
+      // Non-material fields too — "record whatever was amended". Compared against
+      // the values being written (the edit form sends the full order).
+      const nrm = v => (v === undefined || v === null) ? "" : String(v).trim();
+      const textChecks = [
+        ["Customer", existing.customer_name, customer_name],
+        ["Contact", existing.customer_contact, customer_contact],
+        ["Address", existing.customer_address, customer_address],
+        ["Delivery address", existing.delivery_address, delivery_address],
+        ["Email", existing.customer_email, customer_email],
+        ["IC/ID", existing.customer_id_no, customer_id_no],
+        ["Time slot", existing.delivery_time_slot, delivery_time_slot],
+        ["Delivery type", existing.delivery_type, delivery_type],
+        ["Remark", existing.remark, remark],
+        ["Salesman", existing.salesman_name, salesman_names],
+        ["Payment method", existing.payment_method, payment_method],
+      ];
+      for (const [label, a, b] of textChecks) {
+        if (b !== undefined && nrm(a) !== nrm(b)) changes.push(`${label}: ${nrm(a) || "-"} → ${nrm(b) || "-"}`);
+      }
+      const numChecks = [
+        ["Discount", existing.discount, discount],
+        ["Admin charges", existing.admin_charges, admin_charges],
+        ["GST", existing.gst_amount, gst_amount],
+      ];
+      for (const [label, a, b] of numChecks) {
+        if (b !== undefined && (Number(a) || 0) !== (Number(b) || 0)) changes.push(`${label}: ${Number(a) || 0} → ${Number(b) || 0}`);
+      }
       if (changes.length > 0) {
         finalStatus = "amended";
         amendmentNote = `[${new Date().toISOString().slice(0, 16).replace("T", " ")}] Amended by ${req.user.name || req.user.salesman_name || "user"}: ${changes.join("; ")}`;
@@ -13774,7 +13812,96 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         if (existingComm || (orderDateChanged && wasConfirmed)) await calculateCommission(deliveryOrderId, company_id);
       } catch (e) { console.error("commission recalc on order edit:", e.message); }
     }
+    // Record the before/after for manager approval (migration 073). The change
+    // is already applied above; this logs it and the order sits at 'amended'
+    // until a manager approves. Best-effort — never fail the edit that succeeded.
+    if (wasConfirmed && amendmentChanges.length > 0) {
+      try {
+        const snapshot = (o) => ({
+          status: o.status, customer_name: o.customer_name, customer_contact: o.customer_contact,
+          customer_address: o.customer_address, delivery_address: o.delivery_address,
+          customer_email: o.customer_email, customer_id_no: o.customer_id_no,
+          order_date: o.order_date, delivery_date: o.delivery_date, delivery_time_slot: o.delivery_time_slot,
+          delivery_type: o.delivery_type, remark: o.remark, salesman_name: o.salesman_name,
+          payment_method: o.payment_method, subtotal: o.subtotal, discount: o.discount,
+          admin_charges: o.admin_charges, gst_amount: o.gst_amount, deposit: o.deposit,
+          items: (o.sales_order_items || []).map(i => ({
+            product_name: i.product_name, product_code: i.product_code,
+            quantity: i.quantity, unit_price: i.unit_price,
+          })),
+        });
+        await supabase.from("order_amendments").insert({
+          company_id, branch_id: full?.branch_id || existing.branch_id || null,
+          sales_order_id: id, order_number: full?.order_number || existing.order_number || null,
+          status: "pending", before_data: snapshot(existing), after_data: snapshot(full),
+          changes: amendmentChanges,
+          requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null,
+        });
+      } catch (e) { console.error("order_amendments insert (non-fatal):", e.message); }
+    }
     res.json({ order: full });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Order amendment approvals (migration 073) ─────────────────────
+// A confirmed/delivered order that gets edited flips to 'amended' and lands
+// here as a before/after record. master/manager approve (order → confirmed)
+// or reject (order stays 'amended' for correction).
+const isAmendApprover = (req) => ["master", "manager"].includes(req.user.role);
+
+app.get("/order-amendments", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const { status } = req.query;
+    let q = supabase.from("order_amendments").select("*").order("created_at", { ascending: false }).limit(500);
+    if (cid) q = q.eq("company_id", cid);
+    if (!isAmendApprover(req)) q = q.eq("requested_by", req.user.id);
+    if (status) q = q.eq("status", status);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ amendments: data || [], is_approver: isAmendApprover(req) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/order-amendments/:id/approve", requireAuth, async (req, res) => {
+  try {
+    if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can approve amendments" });
+    const cid = getActiveCompanyId(req);
+    const { data: a } = await supabase.from("order_amendments").select("*").eq("id", req.params.id).maybeSingle();
+    if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
+    if (a.status !== "pending") return res.status(400).json({ error: `Amendment is already ${a.status}` });
+    // Accept the change: return the order to 'confirmed' and re-sync to the
+    // legacy delivery order.
+    if (a.sales_order_id) {
+      await supabase.from("sales_orders").update({ status: "confirmed" })
+        .eq("id", a.sales_order_id).eq("company_id", a.company_id).neq("status", "cancelled");
+      const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", a.sales_order_id).maybeSingle();
+      if (full) { try { await syncSalesOrderToDelivery(full, full.sales_order_items); } catch (e) { console.error("amend approve sync:", e.message); } }
+    }
+    const { data, error } = await supabase.from("order_amendments").update({
+      status: "approved", decided_by: req.user.id, decided_by_name: req.user.name || null,
+      decided_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
+    }).eq("id", a.id).select().single();
+    if (error) throw error;
+    res.json({ amendment: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/order-amendments/:id/reject", requireAuth, async (req, res) => {
+  try {
+    if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can reject amendments" });
+    const cid = getActiveCompanyId(req);
+    const { data: a } = await supabase.from("order_amendments").select("company_id, status").eq("id", req.params.id).maybeSingle();
+    if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
+    if (a.status !== "pending") return res.status(400).json({ error: `Amendment is already ${a.status}` });
+    // The order stays 'amended' (flagged) so the salesman/manager can correct
+    // it — the before/after record shows what to restore.
+    const { data, error } = await supabase.from("order_amendments").update({
+      status: "rejected", decided_by: req.user.id, decided_by_name: req.user.name || null,
+      decided_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
+    }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ amendment: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
