@@ -7254,6 +7254,14 @@ app.get("/service-cases", requireAuth, async (req, res) => {
       const itemsBy = {}; for (const it of (allItems || [])) (itemsBy[it.service_id] ||= []).push(it);
       for (const svc of (data || [])) { svc._legs = legsBy[svc.id] || []; svc._items = itemsBy[svc.id] || []; }
     }
+    // Attach each case's SV number (lives on its inert legacy order) so the list
+    // can label rows — batched to avoid N+1.
+    const legacyIds = [...new Set((data || []).map(s => s.legacy_order_id).filter(Boolean))];
+    if (legacyIds.length) {
+      const { data: svRows } = await supabase.from("orders").select("id, sv_number").in("id", legacyIds);
+      const svBy = {}; for (const r of (svRows || [])) svBy[r.id] = r.sv_number;
+      for (const svc of (data || [])) svc._sv_number = svc.legacy_order_id ? (svBy[svc.legacy_order_id] || null) : null;
+    }
     // Salesman role: only show services linked to their orders
     let result = data || [];
     if (req.user.role === "salesman" && req.user.salesman_name) {
