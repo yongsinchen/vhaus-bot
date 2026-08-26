@@ -7542,9 +7542,11 @@ app.patch("/service-requests/:id/reject", requireRole(DATE_APPROVER_ROLES), asyn
 app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { status, description, assigned_to, due_date, delivery_date, service_date, schedule_tbc,
-            customer_name, customer_phone, customer_address, service_type, priority } = req.body;
+            customer_name, customer_phone, customer_address, service_type, priority, amount } = req.body;
     const updates = {};
     if (status !== undefined) updates.status = status;
+    // Editable amount — "" clears it back to NULL.
+    if (amount !== undefined) updates.amount = (amount === null || amount === "") ? null : (Number(amount) || 0);
     if (description !== undefined) { updates.description = description; updates.issue_description = description; }
     if (assigned_to !== undefined) updates.assigned_to = assigned_to;
     if (status === "closed") updates.closed_at = new Date().toISOString();
