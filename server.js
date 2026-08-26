@@ -7368,7 +7368,7 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
 // can create an identical case on approval. `actorUser` is the creator whose
 // name seeds a standalone service's salesman. Throws on failure.
 async function createServiceCaseFull({ companyId, actorUser, body }) {
-  const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date, service_date, schedule_tbc } = body;
+  const { order_id, service_type, description, assigned_to, customer_name, customer_phone, customer_address, priority, due_date, delivery_date, service_date, schedule_tbc, amount } = body;
   const svcType = Number(service_type);
   const isTbc = schedule_tbc === true || schedule_tbc === "true";
   const scheduleDate = isTbc ? null : (delivery_date || due_date || null);
@@ -7397,6 +7397,7 @@ async function createServiceCaseFull({ companyId, actorUser, body }) {
   const svcPatch = {};
   if (service_date) svcPatch.service_date = service_date;
   if (isTbc) svcPatch.schedule_tbc = true;
+  if (amount !== undefined && amount !== null && amount !== "") svcPatch.amount = Number(amount) || 0;
   if (Object.keys(svcPatch).length) {
     const { data: upd } = await supabase.from("services").update(svcPatch).eq("id", result.service.id).select().single();
     if (upd) result.service = upd;
@@ -7440,7 +7441,7 @@ app.post("/service-requests", requireRole(ORDER_ROLES), async (req, res) => {
   try {
     const companyId = getActiveCompanyId(req);
     const { order_id, service_type, description, customer_name, customer_phone, customer_address,
-            service_date, delivery_date, schedule_tbc, items } = req.body || {};
+            service_date, delivery_date, schedule_tbc, items, amount } = req.body || {};
     if (!service_type) return res.status(400).json({ error: "service_type required" });
     // Pull the source SO number + customer defaults from the linked order.
     let soNumber = null, cName = customer_name, cPhone = customer_phone, cAddr = customer_address;
@@ -7457,6 +7458,7 @@ app.post("/service-requests", requireRole(ORDER_ROLES), async (req, res) => {
       service_date: service_date || null, delivery_date: delivery_date || null,
       schedule_tbc: schedule_tbc === true || schedule_tbc === "true",
       items: Array.isArray(items) ? items : [],
+      amount: (amount !== undefined && amount !== null && amount !== "") ? (Number(amount) || 0) : null,
       requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null,
     }).select().single();
     if (error) throw error;
@@ -7503,7 +7505,7 @@ app.patch("/service-requests/:id/approve", requireRole(DATE_APPROVER_ROLES), asy
       description: reqRow.description,
       customer_name: reqRow.customer_name, customer_phone: reqRow.customer_phone, customer_address: reqRow.customer_address,
       service_date: chosenServiceDate, delivery_date: chosenDeliveryDate, schedule_tbc: chosenScheduleTbc,
-      items: reqRow.items || [],
+      items: reqRow.items || [], amount: reqRow.amount,
     };
     const result = await createServiceCaseFull({ companyId: reqRow.company_id || companyId, actorUser, body });
 
