@@ -15,6 +15,7 @@ const doLib = require("./lib/delivery-orders");
 const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
+const productSearch = require("./lib/product-search");
 const { getCommissionableAmount } = commissionLib;
 const crypto = require("crypto");
 
@@ -11134,27 +11135,18 @@ app.get("/organization-products/search", requireAuth, async (req, res) => {
     }
     if (!orgId) return res.json({ products: [] });
 
-    const [byCode, byName] = await Promise.all([
-      supabase.from("organization_products")
-        .select("id, code, name, size, color")
-        .eq("organization_id", orgId).eq("is_active", true).eq("share_enabled", true)
-        .ilike("code", `%${q}%`).order("name").limit(20),
-      supabase.from("organization_products")
-        .select("id, code, name, size, color")
-        .eq("organization_id", orgId).eq("is_active", true).eq("share_enabled", true)
-        .ilike("name", `%${q}%`).order("name").limit(20),
-    ]);
-    if (byCode.error) throw byCode.error;
-    if (byName.error) throw byName.error;
+    // Same token semantics as GET /products (all tokens must match, across
+    // code/name/size/color) so the typeahead and the list agree on what a
+    // multi-word query means. Org masters have no supplier_id column, so
+    // supplier-name tokens are not matched here.
+    let mq = supabase.from("organization_products")
+      .select("id, code, name, size, color")
+      .eq("organization_id", orgId).eq("is_active", true).eq("share_enabled", true);
+    mq = productSearch.applyColumnSearch(mq, q);
+    const { data, error } = await mq.order("name").limit(20);
+    if (error) throw error;
 
-    // Merge, deduplicate by id
-    const seen = new Set();
-    const products = [];
-    for (const p of [...(byCode.data || []), ...(byName.data || [])]) {
-      if (!seen.has(p.id)) { seen.add(p.id); products.push(p); }
-    }
-    products.sort((a, b) => a.name.localeCompare(b.name));
-    res.json({ products: products.slice(0, 20), isCatalogueGroup: !!catalogueGroupId });
+    res.json({ products: data || [], isCatalogueGroup: !!catalogueGroupId });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -11449,7 +11441,12 @@ app.get("/products", requireAuth, async (req, res) => {
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
-    if (search) query = query.or(`name.ilike.%${search}%,code.ilike.%${search}%`);
+    // Token search: every whitespace-separated token must match code, name,
+    // size, color or the supplier name — see lib/product-search.js. Resolve the
+    // filters first, then apply them; awaiting anything that returns the query
+    // builder would execute it here and break every filter chained below.
+    const searchFilters = await productSearch.buildProductSearchFilters({ supabase, companyId: cid, search });
+    query = productSearch.applyFilters(query, searchFilters);
     if (supplier_id) query = query.eq("supplier_id", supplier_id);
     // org_supplier_id: filter by org master — resolve to this company's supplier row(s)
     // first, then filter products by those ids. Used by catalogue-group companies whose
