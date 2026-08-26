@@ -9197,6 +9197,11 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
       .insert(insertRow)
       .select().single();
     if (error) throw error;
+    // Align the order's delivery_date with where it's actually scheduled, so the
+    // Overview (keyed on orders.delivery_date) shows the trip on its scheduled
+    // day / team rather than a stale original date. Best-effort.
+    try { await supabase.from("orders").update({ delivery_date: scheduled_date }).eq("id", order_id); }
+    catch (e) { console.error("[assign] order delivery_date sync (non-fatal):", e.message); }
     res.status(201).json({ schedule: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
