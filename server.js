@@ -3668,6 +3668,17 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
     let drQ = supabase.from("do_review").select("id", { count: "exact", head: true }).eq("status", "Pending");
     if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.or(`company_id.eq.${cid},company_id.is.null`); }
 
+    // 2b. Delivery-date approval queue count — only meaningful for approvers
+    //     (the nav item is approver-gated). Same actionable statuses the
+    //     Delivery Dates page treats as pending: pending + needs_reschedule.
+    const deliveryReqPromise = isDateApprover(req) ? (async () => {
+      let q = supabase.from("delivery_date_requests").select("id", { count: "exact", head: true })
+        .in("status", ["pending", "needs_reschedule"]);
+      if (cid) q = q.eq("company_id", cid);
+      const { count } = await q;
+      return count || 0;
+    })() : Promise.resolve(0);
+
     // 3. Commission summary — only computed for salesmen (the only role whose
     //    dashboard shows the stat card); same math as GET /commission-summary
     const month = `${new Date().toISOString().slice(0, 7)}-01`;
@@ -3695,10 +3706,10 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
       return { payout_month: month, total };
     })() : Promise.resolve(null);
 
-    const [{ data: services }, { count: sp }, { count: dr }, commission] = await Promise.all([svcQ, spQ, drQ, commissionPromise]);
+    const [{ data: services }, { count: sp }, { count: dr }, commission, deliveryReq] = await Promise.all([svcQ, spQ, drQ, commissionPromise, deliveryReqPromise]);
     res.json({
       services: services || [],
-      pending_counts: { service_pending: sp || 0, do_review: dr || 0 },
+      pending_counts: { service_pending: sp || 0, do_review: dr || 0, delivery_requests: deliveryReq || 0 },
       commission_summary: commission,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
