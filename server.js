@@ -8971,9 +8971,11 @@ app.post("/delivery-teams", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async
   try {
     const cid = getActiveCompanyId(req);
     const { vehicle_id, driver_id, helper_id, team_date } = req.body;
-    if (!driver_id || !team_date) return res.status(400).json({ error: "driver_id and team_date required" });
+    // Driver is optional — a team can be vehicle-only (driver assigned later or
+    // carried by the vehicle record). A vehicle and a date are the minimum.
+    if (!vehicle_id || !team_date) return res.status(400).json({ error: "vehicle_id and team_date required" });
     const { data, error } = await supabase.from("delivery_teams")
-      .insert({ company_id: cid, vehicle_id, driver_id, helper_id: helper_id || null, team_date })
+      .insert({ company_id: cid, vehicle_id, driver_id: driver_id || null, helper_id: helper_id || null, team_date })
       .select().single();
     if (error) throw error;
     res.status(201).json({ team: data });
