@@ -10571,18 +10571,29 @@ app.get("/scheduling-suggest", requireAuth, async (req, res) => {
 // `branch_id` is set to null — requires migrations/006_inventory_branch_id_nullable.sql.
 // `warehouse_id` here is passed through only to tag the stock_movements audit log.
 async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type, reference_type, reference_id, notes, created_by) {
+  // Validate the product FIRST. The old code let an invalid product_id through:
+  // the inventory write failed on the FK and the error was swallowed, leaving a
+  // stock_movements row with no matching balance (the "6 in, 0 inventory" bug).
+  // Fail loudly instead so the caller surfaces a real error.
+  if (!product_id) throw new Error("adjustStock: product_id is required");
+  const { data: prod } = await supabase.from("products").select("id").eq("id", product_id).maybeSingle();
+  if (!prod) throw new Error(`adjustStock: product ${product_id} not found — cannot change stock`);
+
   const { data: existing } = await supabase.from("inventory")
     .select("id, on_hand").eq("company_id", company_id).eq("product_id", product_id).maybeSingle();
   const newQty = (existing?.on_hand || 0) + qty_delta;
   if (existing) {
-    await supabase.from("inventory").update({ on_hand: newQty, updated_at: new Date().toISOString() }).eq("id", existing.id);
+    const { error } = await supabase.from("inventory").update({ on_hand: newQty, updated_at: new Date().toISOString() }).eq("id", existing.id);
+    if (error) throw new Error(`adjustStock: inventory update failed — ${error.message}`);
   } else {
-    await supabase.from("inventory").insert({ company_id, product_id, branch_id: null, on_hand: newQty, reserved_qty: 0 });
+    const { error } = await supabase.from("inventory").insert({ company_id, product_id, branch_id: null, on_hand: newQty, reserved_qty: 0 });
+    if (error) throw new Error(`adjustStock: inventory insert failed — ${error.message}`);
   }
-  await supabase.from("stock_movements").insert({
+  const { error: mErr } = await supabase.from("stock_movements").insert({
     company_id, warehouse_id: warehouse_id || null, product_id, type, quantity: qty_delta,
     reference_type, reference_id, notes, created_by,
   });
+  if (mErr) throw new Error(`adjustStock: movement log failed — ${mErr.message}`);
   return newQty;
 }
 
