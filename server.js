@@ -5050,12 +5050,31 @@ app.put("/customers/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Search customer by phone (for order creation auto-detect)
+// Search customer by phone — the typeahead behind the order form's Phone
+// Number field, so a returning customer's details are filled in rather than
+// retyped (which is also what stops a second customer record being created for
+// someone who already exists).
+//
+// Matches phone_normalized, not phone. Stored numbers are formatted every
+// which way ("012-345 6789", "+60 12 3456789") while people type bare digits,
+// so matching the raw column misses most returning customers. phone_normalized
+// is a STORED generated column (migration 027) holding digits only and is
+// always in sync, so normalising the query the same way makes the match
+// format-proof in both directions.
+//
+// Returns only the fields the order form fills in — never the whole row.
 app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
   try {
-    const phone = req.params.phone.trim();
-    const { data } = await supabase.from("customers").select("*")
-      .eq("company_id", getActiveCompanyId(req)).ilike("phone", `%${phone}%`).limit(5);
+    const digits = normalizePhone(req.params.phone);
+    // Under 3 digits almost every customer matches; that is noise, not a hit.
+    if (digits.length < 3) return res.json({ customers: [] });
+    const { data, error } = await supabase.from("customers")
+      .select("id, name, phone, email, address, ic_number")
+      .eq("company_id", getActiveCompanyId(req))
+      .ilike("phone_normalized", `%${digits}%`)
+      .order("name")
+      .limit(8);
+    if (error) throw error;
     res.json({ customers: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
