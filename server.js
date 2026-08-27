@@ -11699,7 +11699,7 @@ app.get("/products", requireAuth, async (req, res) => {
       // Include all org master fields needed by composeProductView: the
       // price/cost fields are fetched so composeProductView can use them as
       // last-resort fallback (when company row has no price at all).
-      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, is_clearance, reorder_point, is_active, review_status, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name,organization_supplier_id), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
+      .select("id, code, name, description, color, size, unit_cost, unit_price, price_override, cost_override, is_standard, is_customizable, is_clearance, reorder_point, packages_per_unit, is_active, review_status, created_at, supplier_id, category_id, organization_product_id, suppliers(id,name,organization_supplier_id), product_categories(id,name), organization_category_id, organization_categories(id,name), organization_products(id, code, name, brand, dimensions, specification, description, image_url, barcode, unit_cost, unit_price, is_customizable, version)", { count: "exact" })
       .order("name")
       .range((page - 1) * limit, page * limit - 1);
     if (cid) query = query.eq("company_id", cid);
@@ -11743,7 +11743,7 @@ app.get("/products", requireAuth, async (req, res) => {
 app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_clearance, organization_product_id: explicitOrgProductId } = req.body;
+    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_clearance, packages_per_unit, organization_product_id: explicitOrgProductId } = req.body;
     if (!code || !name) return res.status(400).json({ error: "code and name are required" });
 
     // Normalize the incoming supplier reference into this company's supplier row
@@ -11775,7 +11775,7 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
     // product picks one kind of category depending on whether the active
     // company is in a catalogue group (see GET/POST /categories).
     const { data, error } = await supabase.from("products")
-      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, is_active: true, is_clearance: is_clearance === true, organization_product_id: orgProductId })
+      .insert({ company_id: cid, code: code.trim().toUpperCase(), name: name.trim(), description: description || null, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard: is_standard !== false, is_customizable: is_customizable === true, reorder_point: reorder_point ?? 0, packages_per_unit: Math.max(1, Number(packages_per_unit) || 1), is_active: true, is_clearance: is_clearance === true, organization_product_id: orgProductId })
       .select().single();
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: `Product code "${code}"${size ? ` (size "${size}")` : ""} already exists` });
@@ -11803,7 +11803,7 @@ app.post("/products", ...requirePerm(PERMS.PRODUCTS_CREATE), async (req, res) =>
 app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, is_clearance } = req.body;
+    const { code, name, description, color, size, supplier_id, org_supplier_id, category_id, organization_category_id, unit_cost, unit_price, is_standard, is_customizable, reorder_point, is_active, is_clearance, packages_per_unit } = req.body;
 
     // Fetch current product to discover organization_product_id before update
     const { data: existing } = await supabase.from("products")
@@ -11815,7 +11815,7 @@ app.put("/products/:id", ...requirePerm(PERMS.PRODUCTS_EDIT), async (req, res) =
     const { companySupplierId, orgSupplierId } = await resolveIncomingProductSupplier(cid, { supplier_id, org_supplier_id });
 
     const { data, error } = await supabase.from("products")
-      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active, is_clearance })
+      .update({ code: code?.trim().toUpperCase(), name: name?.trim(), description, color: color || null, size: size || null, supplier_id: companySupplierId, category_id: organization_category_id ? null : (category_id || null), organization_category_id: organization_category_id || null, unit_cost: unit_cost ?? null, unit_price: unit_price ?? null, is_standard, is_customizable, reorder_point, is_active, is_clearance, ...(packages_per_unit !== undefined ? { packages_per_unit: Math.max(1, Number(packages_per_unit) || 1) } : {}) })
       .eq("id", req.params.id).eq("company_id", cid)
       .select("*, organization_products(id, code, name, brand, description, dimensions, specification, image_url, barcode, unit_cost, unit_price, is_customizable, version)").single();
     if (error) {
