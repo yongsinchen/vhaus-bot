@@ -8778,9 +8778,18 @@ app.post("/package-labels/confirm-all", ...requirePerm(PERMS.WAREHOUSE_SCAN), as
         seen.add(label.product_id);
         const wh = warehouse_id || label.warehouse_id;
         if (wh) {
-          const totalQty = (labels || []).filter(l => l.product_id === label.product_id).length;
-          await adjustStock(cid, wh, label.product_id, totalQty, "in", "do", supplier_delivery_id, `DO received — ${label.product_name}`, req.user.id);
-          stocked++;
+          const boxCount = (labels || []).filter(l => l.product_id === label.product_id).length;
+          // Split packaging: N package labels make one sellable unit. Stock is
+          // counted in UNITS, so divide the box count by packages_per_unit
+          // (default 1 → unchanged). Only whole units are stocked; leftover
+          // boxes wait for the rest of the unit to arrive.
+          const { data: pr } = await supabase.from("products").select("packages_per_unit").eq("id", label.product_id).maybeSingle();
+          const ppu = Math.max(1, Number(pr?.packages_per_unit) || 1);
+          const units = Math.floor(boxCount / ppu);
+          if (units > 0) {
+            await adjustStock(cid, wh, label.product_id, units, "in", "do", supplier_delivery_id, `DO received — ${label.product_name}${ppu > 1 ? ` (${boxCount} pkg ÷ ${ppu})` : ""}`, req.user.id);
+            stocked++;
+          }
         }
       }
     }
@@ -10672,6 +10681,101 @@ app.get("/inventory/summary", requireAuth, async (req, res) => {
       grouped[r.product_id].total_reserved += r.reserved_qty || 0;
     });
     res.json({ summary: Object.values(grouped) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /inventory/projection — forward-looking monthly stock movement.
+// Opening = current on_hand. Then projects, per product, per month:
+//   future OUT  = confirmed, not-yet-delivered sales-order lines, by delivery_date
+//   future IN   = open purchase-order lines (remaining qty), by expected_date
+// so you can see each month's closing balance and when a product goes negative
+// (i.e. the date you must restock by). Optional ?product_id= for one product;
+// ?months= horizon (default 6).
+app.get("/inventory/projection", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "company_id required" });
+    const onlyProduct = req.query.product_id || null;
+    const horizon = Math.min(24, Math.max(1, Number(req.query.months) || 6));
+    const today = new Date().toISOString().slice(0, 10);
+    const monthKey = d => String(d).slice(0, 7);
+
+    // 1. Opening balances (on_hand) + product meta.
+    let invQ = supabase.from("inventory")
+      .select("product_id, on_hand, products(id, code, name, reorder_point)")
+      .eq("company_id", cid);
+    if (onlyProduct) invQ = invQ.eq("product_id", onlyProduct);
+    const { data: inv } = await invQ;
+    const prod = new Map();
+    for (const r of (inv || [])) {
+      if (!r.product_id) continue;
+      prod.set(r.product_id, { product: r.products || { id: r.product_id }, on_hand: Number(r.on_hand) || 0, events: [] });
+    }
+
+    // 2. Future OUT — confirmed orders not yet delivered, dated by delivery_date.
+    let outQ = supabase.from("sales_order_items")
+      .select("product_id, quantity, sales_orders!inner(order_number, status, delivery_date, company_id)")
+      .eq("sales_orders.company_id", cid)
+      .eq("sales_orders.status", "confirmed")
+      .gte("sales_orders.delivery_date", today);
+    if (onlyProduct) outQ = outQ.eq("product_id", onlyProduct);
+    const { data: outs } = await outQ;
+    for (const r of (outs || [])) {
+      if (!r.product_id) continue;
+      const d = r.sales_orders?.delivery_date;
+      if (!d) continue;
+      if (!prod.has(r.product_id)) prod.set(r.product_id, { product: { id: r.product_id }, on_hand: 0, events: [] });
+      prod.get(r.product_id).events.push({ date: String(d).slice(0, 10), type: "out", qty: Number(r.quantity) || 0, ref: r.sales_orders?.order_number || "" });
+    }
+
+    // 3. Future IN — open POs, remaining qty, dated by expected_date.
+    let inQ = supabase.from("purchase_order_items")
+      .select("product_id, quantity, received_qty, purchase_orders!inner(po_number, status, expected_date, company_id)")
+      .eq("purchase_orders.company_id", cid)
+      .not("purchase_orders.status", "in", '("received","cancelled","completed")');
+    if (onlyProduct) inQ = inQ.eq("product_id", onlyProduct);
+    const { data: ins } = await inQ;
+    for (const r of (ins || [])) {
+      if (!r.product_id) continue;
+      const remaining = (Number(r.quantity) || 0) - (Number(r.received_qty) || 0);
+      const d = r.purchase_orders?.expected_date;
+      if (remaining <= 0 || !d) continue; // undated / fully received POs skipped from the timeline
+      if (!prod.has(r.product_id)) prod.set(r.product_id, { product: { id: r.product_id }, on_hand: 0, events: [] });
+      prod.get(r.product_id).events.push({ date: String(d).slice(0, 10), type: "in", qty: remaining, ref: r.purchase_orders?.po_number || "" });
+    }
+
+    // 4. Build a month-by-month running balance per product.
+    const lastMonth = (() => { const t = new Date(); t.setMonth(t.getMonth() + horizon); return t.toISOString().slice(0, 7); })();
+    const thisMonth = today.slice(0, 7);
+    const products = [];
+    for (const [pid, p] of prod) {
+      p.events.sort((a, b) => a.date.localeCompare(b.date));
+      // Emit a row for every month from now to the horizon so gaps are visible.
+      const months = [];
+      const byMonth = {};
+      for (const e of p.events) (byMonth[monthKey(e.date)] ||= []).push(e);
+      let balance = p.on_hand;
+      let firstNegative = null;
+      // month cursor
+      let cur = thisMonth;
+      let guard = 0;
+      while (cur <= lastMonth && guard++ < 48) {
+        const opening = balance;
+        const evs = (byMonth[cur] || []);
+        for (const e of evs) {
+          balance += e.type === "in" ? e.qty : -e.qty;
+          e.balance = balance;
+          if (balance < 0 && !firstNegative) firstNegative = { date: e.date, balance };
+        }
+        months.push({ month: cur, opening, closing: balance, events: evs });
+        // next month
+        const [yy, mm] = cur.split("-").map(Number);
+        const nd = new Date(yy, mm, 1); cur = nd.toISOString().slice(0, 7);
+      }
+      products.push({ product_id: pid, product: p.product, on_hand: p.on_hand, months, first_negative: firstNegative });
+    }
+    products.sort((a, b) => (a.first_negative ? 0 : 1) - (b.first_negative ? 0 : 1) || String(a.product?.name || "").localeCompare(String(b.product?.name || "")));
+    res.json({ as_of: today, horizon_months: horizon, products });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
