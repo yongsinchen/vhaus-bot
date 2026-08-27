@@ -9259,6 +9259,7 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
         if (!result?.already_completed) {
           try { await calculateDeliveryCommission(schedRow.delivery_order_id, cid); }
           catch (e) { console.error("delivery commission calc:", e.message); }
+          await deductStockOnDeliveredDO(schedRow.delivery_order_id, cid, req.user.id);
         }
         const { data: fresh } = await supabase.from("delivery_schedules").select("*").eq("id", req.params.id).single();
         return res.json({ schedule: fresh, delivery_order: result });
@@ -9779,6 +9780,7 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       if (!result?.already_completed) {
         try { await calculateDeliveryCommission(existing.delivery_order_id, cid); }
         catch (e) { console.error("delivery commission calc:", e.message); }
+        await deductStockOnDeliveredDO(existing.delivery_order_id, cid, req.user.id);
       }
       const { data: fresh } = await supabase.from("delivery_schedules")
         .select("*, orders(id, so_number, status)").eq("id", existing.id).single();
@@ -10596,6 +10598,37 @@ async function adjustStock(company_id, warehouse_id, product_id, qty_delta, type
   });
   if (mErr) throw new Error(`adjustStock: movement log failed — ${mErr.message}`);
   return newQty;
+}
+
+// Phase 2 (inventory): deduct stock when a Delivery Order is completed. Called
+// once per DO on FIRST completion (guarded by the caller's !already_completed).
+// Policy: always deduct, allow negative — a negative balance flags "shipped
+// something the system never received". Best-effort: a stock hiccup must never
+// fail a delivery that already completed. Resolves each DO line's product via
+// its sales_order_item; lines with no resolvable product are skipped + logged.
+async function deductStockOnDeliveredDO(deliveryOrderId, cid, actorId) {
+  try {
+    const { data: dord } = await supabase.from("delivery_orders")
+      .select("id, do_number, delivery_order_items(sales_order_item_id, product_code, product_name, quantity, status)")
+      .eq("id", deliveryOrderId).maybeSingle();
+    if (!dord) return;
+    const lines = (dord.delivery_order_items || []).filter(i => i.status !== "cancelled");
+    const soiIds = [...new Set(lines.map(l => l.sales_order_item_id).filter(Boolean))];
+    const soiToProduct = new Map();
+    if (soiIds.length) {
+      const { data: sois } = await supabase.from("sales_order_items").select("id, product_id").in("id", soiIds);
+      for (const s of (sois || [])) if (s.product_id) soiToProduct.set(s.id, s.product_id);
+    }
+    for (const line of lines) {
+      const pid = soiToProduct.get(line.sales_order_item_id) || null;
+      const qty = Number(line.quantity) || 0;
+      if (!pid || qty <= 0) continue; // custom/unlinked line or nothing to ship
+      try {
+        await adjustStock(cid, null, pid, -qty, "out", "delivery", deliveryOrderId,
+          `Delivered — DO ${dord.do_number || deliveryOrderId} · ${line.product_name || line.product_code || ""}`, actorId);
+      } catch (e) { console.error(`[stock-out] skip line (${line.product_name || line.product_code}):`, e.message); }
+    }
+  } catch (e) { console.error("[deductStockOnDeliveredDO] non-fatal:", e.message); }
 }
 
 async function recordLeadTime(company_id, supplier_id, product_id, po_created_at, do_received_at) {
