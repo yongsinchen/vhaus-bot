@@ -13109,8 +13109,12 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
 
 // ── Sales Order Routes ────────────────────────────────────────────
 
-// Generate a readable order number: SO + YYMMDD + 4-digit sequence for the day
-async function nextOrderNumber(company_id, branch_id) {
+// Generate a readable order number: SO + YYMMDD + 4-digit sequence for the day.
+// `opts.peek` computes the number WITHOUT advancing the anchored series — used
+// by the New Order form's preview so merely opening the form never burns a
+// number (an anchored branch self-advances on every real call otherwise).
+async function nextOrderNumber(company_id, branch_id, opts = {}) {
+  const peek = opts.peek === true;
   // Branch running number: each branch continues its OWN numeric series inside
   // its configured band. `order_number_prefix` is the leading-digit band filter
   // (e.g. Alma "1" → 1xxxx, Georgetown "3" → 3xxxxx). The band's first number is
@@ -13162,7 +13166,7 @@ async function nextOrderNumber(company_id, branch_id) {
       }
       // Advance the anchor so the next call starts near the right place (keeps
       // the skip-loop O(1) instead of rescanning from the anchor every time).
-      if (branch?.order_number_next != null) {
+      if (!peek && branch?.order_number_next != null) {
         await supabase.from("branches").update({ order_number_next: next + 1 }).eq("id", branch_id);
       }
       return fmt(next);
@@ -13503,7 +13507,7 @@ app.get("/next-order-number", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "No active company" });
-    const num = await nextOrderNumber(cid, req.query.branch_id || null);
+    const num = await nextOrderNumber(cid, req.query.branch_id || null, { peek: true });
     res.json({ order_number: num });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
