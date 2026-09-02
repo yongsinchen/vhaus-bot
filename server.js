@@ -7511,11 +7511,21 @@ app.patch("/service-requests/:id/approve", requireRole(DATE_APPROVER_ROLES), asy
     if (reqRow.status !== "pending") return res.status(409).json({ error: `Request already ${reqRow.status}` });
 
     // The approver may propose a different schedule date at approval time
-    // (send delivery_date in the body). Empty string => schedule TBC.
-    const hasDateOverride = req.body?.delivery_date !== undefined;
-    const chosenDeliveryDate = hasDateOverride ? (req.body.delivery_date || null) : reqRow.delivery_date;
-    const chosenScheduleTbc = hasDateOverride ? !req.body.delivery_date : reqRow.schedule_tbc;
+    // (send delivery_date in the body). TBC is signalled EXPLICITLY via
+    // schedule_tbc — an empty delivery_date is no longer treated as TBC on its
+    // own (that silently unscheduled requests whose date was only entered as a
+    // service date).
+    const explicitTbc = req.body?.schedule_tbc === true || req.body?.schedule_tbc === "true";
     const chosenServiceDate = req.body?.service_date !== undefined ? (req.body.service_date || null) : reqRow.service_date;
+    // Schedule date the case lands on the delivery board: the approver's
+    // proposed date wins; else the request's wanted-schedule date; else fall
+    // back to the requested service date so a request that carried only a
+    // service date still reaches the board instead of vanishing as TBC.
+    let chosenDeliveryDate = req.body?.delivery_date !== undefined
+      ? (req.body.delivery_date || null)
+      : (reqRow.delivery_date || null);
+    if (!explicitTbc && !chosenDeliveryDate) chosenDeliveryDate = chosenServiceDate || null;
+    const chosenScheduleTbc = explicitTbc || !chosenDeliveryDate;
 
     // Create the real service case, attributing it to the original requester.
     const actorUser = { id: reqRow.requested_by || req.user.id, salesman_name: reqRow.requested_by_name, name: reqRow.requested_by_name };
