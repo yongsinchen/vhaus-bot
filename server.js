@@ -4684,8 +4684,23 @@ const isDateApprover = (req) => DATE_APPROVER_ROLES.includes((req.activeRoleKey 
 // pool (schedule it) immediately. The order stays pending until a Delivery
 // Order is created; the DO is what arranges the actual delivery.
 async function applyRequestDeliveryDate(reqRow, actorId = null) {
-  if (!reqRow.sales_order_id) return;
   const newDate = reqRow.requested_date;
+
+  // Keep the legacy `orders` workhorse row in step with the approved date.
+  // Without this, only sales_orders moved, so the delivery board / Sales Order
+  // search / Telegram / DO matching (which read the legacy row) kept showing
+  // the OLD date — the two views disagreed. Same write direction as the
+  // sales_orders → orders sync, not reverse sync. Runs even for legacy requests
+  // that have no linked sales_order_id.
+  if (reqRow.order_id) {
+    await supabase.from("orders").update({ delivery_date: newDate }).eq("id", reqRow.order_id);
+  } else if (reqRow.so_number) {
+    let oq = supabase.from("orders").update({ delivery_date: newDate }).eq("so_number", reqRow.so_number);
+    if (reqRow.company_id) oq = oq.eq("company_id", reqRow.company_id);
+    await oq;
+  }
+
+  if (!reqRow.sales_order_id) return;
   await supabase.from("sales_orders").update({ delivery_date: newDate }).eq("id", reqRow.sales_order_id);
 
   // Keep an already-created Delivery Order in sync with the newly approved
