@@ -7662,6 +7662,28 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
       if (customer_address !== undefined) orderPatch.address = customer_address || null;
       if (Object.keys(orderPatch).length > 0) await supabase.from("orders").update(orderPatch).eq("id", data.legacy_order_id);
     }
+
+    // Move the service's team assignment + legs onto the new date too. Editing
+    // the date synced services.due_date and the legacy order's delivery_date,
+    // but an assigned service (delivery_schedules keyed by legacy_order_id,
+    // delivery_order_id NULL) and its service_legs stayed on the OLD date — so
+    // the service kept showing on its old day on the delivery route / note.
+    // Only when a real (non-TBC) date is set.
+    if (data?.legacy_order_id && orderDeliveryDate !== undefined && orderDeliveryDate !== "TBC" && orderDeliveryDate) {
+      const { data: svScheds } = await supabase.from("delivery_schedules")
+        .select("id, status").eq("order_id", data.legacy_order_id).is("delivery_order_id", null);
+      for (const s of (svScheds || [])) {
+        // Move only active assignments; failed/cancelled/dispatched/delivered stay.
+        if (!["scheduled", "picking", "loading"].includes(String(s.status || "").trim().toLowerCase())) continue;
+        await supabase.from("delivery_schedules").update({ scheduled_date: orderDeliveryDate }).eq("id", s.id);
+      }
+      // Legs drive the Services list + printed service note — keep them in step
+      // (leave completed/cancelled legs as history).
+      await supabase.from("service_legs")
+        .update({ scheduled_date: orderDeliveryDate })
+        .eq("service_id", req.params.id)
+        .not("status", "in", "(completed,cancelled)");
+    }
     res.json({ service: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
