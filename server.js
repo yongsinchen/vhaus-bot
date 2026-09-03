@@ -13498,7 +13498,7 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
     const company_id = getActiveCompanyId(req);
     const { role, salesman_name } = req.user;
-    const { status, search, salesman, date_from, date_to, branch_id, month, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
+    const { status, search, salesman, date_from, date_to, order_from, order_to, branch_id, month, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
     const lim = Math.min(Number(limit) || 50, 100);
     const pg = Math.max(Number(page) || 1, 1);
     const ascending = sort_order === "asc";
@@ -13521,6 +13521,10 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
       countQ = countQ.gte("order_date", start).lt("order_date", next);
       dataQ = dataQ.gte("order_date", start).lt("order_date", next);
     }
+    // Order-date range (duration). order_date is TEXT YYYY-MM-DD, so string
+    // comparison orders correctly. Independent of the delivery_date range below.
+    if (order_from) { countQ = countQ.gte("order_date", order_from); dataQ = dataQ.gte("order_date", order_from); }
+    if (order_to)   { countQ = countQ.lte("order_date", order_to);   dataQ = dataQ.lte("order_date", order_to); }
     if (search) {
       const filter = `order_number.ilike.%${search}%,customer_name.ilike.%${search}%,customer_contact.ilike.%${search}%`;
       countQ = countQ.or(filter); dataQ = dataQ.or(filter);
