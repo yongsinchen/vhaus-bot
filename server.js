@@ -4683,6 +4683,34 @@ const isDateApprover = (req) => DATE_APPROVER_ROLES.includes((req.activeRoleKey 
 // legacy orders.delivery_date — that would push the order into the delivery
 // pool (schedule it) immediately. The order stays pending until a Delivery
 // Order is created; the DO is what arranges the actual delivery.
+// When an order/service is rescheduled, a delivery_schedule tied to a team for
+// a DIFFERENT date cannot simply follow the date: teams are per-date, so leaving
+// the row on that team orphans the order — excluded from the new date's
+// unassigned pool (a schedule exists on that date) yet shown under no team for
+// that date (its team runs on the old date). Keep the schedule only if its team
+// is already on the new date; otherwise UNASSIGN it (delete the row, and for a
+// DO reset it to draft so it returns to the unassigned-DO pool). Locked/history
+// rows (out for delivery / arrived / delivered / failed / cancelled) are left
+// untouched. Returns "kept" | "unassigned" | "skipped".
+async function rehomeScheduleForReschedule(sched, newDate) {
+  const active = ["scheduled", "picking", "loading"].includes(String(sched.status || "").trim().toLowerCase());
+  if (!active) return "skipped";
+  let teamDate = null;
+  if (sched.team_id) {
+    const { data: t } = await supabase.from("delivery_teams").select("team_date").eq("id", sched.team_id).maybeSingle();
+    teamDate = t?.team_date || null;
+  }
+  if (sched.team_id && teamDate && String(teamDate) === String(newDate)) {
+    await supabase.from("delivery_schedules").update({ scheduled_date: newDate }).eq("id", sched.id);
+    return "kept";
+  }
+  await supabase.from("delivery_schedules").delete().eq("id", sched.id);
+  if (sched.delivery_order_id) {
+    await supabase.from("delivery_orders").update({ status: "draft" }).eq("id", sched.delivery_order_id);
+  }
+  return "unassigned";
+}
+
 async function applyRequestDeliveryDate(reqRow, actorId = null) {
   const newDate = reqRow.requested_date;
 
@@ -4701,20 +4729,14 @@ async function applyRequestDeliveryDate(reqRow, actorId = null) {
   }
 
   // Whole-order (non-DO) team assignments live in delivery_schedules keyed by
-  // the legacy order_id with delivery_order_id NULL — the DO loop below never
-  // sees them, so an order assigned to a team this way stayed on its OLD date
-  // after a reschedule approval (it kept showing on the team's old day). Move
-  // its still-active schedule(s) too; ones already out for delivery / arrived /
-  // delivered are locked history and stay put.
+  // the legacy order_id with delivery_order_id NULL. Re-home each active one to
+  // the new date: it follows only if its team already runs on the new date,
+  // otherwise it's unassigned back to the pool (a team from the old date can't
+  // keep it — that orphaned the order).
   if (reqRow.order_id) {
     const { data: legScheds } = await supabase.from("delivery_schedules")
-      .select("id, status").eq("order_id", reqRow.order_id).is("delivery_order_id", null);
-    for (const s of (legScheds || [])) {
-      // Move only active assignments; failed/cancelled/dispatched/delivered rows
-      // are history and stay on their original date.
-      if (!["scheduled", "picking", "loading"].includes(String(s.status || "").trim().toLowerCase())) continue;
-      await supabase.from("delivery_schedules").update({ scheduled_date: newDate }).eq("id", s.id);
-    }
+      .select("id, status, team_id, delivery_order_id").eq("order_id", reqRow.order_id).is("delivery_order_id", null);
+    for (const s of (legScheds || [])) await rehomeScheduleForReschedule(s, newDate);
   }
 
   if (!reqRow.sales_order_id) return;
@@ -4730,16 +4752,13 @@ async function applyRequestDeliveryDate(reqRow, actorId = null) {
   for (const dord of (dos || [])) {
     if (isLockedScheduleStatus(dord.status)) continue; // dispatched/delivered — do not move
     await supabase.from("delivery_orders").update({ delivery_date: newDate }).eq("id", dord.id);
-    // Move only the still-active schedule(s); failed/dispatched/delivered rows
-    // are history and stay on their original date.
+    // Re-home each active schedule: follow the date only if its team already
+    // runs on the new date, else unassign (delete the row; the DO is reset to
+    // draft by the helper) so it returns to the unassigned-DO pool instead of
+    // orphaning on a team from the old date.
     const { data: scheds } = await supabase.from("delivery_schedules")
-      .select("id, status").eq("delivery_order_id", dord.id);
-    for (const s of (scheds || [])) {
-      // Move only active schedules; failed/cancelled/dispatched/delivered rows
-      // are history and stay on their original date.
-      if (!["scheduled", "picking", "loading"].includes(String(s.status || "").trim().toLowerCase())) continue;
-      await supabase.from("delivery_schedules").update({ scheduled_date: newDate }).eq("id", s.id);
-    }
+      .select("id, status, team_id, delivery_order_id").eq("delivery_order_id", dord.id);
+    for (const s of (scheds || [])) await rehomeScheduleForReschedule(s, newDate);
     await logDoEvent(dord.id, "rescheduled",
       { scheduled_date: newDate, via: "delivery_date_request_approval" }, actorId);
   }
@@ -7671,12 +7690,11 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     // Only when a real (non-TBC) date is set.
     if (data?.legacy_order_id && orderDeliveryDate !== undefined && orderDeliveryDate !== "TBC" && orderDeliveryDate) {
       const { data: svScheds } = await supabase.from("delivery_schedules")
-        .select("id, status").eq("order_id", data.legacy_order_id).is("delivery_order_id", null);
-      for (const s of (svScheds || [])) {
-        // Move only active assignments; failed/cancelled/dispatched/delivered stay.
-        if (!["scheduled", "picking", "loading"].includes(String(s.status || "").trim().toLowerCase())) continue;
-        await supabase.from("delivery_schedules").update({ scheduled_date: orderDeliveryDate }).eq("id", s.id);
-      }
+        .select("id, status, team_id, delivery_order_id").eq("order_id", data.legacy_order_id).is("delivery_order_id", null);
+      // Re-home each active assignment: follow the date only if its team already
+      // runs on the new date, else unassign back to the pool (a team from the
+      // old date can't keep it — that orphaned the service off the board).
+      for (const s of (svScheds || [])) await rehomeScheduleForReschedule(s, orderDeliveryDate);
       // Legs drive the Services list + printed service note — keep them in step
       // (leave completed/cancelled legs as history).
       await supabase.from("service_legs")
