@@ -4700,6 +4700,23 @@ async function applyRequestDeliveryDate(reqRow, actorId = null) {
     await oq;
   }
 
+  // Whole-order (non-DO) team assignments live in delivery_schedules keyed by
+  // the legacy order_id with delivery_order_id NULL — the DO loop below never
+  // sees them, so an order assigned to a team this way stayed on its OLD date
+  // after a reschedule approval (it kept showing on the team's old day). Move
+  // its still-active schedule(s) too; ones already out for delivery / arrived /
+  // delivered are locked history and stay put.
+  if (reqRow.order_id) {
+    const { data: legScheds } = await supabase.from("delivery_schedules")
+      .select("id, status").eq("order_id", reqRow.order_id).is("delivery_order_id", null);
+    for (const s of (legScheds || [])) {
+      // Move only active assignments; failed/cancelled/dispatched/delivered rows
+      // are history and stay on their original date.
+      if (!["scheduled", "picking", "loading"].includes(String(s.status || "").trim().toLowerCase())) continue;
+      await supabase.from("delivery_schedules").update({ scheduled_date: newDate }).eq("id", s.id);
+    }
+  }
+
   if (!reqRow.sales_order_id) return;
   await supabase.from("sales_orders").update({ delivery_date: newDate }).eq("id", reqRow.sales_order_id);
 
@@ -4718,7 +4735,9 @@ async function applyRequestDeliveryDate(reqRow, actorId = null) {
     const { data: scheds } = await supabase.from("delivery_schedules")
       .select("id, status").eq("delivery_order_id", dord.id);
     for (const s of (scheds || [])) {
-      if (String(s.status || "").trim().toLowerCase() !== "scheduled") continue;
+      // Move only active schedules; failed/cancelled/dispatched/delivered rows
+      // are history and stay on their original date.
+      if (!["scheduled", "picking", "loading"].includes(String(s.status || "").trim().toLowerCase())) continue;
       await supabase.from("delivery_schedules").update({ scheduled_date: newDate }).eq("id", s.id);
     }
     await logDoEvent(dord.id, "rescheduled",
