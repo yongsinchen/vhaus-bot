@@ -6469,9 +6469,14 @@ async function calculateCommission(orderId, companyId, opts = {}) {
 // date, not by today's date).
 function getPayoutMonth(orderDate) {
   const d = orderDate ? new Date(orderDate) : new Date();
-  d.setMonth(d.getMonth() + 1);
-  d.setDate(1);
-  return d.toISOString().slice(0, 10);
+  // Build the 1st of the NEXT month from year/month directly. Using
+  // d.setMonth(d.getMonth()+1) while the day-of-month is 31 overflowed for a
+  // month-end order — "Aug 31" + 1 month becomes "Sep 31", which JS rolls to
+  // Oct 1, bucketing the payout a month too late. Date.UTC(y, m+1, 1)
+  // normalizes the month (and year) correctly with the day pinned to 1, and
+  // matches the UTC basis of toISOString below.
+  const next = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
+  return next.toISOString().slice(0, 10);
 }
 
 // ══════════════════════════════════════════════════════════════════
