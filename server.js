@@ -13891,6 +13891,47 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // Detect amendments on confirmed/delivered orders → require manager
     // re-approval. Any change (not just material ones) is recorded before/after
     // and sent to the amendment approval queue (migration 073).
+    // ── DO Lock + critical-change detection (Delivery-Order Lock) ─────
+    // CRITICAL fields = the item set / SKU / option / quantity / unit price /
+    // discount / GST / amounts. NON-critical = customer details (name, contact,
+    // address, email, IC, note, time slot). A CRITICAL change is LOCKED while an
+    // active DO exists, and — without a DO, on a confirmed order — routes through
+    // manager approval. Customer details are always editable and never gated.
+    const _num = v => Number(v) || 0;
+    const _low = v => (v ?? "").toString().trim().toLowerCase();
+    let criticalItemChange = false;
+    if (expandedItems) {
+      const old = existing.sales_order_items || [];
+      const byId = new Map(old.map(i => [String(i.id), i]));
+      if (old.length !== expandedItems.length) criticalItemChange = true;
+      else for (const it of expandedItems) {
+        const ex = it.id != null ? byId.get(String(it.id)) : null;
+        if (!ex) { criticalItemChange = true; break; }
+        const sameIdentity = (ex.product_id || it.product_id)
+          ? String(ex.product_id || "") === String(it.product_id || "")
+          : (_low(ex.product_code) === _low(it.product_code) && _low(ex.product_name) === _low(it.product_name)
+             && _low(ex.size) === _low(it.size) && _low(ex.color) === _low(it.color));
+        if (!sameIdentity || _num(ex.quantity) !== _num(it.quantity) || _num(ex.unit_price) !== _num(it.unit_price)) {
+          criticalItemChange = true; break;
+        }
+      }
+    }
+    const criticalHeaderChange =
+      (discount !== undefined && _num(existing.discount) !== _num(discount)) ||
+      (admin_charges !== undefined && _num(existing.admin_charges) !== _num(admin_charges)) ||
+      (gst_amount !== undefined && _num(existing.gst_amount) !== _num(gst_amount));
+    const criticalChanged = criticalItemChange || criticalHeaderChange;
+
+    // A1: an active Delivery Order LOCKS critical fields. Qty / unit price /
+    // discount / amount / item set can no longer be changed directly — the DO
+    // must be cancelled or completed first. Customer details still pass through.
+    if (hasActiveDo && criticalChanged) {
+      return res.status(409).json({
+        error: "This order has an active Delivery Order. Cancel or complete the Delivery Order before changing items, quantity, unit price, discount, or amount. Customer details can still be edited.",
+        active_delivery_orders: activeDos.map(d => ({ id: d.id, do_number: d.do_number, status: d.status })),
+      });
+    }
+
     let finalStatus = status;
     let amendmentNote = null;
     let amendmentChanges = [];
@@ -13957,8 +13998,11 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         if (b !== undefined && (Number(a) || 0) !== (Number(b) || 0)) changes.push(`${label}: ${Number(a) || 0} → ${Number(b) || 0}`);
       }
       if (changes.length > 0) {
-        finalStatus = "amended";
         amendmentNote = `[${new Date().toISOString().slice(0, 16).replace("T", " ")}] Amended by ${req.user.name || req.user.salesman_name || "user"}: ${changes.join("; ")}`;
+        // A2: customer-detail-only edits stay 'confirmed' — no approval needed.
+        // Only a CRITICAL change (items / qty / price / discount / amount) flips
+        // the order to 'amended' for manager approval.
+        if (criticalChanged) finalStatus = "amended";
       }
     }
 
@@ -14209,12 +14253,23 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
             quantity: i.quantity, unit_price: i.unit_price,
           })),
         });
+        // A4: record EVERY amendment (approval-required or not). A critical
+        // change lands as 'pending' for manager approval; a customer-detail-only
+        // change is auto-recorded as 'approved' (no approval was required) so the
+        // before/after history is complete either way.
+        const autoApproved = !criticalChanged;
         await supabase.from("order_amendments").insert({
           company_id, branch_id: full?.branch_id || existing.branch_id || null,
           sales_order_id: id, order_number: full?.order_number || existing.order_number || null,
-          status: "pending", before_data: snapshot(existing), after_data: snapshot(full),
+          status: autoApproved ? "approved" : "pending",
+          before_data: snapshot(existing), after_data: snapshot(full),
           changes: amendmentChanges,
           requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null,
+          ...(autoApproved ? {
+            decided_by: req.user.id, decided_by_name: req.user.name || req.user.salesman_name || null,
+            decided_at: new Date().toISOString(),
+            decision_note: "Auto-recorded — customer detail edit, no approval required",
+          } : {}),
         });
       } catch (e) { console.error("order_amendments insert (non-fatal):", e.message); }
     }
