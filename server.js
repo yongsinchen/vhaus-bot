@@ -9156,9 +9156,40 @@ app.put("/delivery-teams/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), as
 
 app.delete("/delivery-teams/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE), async (req, res) => {
   try {
+    // P0-13: never silently orphan delivery records. Deleting a team used to
+    // hard-delete every schedule on it, wiping each order's assignment with no
+    // warning. Now: refuse outright if any delivery is already dispatched /
+    // delivered (can't be undone); otherwise, if orders are still assigned,
+    // require an explicit confirmation (force) — and on force, cleanly UNASSIGN
+    // them (orders return to the unassigned pool for their date; DO-linked ones
+    // reset to draft) rather than orphaning them.
+    const force = req.query.force === "true" || req.body?.force === true;
+    const { data: scheds } = await supabase.from("delivery_schedules")
+      .select("id, status, delivery_order_id").eq("team_id", req.params.id);
+    const assigned = scheds || [];
+    const locked = assigned.filter(s => isLockedScheduleStatus(s.status));
+    if (locked.length > 0) {
+      return res.status(409).json({
+        error: `This team has ${locked.length} delivery(s) already out for delivery or delivered — it can't be deleted. Complete or reassign them first.`,
+        locked_count: locked.length, assigned_count: assigned.length,
+      });
+    }
+    if (assigned.length > 0 && !force) {
+      return res.status(409).json({
+        error: `This team still has ${assigned.length} assigned order(s). Unassign or move them first, or confirm to unassign them all.`,
+        assigned_count: assigned.length, requires_confirmation: true,
+      });
+    }
+    // Confirmed (or empty): unassign cleanly. Reset any DO-linked schedule's DO
+    // back to draft so none is left "scheduled" with no schedule.
+    const doIds = [...new Set(assigned.map(s => s.delivery_order_id).filter(Boolean))];
+    for (const doId of doIds) {
+      await supabase.from("delivery_orders").update({ status: "draft" })
+        .eq("id", doId).not("status", "in", '("out_for_delivery","arrived","delivered","cancelled")');
+    }
     await supabase.from("delivery_schedules").delete().eq("team_id", req.params.id);
     await supabase.from("delivery_teams").delete().eq("id", req.params.id);
-    res.json({ ok: true });
+    res.json({ ok: true, unassigned: assigned.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
