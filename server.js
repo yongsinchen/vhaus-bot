@@ -13324,11 +13324,24 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
     // color") equals/prefixes the SO item's product_name.
     const usedJson = new Set();
     const findArrival = (soi) => {
+      // P0-05: prefer the EXACT immutable line id (soiId) that
+      // syncSalesOrderToDelivery now stamps on each JSON line — an arrival can
+      // then only ever land on its own order line, never a sibling that shares a
+      // code/name. Fall back to the 1:1 consuming code/name match for legacy
+      // JSON written before soiId existed.
+      for (let k = 0; k < jsonItems.length; k++) {
+        if (usedJson.has(k)) continue;
+        const ji = jsonItems[k];
+        if (ji && ji.soiId != null && String(ji.soiId) === String(soi.id)) {
+          usedJson.add(k); return ji.arrivalDate || null;
+        }
+      }
       const code = (soi.product_code || "").trim().toLowerCase();
       const name = (soi.product_name || "").trim().toLowerCase();
       for (let k = 0; k < jsonItems.length; k++) {
         if (usedJson.has(k)) continue;
         const ji = jsonItems[k];
+        if (ji && ji.soiId != null) continue; // id-bearing lines only match by id (above)
         const jCode = (ji.itemCode || "").trim().toLowerCase();
         const jName = (ji.itemName || "").trim().toLowerCase();
         const codeHit = code && jCode && code === jCode;
@@ -13443,15 +13456,42 @@ async function findOrCreateCustomerForOrder(order) {
 
 async function syncSalesOrderToDelivery(order, items) {
   try {
-    const deliveryItems = (items || []).map(it => ({
-      itemCode: it.product_code || "",
-      itemName: [it.product_name, it.size, it.color, it.custom_dimensions].filter(Boolean).join(" "),
-      unit: String(it.quantity || 1),
-      supplier: it.supplier_name || "",
-      itemOrderDate: "", supplierSentDate: "", arrivalDate: "",
-    }));
     const { data: existing } = await supabase.from("orders")
-      .select("id, customer_id").eq("company_id", order.company_id).eq("so_number", order.order_number).maybeSingle();
+      .select("id, customer_id, items").eq("company_id", order.company_id).eq("so_number", order.order_number).maybeSingle();
+    // P0-04 / P0-05: preserve each line's arrival across a re-sync and anchor it
+    // to the immutable line id. Rebuilding items with arrivalDate:"" used to wipe
+    // a recorded arrival on every SO edit. Source arrival from the durable
+    // per-line arrived_at (keyed by sales_order_items.id); else carry the prior
+    // legacy JSON arrival, matched by that same immutable id (soiId) when the
+    // prior JSON has it, otherwise by exact code+name. Also stamp soiId on every
+    // JSON line so the reverse sync (syncArrivalsToSalesOrderItems) and the
+    // supplier-DO matcher can target the exact order line.
+    let prevItems = [];
+    try { prevItems = typeof existing?.items === "string" ? JSON.parse(existing.items || "[]") : (existing?.items || []); } catch { prevItems = []; }
+    const prevById = new Map();
+    const prevByKey = new Map();
+    const arrivalKeyOf = (code, name) => `${(code || "").toLowerCase().trim()}|${(name || "").toLowerCase().replace(/\s+/g, " ").trim()}`;
+    for (const p of (Array.isArray(prevItems) ? prevItems : [])) {
+      if (p && p.soiId != null) prevById.set(String(p.soiId), p);
+      else if (p) { const k = arrivalKeyOf(p.itemCode, p.itemName); if (!prevByKey.has(k)) prevByKey.set(k, p); }
+    }
+    const deliveryItems = (items || []).map(it => {
+      const itemName = [it.product_name, it.size, it.color, it.custom_dimensions].filter(Boolean).join(" ");
+      const prior = (it.id != null && prevById.get(String(it.id))) || prevByKey.get(arrivalKeyOf(it.product_code, itemName)) || null;
+      const arrivalDate = it.arrived_at ? String(it.arrived_at).slice(0, 10) : (prior && prior.arrivalDate ? prior.arrivalDate : "");
+      const entry = {
+        soiId: it.id ?? null,
+        itemCode: it.product_code || "",
+        itemName,
+        unit: String(it.quantity || 1),
+        supplier: it.supplier_name || "",
+        itemOrderDate: "", supplierSentDate: "", arrivalDate,
+      };
+      // Preserve a partial-arrival count when one was recorded and arrived_at
+      // has not superseded it.
+      if (!it.arrived_at && prior && prior.arrivedQty != null) entry.arrivedQty = prior.arrivedQty;
+      return entry;
+    });
     const customer_id = existing?.customer_id || await findOrCreateCustomerForOrder(order);
     const row = {
       company_id: order.company_id,
@@ -14023,6 +14063,24 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         if (upErr) throw upErr;
       }
     } else if (expandedItems) {
+      // P0-04: a full rebuild (delete + reinsert) would drop each line's recorded
+      // arrival, which lives on the row (arrived_at). Carry arrived_at across the
+      // rebuild, matched by product identity (the row id necessarily changes on
+      // reinsert), consuming each match so two identical lines can't both claim
+      // the same arrival.
+      const _an = v => (v ?? "").toString().trim().toLowerCase();
+      const _identityKey = it => it.product_id
+        ? `p:${it.product_id}`
+        : `t:${_an(it.product_code)}|${_an(it.product_name)}|${_an(it.size)}|${_an(it.color)}`;
+      const prevArrivals = (existing.sales_order_items || [])
+        .filter(i => i.arrived_at)
+        .map(i => ({ used: false, arrived_at: i.arrived_at, key: _identityKey(i) }));
+      const takeArrival = it => {
+        const key = _identityKey(it);
+        const hit = prevArrivals.find(p => !p.used && p.key === key);
+        if (hit) { hit.used = true; return hit.arrived_at; }
+        return null;
+      };
       await supabase.from("sales_order_items").delete().eq("order_id", id);
       const itemRows = [];
       for (const it of expandedItems) {
@@ -14054,6 +14112,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
           bundle_id: it.bundle_id || null,
           bundle_instance_id: it.bundle_instance_id || null,
           bundle_component_price: it.bundle_component_price ?? null,
+          // P0-04: keep any recorded arrival for a line that still exists.
+          arrived_at: takeArrival(it),
         });
       }
       // is_clearance, unit_cost AND supplier_name are resolved server-side
