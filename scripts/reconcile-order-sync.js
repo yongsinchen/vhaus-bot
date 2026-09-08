@@ -21,17 +21,23 @@ if (!SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// P0-16: SO/order numbers are unique only per (company_id, number) — two
+// companies legitimately sharing a number is valid, not a mismatch. Every
+// lookup below is keyed by the composite, never the bare number alone.
+const key = (companyId, number) => `${companyId}|${number}`;
+
 async function run() {
   console.log("🔍 Fetching orders...");
-  const { data: legacyOrders } = await supabase.from("orders").select("id, so_number, customer_name, status, delivery_date, balance, order_amount, contact, items, type").order("created_at");
-  const { data: salesOrders } = await supabase.from("sales_orders").select("id, order_number, customer_name, status, delivery_status, delivery_date, subtotal, deposit, discount, gst_amount, gst_waived, customer_contact").order("created_at");
+  const { data: legacyOrders } = await supabase.from("orders").select("id, company_id, so_number, customer_name, status, delivery_date, balance, order_amount, contact, items, type").order("created_at");
+  const { data: salesOrders } = await supabase.from("sales_orders").select("id, company_id, order_number, customer_name, status, delivery_status, delivery_date, subtotal, deposit, discount, gst_amount, gst_waived, customer_contact").order("created_at");
 
   const soMap = new Map();
-  for (const so of (salesOrders || [])) soMap.set(so.order_number, so);
+  for (const so of (salesOrders || [])) soMap.set(key(so.company_id, so.order_number), so);
 
   const legacyMap = new Map();
   for (const o of (legacyOrders || [])) {
-    if (!legacyMap.has(o.so_number)) legacyMap.set(o.so_number, o);
+    const k = key(o.company_id, o.so_number);
+    if (!legacyMap.has(k)) legacyMap.set(k, o);
   }
 
   const missingInSales = [];
@@ -44,9 +50,9 @@ async function run() {
   // Check legacy → sales_orders
   for (const o of (legacyOrders || [])) {
     if (o.type === "Service") continue;
-    const so = soMap.get(o.so_number);
+    const so = soMap.get(key(o.company_id, o.so_number));
     if (!so) {
-      missingInSales.push({ so_number: o.so_number, legacy_id: o.id, customer: o.customer_name });
+      missingInSales.push({ so_number: o.so_number, company_id: o.company_id, legacy_id: o.id, customer: o.customer_name });
       continue;
     }
 
@@ -79,10 +85,20 @@ async function run() {
 
   // Check sales_orders → legacy
   for (const so of (salesOrders || [])) {
-    if (!legacyMap.has(so.order_number)) {
-      missingInLegacy.push({ order_number: so.order_number, sales_id: so.id, customer: so.customer_name });
+    if (!legacyMap.has(key(so.company_id, so.order_number))) {
+      missingInLegacy.push({ order_number: so.order_number, company_id: so.company_id, sales_id: so.id, customer: so.customer_name });
     }
   }
+
+  // Informational only — same number used by more than one company is VALID
+  // (P0-16), not a mismatch. Reported separately so it's never confused with
+  // an actual inconsistency above.
+  const numberToCompanies = new Map();
+  for (const so of (salesOrders || [])) {
+    if (!numberToCompanies.has(so.order_number)) numberToCompanies.set(so.order_number, new Set());
+    numberToCompanies.get(so.order_number).add(so.company_id);
+  }
+  const crossCompanyNumbers = [...numberToCompanies.entries()].filter(([, companies]) => companies.size > 1);
 
   // Report
   console.log("\n" + "=".repeat(60));
@@ -92,10 +108,13 @@ async function run() {
   console.log(`Total sales_orders:  ${(salesOrders || []).length}`);
 
   console.log(`\n📋 Legacy orders missing in sales_orders: ${missingInSales.length}`);
-  for (const m of missingInSales.slice(0, 20)) console.log(`   ${m.so_number} — ${m.customer}`);
+  for (const m of missingInSales.slice(0, 20)) console.log(`   ${m.so_number} (company ${m.company_id}) — ${m.customer}`);
 
   console.log(`\n📋 sales_orders missing in legacy: ${missingInLegacy.length}`);
-  for (const m of missingInLegacy.slice(0, 20)) console.log(`   ${m.order_number} — ${m.customer}`);
+  for (const m of missingInLegacy.slice(0, 20)) console.log(`   ${m.order_number} (company ${m.company_id}) — ${m.customer}`);
+
+  console.log(`\nℹ️  SO numbers shared across companies (VALID, not an error — P0-16): ${crossCompanyNumbers.length}`);
+  for (const [num, companies] of crossCompanyNumbers.slice(0, 20)) console.log(`   ${num}: companies ${[...companies].join(", ")}`);
 
   console.log(`\n⚠️  Status mismatches: ${statusMismatch.length}`);
   for (const m of statusMismatch.slice(0, 20)) console.log(`   ${m.so_number}: legacy=${m.legacy_status} sales=${m.sales_status} expected=${m.expected}`);

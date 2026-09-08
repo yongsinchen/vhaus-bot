@@ -171,9 +171,12 @@ async function migrate() {
   if (ordErr) { console.error("Failed to load orders:", ordErr.message); process.exit(1); }
   console.log(`Total legacy orders: ${allOrders.length}`);
 
-  // Load existing sales_orders to check for duplicates
-  const { data: existingSO } = await supabase.from("sales_orders").select("id, order_number, legacy_order_id");
-  const existingByNumber = new Map((existingSO || []).map(so => [so.order_number, so]));
+  // Load existing sales_orders to check for duplicates. P0-16: order_number
+  // is unique only per (company_id, order_number) — keying by order_number
+  // alone would false-positive-skip a legitimate different-company order
+  // that happens to share a number.
+  const { data: existingSO } = await supabase.from("sales_orders").select("id, company_id, order_number, legacy_order_id");
+  const existingByNumber = new Map((existingSO || []).map(so => [`${so.company_id}|${so.order_number}`, so]));
   const existingByLegacyId = new Map((existingSO || []).filter(so => so.legacy_order_id).map(so => [so.legacy_order_id, so]));
   console.log(`Existing sales_orders: ${(existingSO || []).length}`);
 
@@ -207,10 +210,11 @@ async function migrate() {
           continue;
         }
 
-        // Skip if already migrated (by order_number or legacy_order_id)
-        if (existingByNumber.has(order.so_number) || existingByLegacyId.has(order.id)) {
+        // Skip if already migrated (by company-scoped order_number or legacy_order_id)
+        const companyNumberKey = `${order.company_id}|${order.so_number}`;
+        if (existingByNumber.has(companyNumberKey) || existingByLegacyId.has(order.id)) {
           stats.skipped_existing++;
-          const existing = existingByNumber.get(order.so_number) || existingByLegacyId.get(order.id);
+          const existing = existingByNumber.get(companyNumberKey) || existingByLegacyId.get(order.id);
           logs.push({ legacy_order_id: order.id, legacy_so_number: order.so_number, new_sales_order_id: existing?.id, status: "skipped_existing", message: "Already migrated" });
           continue;
         }

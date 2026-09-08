@@ -1808,10 +1808,64 @@ const findOrderBySoToken = async (soToken, { companyId = null, select = "*", typ
     if (types) q = q.in("type", types);
     return q;
   };
-  let { data } = await base().eq("so_number", t).limit(1);
-  if (data && data[0]) return data[0];
-  ({ data } = await base().ilike("so_number", `%${t}%`).limit(20));
-  return (data || []).find(o => String(o.so_number || "").split(/\s+/).includes(t)) || null;
+  if (companyId) {
+    let { data } = await base().eq("so_number", t).limit(1);
+    if (data && data[0]) return data[0];
+    ({ data } = await base().ilike("so_number", `%${t}%`).limit(20));
+    return (data || []).find(o => String(o.so_number || "").split(/\s+/).includes(t)) || null;
+  }
+  // P0-16: orders.so_number is unique only per (company_id, so_number) — two
+  // companies may legitimately share the same SO number. With no company
+  // context, NEVER pick an arbitrary match: if the token resolves to rows in
+  // more than one company, return an ambiguous marker instead of guessing.
+  let { data: rows } = await base().eq("so_number", t);
+  if (!rows || rows.length === 0) {
+    ({ data: rows } = await base().ilike("so_number", `%${t}%`).limit(20));
+    rows = (rows || []).filter(o => String(o.so_number || "").split(/\s+/).includes(t));
+  }
+  if (!rows || rows.length === 0) return null;
+  const distinctCompanies = new Set(rows.map(o => o.company_id).filter(Boolean));
+  if (distinctCompanies.size > 1) return { ambiguous: true, companies: [...distinctCompanies], candidates: rows };
+  return rows[0];
+};
+
+// Exact-match, company-aware `orders` lookup for the Telegram command
+// handlers (no fuzzy split-SO matching — those flows expect the operator to
+// type the exact SO). Same no-guess rule as findOrderBySoToken (P0-16): when
+// companyId is unknown and the SO exists in more than one company, returns
+// `{ ambiguous: true, companies }` rather than picking one.
+const resolveOrderBySoNumber = async (soNumber, companyId, { select = "*", types = null } = {}) => {
+  let q = supabase.from("orders").select(select).eq("so_number", soNumber);
+  if (types) q = q.in("type", types);
+  if (companyId) {
+    const { data, error } = await q.eq("company_id", companyId).maybeSingle();
+    if (error) return { error };
+    return { order: data || null };
+  }
+  const { data, error } = await q;
+  if (error) return { error };
+  const rows = data || [];
+  if (rows.length === 0) return { order: null };
+  const distinctCompanies = new Set(rows.map(r => r.company_id).filter(Boolean));
+  if (distinctCompanies.size > 1) return { ambiguous: true, companies: [...distinctCompanies] };
+  return { order: rows[0] };
+};
+
+// Same no-guess rule for order_trips (now company-scoped, see migration 078).
+const resolveOrderTripBySoNumber = async (soNumber, tripNo, companyId) => {
+  let q = supabase.from("order_trips").select("*").eq("so_number", soNumber).eq("trip_no", tripNo);
+  if (companyId) {
+    const { data, error } = await q.eq("company_id", companyId).maybeSingle();
+    if (error) return { error };
+    return { trip: data || null };
+  }
+  const { data, error } = await q;
+  if (error) return { error };
+  const rows = data || [];
+  if (rows.length === 0) return { trip: null };
+  const distinctCompanies = new Set(rows.map(r => r.company_id).filter(Boolean));
+  if (distinctCompanies.size > 1) return { ambiguous: true, companies: [...distinctCompanies] };
+  return { trip: rows[0] };
 };
 
 // Order status lookup ("where is SO 31006") shared by both channels.
@@ -1819,6 +1873,7 @@ const findOrderBySoToken = async (soToken, { companyId = null, select = "*", typ
 const buildOrderStatusReply = async (soToken, companyId = null) => {
   const o = await findOrderBySoToken(soToken, { companyId, select: "id, so_number, customer_name, status, delivery_date, time_slot, balance, items, type, salesman" });
   if (!o) return null;
+  if (o.ambiguous) return `⚠️ SO ${soToken} exists in more than one company. Please search it in the web Sales Order search (which shows the company for each match) instead.`;
   let items = [];
   try { items = typeof o.items === "string" ? JSON.parse(o.items || "[]") : (o.items || []); } catch { items = []; }
   const arrived = items.filter(i => i.arrivalDate).length;
@@ -1873,7 +1928,10 @@ Example: /${isApprove ? "approve" : "reject"} 11576`);
     const { isTrip, tripId, tripNo, orderId, newDate, customerName, salesmanName } = approval;
     if (isTrip) {
       await supabase.from("order_trips").update({ scheduled_date: newDate }).eq("id", tripId);
-      if (tripNo === 1) await supabase.from("orders").update({ delivery_date: newDate }).eq("so_number", soNumber);
+      // P0-16: orderId (the specific orders.id) is already resolved onto the
+      // pending approval when it was created — use it instead of a bare
+      // so_number, which is no longer guaranteed unique across companies.
+      if (tripNo === 1 && orderId) await supabase.from("orders").update({ delivery_date: newDate }).eq("id", orderId);
     } else {
       await supabase.from("orders").update({ delivery_date: newDate }).eq("id", orderId);
     }
@@ -2055,8 +2113,10 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
     if (isTbc) updatePayload.status = "Scheduled";
     const { error } = await supabase.from("order_trips").update(updatePayload).eq("id", tripId);
     if (error) { await sendMessage(chatId, `❌ Failed to update: ${error.message}`); return; }
-    if (tripNo === 1) {
-      await supabase.from("orders").update({ delivery_date: dbDate }).eq("so_number", soNumber);
+    // P0-16: orderId is resolved (scoped by the trip's own company_id) when
+    // the reschedule session started — key off it, not the bare so_number.
+    if (tripNo === 1 && orderId) {
+      await supabase.from("orders").update({ delivery_date: dbDate }).eq("id", orderId);
     }
     clearSession(key);
     await sendMessage(chatId,
@@ -2233,10 +2293,16 @@ Reply YES / CANCEL or correct again.`);
       const soNumber = tripMatch ? tripMatch[1] : (soOnly ? soOnly[1] : text.trim());
       const tripNo = tripMatch ? parseInt(tripMatch[2]) : null;
 
+      // P0-16: resolve the authenticated Telegram user's company — trustworthy
+      // context, since this session only reaches here past the linked-user
+      // auth gate. Scoped lookups below never guess across companies.
+      const tgUser = await getTelegramUser(userId);
+      const companyId = tgUser?.company_id || null;
+
       if (tripNo) {
-        const { data: trip } = await supabase
-          .from("order_trips").select("*")
-          .eq("so_number", soNumber).eq("trip_no", tripNo).maybeSingle();
+        const { trip, ambiguous, error } = await resolveOrderTripBySoNumber(soNumber, tripNo, companyId);
+        if (error) { await sendMessage(chatId, `❌ Database error: ${error.message}`); return true; }
+        if (ambiguous) { await sendMessage(chatId, `⚠️ Trip ${tripNo} for SO *${soNumber}* exists in more than one company. Please contact admin.`); return true; }
         if (!trip) {
           await sendMessage(chatId, `❌ Trip ${tripNo} for SO *${soNumber}* not found.\nPlease check and try again.`);
           return true;
@@ -2245,7 +2311,13 @@ Reply YES / CANCEL or correct again.`);
           await sendMessage(chatId, `❌ Trip ${tripNo} is already *${trip.status}* and cannot be rescheduled.`);
           return true;
         }
-        setSession(key, "reschedule", "waiting_date", { soNumber, tripNo, tripId: trip.id, currentDate: trip.scheduled_date, isTrip: true });
+        // Trip 1's date also mirrors onto the parent orders row (see
+        // applyRescheduleDate/handleApprovalCommand) — resolve that order's id
+        // once now, scoped by the trip's own company_id, so later updates key
+        // off id rather than a bare so_number.
+        const { data: parentOrder } = await supabase.from("orders")
+          .select("id").eq("company_id", trip.company_id).eq("so_number", soNumber).maybeSingle();
+        setSession(key, "reschedule", "waiting_date", { soNumber, tripNo, tripId: trip.id, orderId: parentOrder?.id || null, currentDate: trip.scheduled_date, isTrip: true });
         await sendMessage(chatId,
           `📋 *SO ${soNumber} — Trip ${tripNo} of ${trip.total_trips}*\n` +
           `📅 Currently scheduled: *${fmtDate(trip.scheduled_date)}*\n\n` +
@@ -2253,9 +2325,11 @@ Reply YES / CANCEL or correct again.`);
         );
       } else {
         // Find order — check both Delivery and Service types
-        const { data: order } = await supabase
-          .from("orders").select("id, so_number, customer_name, delivery_date, type")
-          .eq("so_number", soNumber).in("type", ["Delivery", "Service"]).maybeSingle();
+        const { order, ambiguous, error } = await resolveOrderBySoNumber(soNumber, companyId, {
+          select: "id, so_number, customer_name, delivery_date, type", types: ["Delivery", "Service"],
+        });
+        if (error) { await sendMessage(chatId, `❌ Database error: ${error.message}`); return true; }
+        if (ambiguous) { await sendMessage(chatId, `⚠️ SO *${soNumber}* exists in more than one company. Please contact admin.`); return true; }
         if (!order) {
           await sendMessage(chatId, `❌ SO *${soNumber}* not found.\nPlease check and try again.`);
           return true;
@@ -2324,9 +2398,15 @@ Reply YES / CANCEL or correct again.`);
     // step: waiting_so
     if (session.step === "waiting_so") {
       const soNumber = text.trim();
-      const { data: order } = await supabase
-        .from("orders").select("id, so_number, customer_name, status")
-        .eq("so_number", soNumber).eq("type", "Delivery").maybeSingle();
+      const tgUser = await getTelegramUser(userId);
+      const { order, ambiguous, error } = await resolveOrderBySoNumber(soNumber, tgUser?.company_id || null, {
+        select: "id, so_number, customer_name, status", types: ["Delivery"],
+      });
+      if (error) { await sendMessage(chatId, `❌ Database error: ${error.message}`); return true; }
+      if (ambiguous) {
+        await sendMessage(chatId, `⚠️ SO *${soNumber}* exists in more than one company. Please contact admin.`);
+        return true;
+      }
       if (!order) {
         await sendMessage(chatId, `❌ SO *${soNumber}* not found.
 Please check and try again, or type *cancel*.`);
@@ -2440,15 +2520,19 @@ const handleFlagCommand = async (chatId, text, from) => {
     ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
     : (from?.username || "Unknown");
 
-  // Find the order
-  const { data: order, error: findErr } = await supabase
-    .from("orders")
-    .select("id, so_number, customer_name, status, remark, delivery_date")
-    .eq("so_number", soNumber)
-    .maybeSingle();
+  // Find the order — scoped by the poster's linked company when known (P0-16:
+  // so_number alone is no longer guaranteed unique across companies).
+  const tgUser = await getTelegramUser(from?.id);
+  const { order, ambiguous, error: findErr } = await resolveOrderBySoNumber(soNumber, tgUser?.company_id || null, {
+    select: "id, so_number, customer_name, status, remark, delivery_date",
+  });
 
   if (findErr) {
     await sendMessage(chatId, `❌ Database error: ${findErr.message}`);
+    return;
+  }
+  if (ambiguous) {
+    await sendMessage(chatId, `⚠️ SO *${soNumber}* exists in more than one company. Please contact admin.`);
     return;
   }
   if (!order) {
@@ -2470,11 +2554,12 @@ const handleFlagCommand = async (chatId, text, from) => {
     ? `${order.remark} | ${flagEntry}`
     : flagEntry;
 
-  // Update order: status → Flagged, remark → append flag note
+  // Update order: status → Flagged, remark → append flag note. Keyed by the
+  // already-resolved id — never re-query by bare so_number for a write.
   const { error: updateErr } = await supabase
     .from("orders")
     .update({ status: "Flagged", remark: updatedRemark })
-    .eq("so_number", soNumber);
+    .eq("id", order.id);
 
   if (updateErr) {
     await sendMessage(chatId, `❌ Failed to flag SO *${soNumber}*: ${updateErr.message}`);
@@ -2577,7 +2662,7 @@ const parseDeliveryTemplate = (text) => {
 };
 
 // ── Handle Delivery Group Template ────────────────────────────────
-const handleDeliveryTemplate = async (chatId, text) => {
+const handleDeliveryTemplate = async (chatId, text, from) => {
   if (!text.trim().toUpperCase().startsWith("DELIVERY")) return false;
   const parsed = parseDeliveryTemplate(text);
   if (!parsed) {
@@ -2619,14 +2704,19 @@ const handleDeliveryTemplate = async (chatId, text) => {
   });
   const driverNote = `Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""} (${now})`;
 
-  // Find the order
-  const { data: order, error: findErr } = await supabase
-    .from("orders")
-    .select("id, so_number, customer_name, remark, status, is_multi_trip, planned_trips, first_delivery_date")
-    .eq("so_number", soNumber).eq("type", "Delivery").maybeSingle();
+  // Find the order — scoped by the poster's linked company when known
+  // (P0-16: so_number alone is no longer guaranteed unique across companies).
+  const tgUser = await getTelegramUser(from?.id);
+  const { order, ambiguous, error: findErr } = await resolveOrderBySoNumber(soNumber, tgUser?.company_id || null, {
+    select: "id, so_number, customer_name, remark, status, is_multi_trip, planned_trips, first_delivery_date, company_id, branch_id",
+    types: ["Delivery"],
+  });
 
   if (findErr) { await sendMessage(chatId, `❌ Database error: ${findErr.message}`); return true; }
+  if (ambiguous) { await sendMessage(chatId, `⚠️ SO *${soNumber}* exists in more than one company. Please contact admin.`); return true; }
   if (!order) { await sendMessage(chatId, `❌ SO *${soNumber}* not found.\nPlease check the SO number.`); return true; }
+  // Every subsequent order_trips/orders/service_pending write below is keyed
+  // off this resolved order's id/company_id — never a bare so_number again.
 
   const updatedRemark = order.remark ? `${order.remark} | ${driverNote}` : driverNote;
 
@@ -2637,7 +2727,7 @@ const handleDeliveryTemplate = async (chatId, text) => {
   if (order.is_multi_trip) {
     // Find the current Out for Delivery / Assigned trip
     const { data: trips } = await supabase
-      .from("order_trips").select("*").eq("so_number", soNumber)
+      .from("order_trips").select("*").eq("company_id", order.company_id).eq("so_number", soNumber)
       .in("status", ["Out for Delivery", "Assigned", "Scheduled"])
       .order("trip_no");
 
@@ -2656,14 +2746,14 @@ const handleDeliveryTemplate = async (chatId, text) => {
     // Update order remark + first delivery date
     await supabase.from("orders")
       .update({ remark: updatedRemark, first_delivery_date: firstDeliveryDate, status: "In Progress" })
-      .eq("so_number", soNumber);
+      .eq("id", order.id);
 
     if (isSettle) {
       // Settled — mark order Delivered, cancel remaining trips
-      await supabase.from("orders").update({ status: "Delivered" }).eq("so_number", soNumber);
+      await supabase.from("orders").update({ status: "Delivered" }).eq("id", order.id);
       await supabase.from("order_trips")
         .update({ status: "Cancelled" })
-        .eq("so_number", soNumber)
+        .eq("company_id", order.company_id).eq("so_number", soNumber)
         .in("status", ["Scheduled", "Assigned"])
         .gt("trip_no", currentTrip.trip_no);
 
@@ -2692,9 +2782,10 @@ const handleDeliveryTemplate = async (chatId, text) => {
         await supabase.from("order_trips").insert({
           so_number: soNumber, sv_number: svNumber,
           trip_no: newTripNo, total_trips: newTotal, status: "Scheduled",
+          company_id: order.company_id, branch_id: order.branch_id || null,
         });
         // Update total_trips on all existing trips
-        await supabase.from("order_trips").update({ total_trips: newTotal }).eq("so_number", soNumber);
+        await supabase.from("order_trips").update({ total_trips: newTotal }).eq("company_id", order.company_id).eq("so_number", soNumber);
 
         await sendMessage(chatId,
           `⚠️ *SO ${soNumber} — Trip ${currentTrip.trip_no} Not Settled*\n\n` +
@@ -2735,7 +2826,7 @@ const handleDeliveryTemplate = async (chatId, text) => {
   if (isSettle) {
     await supabase.from("orders")
       .update({ status: "Delivered", remark: updatedRemark, first_delivery_date: firstDeliveryDate })
-      .eq("so_number", soNumber);
+      .eq("id", order.id);
 
     await sendMessage(chatId,
       `✅ *SO ${soNumber} — Settled*\n\n` +
@@ -2754,7 +2845,7 @@ const handleDeliveryTemplate = async (chatId, text) => {
     const fullRemark = note ? `${updatedRemark} | Issue: ${note}` : updatedRemark;
     await supabase.from("orders")
       .update({ remark: fullRemark, first_delivery_date: firstDeliveryDate })
-      .eq("so_number", soNumber);
+      .eq("id", order.id);
 
     await supabase.from("service_pending").insert({
       so_number: soNumber, driver, helper: helper || null,
@@ -2788,12 +2879,18 @@ const handleDeliveryTemplate = async (chatId, text) => {
 app.get("/order-trips", requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date is required" });
-  const { data, error } = await supabase
+  const cid = getActiveCompanyId(req);
+  // P0-16: the FK this embed names was renamed to order_trips_company_so_number_fkey
+  // when the composite (company_id, so_number) uniqueness/FK was added — the old
+  // order_trips_so_number_fkey no longer exists, so the stale name here would 500.
+  let q = supabase
     .from("order_trips")
-    .select("*, orders!order_trips_so_number_fkey(id, so_number, customer_name, address, contact, items, time_slot, balance, salesman, remark)")
+    .select("*, orders!order_trips_company_so_number_fkey(id, so_number, customer_name, address, contact, items, time_slot, balance, salesman, remark)")
     .eq("scheduled_date", date)
     .in("status", ["Scheduled", "Assigned"])
     .order("trip_no");
+  if (cid) q = q.eq("company_id", cid);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
@@ -2801,11 +2898,14 @@ app.get("/order-trips", requireAuth, async (req, res) => {
 // GET /order-trips/so/:soNumber — all trips for a specific SO
 app.get("/order-trips/so/:soNumber", requireAuth, async (req, res) => {
   const { soNumber } = req.params;
-  const { data, error } = await supabase
+  const cid = getActiveCompanyId(req);
+  let q = supabase
     .from("order_trips")
     .select("*")
     .eq("so_number", soNumber)
     .order("trip_no");
+  if (cid) q = q.eq("company_id", cid);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
@@ -2823,19 +2923,25 @@ app.patch("/order-trips/:id/cancel", requireRole(MANAGE_ROLES), async (req, res)
 // PATCH /order-trips/:id — update trip (date, status, driver, helper)
 app.patch("/order-trips/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   const { id } = req.params;
-  const { scheduled_date, status, driver, helper, trip_no, vehicle_id, remark } = req.body;
+  // P0-16 / previously-reported bug: order_trips has no vehicle_id column —
+  // accepting it here always fails the update below (Postgres "column does
+  // not exist"), silently blocking every field in the same request whenever
+  // a caller happens to send it. Trip-level vehicle assignment isn't a
+  // feature this table supports; dropped rather than papered over.
+  const { scheduled_date, status, driver, helper, trip_no, remark } = req.body;
   const updates = {};
   if (scheduled_date !== undefined) updates.scheduled_date = scheduled_date;
   if (status !== undefined) updates.status = status;
   if (driver !== undefined) updates.driver = driver;
   if (helper !== undefined) updates.helper = helper;
   if (trip_no !== undefined) updates.trip_no = trip_no;
-  if (vehicle_id !== undefined) updates.vehicle_id = vehicle_id;
   if (remark !== undefined) updates.remark = remark;
-  // Prior scheduled_date/so_number/trip_no — needed for the delivery_activity
-  // feed entry below when the date is the field being changed.
+  // Prior scheduled_date/so_number/trip_no/company_id/branch_id — needed for
+  // the delivery_activity feed entry below when the date is the field being
+  // changed. order_trips carries its own company_id/branch_id now, so no
+  // join to `orders` is needed to resolve them (P0-16).
   const { data: beforeTrip } = scheduled_date !== undefined
-    ? await supabase.from("order_trips").select("scheduled_date, so_number, trip_no").eq("id", id).maybeSingle()
+    ? await supabase.from("order_trips").select("scheduled_date, so_number, trip_no, company_id, branch_id").eq("id", id).maybeSingle()
     : { data: null };
   const { data, error } = await supabase
     .from("order_trips")
@@ -2844,22 +2950,18 @@ app.patch("/order-trips/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     .select()
     .single();
   if (error) return res.status(500).json({ error: error.message });
-  if (beforeTrip?.so_number) {
-    // order_trips has no company_id column — resolve via the parent order
-    // (order_trips.so_number → orders.so_number). Best-effort, non-fatal.
+  if (beforeTrip?.so_number && beforeTrip.company_id) {
     const { data: ord } = await supabase.from("orders")
-      .select("id, company_id, branch_id").eq("so_number", beforeTrip.so_number).maybeSingle();
-    if (ord?.company_id) {
-      await logDeliveryActivity({
-        companyId: ord.company_id, branchId: ord.branch_id || null,
-        soNumber: beforeTrip.so_number, orderId: ord.id,
-        tripNo: beforeTrip.trip_no ?? trip_no ?? null,
-        action: scheduled_date ? (beforeTrip.scheduled_date ? "rescheduled" : "arranged") : "set_tbc",
-        fromDate: beforeTrip.scheduled_date || null, toDate: scheduled_date || null,
-        source: "web", actorId: req.user?.id || null,
-        actorName: req.user?.name || req.user?.salesman_name || null,
-      });
-    }
+      .select("id").eq("company_id", beforeTrip.company_id).eq("so_number", beforeTrip.so_number).maybeSingle();
+    await logDeliveryActivity({
+      companyId: beforeTrip.company_id, branchId: beforeTrip.branch_id || null,
+      soNumber: beforeTrip.so_number, orderId: ord?.id || null,
+      tripNo: beforeTrip.trip_no ?? trip_no ?? null,
+      action: scheduled_date ? (beforeTrip.scheduled_date ? "rescheduled" : "arranged") : "set_tbc",
+      fromDate: beforeTrip.scheduled_date || null, toDate: scheduled_date || null,
+      source: "web", actorId: req.user?.id || null,
+      actorName: req.user?.name || req.user?.salesman_name || null,
+    });
   }
   res.json(data);
 });
@@ -2868,10 +2970,15 @@ app.patch("/order-trips/:id", requireRole(MANAGE_ROLES), async (req, res) => {
 app.post("/order-trips/so/:soNumber/cancel-remaining", requireRole(MANAGE_ROLES), async (req, res) => {
   const { soNumber } = req.params;
   const { after_trip_no } = req.body;
+  const cid = getActiveCompanyId(req);
+  // P0-16: this is a write — refuse to guess across companies when the
+  // caller has no active company context, rather than cancelling trips for
+  // every company that happens to share this SO number.
+  if (!cid) return res.status(400).json({ error: "ambiguous_company", message: "No active company selected — cannot scope this update safely." });
   const { error } = await supabase
     .from("order_trips")
     .update({ status: "Cancelled" })
-    .eq("so_number", soNumber)
+    .eq("company_id", cid).eq("so_number", soNumber)
     .in("status", ["Scheduled", "Assigned"])
     .gt("trip_no", after_trip_no || 0);
   if (error) return res.status(500).json({ error: error.message });
@@ -3073,14 +3180,15 @@ app.patch("/delivery/routes/:id", requireRole(MANAGE_ROLES), async (req, res) =>
       // For multi-trip orders — update the trip status instead
       const multiOrderIds = (regularOrders || []).filter(o => o.is_multi_trip).map(o => o.id);
       if (multiOrderIds.length > 0 && req.body.status === "Out for Delivery") {
-        // Get SO numbers for multi-trip orders in this route
+        // Get SO numbers (+ company) for multi-trip orders in this route
         const { data: multiOrders } = await supabase
-          .from("orders").select("so_number").in("id", multiOrderIds);
-        const soNumbers = (multiOrders || []).map(o => o.so_number);
-        // Mark their current Assigned/Scheduled trip as Out for Delivery
-        for (const soNumber of soNumbers) {
+          .from("orders").select("so_number, company_id").in("id", multiOrderIds);
+        // Mark their current Assigned/Scheduled trip as Out for Delivery —
+        // scoped by company_id + so_number (P0-16: so_number alone is no
+        // longer guaranteed unique across companies).
+        for (const mo of (multiOrders || [])) {
           const { data: trips } = await supabase
-            .from("order_trips").select("id").eq("so_number", soNumber)
+            .from("order_trips").select("id").eq("company_id", mo.company_id).eq("so_number", mo.so_number)
             .in("status", ["Assigned", "Scheduled"]).order("trip_no").limit(1);
           if (trips && trips.length > 0) {
             await supabase.from("order_trips").update({ status: "Out for Delivery" }).eq("id", trips[0].id);
@@ -3957,11 +4065,15 @@ app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, 
   // Prevent double conversion
   if (sp.status === "Converted") return res.status(400).json({ error: "Already converted" });
 
-  // Get original delivery order for customer info
-  const { data: origOrder } = await supabase
-    .from("orders").select("*").eq("so_number", sp.so_number).eq("type", "Delivery").maybeSingle();
+  // Get original delivery order for customer info — scoped by the
+  // service_pending row's own company when known (P0-16: so_number alone is
+  // no longer guaranteed unique across companies).
+  const spCompanyId = sp.company_id || getActiveCompanyId(req);
+  let origOrderQ = supabase.from("orders").select("*").eq("so_number", sp.so_number).eq("type", "Delivery");
+  if (spCompanyId) origOrderQ = origOrderQ.eq("company_id", spCompanyId);
+  const { data: origOrder } = await origOrderQ.maybeSingle();
 
-  const companyId = origOrder?.company_id || sp.company_id || getActiveCompanyId(req);
+  const companyId = origOrder?.company_id || spCompanyId;
 
   // Infer service type from note if not provided
   let svcType = Number(service_type) || 0;
@@ -4217,11 +4329,13 @@ app.post("/auto-schedule/approve", requireRole(MANAGE_ROLES), async (req, res) =
 
     // Add orders to route with sequence + time slots
     for (const stop of vehicle.stops) {
+      // .maybeSingle() (not .single()) — .single() throws on 0 rows, turning a
+      // missing stop into a request-ending error instead of a skip.
       const { data: order } = await supabase
         .from("orders")
         .select("id, estimated_duration")
-        .eq("so_number", stop.so_number)
-        .single();
+        .eq("company_id", company_id).eq("so_number", stop.so_number)
+        .maybeSingle();
 
       if (!order) continue;
 
@@ -6948,11 +7062,10 @@ app.post("/sales-orders/resync-missing", requireRole(["master", "manager"]), asy
     let synced = 0, commissioned = 0, failed = 0; const errors = [];
     for (const so of missing) {
       try {
-        const orderId = await syncSalesOrderToDelivery(so, so.sales_order_items);
-        // syncSalesOrderToDelivery swallows its own errors and returns null.
+        const { orderId, syncError } = await syncSalesOrderToDelivery(so, so.sales_order_items);
         // A null id means the `orders` row was NOT created (e.g. an insert that
         // failed) — report it as a failure, don't count it as synced.
-        if (!orderId) { failed++; errors.push({ order_number: so.order_number, error: "sync produced no order row (insert failed — check server logs)" }); continue; }
+        if (!orderId) { failed++; errors.push({ order_number: so.order_number, error: syncError?.message || "sync produced no order row (insert failed — check server logs)" }); continue; }
         try { await calculateCommission(orderId, cid, { cascade: false }); commissioned++; } catch (e) { /* commission is best-effort */ }
         synced++;
       } catch (e) { failed++; errors.push({ order_number: so.order_number, error: e.message }); }
@@ -8298,6 +8411,7 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
     const beginSchedule = async (soToken) => {
       const order = await findOrderBySoToken(soToken, { companyId, select: "id, so_number, customer_name, delivery_date, type, status, is_multi_trip", types: ["Delivery", "Service"] });
       if (!order) { reply(`SO ${soToken} not found. Check the number and try again, or type "help".`); return null; }
+      if (order.ambiguous) { reply(`SO ${soToken} exists in more than one company. Please use the web Sales Order search to find the right one.`); return null; }
       if (["Delivered", "Cancelled"].includes(order.status)) { reply(`SO ${order.so_number} is already ${order.status} — it can't be rescheduled.`); return null; }
       const data = {
         soNumber: order.so_number, orderId: order.id, currentDate: order.delivery_date,
@@ -8409,7 +8523,7 @@ app.post("/telegram/webhook", async (req, res) => {
     // ── Group B: Delivery template messages ───────────────────────
     if (String(chatId) === String(DELIVERY_GROUP_CHAT_ID)) {
       if (message.text) {
-        await handleDeliveryTemplate(chatId, message.text);
+        await handleDeliveryTemplate(chatId, message.text, message.from);
       }
       return;
     }
@@ -8963,11 +9077,14 @@ app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), 
       }
     }
 
+    const packingsCid = getActiveCompanyId(req);
     for (const item of items) {
       // Try to find the order_item to link
       let orderItemId = item.order_item_id || null;
       if (!orderItemId && item.so_number) {
-        const { data: order } = await supabase.from("orders").select("id").eq("so_number", item.so_number).maybeSingle();
+        let orderQ = supabase.from("orders").select("id").eq("so_number", item.so_number);
+        if (packingsCid) orderQ = orderQ.eq("company_id", packingsCid);
+        const { data: order } = await orderQ.maybeSingle();
         if (order) {
           const { data: oi } = await supabase.from("order_items").select("id")
             .eq("order_id", order.id).ilike("product_name", `%${item.product_name || item.item_name || ""}%`).limit(1).maybeSingle();
@@ -9552,8 +9669,12 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
 
     // Source 1: delivery_schedules (new system). Phase 3: DO schedules pick
     // ONLY that shipment's items (product-matched), tagged with the DO number.
+    // P0-16: this endpoint already requires cid — scope the schedules query by
+    // it too (previously unscoped, leaking every company's schedules into the
+    // date-range fetch regardless of the so_number issue).
     const { data: schedules } = await supabase.from("delivery_schedules")
-      .select(`*, orders(id, so_number, customer_name, address), ${SELECTS.DO_MATCH_NESTED_SELECT}`)
+      .select(`*, orders(id, so_number, customer_name, address, company_id), ${SELECTS.DO_MATCH_NESTED_SELECT}`)
+      .eq("company_id", cid)
       .gte("scheduled_date", startDate).lte("scheduled_date", endDate).in("status", ["scheduled", "picking"]);
     for (const sched of (schedules || [])) {
       if (!sched.orders?.id) continue;
@@ -9562,7 +9683,7 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
         : null;
       // A DO schedule must not ALSO trigger the whole-order fallback below
       seenSO.add(sched.orders.so_number);
-      await addPickItemsForOrder(sched.orders.id, sched.orders.so_number, sched.orders.customer_name, sched.scheduled_date, pickItems, doInfo);
+      await addPickItemsForOrder(sched.orders.id, sched.orders.company_id, sched.orders.so_number, sched.orders.customer_name, sched.scheduled_date, pickItems, doInfo);
     }
 
     // Source 2: orders with delivery_date in range (text column, string compare works for YYYY-MM-DD)
@@ -9592,7 +9713,10 @@ app.get("/unified-pick-list", requireAuth, async (req, res) => {
     }
     const soNumbers = orders.map(o => o.so_number).filter(Boolean);
     if (soNumbers.length > 0) {
-      const { data: lbs } = await supabase.from("package_labels").select("*").in("so_number", soNumbers).in("status", ["stored", "put_away"]);
+      // P0-16: soNumbers came from a company-scoped `orders` query above —
+      // scope this label lookup the same way so a same-numbered SO in
+      // another company can never leak its labels into this pick list.
+      const { data: lbs } = await supabase.from("package_labels").select("*").eq("company_id", cid).in("so_number", soNumbers).in("status", ["stored", "put_away"]);
       allLabels = lbs || [];
     }
     // Build lookup maps
@@ -9664,7 +9788,7 @@ function buildDoItemMatcher(dord) {
   };
 }
 
-async function addPickItemsForOrder(orderId, soNumber, customerName, deliveryDate, pickItems, doInfo = null) {
+async function addPickItemsForOrder(orderId, companyId, soNumber, customerName, deliveryDate, pickItems, doInfo = null) {
   // doInfo (Phase 3): { doNumber, matcher } — restrict output to the Delivery
   // Order's items and tag rows with the DO number. Null = whole order (legacy).
   const matches = doInfo ? doInfo.matcher : null;
@@ -9682,9 +9806,12 @@ async function addPickItemsForOrder(orderId, soNumber, customerName, deliveryDat
       found = true;
     }
   }
-  // Fallback to package_labels
+  // Fallback to package_labels — scoped by company_id (P0-16: so_number alone
+  // is no longer guaranteed unique across companies).
   if (!found) {
-    const { data: labels } = await supabase.from("package_labels").select("*").eq("so_number", soNumber).in("status", ["stored", "put_away"]);
+    let labelQ = supabase.from("package_labels").select("*").eq("so_number", soNumber).in("status", ["stored", "put_away"]);
+    if (companyId) labelQ = labelQ.eq("company_id", companyId);
+    const { data: labels } = await labelQ;
     for (const l of (labels || [])) {
       if (matches && !matches(l.product_code, l.product_name)) continue;
       pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, location_code: l.location_code, _product_name: l.product_name, _product_code: l.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate, _source: "package_labels", ...doTag });
@@ -9697,7 +9824,9 @@ app.get("/unified-loading-list", requireAuth, async (req, res) => {
   try {
     const { team_id, date } = req.query;
     if (!team_id && !date) return res.status(400).json({ error: "team_id or date required" });
-    let q = supabase.from("delivery_schedules").select(`*, orders(id, so_number, customer_name), ${SELECTS.DO_MATCH_NESTED_SELECT}`);
+    const cid = getActiveCompanyId(req);
+    let q = supabase.from("delivery_schedules").select(`*, orders(id, so_number, customer_name, company_id), ${SELECTS.DO_MATCH_NESTED_SELECT}`);
+    if (cid) q = q.eq("company_id", cid);
     if (team_id) q = q.eq("team_id", team_id);
     if (date) q = q.eq("scheduled_date", date);
     q = q.in("status", ["scheduled", "picking", "loading"]);
@@ -9717,8 +9846,9 @@ app.get("/unified-loading-list", requireAuth, async (req, res) => {
           items.push({ ...p, _product_name: oi?.product_name, _product_code: oi?.product_code, _customer: sched.orders.customer_name, _so_number: sched.orders.so_number });
         }
       }
-      // Fallback to package_labels
-      const { data: labels } = await supabase.from("package_labels").select("*").eq("so_number", sched.orders.so_number).in("status", ["picked", "loaded"]);
+      // Fallback to package_labels — scoped by the order's own company_id
+      // (P0-16: so_number alone is no longer guaranteed unique across companies).
+      const { data: labels } = await supabase.from("package_labels").select("*").eq("company_id", sched.orders.company_id).eq("so_number", sched.orders.so_number).in("status", ["picked", "loaded"]);
       for (const l of (labels || [])) {
         if (doMatch && !doMatch(l.product_code, l.product_name)) continue;
         if (!items.find(i => i.qr_code === l.qr_code)) {
@@ -10623,8 +10753,8 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
           if (p.status === "picked" || p.status === "loaded") pickedCount++;
         }
       }
-      // Also check package_labels fallback
-      const { data: labels } = await supabase.from("package_labels").select("status").eq("so_number", order.so_number);
+      // Also check package_labels fallback (scoped by company — P0-16)
+      const { data: labels } = await supabase.from("package_labels").select("status").eq("company_id", cid).eq("so_number", order.so_number);
       if ((labels || []).length > 0 && packedCount === 0 && storedCount === 0) {
         for (const l of labels) {
           if (l.status === "stored" || l.status === "put_away") storedCount++;
@@ -13608,8 +13738,30 @@ async function syncSalesOrderToDelivery(order, items) {
       items: JSON.stringify(deliveryItems),
     };
     let orderId;
-    if (existing) { await supabase.from("orders").update(row).eq("id", existing.id); orderId = existing.id; }
-    else { const { data: ins } = await supabase.from("orders").insert(row).select("id").single(); orderId = ins?.id; }
+    let writeError = null;
+    if (existing) {
+      const { error: updErr } = await supabase.from("orders").update(row).eq("id", existing.id);
+      orderId = updErr ? null : existing.id;
+      writeError = updErr;
+    } else {
+      const { data: ins, error: insErr } = await supabase.from("orders").insert(row).select("id").single();
+      orderId = ins?.id || null;
+      writeError = insErr;
+    }
+    // P0-16: the write above is the required operational projection — sales_orders
+    // is already committed by the time this runs, so a failure here must never be
+    // silently swallowed (that produced the exact "sales_orders exists, orders
+    // projection missing" bug this fix targets). This is NOT limited to 23505 —
+    // any failure surfaces the same way. The canonical Sales Order is NOT rolled
+    // back (no atomic cross-write support here); the failure is logged with full
+    // context and reported back to the caller instead.
+    if (writeError) {
+      logProjectionSyncFailure({
+        salesOrderId: order.id, companyId: order.company_id, orderNumber: order.order_number,
+        operation: existing ? "update" : "insert", error: writeError,
+      });
+      return { orderId: null, syncError: writeError };
+    }
     // Sync order_items so packings can link to them
     if (orderId && Array.isArray(items) && items.length > 0) {
       await supabase.from("order_items").delete().eq("order_id", orderId);
@@ -13621,10 +13773,44 @@ async function syncSalesOrderToDelivery(order, items) {
       }));
       await supabase.from("order_items").insert(oiRows);
     }
-    return orderId;
+    return { orderId, syncError: null };
   } catch (e) {
-    console.error("syncSalesOrderToDelivery error:", e.message);
-    return null;
+    logProjectionSyncFailure({
+      salesOrderId: order?.id, companyId: order?.company_id, orderNumber: order?.order_number,
+      operation: "sync", error: e,
+    });
+    return { orderId: null, syncError: e };
+  }
+}
+
+// P0-16: structured, always-logged record of a failed sales_orders → orders
+// projection sync — never silently swallowed. This is a best-effort admin
+// notification, NOT the source of truth for detecting the inconsistency:
+// scripts/audit-data-consistency.js independently re-derives "sales_orders
+// row with no matching orders row" straight from both tables, so the
+// inconsistency stays detectable even if this log line or notification is
+// lost (server restart, Telegram down, etc).
+function logProjectionSyncFailure({ salesOrderId, companyId, orderNumber, operation, error }) {
+  const record = {
+    event: "projection_sync_failure",
+    sales_order_id: salesOrderId ?? null,
+    company_id: companyId ?? null,
+    order_number: orderNumber ?? null,
+    operation,
+    error_code: error?.code ?? null,
+    error_message: error?.message ?? String(error),
+    at: new Date().toISOString(),
+  };
+  console.error("[P0-16 projection sync failure]", JSON.stringify(record));
+  if (ADMIN_CHAT_ID) {
+    sendMessage(ADMIN_CHAT_ID,
+      `🚨 *Operational projection sync FAILED*\n\n` +
+      `📋 SO: *${orderNumber || "-"}*\n` +
+      `🏢 Company: ${companyId || "-"}\n` +
+      `⚙️ Operation: ${operation}\n` +
+      `❌ ${error?.message || error}\n\n` +
+      `_The Sales Order was saved, but Delivery/Telegram/Driver may not see it. Check scripts/audit-data-consistency.js._`
+    ).catch(() => {});
   }
 }
 
@@ -13733,7 +13919,7 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
     // Load legacy order for arrival data
     let legacyOrder = null;
     if (data.order_number) {
-      const { data: leg } = await supabase.from("orders").select("id, items").eq("so_number", data.order_number).maybeSingle();
+      const { data: leg } = await supabase.from("orders").select("id, items").eq("company_id", data.company_id).eq("so_number", data.order_number).maybeSingle();
       legacyOrder = leg;
     }
     res.json({ order: data, legacy_order: legacyOrder });
@@ -13890,20 +14076,27 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", order.id).single();
     await attachLinkedProducts(full?.sales_order_items);
-    await syncSalesOrderToDelivery(full, full.sales_order_items);
+    const { syncError } = await syncSalesOrderToDelivery(full, full.sales_order_items);
     // An order created already CONFIRMED must get its commission row now.
     // The status-flip path (PATCH /sales-orders/:id/status) calculates
     // commission on later confirmation, but an order created straight into
     // "confirmed" would otherwise have NO commission until it was next edited,
     // scheduled, or paid — leaving it invisible in the payout. Mirror the
     // confirm path here (row is pending until the deposit gate is met).
-    if (full?.status === "confirmed") {
+    if (!syncError && full?.status === "confirmed") {
       try {
-        const { data: legacyOrder } = await supabase.from("orders").select("id").eq("so_number", full.order_number).maybeSingle();
-        if (legacyOrder) await calculateCommission(legacyOrder.id, getActiveCompanyId(req));
+        const { data: legacyOrder } = await supabase.from("orders").select("id").eq("company_id", full.company_id).eq("so_number", full.order_number).maybeSingle();
+        if (legacyOrder) await calculateCommission(legacyOrder.id, full.company_id);
       } catch (e) { console.error("commission calc on create:", e.message); }
     }
-    res.status(201).json({ order: full });
+    // P0-16: the Sales Order (canonical) is already committed at this point —
+    // it is NOT rolled back on a projection failure. But the response must not
+    // claim unconditional success when Delivery/Telegram/Driver won't see this
+    // order yet; surface it so the caller can retry the sync or alert ops.
+    res.status(201).json({
+      order: full,
+      ...(syncError ? { projection_sync_warning: "Sales order saved, but it may not yet be visible in Delivery/Telegram/Driver. An admin has been notified — retry or check scripts/audit-data-consistency.js." } : {}),
+    });
   } catch (err) { console.error("POST /sales-orders error:", err); res.status(500).json({ error: err.message }); }
 });
 
@@ -14271,7 +14464,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
     await attachLinkedProducts(full?.sales_order_items);
-    const deliveryOrderId = await syncSalesOrderToDelivery(full, full.sales_order_items);
+    const { orderId: deliveryOrderId, syncError: projectionSyncError } = await syncSalesOrderToDelivery(full, full.sales_order_items);
     // Fold any recorded payments back into the paid/deposit + balance now that
     // the edited deposit/total has been written (sync set balance = total −
     // deposit; recompute adds initial_deposit + payments so payments aren't lost).
@@ -14333,7 +14526,12 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         });
       } catch (e) { console.error("order_amendments insert (non-fatal):", e.message); }
     }
-    res.json({ order: full });
+    // P0-16: don't report unconditional success when the operational
+    // projection failed to sync — see POST /sales-orders for the same pattern.
+    res.json({
+      order: full,
+      ...(projectionSyncError ? { projection_sync_warning: "Sales order saved, but it may not yet be visible in Delivery/Telegram/Driver. An admin has been notified — retry or check scripts/audit-data-consistency.js." } : {}),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -14366,18 +14564,22 @@ app.patch("/order-amendments/:id/approve", requireAuth, async (req, res) => {
     if (a.status !== "pending") return res.status(400).json({ error: `Amendment is already ${a.status}` });
     // Accept the change: return the order to 'confirmed' and re-sync to the
     // legacy delivery order.
+    let amendSyncError = null;
     if (a.sales_order_id) {
       await supabase.from("sales_orders").update({ status: "confirmed" })
         .eq("id", a.sales_order_id).eq("company_id", a.company_id).neq("status", "cancelled");
       const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", a.sales_order_id).maybeSingle();
-      if (full) { try { await syncSalesOrderToDelivery(full, full.sales_order_items); } catch (e) { console.error("amend approve sync:", e.message); } }
+      if (full) { const r = await syncSalesOrderToDelivery(full, full.sales_order_items); amendSyncError = r.syncError; }
     }
     const { data, error } = await supabase.from("order_amendments").update({
       status: "approved", decided_by: req.user.id, decided_by_name: req.user.name || null,
       decided_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
     }).eq("id", a.id).select().single();
     if (error) throw error;
-    res.json({ amendment: data });
+    res.json({
+      amendment: data,
+      ...(amendSyncError ? { projection_sync_warning: "Amendment approved, but the operational projection sync failed. An admin has been notified — check scripts/audit-data-consistency.js." } : {}),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -14437,11 +14639,11 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
       .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req))
       .select("*, sales_order_items(*)").single();
     if (error) throw error;
-    await syncSalesOrderToDelivery(data, data.sales_order_items);
+    const { syncError: statusSyncError } = await syncSalesOrderToDelivery(data, data.sales_order_items);
     // Recalculate commission on status change (cancel claws back, confirm may enable)
     if (["cancelled", "confirmed", "amended"].includes(status)) {
       try {
-        const { data: legacyOrder } = await supabase.from("orders").select("id, company_id").eq("so_number", data.order_number).maybeSingle();
+        const { data: legacyOrder } = await supabase.from("orders").select("id, company_id").eq("company_id", data.company_id).eq("so_number", data.order_number).maybeSingle();
         if (legacyOrder) {
           if (status === "cancelled") {
             // Clawback: set all commissions for this order to status "clawback"
@@ -14450,12 +14652,15 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
             // keyed on the sales order (data.id), unpaid rows only.
             await reverseDeliveryCommission(data.id, cancel_reason || "sales order cancelled");
           } else {
-            await calculateCommission(legacyOrder.id, getActiveCompanyId(req));
+            await calculateCommission(legacyOrder.id, data.company_id);
           }
         }
       } catch (e) { console.error("commission recalc on status change:", e.message); }
     }
-    res.json({ order: { id: data.id, status: data.status } });
+    res.json({
+      order: { id: data.id, status: data.status },
+      ...(statusSyncError ? { projection_sync_warning: "Status updated, but the operational projection sync failed. An admin has been notified — check scripts/audit-data-consistency.js." } : {}),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

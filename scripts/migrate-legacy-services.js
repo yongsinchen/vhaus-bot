@@ -81,7 +81,10 @@ async function migrate() {
     // Find original order (linked_so)
     let originalOrderId = null;
     if (order.linked_so) {
-      const { data: orig } = await supabase.from("orders").select("id").eq("so_number", order.linked_so).maybeSingle();
+      // P0-16: so_number alone is no longer guaranteed unique across
+      // companies — scope by the service order's own company.
+      const { data: orig } = await supabase.from("orders").select("id")
+        .eq("company_id", order.company_id).eq("so_number", order.linked_so).maybeSingle();
       if (orig) originalOrderId = orig.id;
     }
 
