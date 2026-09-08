@@ -9193,6 +9193,66 @@ app.delete("/delivery-teams/:id", ...requirePerm(PERMS.DELIVERY_ASSIGN_VEHICLE),
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// DELETE /delivery/dates/:date — Delivery Date delete safety. Removing a whole
+// delivery date must NEVER orphan delivery records. Refuse if the date still
+// holds any assigned orders, delivery orders, trips, routes, or team
+// assignments — the admin must move / unassign / cancel those first. Only an
+// EMPTY date (or one holding just empty team shells) may be deleted. This is a
+// backend-enforced rule, not just a frontend confirmation.
+app.delete("/delivery/dates/:date", requireRole(MANAGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const date = String(req.params.date || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "Invalid date — YYYY-MM-DD required" });
+
+    // Everything that would be orphaned by deleting the date.
+    let schedQ = supabase.from("delivery_schedules").select("id, status").eq("scheduled_date", date);
+    if (cid) schedQ = schedQ.eq("company_id", cid);
+    const { data: schedules } = await schedQ;
+    const assignedSchedules = (schedules || []).filter(s => String(s.status || "").toLowerCase() !== "cancelled").length;
+
+    let doQ = supabase.from("delivery_orders").select("id", { count: "exact", head: true })
+      .eq("delivery_date", date).not("status", "in", '("draft","cancelled")');
+    if (cid) doQ = doQ.eq("company_id", cid);
+    const { count: doCount } = await doQ;
+
+    const { count: tripCount } = await supabase.from("order_trips")
+      .select("id", { count: "exact", head: true }).eq("scheduled_date", date);
+    const { count: routeCount } = await supabase.from("delivery_routes")
+      .select("id", { count: "exact", head: true }).eq("delivery_date", date);
+
+    let ordQ = supabase.from("orders").select("id", { count: "exact", head: true })
+      .eq("delivery_date", date).not("status", "in", '("Delivered","Cancelled")');
+    if (cid) ordQ = ordQ.eq("company_id", cid);
+    const { count: orderCount } = await ordQ;
+
+    const blockers = {
+      scheduled_orders: orderCount || 0,
+      team_assignments: assignedSchedules,
+      delivery_orders: doCount || 0,
+      trips: tripCount || 0,
+      routes: routeCount || 0,
+    };
+    const total = Object.values(blockers).reduce((s, n) => s + n, 0);
+    if (total > 0) {
+      return res.status(409).json({
+        error: `This delivery date (${date}) still has ${total} delivery record(s): `
+          + `${blockers.scheduled_orders} scheduled order(s), ${blockers.team_assignments} team assignment(s), `
+          + `${blockers.delivery_orders} delivery order(s), ${blockers.trips} trip(s), ${blockers.routes} route(s). `
+          + `Move, unassign, or cancel them first — the date can't be deleted while records exist.`,
+        blockers, requires_cleanup: true,
+      });
+    }
+
+    // Safe: only empty team shells / empty routes remain for the date — clear them.
+    let teamDel = supabase.from("delivery_teams").delete().eq("team_date", date);
+    if (cid) teamDel = teamDel.eq("company_id", cid);
+    await teamDel;
+    await supabase.from("delivery_routes").delete().eq("delivery_date", date);
+    res.json({ ok: true, deleted_date: date });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Delivery Blocked Dates (Fix #7, migration 042) ────────────────
 // Company-configurable calendar of dates that SOFT-block delivery
 // scheduling — see getBlockedDateReason() above and its call sites in
