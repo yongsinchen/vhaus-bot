@@ -10431,7 +10431,7 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
       // "*" instead of 500ing the whole unassigned-DO pool. Mirrors the same
       // fallback GET /delivery-schedules already has.
       let q2 = supabase.from("delivery_orders")
-        .select("*, delivery_order_items(*), sales_orders(id, order_number, customer_name, customer_contact, customer_address, delivery_date, delivery_time_slot)")
+        .select("*, delivery_order_items(*), sales_orders(id, order_number, customer_name, customer_contact, customer_address, delivery_date, delivery_time_slot), delivery_schedules(id, status, team_id, scheduled_date, delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate), driver:users!delivery_teams_driver_id_fkey(name)))")
         .eq("company_id", companyId)
         .order("created_at", { ascending: false })
         .limit(500);
