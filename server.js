@@ -3811,7 +3811,7 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
 
     // Order amendment approvals — master/manager only.
     const amendReqPromise = ["master", "manager"].includes(roleKey) ? (async () => {
-      let q = supabase.from("order_amendments").select("id", { count: "exact", head: true }).eq("status", "pending");
+      let q = supabase.from("sales_order_amendments").select("id", { count: "exact", head: true }).eq("status", "pending");
       if (cid) q = q.eq("company_id", cid);
       const { count } = await q;
       return count || 0;
@@ -14112,6 +14112,94 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (amendmentNote) {
       updateData.notes = [amendmentNote, notes || ""].filter(Boolean).join("\n");
     }
+
+    // ── P0-18: critical amendment on a confirmed/delivered order ─────────
+    // Canonical rule: a critical change (items/SKU/qty/price/discount/amount)
+    // on an already-confirmed order must NOT touch the live sales_orders /
+    // sales_order_items rows at all — it is recorded as a PENDING proposal and
+    // only applied by applySalesOrderAmendment() when a manager approves it.
+    // (hasActiveDo && criticalChanged already 409'd above, so hasActiveDo is
+    // guaranteed false here — only the full-rebuild item shape applies.)
+    if (wasConfirmed && criticalChanged) {
+      const { data: existingPending } = await supabase.from("sales_order_amendments")
+        .select("id").eq("company_id", company_id).eq("sales_order_id", id).eq("status", "pending").maybeSingle();
+      if (existingPending) {
+        return res.status(409).json({
+          error: "An amendment is already pending review for this order. Wait for a manager to approve or reject it before submitting another change.",
+          amendment_id: existingPending.id,
+        });
+      }
+
+      // Compute the exact item rows that WOULD be written — same resolution
+      // and arrival-preservation logic as the immediate-apply path below —
+      // captured now so a manager approves exactly what was requested, not a
+      // version re-resolved against a possibly-different catalog state later.
+      let proposedItemRows = null;
+      if (expandedItems) {
+        const _an = v => (v ?? "").toString().trim().toLowerCase();
+        const _identityKey = it => it.product_id
+          ? `p:${it.product_id}`
+          : `t:${_an(it.product_code)}|${_an(it.product_name)}|${_an(it.size)}|${_an(it.color)}`;
+        const prevArrivals = (existing.sales_order_items || [])
+          .filter(i => i.arrived_at)
+          .map(i => ({ used: false, arrived_at: i.arrived_at, key: _identityKey(i) }));
+        const takeArrival = it => {
+          const key = _identityKey(it);
+          const hit = prevArrivals.find(p => !p.used && p.key === key);
+          if (hit) { hit.used = true; return hit.arrived_at; }
+          return null;
+        };
+        proposedItemRows = expandedItems.map(it => ({
+          product_id: it.product_id || null, product_code: it.product_code || null,
+          product_name: it.product_name || null, size: it.size || null, color: it.color || null,
+          is_custom: it.is_custom === true, custom_dimensions: it.custom_dimensions || null,
+          custom_specs: it.custom_specs || null,
+          quantity: Number(it.quantity) || 1, unit_price: it.unit_price ?? null, unit_cost: it.unit_cost ?? null,
+          attachment_url: it.attachment_url || null, notes: it.notes || null,
+          // "save as reusable" product-creation is a catalog side effect —
+          // deferred until (and only run at) actual approval time, not here.
+          linked_custom_item: it.linked_custom_item === true,
+          bundle_id: it.bundle_id || null, bundle_instance_id: it.bundle_instance_id || null,
+          bundle_component_price: it.bundle_component_price ?? null,
+          arrived_at: takeArrival(it),
+        }));
+        const productDefaults = await resolveProductLineDefaults(company_id, proposedItemRows);
+        for (const row of proposedItemRows) {
+          const d = row.product_id ? productDefaults.get(row.product_id) : null;
+          row.is_clearance = d ? d.is_clearance : false;
+          if (d) row.unit_cost = d.unit_cost;
+          row.supplier_name = d ? d.supplier_name : null;
+        }
+      }
+
+      // The proposal's status is what the order becomes ONCE approved
+      // (matches existing approve behavior: an amended order returns to
+      // 'confirmed'); "amended" itself is only ever the live pending-flag.
+      const proposedSnapshot = { ...updateData, status: "confirmed", items: proposedItemRows };
+
+      const { error: amendErr } = await supabase.from("sales_order_amendments").insert({
+        company_id, branch_id: existing.branch_id || null, sales_order_id: id,
+        order_number: existing.order_number, customer_name: existing.customer_name,
+        category: "critical", status: "pending",
+        before_snapshot: existing, proposed_snapshot: proposedSnapshot,
+        changes: amendmentChanges,
+        requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null,
+      });
+      if (amendErr) throw amendErr;
+
+      // Flip status to 'amended' as the pending-review flag ONLY — every
+      // other field on the live order is left untouched.
+      await supabase.from("sales_orders").update({ status: "amended" }).eq("id", id).eq("company_id", company_id);
+
+      const { data: unchangedOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).maybeSingle();
+      await attachLinkedProducts(unchangedOrder?.sales_order_items);
+      return res.json({
+        order: unchangedOrder,
+        pending_amendment: true,
+        message: "This is a critical change (items, price, discount, or amount). It has been submitted for manager approval — the order's live data has NOT been changed yet.",
+      });
+    }
+
     const { error: updErr } = await supabase.from("sales_orders").update(updateData).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
@@ -14267,9 +14355,11 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         if (existingComm || (orderDateChanged && wasConfirmed)) await calculateCommission(deliveryOrderId, company_id);
       } catch (e) { console.error("commission recalc on order edit:", e.message); }
     }
-    // Record the before/after for manager approval (migration 073). The change
-    // is already applied above; this logs it and the order sits at 'amended'
-    // until a manager approves. Best-effort — never fail the edit that succeeded.
+    // Record the before/after audit trail for a non-critical edit on a
+    // confirmed/delivered order. P0-18: a CRITICAL change never reaches this
+    // point — it returned early above as a pending amendment before anything
+    // was written. Only customer-detail-only edits (never gated) land here,
+    // auto-recorded as already-approved history.
     if (wasConfirmed && amendmentChanges.length > 0) {
       try {
         const snapshot = (o) => ({
@@ -14285,25 +14375,20 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
             quantity: i.quantity, unit_price: i.unit_price,
           })),
         });
-        // A4: record EVERY amendment (approval-required or not). A critical
-        // change lands as 'pending' for manager approval; a customer-detail-only
-        // change is auto-recorded as 'approved' (no approval was required) so the
-        // before/after history is complete either way.
-        const autoApproved = !criticalChanged;
-        await supabase.from("order_amendments").insert({
+        const { error: nonCriticalAmendErr } = await supabase.from("sales_order_amendments").insert({
           company_id, branch_id: full?.branch_id || existing.branch_id || null,
           sales_order_id: id, order_number: full?.order_number || existing.order_number || null,
-          status: autoApproved ? "approved" : "pending",
-          before_data: snapshot(existing), after_data: snapshot(full),
+          customer_name: full?.customer_name || existing.customer_name,
+          category: "customer_detail", status: "approved",
+          before_snapshot: snapshot(existing), proposed_snapshot: snapshot(full),
           changes: amendmentChanges,
           requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null,
-          ...(autoApproved ? {
-            decided_by: req.user.id, decided_by_name: req.user.name || req.user.salesman_name || null,
-            decided_at: new Date().toISOString(),
-            decision_note: "Auto-recorded — customer detail edit, no approval required",
-          } : {}),
+          reviewed_by: req.user.id, reviewed_by_name: req.user.name || req.user.salesman_name || null,
+          reviewed_at: new Date().toISOString(),
+          decision_note: "Auto-recorded — customer detail edit, no approval required",
         });
-      } catch (e) { console.error("order_amendments insert (non-fatal):", e.message); }
+        if (nonCriticalAmendErr) throw nonCriticalAmendErr;
+      } catch (e) { console.error("sales_order_amendments insert (non-fatal):", e.message); }
     }
     // P0-16: don't report unconditional success when the operational
     // projection failed to sync — see POST /sales-orders for the same pattern.
@@ -14314,17 +14399,94 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Order amendment approvals (migration 073) ─────────────────────
-// A confirmed/delivered order that gets edited flips to 'amended' and lands
-// here as a before/after record. master/manager approve (order → confirmed)
-// or reject (order stays 'amended' for correction).
+// ── Order amendment approvals (P0-18) ─────────────────────────────
+// Canonical table: sales_order_amendments (NOT order_amendments — that name
+// doesn't exist in the DB; migration 073 was written but never applied under
+// that name). A CRITICAL edit to a confirmed/delivered order is recorded here
+// as 'pending' and does NOT touch sales_orders/sales_order_items — the live
+// order flips to status 'amended' only as a pending-review flag. A manager
+// approve applies proposed_snapshot (see applySalesOrderAmendment below);
+// reject restores the live status with nothing ever having been applied. A
+// non-critical (customer-detail-only) edit is recorded here already
+// 'approved' — see PUT /sales-orders/:id.
 const isAmendApprover = (req) => ["master", "manager"].includes(req.user.role);
+
+// Apply a pending amendment's proposed_snapshot to the live sales_orders /
+// sales_order_items rows. This is the ONLY place that does so — never at
+// request time (PUT /sales-orders/:id only ever stores the proposal).
+// Conflict protection: if the live order has drifted from the amendment's
+// before_snapshot since it was requested (another edit landed in between),
+// refuses to apply and marks the amendment 'conflict' for manual review
+// instead of blindly overwriting unrelated changes.
+async function applySalesOrderAmendment(amendment) {
+  const { data: liveOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", amendment.sales_order_id).maybeSingle();
+  if (!liveOrder) return { error: "Sales order no longer exists" };
+
+  // Compare live vs. as-requested state, excluding the 'amended' status flag
+  // this amendment itself set (comparing it would always "conflict" — the
+  // flag IS the expected difference). Items compared via a stable, sorted
+  // projection so DB return order alone can never cause a false conflict.
+  const projectHeader = (o) => ({
+    customer_name: o.customer_name, customer_contact: o.customer_contact, customer_address: o.customer_address,
+    delivery_address: o.delivery_address, customer_email: o.customer_email, customer_id_no: o.customer_id_no,
+    customer_id_type: o.customer_id_type, order_date: o.order_date, delivery_date: o.delivery_date,
+    delivery_time_slot: o.delivery_time_slot, delivery_type: o.delivery_type, remark: o.remark,
+    salesman_name: o.salesman_name, payment_method: o.payment_method, subtotal: o.subtotal, discount: o.discount,
+    admin_charges: o.admin_charges, gst_amount: o.gst_amount, gst_waived: o.gst_waived, deposit: o.deposit,
+    branch_id: o.branch_id, country: o.country, gst_rate: o.gst_rate, einvoice_requested: o.einvoice_requested,
+  });
+  const projectItems = (items) => (items || []).map(i => ({
+    product_id: i.product_id, product_code: i.product_code, product_name: i.product_name,
+    size: i.size, color: i.color, quantity: i.quantity, unit_price: i.unit_price,
+  })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+
+  const before = amendment.before_snapshot || {};
+  const headerConflict = JSON.stringify(projectHeader(liveOrder)) !== JSON.stringify(projectHeader(before));
+  const itemsConflict = JSON.stringify(projectItems(liveOrder.sales_order_items)) !== JSON.stringify(projectItems(before.sales_order_items));
+
+  if (headerConflict || itemsConflict) {
+    await supabase.from("sales_order_amendments").update({
+      status: "conflict",
+      decision_note: "The sales order changed after this amendment was requested — requires manual review before it can be applied.",
+      updated_at: new Date().toISOString(),
+    }).eq("id", amendment.id);
+    return { conflict: true };
+  }
+
+  const proposed = amendment.proposed_snapshot || {};
+  const { items: proposedItems, ...proposedHeader } = proposed;
+  const { error: updErr } = await supabase.from("sales_orders").update(proposedHeader)
+    .eq("id", amendment.sales_order_id).eq("company_id", amendment.company_id);
+  if (updErr) return { error: updErr.message };
+
+  if (Array.isArray(proposedItems)) {
+    await supabase.from("sales_order_items").delete().eq("order_id", amendment.sales_order_id);
+    const rows = proposedItems.map(it => ({ ...it, order_id: amendment.sales_order_id, line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1) }));
+    if (rows.length) {
+      const { error: itemsErr } = await supabase.from("sales_order_items").insert(rows);
+      if (itemsErr) return { error: itemsErr.message };
+    }
+  }
+
+  const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", amendment.sales_order_id).maybeSingle();
+  await attachLinkedProducts(full?.sales_order_items);
+  const { orderId: deliveryOrderId, syncError } = await syncSalesOrderToDelivery(full, full.sales_order_items);
+  if (deliveryOrderId) {
+    try { await recomputeOrderPaid(deliveryOrderId); } catch (e) { console.error("recomputeOrderPaid on amendment approval:", e.message); }
+    try {
+      const { data: existingComm } = await supabase.from("commissions").select("id").eq("order_id", deliveryOrderId).limit(1).maybeSingle();
+      if (existingComm) await calculateCommission(deliveryOrderId, amendment.company_id);
+    } catch (e) { console.error("commission recalc on amendment approval:", e.message); }
+  }
+
+  return { applied: true, order: full, syncError };
+}
 
 app.get("/order-amendments", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     const { status } = req.query;
-    let q = supabase.from("order_amendments").select("*").order("created_at", { ascending: false }).limit(500);
+    let q = supabase.from("sales_order_amendments").select("*").order("created_at", { ascending: false }).limit(500);
     if (cid) q = q.eq("company_id", cid);
     if (!isAmendApprover(req)) q = q.eq("requested_by", req.user.id);
     if (status) q = q.eq("status", status);
@@ -14338,26 +14500,28 @@ app.patch("/order-amendments/:id/approve", requireAuth, async (req, res) => {
   try {
     if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can approve amendments" });
     const cid = getActiveCompanyId(req);
-    const { data: a } = await supabase.from("order_amendments").select("*").eq("id", req.params.id).maybeSingle();
+    // Company isolation (P0-16/P0-18): scoped by company_id + this
+    // amendment's own id — never by SO number.
+    const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
     if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
+    // Idempotency: a second approval attempt on the same id is a no-op error,
+    // never a second application of the change.
     if (a.status !== "pending") return res.status(400).json({ error: `Amendment is already ${a.status}` });
-    // Accept the change: return the order to 'confirmed' and re-sync to the
-    // legacy delivery order.
-    let amendSyncError = null;
-    if (a.sales_order_id) {
-      await supabase.from("sales_orders").update({ status: "confirmed" })
-        .eq("id", a.sales_order_id).eq("company_id", a.company_id).neq("status", "cancelled");
-      const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", a.sales_order_id).maybeSingle();
-      if (full) { const r = await syncSalesOrderToDelivery(full, full.sales_order_items); amendSyncError = r.syncError; }
+
+    const result = await applySalesOrderAmendment(a);
+    if (result.error) return res.status(500).json({ error: result.error });
+    if (result.conflict) {
+      return res.status(409).json({ error: "The sales order changed since this amendment was requested — cannot apply automatically. Reload the order and review.", amendment_status: "conflict" });
     }
-    const { data, error } = await supabase.from("order_amendments").update({
-      status: "approved", decided_by: req.user.id, decided_by_name: req.user.name || null,
-      decided_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
+
+    const { data, error } = await supabase.from("sales_order_amendments").update({
+      status: "approved", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
+      reviewed_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
     }).eq("id", a.id).select().single();
     if (error) throw error;
     res.json({
-      amendment: data,
-      ...(amendSyncError ? { projection_sync_warning: "Amendment approved, but the operational projection sync failed. An admin has been notified — check scripts/audit-data-consistency.js." } : {}),
+      amendment: data, order: result.order,
+      ...(result.syncError ? { projection_sync_warning: "Amendment approved, but the operational projection sync failed. An admin has been notified — check scripts/audit-data-consistency.js." } : {}),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -14366,14 +14530,18 @@ app.patch("/order-amendments/:id/reject", requireAuth, async (req, res) => {
   try {
     if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can reject amendments" });
     const cid = getActiveCompanyId(req);
-    const { data: a } = await supabase.from("order_amendments").select("company_id, status").eq("id", req.params.id).maybeSingle();
+    const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
     if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
     if (a.status !== "pending") return res.status(400).json({ error: `Amendment is already ${a.status}` });
-    // The order stays 'amended' (flagged) so the salesman/manager can correct
-    // it — the before/after record shows what to restore.
-    const { data, error } = await supabase.from("order_amendments").update({
-      status: "rejected", decided_by: req.user.id, decided_by_name: req.user.name || null,
-      decided_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
+    // Canonical rule: reject = the live order was never touched, so restore
+    // its status to what it was before this amendment was requested (never
+    // leave it stuck at 'amended' for someone to manually correct).
+    const restoredStatus = a.before_snapshot?.status || "confirmed";
+    await supabase.from("sales_orders").update({ status: restoredStatus })
+      .eq("id", a.sales_order_id).eq("company_id", a.company_id).eq("status", "amended");
+    const { data, error } = await supabase.from("sales_order_amendments").update({
+      status: "rejected", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
+      reviewed_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
     }).eq("id", req.params.id).select().single();
     if (error) throw error;
     res.json({ amendment: data });
@@ -14385,6 +14553,7 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { status, cancel_reason } = req.body;
+    const cidForStatus = getActiveCompanyId(req);
     // Both committing statuses share the amended-reconfirm and e-invoice guards.
     if (status === "confirmed" || status === "pending_deposit") {
       const { data: existing } = await supabase.from("sales_orders")
@@ -14392,6 +14561,33 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
         .eq("id", req.params.id).single();
       if (existing?.status === "amended" && !["master", "manager"].includes(req.user.role)) {
         return res.status(403).json({ error: "Only manager can re-confirm amended orders" });
+      }
+      // P0-18: "Re-confirm" on an amended order IS the approval action for its
+      // pending critical amendment (this is the frontend's only amendment
+      // approval control today — see PATCH /order-amendments/:id/approve for
+      // the dedicated endpoint). Route through the same apply-and-conflict-
+      // check logic rather than a bare status flip: the proposed change was
+      // never applied at request time, so a plain status update here would
+      // "confirm" an order that never actually received its amendment.
+      if (status === "confirmed" && existing?.status === "amended") {
+        const { data: pending } = await supabase.from("sales_order_amendments")
+          .select("*").eq("company_id", cidForStatus).eq("sales_order_id", req.params.id).eq("status", "pending").maybeSingle();
+        if (pending) {
+          const result = await applySalesOrderAmendment(pending);
+          if (result.error) return res.status(500).json({ error: result.error });
+          if (result.conflict) return res.status(409).json({ error: "The sales order changed since this amendment was requested — cannot apply automatically. Reload the order and review.", amendment_status: "conflict" });
+          await supabase.from("sales_order_amendments").update({
+            status: "approved", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
+            reviewed_at: new Date().toISOString(), decision_note: "Approved via Re-confirm", updated_at: new Date().toISOString(),
+          }).eq("id", pending.id);
+          return res.json({
+            order: { id: result.order.id, status: result.order.status },
+            ...(result.syncError ? { projection_sync_warning: "Status updated, but the operational projection sync failed. An admin has been notified — check scripts/audit-data-consistency.js." } : {}),
+          });
+        }
+        // No pending amendment found (e.g. already resolved elsewhere) — fall
+        // through to the defensive bare status flip below rather than
+        // getting the order stuck at 'amended' with nothing to approve.
       }
       // E-invoice rule also guards direct status flips (dropdown confirm,
       // amended re-approval) — required when over RM10,000 OR the customer
