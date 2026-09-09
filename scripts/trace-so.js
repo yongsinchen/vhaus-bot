@@ -65,7 +65,9 @@ async function traceCompany(soNumber, companyId) {
     console.log(`   id=${so.id}  status=${fmt(so.status)}  delivery_status=${fmt(so.delivery_status)}`);
     console.log(`   customer=${fmt(so.customer_name)}  delivery_date=${fmt(so.delivery_date)}  branch_id=${fmt(so.branch_id)}`);
     console.log(`   subtotal=${fmt(so.subtotal)}  discount=${fmt(so.discount)}  gst=${fmt(so.gst_amount)}  deposit=${fmt(so.deposit)}`);
-    const { data: items } = await supabase.from("sales_order_items").select("*").eq("sales_order_id", so.id);
+    // sales_order_items' FK column is order_id (references sales_orders.id),
+    // not sales_order_id.
+    const { data: items } = await supabase.from("sales_order_items").select("*").eq("order_id", so.id);
     console.log(`\n📦 sales_order_items: ${(items || []).length}`);
     for (const it of (items || [])) {
       console.log(`   [${it.id}] ${fmt(it.product_name)}  qty=${fmt(it.quantity)}  arrived_at=${fmt(it.arrived_at)}`);
