@@ -14113,14 +14113,27 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       updateData.notes = [amendmentNote, notes || ""].filter(Boolean).join("\n");
     }
 
-    // ── P0-18: critical amendment on a confirmed/delivered order ─────────
+    // ── P0-18/P0-FINAL: critical amendment on a confirmed/delivered/amended
+    // order ────────────────────────────────────────────────────────────
     // Canonical rule: a critical change (items/SKU/qty/price/discount/amount)
     // on an already-confirmed order must NOT touch the live sales_orders /
     // sales_order_items rows at all — it is recorded as a PENDING proposal and
     // only applied by applySalesOrderAmendment() when a manager approves it.
     // (hasActiveDo && criticalChanged already 409'd above, so hasActiveDo is
     // guaranteed false here — only the full-rebuild item shape applies.)
-    if (wasConfirmed && criticalChanged) {
+    //
+    // P0 FINAL AUDIT BLOCKER FIX: wasConfirmed alone (["confirmed","delivered"])
+    // missed the case where the order is CURRENTLY "amended" — either because a
+    // critical amendment is already pending, or because one was marked
+    // 'conflict' and never resolved. Since wasConfirmed was false for "amended",
+    // this whole gate (including the existingPending 409 guard just below) was
+    // skipped entirely, so a second edit on an amended order applied directly to
+    // the live order with no approval step — a real approval bypass. Checking
+    // existing.status === "amended" here restores the gate; the existingPending
+    // guard (status === 'pending') still correctly lets a NEW amendment
+    // supersede one that is 'conflict' or already resolved, so a conflicted
+    // amendment is never a permanent dead end.
+    if ((wasConfirmed || existing.status === "amended") && criticalChanged) {
       const { data: existingPending } = await supabase.from("sales_order_amendments")
         .select("id").eq("company_id", company_id).eq("sales_order_id", id).eq("status", "pending").maybeSingle();
       if (existingPending) {
