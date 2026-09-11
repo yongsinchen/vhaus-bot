@@ -10316,7 +10316,11 @@ app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDE
       delivery_address: so.delivery_address || so.customer_address || legacyOrder?.address || null,
       contact: so.customer_contact || legacyOrder?.contact || null,
       status: "draft", pick_status: "pending",
-      delivery_date: delivery_date || null, remark: remark || null,
+      delivery_date: delivery_date || null,
+      // P0 hotfix: SO-level delivery remark/instructions must follow every
+      // DO cut from that SO unless an authorized user explicitly overrides
+      // it. See doLib.resolveDoRemark for exact semantics/frontend caveat.
+      remark: doLib.resolveDoRemark(remark, so.remark),
       created_by: req.user.id,
     }).select().single();
     if (doErr) throw doErr;
