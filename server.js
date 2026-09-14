@@ -19,6 +19,7 @@ const commissionLib = require("./lib/commission");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
+const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { getCommissionableAmount } = commissionLib;
 const crypto = require("crypto");
 
@@ -14863,6 +14864,29 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       order: full,
       ...(projectionSyncError ? { projection_sync_warning: "Sales order saved, but it may not yet be visible in Delivery/Telegram/Driver. An admin has been notified — retry or check scripts/audit-data-consistency.js." } : {}),
     });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── URGENT production fix — SO number identity/reference correction ────
+// Deliberately its own endpoint rather than folded into PUT /sales-orders/:id
+// above: that handler's deposit/payments lookup (~line 14520) and its
+// non-critical-amendment snapshot both key off existing.order_number at
+// different points in a 600-line flow — splicing a rename into the middle
+// of that is far riskier than this small, self-contained route. See
+// lib/sales-order-rename.js for the full rationale and the exact
+// canonical-update-set this touches (sales_orders.order_number +
+// orders.so_number only; every other table audited has no copied so_number
+// or references the SO by an immutable id/FK unaffected by a rename).
+app.patch("/sales-orders/:id/order-number", requireAuth, async (req, res) => {
+  try {
+    if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const company_id = getActiveCompanyId(req);
+    const result = await renameSalesOrderNumber(supabase, {
+      id: req.params.id, companyId: company_id, newNumber: req.body?.order_number,
+      actor: { id: req.user.id, name: req.user.name || req.user.salesman_name || null },
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, ...(result.code ? { code: result.code } : {}) });
+    res.json(result);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
