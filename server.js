@@ -11009,6 +11009,25 @@ app.get("/sales-orders/:id/delivery-recommendation", ...requirePerm(PERMS.DELIVE
 });
 
 // ── Auto-Ready Check + Missing Item Alerts ──────────────────────
+// P1 — Delivery Readiness Split-DO Awareness. Two sources, exactly like the
+// unified pick/loading-list's proven pattern:
+//   Source 1: active, dated Delivery Orders — one readiness row per DO, its
+//     items/packing judged from THAT DO alone. "Active" per the confirmed
+//     rule: superseded_at IS NULL, delivery_date IS NOT NULL, status IN
+//     ('draft','scheduled'). Deliberately NOT gated on having a
+//     delivery_schedules row/team — readiness is about whether the
+//     shipment's items are ready for its committed date, not whether a team
+//     has been assigned yet (out_for_delivery/arrived/completed/cancelled
+//     are excluded: already dispatched or otherwise inactive/terminal).
+//   Source 2: the legacy whole-order scan, unchanged, EXCEPT it now skips
+//     any so_number already represented by a Source-1 row — an order that's
+//     shipping as one or more DOs is never ALSO shown as one blended
+//     whole-order card (the confirmed false-positive/negative mechanism
+//     from the audit).
+// Packing/label progress is scoped to each DO's own items via the real FK
+// linkage this schema already has (order_item_packings.do_item_id,
+// package_labels.delivery_order_id) — never blended with a sibling DO's
+// progress via a so_number-wide (whole-SO) lookup.
 app.get("/delivery-readiness", requireAuth, async (req, res) => {
   try {
     const { date, days = 3 } = req.query;
@@ -11017,25 +11036,113 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
     const startDate = date || new Date().toISOString().slice(0, 10);
     const endDate = new Date(new Date(startDate).getTime() + Number(days) * 86400000).toISOString().slice(0, 10);
 
-    // Get all orders with delivery_date in range
+    const results = [];
+    const seenSO = new Set();
+
+    // ── Source 1: active, dated Delivery Orders in the window ──────────
+    const { data: activeDos } = await supabase.from("delivery_orders")
+      .select(`id, do_number, order_id, status, delivery_date,
+        sales_orders(order_number, customer_name),
+        delivery_order_items(id, sales_order_item_id, product_code, product_name, status)`)
+      .eq("company_id", cid)
+      .is("superseded_at", null)
+      .not("delivery_date", "is", null)
+      .in("status", ["draft", "scheduled"])
+      .gte("delivery_date", startDate).lte("delivery_date", endDate);
+
+    // Batch-resolve arrival + legacy-order data across every DO up front —
+    // avoids an N+1 query pattern across a window with many DOs.
+    const allSoiIds = [...new Set((activeDos || []).flatMap(d => (d.delivery_order_items || []).map(i => i.sales_order_item_id).filter(Boolean)))];
+    let soiById = new Map();
+    if (allSoiIds.length) {
+      const { data: sois } = await supabase.from("sales_order_items").select("id, arrived_at, product_code, product_name").in("id", allSoiIds);
+      soiById = new Map((sois || []).map(s => [s.id, s]));
+    }
+    const legacyOrderIds = [...new Set((activeDos || []).map(d => d.order_id).filter(Boolean))];
+    let legacyOrderById = new Map();
+    if (legacyOrderIds.length) {
+      const { data: legacyOrders } = await supabase.from("orders").select("id, items, balance").in("id", legacyOrderIds);
+      legacyOrderById = new Map((legacyOrders || []).map(o => [o.id, o]));
+    }
+
+    for (const dord of (activeDos || [])) {
+      const doItems = (dord.delivery_order_items || []).filter(i => i.status !== "cancelled");
+      const totalItems = doItems.length;
+      const legacyOrd = dord.order_id ? legacyOrderById.get(dord.order_id) : null;
+      const legacySet = doLib.buildLegacyArrivalSet(legacyOrd?.items);
+
+      let arrivedItems = 0;
+      const missingItems = [];
+      for (const i of doItems) {
+        const soi = i.sales_order_item_id ? soiById.get(i.sales_order_item_id) : null;
+        if (doLib.isItemArrived(soi || { product_code: i.product_code, product_name: i.product_name }, legacySet)) arrivedItems++;
+        else missingItems.push(i.product_name || i.product_code || "item");
+      }
+
+      // Warehouse progress scoped to THIS DO's own items via the real FK
+      // linkage — never a so_number-wide lookup that would blend a sibling
+      // DO's progress into this one's counts.
+      const doItemIds = doItems.map(i => i.id);
+      let packedCount = 0, storedCount = 0, pickedCount = 0;
+      if (doItemIds.length > 0) {
+        const { data: packings } = await supabase.from("order_item_packings").select("status").in("do_item_id", doItemIds);
+        for (const p of (packings || [])) {
+          if (p.status === "packed") packedCount++;
+          if (p.status === "put_away") storedCount++;
+          if (p.status === "picked" || p.status === "loaded") pickedCount++;
+        }
+      }
+      if (packedCount === 0 && storedCount === 0) {
+        const { data: labels } = await supabase.from("package_labels").select("status").eq("company_id", cid).eq("delivery_order_id", dord.id);
+        for (const l of (labels || [])) {
+          if (l.status === "stored" || l.status === "put_away") storedCount++;
+          if (l.status === "picked" || l.status === "loaded") pickedCount++;
+        }
+      }
+
+      const hasBalance = parseFloat(legacyOrd?.balance) > 0;
+      const alerts = [];
+      if (missingItems.length > 0) alerts.push({ type: "missing_items", severity: "high", message: `${missingItems.length} item(s) not arrived`, items: missingItems });
+      if (totalItems > 0 && storedCount === 0 && pickedCount === 0 && packedCount === 0) alerts.push({ type: "no_packages", severity: "medium", message: "No items in warehouse (no QR labels)" });
+      if (storedCount > 0 && pickedCount === 0) alerts.push({ type: "not_picked", severity: "medium", message: `${storedCount} item(s) stored but not picked yet` });
+      if (hasBalance) alerts.push({ type: "balance", severity: "low", message: `Outstanding balance: RM ${legacyOrd.balance}` });
+
+      const isReady = missingItems.length === 0 && alerts.filter(a => a.severity === "high").length === 0;
+      const soNumber = dord.sales_orders?.order_number || null;
+
+      results.push({
+        order_id: legacyOrd?.id || null, delivery_order_id: dord.id, do_number: dord.do_number,
+        so_number: soNumber, customer_name: dord.sales_orders?.customer_name || null,
+        delivery_date: dord.delivery_date, status: dord.status,
+        total_items: totalItems, arrived_items: arrivedItems, missing_items: missingItems,
+        packed: packedCount, stored: storedCount, picked: pickedCount,
+        balance: legacyOrd?.balance ?? null, is_ready: isReady, alerts,
+      });
+      if (soNumber) seenSO.add(soNumber);
+
+      // Keep this DO's own live schedule (if any) in sync with the SAME
+      // computation that actually appears in the response — no more parallel,
+      // never-surfaced calculation.
+      await supabase.from("delivery_schedules").update({ is_ready: isReady }).eq("delivery_order_id", dord.id);
+    }
+
+    // ── Source 2: legacy orders — skip any SO already covered by Source 1 ──
     const { data: allOrders } = await supabase.from("orders")
       .select("id, so_number, customer_name, delivery_date, status, items, balance")
       .eq("company_id", cid).in("status", ["Pending", "Confirmed", "In Progress"]);
     const orders = (allOrders || []).filter(o => {
+      if (seenSO.has(o.so_number)) return false;
       const dd = (o.delivery_date || "").trim();
       return dd >= startDate && dd <= endDate;
     });
 
-    const results = [];
     for (const order of orders) {
       const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
       const totalItems = Array.isArray(items) ? items.length : 0;
 
-      // Check item arrival status
       const arrivedItems = Array.isArray(items) ? items.filter(i => i.arrivalDate).length : 0;
       const missingItems = Array.isArray(items) ? items.filter(i => i.itemName && !i.arrivalDate).map(i => i.itemName) : [];
 
-      // Check warehouse packings
       const { data: orderItems } = await supabase.from("order_items").select("id").eq("order_id", order.id);
       const oiIds = (orderItems || []).map(oi => oi.id);
       let packedCount = 0, storedCount = 0, pickedCount = 0;
@@ -11047,7 +11154,6 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
           if (p.status === "picked" || p.status === "loaded") pickedCount++;
         }
       }
-      // Also check package_labels fallback (scoped by company — P0-16)
       const { data: labels } = await supabase.from("package_labels").select("status").eq("company_id", cid).eq("so_number", order.so_number);
       if ((labels || []).length > 0 && packedCount === 0 && storedCount === 0) {
         for (const l of labels) {
@@ -11056,10 +11162,7 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
         }
       }
 
-      // Check balance
       const hasBalance = parseFloat(order.balance) > 0;
-
-      // Determine readiness
       const alerts = [];
       if (missingItems.length > 0) alerts.push({ type: "missing_items", severity: "high", message: `${missingItems.length} item(s) not arrived`, items: missingItems });
       if (totalItems > 0 && storedCount === 0 && pickedCount === 0 && packedCount === 0) alerts.push({ type: "no_packages", severity: "medium", message: "No items in warehouse (no QR labels)" });
@@ -11069,52 +11172,18 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
       const isReady = missingItems.length === 0 && alerts.filter(a => a.severity === "high").length === 0;
 
       results.push({
-        order_id: order.id, so_number: order.so_number, customer_name: order.customer_name,
+        order_id: order.id, delivery_order_id: null, do_number: null,
+        so_number: order.so_number, customer_name: order.customer_name,
         delivery_date: order.delivery_date, status: order.status,
         total_items: totalItems, arrived_items: arrivedItems, missing_items: missingItems,
         packed: packedCount, stored: storedCount, picked: pickedCount,
         balance: order.balance, is_ready: isReady, alerts,
       });
-    }
 
-    // Auto-update is_ready on delivery_schedules.
-    // Phase 3: whole-order readiness applies only to legacy (NULL-DO) rows —
-    // a DO schedule is ready when ITS OWN items have arrived, judged below,
-    // so the arrived sofa ships while the wardrobe is still at the supplier.
-    for (const r of results) {
-      await supabase.from("delivery_schedules").update({ is_ready: r.is_ready }).eq("order_id", r.order_id).is("delivery_order_id", null);
+      // Whole-order readiness sync applies only to legacy (NULL-DO) schedule
+      // rows — a DO schedule's is_ready is driven by the Source-1 loop above.
+      await supabase.from("delivery_schedules").update({ is_ready: isReady }).eq("order_id", order.id).is("delivery_order_id", null);
     }
-
-    // Per-DO readiness for DO schedules in the window
-    try {
-      const { data: doScheds } = await supabase.from("delivery_schedules")
-        .select("id, scheduled_date, delivery_orders(id, do_number, order_id, delivery_order_items(sales_order_item_id, product_code, product_name, status))")
-        .not("delivery_order_id", "is", null)
-        .gte("scheduled_date", startDate).lte("scheduled_date", endDate)
-        .in("status", ["scheduled", "picking"]);
-      for (const sched of (doScheds || [])) {
-        const dord = sched.delivery_orders;
-        if (!dord) continue;
-        const doItems = (dord.delivery_order_items || []).filter(i => i.status !== "cancelled");
-        // Arrival per item: sales_order_items.arrived_at first, legacy orders.items JSON fallback
-        const soiIds = doItems.map(i => i.sales_order_item_id).filter(Boolean);
-        let soiById = new Map();
-        if (soiIds.length > 0) {
-          const { data: sois } = await supabase.from("sales_order_items").select("id, arrived_at, product_code, product_name").in("id", soiIds);
-          soiById = new Map((sois || []).map(s => [s.id, s]));
-        }
-        let legacySet = new Set();
-        if (dord.order_id) {
-          const { data: legacyOrd } = await supabase.from("orders").select("items").eq("id", dord.order_id).maybeSingle();
-          legacySet = doLib.buildLegacyArrivalSet(legacyOrd?.items);
-        }
-        const allArrived = doItems.length > 0 && doItems.every(i => {
-          const soi = i.sales_order_item_id ? soiById.get(i.sales_order_item_id) : null;
-          return doLib.isItemArrived(soi || { product_code: i.product_code, product_name: i.product_name }, legacySet);
-        });
-        await supabase.from("delivery_schedules").update({ is_ready: allArrived }).eq("id", sched.id);
-      }
-    } catch (doReadyErr) { console.error("[delivery-readiness] DO readiness failed (non-fatal):", doReadyErr.message); }
 
     results.sort((a, b) => (a.delivery_date || "").localeCompare(b.delivery_date || ""));
     res.json({ orders: results, ready: results.filter(r => r.is_ready).length, total: results.length });
