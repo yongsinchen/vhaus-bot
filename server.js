@@ -18,6 +18,7 @@ const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
+const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const { getCommissionableAmount } = commissionLib;
 const crypto = require("crypto");
 
@@ -4827,57 +4828,22 @@ async function rehomeScheduleForReschedule(sched, newDate) {
   return "unassigned";
 }
 
-async function applyRequestDeliveryDate(reqRow, actorId = null) {
-  const newDate = reqRow.requested_date;
+// P1-2: applyRequestDeliveryDate() (the old inline SO-wide implementation)
+// is retired — createDeliveryDateApprovalService().applyApprovedDeliveryDate()
+// (lib/delivery-date-approval.js) is now the ONE canonical mutation path,
+// used by manual approval, "pick a proposed date", AND system auto-approval.
+// Instantiated once here since logDoEvent/isLockedScheduleStatus (both
+// hoisted function declarations) are already in scope by module-load time.
+const deliveryDateApprovalService = createDeliveryDateApprovalService({ supabase, isLockedScheduleStatus, logDoEvent });
 
-  // Keep the legacy `orders` workhorse row in step with the approved date.
-  // Without this, only sales_orders moved, so the delivery board / Sales Order
-  // search / Telegram / DO matching (which read the legacy row) kept showing
-  // the OLD date — the two views disagreed. Same write direction as the
-  // sales_orders → orders sync, not reverse sync. Runs even for legacy requests
-  // that have no linked sales_order_id.
-  if (reqRow.order_id) {
-    await supabase.from("orders").update({ delivery_date: newDate }).eq("id", reqRow.order_id);
-  } else if (reqRow.so_number) {
-    let oq = supabase.from("orders").update({ delivery_date: newDate }).eq("so_number", reqRow.so_number);
-    if (reqRow.company_id) oq = oq.eq("company_id", reqRow.company_id);
-    await oq;
-  }
-
-  // Whole-order (non-DO) team assignments live in delivery_schedules keyed by
-  // the legacy order_id with delivery_order_id NULL. Re-home each active one to
-  // the new date: it follows only if its team already runs on the new date,
-  // otherwise it's unassigned back to the pool (a team from the old date can't
-  // keep it — that orphaned the order).
-  if (reqRow.order_id) {
-    const { data: legScheds } = await supabase.from("delivery_schedules")
-      .select("id, status, team_id, delivery_order_id").eq("order_id", reqRow.order_id).is("delivery_order_id", null);
-    for (const s of (legScheds || [])) await rehomeScheduleForReschedule(s, newDate);
-  }
-
-  if (!reqRow.sales_order_id) return;
-  await supabase.from("sales_orders").update({ delivery_date: newDate }).eq("id", reqRow.sales_order_id);
-
-  // Keep an already-created Delivery Order in sync with the newly approved
-  // date. Without this, approving a new date only moves the sales_order while
-  // an existing DO (and its schedule) stays stuck on the old day. A DO that is
-  // already out for delivery / arrived / delivered is locked (route-locking
-  // rules) and left untouched; only its non-dispatched schedules move.
-  const { data: dos } = await supabase.from("delivery_orders")
-    .select("id, status").eq("sales_order_id", reqRow.sales_order_id).neq("status", "cancelled");
-  for (const dord of (dos || [])) {
-    if (isLockedScheduleStatus(dord.status)) continue; // dispatched/delivered — do not move
-    await supabase.from("delivery_orders").update({ delivery_date: newDate }).eq("id", dord.id);
-    // Re-home each active schedule: follow the date only if its team already
-    // runs on the new date, else unassign (delete the row; the DO is reset to
-    // draft by the helper) so it returns to the unassigned-DO pool instead of
-    // orphaning on a team from the old date.
-    const { data: scheds } = await supabase.from("delivery_schedules")
-      .select("id, status, team_id, delivery_order_id").eq("delivery_order_id", dord.id);
-    for (const s of (scheds || [])) await rehomeScheduleForReschedule(s, newDate);
-    await logDoEvent(dord.id, "rescheduled",
-      { scheduled_date: newDate, via: "delivery_date_request_approval" }, actorId);
-  }
+// Human-readable message for each applyApprovedDeliveryDate() conflict code
+// — mirrors the same pattern used for apply_active_do_amendment()'s conflicts.
+function deliveryDateConflictMessage(code) {
+  return {
+    delivery_order_not_found: "The selected Delivery Order could not be found for this request.",
+    delivery_order_superseded: "The selected Delivery Order was superseded — submit a new request against the current replacement Delivery Order.",
+    delivery_date_change_conflict: "The selected Delivery Order is already out for delivery, arrived, delivered, completed, or cancelled — its date can no longer be changed.",
+  }[code] || "This request can no longer be applied.";
 }
 
 // P0 hotfix: server-side snapshot of the CURRENT approved/operational
@@ -4900,8 +4866,17 @@ async function applyRequestDeliveryDate(reqRow, actorId = null) {
 // ever loosened) silently store garbage. Validate against YYYY-MM-DD and
 // treat anything else exactly like "no operational date" — null.
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-async function resolveOriginalDeliveryDate(companyId, { salesOrderId, orderId }) {
+// P1-2: deliveryOrderId branch added — a DO-scoped request's original_date
+// comes from the selected delivery_orders.delivery_date (a real DATE column,
+// confirmed live) rather than the SO/legacy TEXT fields. Never used to pick
+// which DO to target — that's resolveDeliveryDateRequestTarget()'s job; this
+// only reads the date off an already-resolved DO.
+async function resolveOriginalDeliveryDate(companyId, { salesOrderId, orderId, deliveryOrderId }) {
   const clean = v => (v && ISO_DATE_RE.test(v)) ? v : null;
+  if (deliveryOrderId) {
+    const { data } = await supabase.from("delivery_orders").select("delivery_date").eq("id", deliveryOrderId).eq("company_id", companyId).maybeSingle();
+    return data ? clean(data.delivery_date) : null;
+  }
   if (salesOrderId) {
     const { data } = await supabase.from("sales_orders").select("delivery_date").eq("id", salesOrderId).eq("company_id", companyId).maybeSingle();
     return data ? clean(data.delivery_date) : null;
@@ -4913,11 +4888,82 @@ async function resolveOriginalDeliveryDate(companyId, { salesOrderId, orderId })
   return null;
 }
 
+// P1-2: resolve which Delivery Order (if any) a NEW delivery_date_requests
+// row should target, and validate a client-supplied one rather than trusting
+// it. Shared by both writers (POST /delivery-date-requests, POST
+// /assistant/chat) so the 0/1/many selection rule can never drift between
+// them. "Active" DOs come from resolveActiveDeliveryOrders() (lib/
+// delivery-date-approval.js), itself built on doLib.isOperationallyActive —
+// the one canonical definition, never redefined here.
+//
+// @returns one of:
+//   { ok: true, deliveryOrderId: string|null, activeDeliveryOrders }
+//   { ok: false, code: "delivery_order_selection_required" | "invalid_delivery_order", activeDeliveryOrders }
+async function resolveDeliveryDateRequestTarget({ companyId, salesOrderId, clientDeliveryOrderId }) {
+  const activeDeliveryOrders = salesOrderId ? await resolveActiveDeliveryOrders({ supabase, companyId, salesOrderId }) : [];
+  if (activeDeliveryOrders.length === 0) {
+    return { ok: true, deliveryOrderId: null, activeDeliveryOrders };
+  }
+  if (activeDeliveryOrders.length === 1) {
+    // Exactly one valid active DO — auto-selected. A client-supplied id is
+    // honored only if it agrees; anything else is a client/DO-state mismatch.
+    if (clientDeliveryOrderId && clientDeliveryOrderId !== activeDeliveryOrders[0].id) {
+      return { ok: false, code: "invalid_delivery_order", activeDeliveryOrders };
+    }
+    return { ok: true, deliveryOrderId: activeDeliveryOrders[0].id, activeDeliveryOrders };
+  }
+  // 2+ active DOs — explicit selection is mandatory, never guessed.
+  if (!clientDeliveryOrderId) {
+    return { ok: false, code: "delivery_order_selection_required", activeDeliveryOrders };
+  }
+  if (!activeDeliveryOrders.some(d => d.id === clientDeliveryOrderId)) {
+    return { ok: false, code: "invalid_delivery_order", activeDeliveryOrders };
+  }
+  return { ok: true, deliveryOrderId: clientDeliveryOrderId, activeDeliveryOrders };
+}
+
+// P1-2: shared by both delivery_date_requests writers (web + chat) — the
+// 10-day rule (evaluateDeliveryDateApproval, the ONE threshold
+// implementation) decides auto vs. pending at the moment of creation; an
+// auto-approved row is applied through the SAME canonical
+// applyApprovedDeliveryDate() manual approval uses — never a second,
+// bypass mutation path. If applying somehow conflicts (defensive — the
+// caller already validated the DO/date before reaching here), the row
+// falls back to "pending" for a human to review rather than standing as a
+// falsely-approved row with zero real effect.
+async function createDeliveryDateRequestAndMaybeAutoApprove(insertPayload, actorId) {
+  const decision = evaluateDeliveryDateApproval({ requestedDate: insertPayload.requested_date });
+  if (!decision.valid) {
+    return { status: 400, error: decision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" };
+  }
+
+  const { data: created, error } = await supabase.from("delivery_date_requests").insert({
+    ...insertPayload,
+    status: decision.autoApproved ? "approved" : "pending",
+    auto_approved: decision.autoApproved,
+    reviewed_at: decision.autoApproved ? new Date().toISOString() : null,
+    decision_note: decision.autoApproved ? "Auto-approved — requested date is 10+ calendar days out" : null,
+  }).select().single();
+  if (error) return { status: 500, error: error.message };
+
+  if (decision.autoApproved) {
+    const result = await deliveryDateApprovalService.applyApprovedDeliveryDate(created, actorId);
+    if (result.conflict) {
+      await supabase.from("delivery_date_requests").update({
+        status: "pending", auto_approved: false, reviewed_at: null,
+        decision_note: `Auto-approval could not be applied (${deliveryDateConflictMessage(result.conflict)}) — needs manual review.`,
+      }).eq("id", created.id);
+      created.status = "pending"; created.auto_approved = false;
+    }
+  }
+  return { status: 201, request: created };
+}
+
 // POST /delivery-date-requests — salesman requests a date for an existing order.
 app.post("/delivery-date-requests", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { order_id, so_number, requested_date, remark } = req.body || {};
+    const { order_id, so_number, requested_date, remark, delivery_order_id } = req.body || {};
     if (!requested_date) return res.status(400).json({ error: "requested_date is required" });
     let ordQ = supabase.from("orders").select("id, so_number, customer_name, company_id, branch_id").limit(1);
     if (order_id) ordQ = ordQ.eq("id", order_id);
@@ -4928,19 +4974,39 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
     const ord = ords?.[0];
     if (!ord) return res.status(404).json({ error: "Order not found" });
     const { data: so } = await supabase.from("sales_orders").select("id").eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
-    // One open request per order — supersede any existing open one.
-    await supabase.from("delivery_date_requests")
+
+    // P1-2: resolve/validate which Delivery Order (if any) this targets —
+    // never trust req.body.delivery_order_id directly.
+    const target = await resolveDeliveryDateRequestTarget({ companyId: ord.company_id, salesOrderId: so?.id || null, clientDeliveryOrderId: delivery_order_id || null });
+    if (!target.ok) {
+      return res.status(400).json({
+        error: target.code === "delivery_order_selection_required"
+          ? "This order has multiple deliveries — select which Delivery Order to reschedule."
+          : "The selected Delivery Order is not valid for this order.",
+        code: target.code, active_delivery_orders: target.activeDeliveryOrders,
+      });
+    }
+    // One open request per target — DO-scoped and SO-level are independent
+    // (see migration 094's two partial unique indexes). Supersede any
+    // existing open one for the SAME target only.
+    let supersedeQ = supabase.from("delivery_date_requests")
       .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
-      .eq("order_id", ord.id).in("status", ["pending", "needs_reschedule"]);
-    const originalDate = await resolveOriginalDeliveryDate(ord.company_id, { salesOrderId: so?.id || null, orderId: ord.id });
-    const { data: created, error } = await supabase.from("delivery_date_requests").insert({
+      .in("status", ["pending", "needs_reschedule"]);
+    supersedeQ = target.deliveryOrderId ? supersedeQ.eq("delivery_order_id", target.deliveryOrderId) : supersedeQ.eq("order_id", ord.id).is("delivery_order_id", null);
+    await supersedeQ;
+
+    const originalDate = await resolveOriginalDeliveryDate(ord.company_id, { salesOrderId: so?.id || null, orderId: ord.id, deliveryOrderId: target.deliveryOrderId });
+    const targetDo = target.activeDeliveryOrders.find(d => d.id === target.deliveryOrderId) || null;
+    const { status, request, error } = await createDeliveryDateRequestAndMaybeAutoApprove({
       company_id: ord.company_id, branch_id: ord.branch_id || null, order_id: ord.id,
       sales_order_id: so?.id || null, so_number: ord.so_number, customer_name: ord.customer_name,
-      requested_date, original_date: originalDate, remark: remark || null, status: "pending",
+      delivery_order_id: target.deliveryOrderId, requested_date, original_date: originalDate,
+      original_team_id: targetDo?.team_id || null, original_team_name: targetDo?.team_name || null,
+      schedule_id: targetDo?.schedule_id || null, remark: remark || null,
       requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null, requested_via: "web",
-    }).select().single();
-    if (error) throw error;
-    res.status(201).json({ request: created });
+    }, req.user.id);
+    if (error) return res.status(status).json({ error });
+    res.status(status).json({ request });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4949,7 +5015,12 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     const { status } = req.query;
-    let q = supabase.from("delivery_date_requests").select("*").order("created_at", { ascending: false }).limit(500);
+    // P1-2: joined DO fields so the approval card/detail can show the exact
+    // shipment (do_number/status/delivery_date/superseded_at) without a
+    // second round-trip per row.
+    let q = supabase.from("delivery_date_requests")
+      .select("*, delivery_orders!delivery_order_id(do_number, status, delivery_date, superseded_at)")
+      .order("created_at", { ascending: false }).limit(500);
     if (cid) q = q.eq("company_id", cid);
     if (!isDateApprover(req)) q = q.eq("requested_by", req.user.id);
     if (status) q = q.eq("status", status);
@@ -5003,7 +5074,41 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PATCH /delivery-date-requests/:id/approve — PIC approves; date lands on order.
+// P1-2: atomic claim + apply + compensating revert-on-conflict — shared by
+// /approve and /pick (and the auto-approval path at creation uses the plain
+// insert-then-apply shape instead, since nothing can race a brand-new row).
+// The claim (status -> "approved", conditioned on the row still being
+// pending/needs_reschedule) is a compare-and-swap: a concurrent double-click
+// or retry loses the race and gets "already decided" — never a second
+// mutation. If applyApprovedDeliveryDate() then reports a conflict (DO
+// superseded/locked/not found), the claim is reverted to its original state
+// rather than left standing as a falsely-approved row with zero real effect.
+async function claimAndApplyDeliveryDateRequest(r, { actorId, newRequestedDate, extraUpdateFields = {} }) {
+  const claimPayload = {
+    status: "approved",
+    requested_date: newRequestedDate !== undefined ? newRequestedDate : r.requested_date,
+    reviewed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    ...extraUpdateFields,
+  };
+  const { data: claimedRows, error: claimErr } = await supabase.from("delivery_date_requests")
+    .update(claimPayload).eq("id", r.id).in("status", ["pending", "needs_reschedule"]).select();
+  if (claimErr) return { status: 500, error: claimErr.message };
+  const claimed = claimedRows?.[0];
+  if (!claimed) return { status: 400, error: "Request is already decided" };
+
+  const result = await deliveryDateApprovalService.applyApprovedDeliveryDate(claimed, actorId);
+  if (result.conflict) {
+    await supabase.from("delivery_date_requests").update({
+      status: r.status, requested_date: r.requested_date,
+      reviewed_by: r.reviewed_by || null, reviewed_by_name: r.reviewed_by_name || null, reviewed_at: r.reviewed_at || null,
+      decision_note: deliveryDateConflictMessage(result.conflict), updated_at: new Date().toISOString(),
+    }).eq("id", r.id);
+    return { status: 409, error: deliveryDateConflictMessage(result.conflict), code: result.conflict };
+  }
+  return { status: 200, request: claimed, result };
+}
+
+// PATCH /delivery-date-requests/:id/approve — PIC approves; date lands on order/DO.
 app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) => {
   try {
     if (!isDateApprover(req)) return res.status(403).json({ error: "Not allowed to approve delivery dates" });
@@ -5011,15 +5116,12 @@ app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) =
     const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
     if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
     if (!["pending", "needs_reschedule"].includes(r.status)) return res.status(400).json({ error: `Request is already ${r.status}` });
-    // Records the agreed date but leaves the order pending for a Delivery Order
-    // (does not schedule it). Same for the salesman "pick" path below.
-    await applyRequestDeliveryDate(r, req.user.id);
-    const { data, error } = await supabase.from("delivery_date_requests").update({
-      status: "approved", reviewed_by: req.user.id, reviewed_by_name: req.user.name || null,
-      reviewed_at: new Date().toISOString(), decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
-    }).eq("id", r.id).select().single();
-    if (error) throw error;
-    res.json({ request: data });
+    const outcome = await claimAndApplyDeliveryDateRequest(r, {
+      actorId: req.user.id,
+      extraUpdateFields: { reviewed_by: req.user.id, reviewed_by_name: req.user.name || null, decision_note: req.body?.note || null },
+    });
+    if (outcome.error) return res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
+    res.json({ request: outcome.request });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5069,13 +5171,12 @@ app.patch("/delivery-date-requests/:id/pick", requireAuth, async (req, res) => {
     if (r.status !== "needs_reschedule") return res.status(400).json({ error: "No alternatives to pick from" });
     const alts = Array.isArray(r.alternative_dates) ? r.alternative_dates : [];
     if (!alts.includes(picked)) return res.status(400).json({ error: "Pick one of the proposed dates" });
-    await applyRequestDeliveryDate({ ...r, requested_date: picked }, req.user.id);
-    const { data, error } = await supabase.from("delivery_date_requests").update({
-      status: "approved", requested_date: picked, reviewed_at: new Date().toISOString(),
-      decision_note: (r.decision_note ? r.decision_note + " · " : "") + "Salesman picked a proposed date", updated_at: new Date().toISOString(),
-    }).eq("id", r.id).select().single();
-    if (error) throw error;
-    res.json({ request: data });
+    const outcome = await claimAndApplyDeliveryDateRequest(r, {
+      actorId: req.user.id, newRequestedDate: picked,
+      extraUpdateFields: { decision_note: (r.decision_note ? r.decision_note + " · " : "") + "Salesman picked a proposed date" },
+    });
+    if (outcome.error) return res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
+    res.json({ request: outcome.request });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -8421,23 +8522,72 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
         return reply(`✅ SO ${soNumber}${customerName ? ` — ${customerName}` : ""} set to TBC (no date).`, ["best date"]);
       }
 
-      // An actual date does NOT move the order — it creates a pending request
-      // in the Delivery Dates tab for a PIC (incl. Master) to approve.
+      // An actual date does NOT move the order directly — it creates a
+      // delivery_date_requests row (pending, or auto-approved by the 10-day
+      // rule — see finalizeDeliveryDateRequest).
       const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", companyId).eq("order_number", soNumber).maybeSingle();
-      await supabase.from("delivery_date_requests")
-        .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
-        .eq("order_id", orderId).in("status", ["pending", "needs_reschedule"]);
-      const originalDate = await resolveOriginalDeliveryDate(companyId, { salesOrderId: soRow?.id || null, orderId });
-      const { error: reqErr } = await supabase.from("delivery_date_requests").insert({
-        company_id: companyId, branch_id: existingOrder?.branch_id || null, order_id: orderId,
-        sales_order_id: soRow?.id || null, so_number: soNumber, customer_name: customerName || null,
-        requested_date: newDate, original_date: originalDate, remark: remark || null, status: "pending",
-        requested_by: req.user.id, requested_by_name: req.user.salesman_name || req.user.name || null, requested_via: "chat",
+
+      // P1-2: resolve this SO's active Delivery Orders before creating the
+      // request — chat must never guess which one when there's more than
+      // one. This mirrors resolveDeliveryDateRequestTarget()'s 0/1/many rule
+      // used by the web writer, just surfaced conversationally instead of
+      // as a JSON 400.
+      const activeDeliveryOrders = soRow?.id ? await resolveActiveDeliveryOrders({ supabase, companyId, salesOrderId: soRow.id }) : [];
+      if (activeDeliveryOrders.length > 1) {
+        setSession(key, "web_schedule", "select_do", {
+          soNumber, orderId, customerName, isMultiTrip, remark, salesOrderId: soRow.id,
+          branchId: existingOrder?.branch_id || null, requestedDate: newDate, candidateDos: activeDeliveryOrders,
+        });
+        return reply(
+          [
+            `SO ${soNumber} has more than one delivery — which one do you want to reschedule?`,
+            "",
+            ...activeDeliveryOrders.map((d, i) => `${i + 1}. ${d.do_number} — current ${fmtDate(d.delivery_date)}${d.team_name ? ` — ${d.team_name}` : ""}${d.items.length ? ` — ${d.items.map(it => `${it.product_name} x${it.quantity}`).join(", ")}` : ""}`),
+            "",
+            "Reply with the DO number or its list number, or \"cancel\".",
+          ].join("\n"),
+          activeDeliveryOrders.map(d => d.do_number)
+        );
+      }
+      const deliveryOrderId = activeDeliveryOrders.length === 1 ? activeDeliveryOrders[0].id : null;
+      const targetDo = activeDeliveryOrders[0] || null;
+      return finalizeDeliveryDateRequest({
+        soNumber, orderId, customerName, salesOrderId: soRow?.id || null,
+        branchId: existingOrder?.branch_id || null, requestedDate: newDate, remark, deliveryOrderId, targetDo,
       });
-      if (reqErr) return reply(`❌ Failed to send request: ${reqErr.message}`);
+    };
+
+    // Shared tail: validate uniqueness for the resolved target, create the
+    // delivery_date_requests row (auto-approved or pending per the 10-day
+    // rule), and reply. Used both directly by processDate (0/1 active DO)
+    // and after the user resolves a select_do prompt (2+ active DOs).
+    const finalizeDeliveryDateRequest = async ({ soNumber, orderId, customerName, salesOrderId, branchId, requestedDate, remark, deliveryOrderId, targetDo }) => {
+      let supersedeQ = supabase.from("delivery_date_requests")
+        .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
+        .in("status", ["pending", "needs_reschedule"]);
+      supersedeQ = deliveryOrderId ? supersedeQ.eq("delivery_order_id", deliveryOrderId) : supersedeQ.eq("order_id", orderId).is("delivery_order_id", null);
+      await supersedeQ;
+
+      const originalDate = await resolveOriginalDeliveryDate(companyId, { salesOrderId, orderId, deliveryOrderId });
+      const { status, request, error } = await createDeliveryDateRequestAndMaybeAutoApprove({
+        company_id: companyId, branch_id: branchId, order_id: orderId,
+        sales_order_id: salesOrderId, so_number: soNumber, customer_name: customerName || null,
+        delivery_order_id: deliveryOrderId, requested_date: requestedDate, original_date: originalDate,
+        original_team_id: targetDo?.team_id || null, original_team_name: targetDo?.team_name || null,
+        schedule_id: targetDo?.schedule_id || null, remark: remark || null, status: "pending",
+        requested_by: req.user.id, requested_by_name: req.user.salesman_name || req.user.name || null, requested_via: "chat",
+      }, req.user.id);
+      if (error) return reply(`❌ Failed to send request: ${error}`);
       clearSession(key);
+      const doLine = deliveryOrderId && targetDo ? ` (${targetDo.do_number})` : "";
+      if (request.status === "approved") {
+        return reply([
+          `✅ SO ${soNumber}${doLine}${customerName ? ` — ${customerName}` : ""} auto-approved for ${fmtDate(requestedDate)} (10+ days out).`,
+          remark ? `📝 Remark: "${remark}"` : null,
+        ].filter(Boolean).join("\n"), ["best date"]);
+      }
       return reply([
-        `📅 Request sent for approval — SO ${soNumber}${customerName ? ` — ${customerName}` : ""} for ${fmtDate(newDate)}.`,
+        `📅 Request sent for approval — SO ${soNumber}${doLine}${customerName ? ` — ${customerName}` : ""} for ${fmtDate(requestedDate)}.`,
         remark ? `📝 Remark: "${remark}"` : null,
         `The order has NOT moved yet — it moves once approved in the *Delivery Dates* tab.`,
       ].filter(Boolean).join("\n"), ["best date"]);
@@ -8490,6 +8640,29 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       const sessRemark = extractRemark(text);
       const sessData = sessRemark ? { ...session.data, remark: sessRemark } : session.data;
       return processDate(sessData, session.step, newDate);
+    }
+
+    // P1-2: resuming a multi-DO clarification prompt — match the reply
+    // against the candidate list by DO number or its list position. Never
+    // guess: an unmatched reply re-prompts instead of picking one.
+    if (session?.mode === "web_schedule" && session.step === "select_do") {
+      const { candidateDos, soNumber, orderId, customerName, salesOrderId, branchId, requestedDate, remark } = session.data;
+      const raw = text.trim();
+      let chosen = candidateDos.find(d => d.do_number.toLowerCase() === raw.toLowerCase());
+      if (!chosen) {
+        const idx = parseInt(raw, 10);
+        if (Number.isInteger(idx) && idx >= 1 && idx <= candidateDos.length) chosen = candidateDos[idx - 1];
+      }
+      if (!chosen) {
+        return reply(
+          `Didn't catch that — reply with one of: ${candidateDos.map(d => d.do_number).join(", ")}, or "cancel".`,
+          candidateDos.map(d => d.do_number)
+        );
+      }
+      return finalizeDeliveryDateRequest({
+        soNumber, orderId, customerName, salesOrderId, branchId, requestedDate, remark,
+        deliveryOrderId: chosen.id, targetDo: chosen,
+      });
     }
 
     // Day load: "load 15/7" or a bare date
@@ -10503,7 +10676,17 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
   try {
     const companyId = getActiveCompanyId(req);
     if (!companyId) return res.json({ delivery_orders: [] });
-    const { status } = req.query;
+    const { status, so_number } = req.query;
+    let { sales_order_id } = req.query;
+    // P1-2: DO picker for a Delivery Date Request — accept either id directly,
+    // or a so_number (what the request-creation UI already has from its order
+    // search), resolved server-side. Always scoped by the caller's active
+    // company, never a client-supplied company_id.
+    if (!sales_order_id && so_number) {
+      const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", companyId).eq("order_number", so_number).maybeSingle();
+      sales_order_id = soRow?.id || null;
+      if (!sales_order_id) return res.json({ delivery_orders: [] });
+    }
     let q = supabase.from("delivery_orders")
       .select(SELECTS.DELIVERY_ORDER_LIST_SELECT)
       .eq("company_id", companyId)
@@ -10513,6 +10696,7 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
       const list = String(status).split(",").map(s => s.trim()).filter(Boolean);
       q = list.length > 1 ? q.in("status", list) : q.eq("status", list[0]);
     }
+    if (sales_order_id) q = q.eq("sales_order_id", sales_order_id);
     const { data, error } = await q;
     if (error) {
       // Defense-in-depth: DELIVERY_ORDER_LIST_SELECT references
