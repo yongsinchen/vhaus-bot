@@ -4879,6 +4879,39 @@ async function applyRequestDeliveryDate(reqRow, actorId = null) {
   }
 }
 
+// P0 hotfix: server-side snapshot of the CURRENT approved/operational
+// delivery date at the moment a new delivery_date_requests row is created —
+// this becomes original_date, the "Before" value the approval UI shows
+// opposite requested_date. Never derived from (or overridable by) frontend
+// input — there is no such input field anywhere in this codebase, and this
+// keeps it that way by construction (callers never pass a client value in).
+// Company-scoped by construction: both lookups filter on the caller-supplied
+// companyId (the request row's own company, an immutable id, never resolved
+// by so_number/token). sales_orders.delivery_date is preferred (the
+// canonical operational field); orders.delivery_date is the fallback for a
+// legacy request with no linked sales_order_id. Returns null (never guesses)
+// if the relevant id is absent or its row/date isn't found in that company.
+//
+// Both source columns are TEXT, not DATE (confirmed live) — sales_orders.
+// delivery_date can hold the literal placeholder "TBC" for a not-yet-set
+// date. original_date is a real DATE column, so a non-ISO value here must
+// never be passed through: it would either fail the insert outright or (if
+// ever loosened) silently store garbage. Validate against YYYY-MM-DD and
+// treat anything else exactly like "no operational date" — null.
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+async function resolveOriginalDeliveryDate(companyId, { salesOrderId, orderId }) {
+  const clean = v => (v && ISO_DATE_RE.test(v)) ? v : null;
+  if (salesOrderId) {
+    const { data } = await supabase.from("sales_orders").select("delivery_date").eq("id", salesOrderId).eq("company_id", companyId).maybeSingle();
+    return data ? clean(data.delivery_date) : null;
+  }
+  if (orderId) {
+    const { data } = await supabase.from("orders").select("delivery_date").eq("id", orderId).eq("company_id", companyId).maybeSingle();
+    return data ? clean(data.delivery_date) : null;
+  }
+  return null;
+}
+
 // POST /delivery-date-requests — salesman requests a date for an existing order.
 app.post("/delivery-date-requests", requireAuth, async (req, res) => {
   try {
@@ -4898,10 +4931,11 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
     await supabase.from("delivery_date_requests")
       .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
       .eq("order_id", ord.id).in("status", ["pending", "needs_reschedule"]);
+    const originalDate = await resolveOriginalDeliveryDate(ord.company_id, { salesOrderId: so?.id || null, orderId: ord.id });
     const { data: created, error } = await supabase.from("delivery_date_requests").insert({
       company_id: ord.company_id, branch_id: ord.branch_id || null, order_id: ord.id,
       sales_order_id: so?.id || null, so_number: ord.so_number, customer_name: ord.customer_name,
-      requested_date, remark: remark || null, status: "pending",
+      requested_date, original_date: originalDate, remark: remark || null, status: "pending",
       requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null, requested_via: "web",
     }).select().single();
     if (error) throw error;
@@ -8392,10 +8426,11 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       await supabase.from("delivery_date_requests")
         .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
         .eq("order_id", orderId).in("status", ["pending", "needs_reschedule"]);
+      const originalDate = await resolveOriginalDeliveryDate(companyId, { salesOrderId: soRow?.id || null, orderId });
       const { error: reqErr } = await supabase.from("delivery_date_requests").insert({
         company_id: companyId, branch_id: existingOrder?.branch_id || null, order_id: orderId,
         sales_order_id: soRow?.id || null, so_number: soNumber, customer_name: customerName || null,
-        requested_date: newDate, remark: remark || null, status: "pending",
+        requested_date: newDate, original_date: originalDate, remark: remark || null, status: "pending",
         requested_by: req.user.id, requested_by_name: req.user.salesman_name || req.user.name || null, requested_via: "chat",
       });
       if (reqErr) return reply(`❌ Failed to send request: ${reqErr.message}`);
