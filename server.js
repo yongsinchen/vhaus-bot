@@ -12,6 +12,7 @@ const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry")
 const { OrganizationIdentityService } = require("./organization-identity-service");
 const { composeProductView, composeSupplierView } = require("./lib/product-view-composer");
 const doLib = require("./lib/delivery-orders");
+const { classifySalesOrderItemEdit, identityKey: soItemIdentityKey } = require("./lib/sales-order-item-diff");
 const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
@@ -9494,8 +9495,21 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
       if (!allowed) return res.status(403).json({ error: "Permission denied: DELIVERY_ORDER_SCHEDULE" });
 
       const { data: dord } = await supabase.from("delivery_orders")
-        .select("id, status, order_id, do_number, sales_orders(branch_id)").eq("id", delivery_order_id).eq("company_id", cid).maybeSingle();
+        .select("id, status, order_id, do_number, superseded_at, superseded_by_do_id, sales_orders(branch_id)").eq("id", delivery_order_id).eq("company_id", cid).maybeSingle();
       if (!dord) return res.status(404).json({ error: "Delivery order not found" });
+      // P1-1 stabilization: a superseded DO's status can still read "draft"
+      // (apply_active_do_amendment() never touches it — superseded_at is the
+      // sole authoritative retirement flag, see doLib.isOperationallyActive)
+      // — so the status check below is not enough on its own. Backend-level
+      // guard, independent of any frontend filtering: this is what actually
+      // prevented SO 56190's dead DO from being re-scheduled after the fact.
+      if (dord.superseded_at) {
+        return res.status(409).json({
+          error: `Delivery order ${dord.do_number} was superseded and cannot be scheduled — see the replacement Delivery Order.`,
+          code: "delivery_order_superseded",
+          superseded_by_do_id: dord.superseded_by_do_id || null,
+        });
+      }
       // draft = first attempt; failed = re-attempt (Phase 5). Anything else is
       // already in flight or terminal.
       if (!["draft", "failed"].includes(dord.status)) {
@@ -9582,7 +9596,7 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     // status (pre-update) for the SEV-2 team-reassignment lock guard below —
     // req.body.status is the caller's REQUESTED status, not what's actually
     // stored, so the guard must read the DB row, not the request.
-    let checkQ = supabase.from("delivery_schedules").select("id, status").eq("id", req.params.id);
+    let checkQ = supabase.from("delivery_schedules").select("id, status, delivery_order_id").eq("id", req.params.id);
     if (cid) checkQ = checkQ.eq("company_id", cid);
     const { data: currentSchedule } = await checkQ.maybeSingle();
     if (cid && !currentSchedule) return res.status(404).json({ error: "Schedule not found" });
@@ -9592,6 +9606,22 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     // out_for_delivery/arrived/delivered — see isLockedScheduleStatus.
     if (team_id !== undefined && currentSchedule && isLockedScheduleStatus(currentSchedule.status)) {
       return res.status(400).json({ error: `Cannot reassign team — schedule is already ${currentSchedule.status}` });
+    }
+
+    // P1-1 stabilization: never let a schedule attached to a superseded DO be
+    // reassigned to another team — that DO is retired regardless of its own
+    // status column (superseded_at is authoritative). Defense-in-depth for
+    // any stale schedule left over from before this fix (e.g. SO 56190).
+    if (team_id !== undefined && currentSchedule?.delivery_order_id) {
+      const { data: linkedDo } = await supabase.from("delivery_orders")
+        .select("do_number, superseded_at, superseded_by_do_id").eq("id", currentSchedule.delivery_order_id).maybeSingle();
+      if (linkedDo?.superseded_at) {
+        return res.status(409).json({
+          error: `Delivery order ${linkedDo.do_number} was superseded and cannot be reassigned — see the replacement Delivery Order.`,
+          code: "delivery_order_superseded",
+          superseded_by_do_id: linkedDo.superseded_by_do_id || null,
+        });
+      }
     }
 
     // Phase 2A: an admin marking a DO schedule "delivered" must go through
@@ -9676,13 +9706,29 @@ app.delete("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async
       return res.status(400).json({ error: `Cannot delete — schedule is already ${existing.status}` });
     }
 
+    // P1-1 stabilization: a superseded DO is retired regardless of its
+    // status column (see doLib.isOperationallyActive) — this schedule row
+    // being deleted may itself be exactly the stale data left over from
+    // before this fix. Check superseded_at BEFORE the "reset to draft"
+    // step below, so unassigning a superseded DO's leftover schedule can
+    // never flip it back into "draft" — which would resurrect it into the
+    // assignable Unassigned pool as if it were a live DO.
+    let supersededDoId = null;
+    if (existing.delivery_order_id) {
+      const { data: linkedDo } = await supabase.from("delivery_orders")
+        .select("superseded_at").eq("id", existing.delivery_order_id).maybeSingle();
+      if (linkedDo?.superseded_at) supersededDoId = existing.delivery_order_id;
+    }
+
     let dq = supabase.from("delivery_schedules").delete().eq("id", req.params.id);
     if (cid) dq = dq.eq("company_id", cid);
     await dq;
 
     if (existing.delivery_order_id) {
-      await supabase.from("delivery_orders").update({ status: "draft" }).eq("id", existing.delivery_order_id);
-      await logDoEvent(existing.delivery_order_id, "unscheduled", { schedule_id: existing.id }, req.user.id);
+      if (!supersededDoId) {
+        await supabase.from("delivery_orders").update({ status: "draft" }).eq("id", existing.delivery_order_id);
+      }
+      await logDoEvent(existing.delivery_order_id, "unscheduled", { schedule_id: existing.id, superseded: !!supersededDoId }, req.user.id);
     } else if (existing.order_id && existing.scheduled_date) {
       // Legacy order: the unassigned pool is keyed on orders.delivery_date, so
       // snap it to the date this stop was scheduled on. Without this, an order
@@ -10554,10 +10600,20 @@ app.patch("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_EDIT), asy
   try {
     const companyId = getActiveCompanyId(req);
     const { data: dord } = await supabase.from("delivery_orders")
-      .select("id, status, delivery_date").eq("id", req.params.id).eq("company_id", companyId).maybeSingle();
+      .select("id, status, delivery_date, superseded_at, superseded_by_do_id").eq("id", req.params.id).eq("company_id", companyId).maybeSingle();
     if (!dord) return res.status(404).json({ error: "Delivery order not found" });
     if (["completed", "cancelled"].includes(dord.status)) {
       return res.status(400).json({ error: `Cannot edit a ${dord.status} delivery order` });
+    }
+    // P1-1 stabilization: a superseded DO is retired regardless of its status
+    // column — reschedule (which also re-homes its schedule/team, see below)
+    // must never operate on it. See POST /delivery-schedules's identical guard.
+    if (dord.superseded_at) {
+      return res.status(409).json({
+        error: "This delivery order was superseded and cannot be rescheduled — see the replacement Delivery Order.",
+        code: "delivery_order_superseded",
+        superseded_by_do_id: dord.superseded_by_do_id || null,
+      });
     }
 
     const { delivery_date, remark, customer_confirmed } = req.body;
@@ -14376,17 +14432,42 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // returns as a pending amendment before this line is ever reached. This
     // rebuild path only runs for orders with no DO at all, or a
     // customer-detail-only edit that isn't "critical" to begin with.
+    //
+    // P0 BLOCKER FIX: this used to unconditionally DELETE every
+    // sales_order_items row and INSERT fresh ones with brand-new ids,
+    // regardless of whether anything actually changed — it ran whenever the
+    // request merely included an `items` array. delivery_order_items.
+    // sales_order_item_id has an ON DELETE SET NULL FK, so ANY save that
+    // resubmitted the (unchanged) items array — a remark-only edit, a
+    // customer-detail-only edit, even a no-op re-save — silently orphaned
+    // any active DO's item lineage, with zero amendment record and zero
+    // warning (confirmed live as the root cause of a P1-1 replacement DO
+    // ending up with 0 items). It also reset delivered_qty/arrived_at back
+    // to their defaults on every such save for a still-existing line,
+    // discarding real delivery progress. Fixed to match this repo's
+    // existing lineage-preserving pattern — the same shape
+    // apply_active_do_amendment() (migration 089) already uses for its own
+    // item mutation: a submitted line whose id matches an existing row is
+    // UPSERTed in place (id — and delivered_qty/arrived_at/delivery_status,
+    // simply omitted from the payload — never change), so any DO's FK to it
+    // survives and in-progress delivery ledgers aren't wiped. Only a
+    // genuinely new line (no id, or an id not on this order) gets a fresh
+    // id; only a genuinely removed line (an existing id absent from the
+    // submitted set) is DELETEd.
     if (expandedItems) {
-      // P0-04: a full rebuild (delete + reinsert) would drop each line's recorded
-      // arrival, which lives on the row (arrived_at). Carry arrived_at across the
-      // rebuild, matched by product identity (the row id necessarily changes on
-      // reinsert), consuming each match so two identical lines can't both claim
-      // the same arrival.
-      const _an = v => (v ?? "").toString().trim().toLowerCase();
-      const _identityKey = it => it.product_id
-        ? `p:${it.product_id}`
-        : `t:${_an(it.product_code)}|${_an(it.product_name)}|${_an(it.size)}|${_an(it.color)}`;
-      const prevArrivals = (existing.sales_order_items || [])
+      // classifySalesOrderItemEdit (lib/sales-order-item-diff.js) is the
+      // single source of truth for "which submitted lines are edits to an
+      // existing row vs. genuinely new/removed" — unit-tested in isolation
+      // (scripts/test-p1-1-item-lineage-preservation.js). Reused here rather
+      // than re-derived inline so this decision can never drift out of sync
+      // with what the test actually covers.
+      const { matchedIds, removedRows } = classifySalesOrderItemEdit(existing.sales_order_items, expandedItems);
+      const _identityKey = soItemIdentityKey;
+      // Only a line that is truly disappearing (matched by no submitted
+      // item) frees up its arrival for a genuinely new line to inherit — a
+      // still-matched line keeps its own row, and its own arrived_at,
+      // completely untouched.
+      const prevArrivals = removedRows
         .filter(i => i.arrived_at)
         .map(i => ({ used: false, arrived_at: i.arrived_at, key: _identityKey(i) }));
       const takeArrival = it => {
@@ -14395,8 +14476,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         if (hit) { hit.used = true; return hit.arrived_at; }
         return null;
       };
-      await supabase.from("sales_order_items").delete().eq("order_id", id);
-      const itemRows = [];
+
+      const upsertRows = [];
       for (const it of expandedItems) {
         let productId = it.product_id || null;
         let linkedCustom = it.linked_custom_item === true;
@@ -14411,7 +14492,9 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
             console.error("[PUT /sales-orders/:id] save_as_reusable product creation failed (non-fatal):", reusableErr.message);
           }
         }
-        itemRows.push({
+        const isMatched = it.id != null && matchedIds.has(String(it.id));
+        const row = {
+          id: isMatched ? String(it.id) : crypto.randomUUID(),
           order_id: id, product_id: productId, product_code: it.product_code || null,
           product_name: it.product_name || null, size: it.size || null, color: it.color || null,
           is_custom: it.is_custom === true, custom_dimensions: it.custom_dimensions || null,
@@ -14420,15 +14503,20 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
           line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1),
           attachment_url: it.attachment_url || null, notes: it.notes || null,
           requires_product_review: requiresReview,
-          // Item edits delete+reinsert rows — the linked-custom flag must
-          // round-trip through the form or linking history is lost on edit.
+          // Item edits used to always delete+reinsert rows — the linked-custom
+          // flag must round-trip through the form or linking history is lost.
           linked_custom_item: linkedCustom,
           bundle_id: it.bundle_id || null,
           bundle_instance_id: it.bundle_instance_id || null,
           bundle_component_price: it.bundle_component_price ?? null,
-          // P0-04: keep any recorded arrival for a line that still exists.
-          arrived_at: takeArrival(it),
-        });
+        };
+        // A genuinely new line has no delivery history of its own to
+        // preserve — carry forward a matching REMOVED line's arrival, same
+        // as before (P0-04). A matched (existing-id) line simply omits
+        // arrived_at/delivered_qty/delivery_status here so the upsert's
+        // ON CONFLICT DO UPDATE never touches them.
+        if (!isMatched) row.arrived_at = takeArrival(it);
+        upsertRows.push(row);
       }
       // is_clearance, unit_cost AND supplier_name are resolved server-side
       // from the products/suppliers tables for every product-linked line —
@@ -14436,16 +14524,23 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       // resolveProductLineDefaults). Custom/unlinked lines keep whatever
       // unit_cost the client sent (no catalog authority to check) and get a
       // null supplier_name.
-      const productDefaults = await resolveProductLineDefaults(company_id, itemRows);
-      for (const row of itemRows) {
+      const productDefaults = await resolveProductLineDefaults(company_id, upsertRows);
+      for (const row of upsertRows) {
         const d = row.product_id ? productDefaults.get(row.product_id) : null;
         row.is_clearance = d ? d.is_clearance : false;
         if (d) row.unit_cost = d.unit_cost;
         row.supplier_name = d ? d.supplier_name : null;
       }
 
-      const { error: itemsErr } = await supabase.from("sales_order_items").insert(itemRows);
-      if (itemsErr) throw itemsErr;
+      const removedIds = removedRows.map(r => r.id);
+      if (removedIds.length) {
+        const { error: delErr } = await supabase.from("sales_order_items").delete().in("id", removedIds);
+        if (delErr) throw delErr;
+      }
+      if (upsertRows.length) {
+        const { error: itemsErr } = await supabase.from("sales_order_items").upsert(upsertRows, { onConflict: "id" });
+        if (itemsErr) throw itemsErr;
+      }
     }
 
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
