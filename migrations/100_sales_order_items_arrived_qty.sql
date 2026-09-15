@@ -1,0 +1,91 @@
+-- ══════════════════════════════════════════════════════════════════
+-- Migration 100: sales_order_items.arrived_qty — canonical physical
+-- arrival QUANTITY (P1-4D).
+--
+-- SCHEMA-ONLY. This migration does NOT backfill any historical data —
+-- every existing row gets the safe default (0). A separate, explicitly
+-- reviewed backfill step (using the exact same soiId -> SKU -> item-name
+-- -> legacy-prefix match precedence already proven in P1-4C/P1-4D's
+-- read-only simulation) is run only after this migration is confirmed
+-- live, and only writes a value where the match was UNAMBIGUOUS. Rows
+-- where the historical match is ambiguous or absent are deliberately
+-- left at 0 and reported separately — never guessed.
+--
+-- WHY THIS COLUMN, AND WHY NOW:
+-- Before this migration, "has this item arrived" was a boolean
+-- (sales_order_items.arrived_at, migration 015) with NO quantity
+-- component — a single unit of a 10-unit line arriving made the ENTIRE
+-- line read as "arrived" for every consumer of isItemArrived()
+-- (delivery-readiness, validateDoRequest's arrival gate). That silently
+-- permitted an outbound Delivery Order to be created/scheduled for the
+-- FULL ordered quantity even when only a fraction had physically reached
+-- the warehouse. arrived_qty makes "how much has physically arrived" a
+-- real, comparable number, so DO-creation and readiness math can be
+-- capped by actual physical stock instead of a yes/no flag.
+--
+-- WHY NUMERIC(12,2): matches every sibling quantity column already on
+-- this exact table (sales_order_items.quantity, delivered_qty — both
+-- confirmed NUMERIC(12,2) per migration 015) and on delivery_order_items
+-- (quantity, delivered_qty — same migration). Using anything else would
+-- make ordered/arrived/delivered/allocated quantities incomparable
+-- without casts throughout the allocation math in lib/delivery-orders.js.
+--
+-- WHY DEFAULT 0 (safe for new rows): a brand-new sales_order_items row
+-- represents a line that has not yet had any physical arrival recorded
+-- against it — 0 is the only value consistent with "nothing has arrived
+-- yet," matching delivered_qty's own DEFAULT 0 on the same table.
+--
+-- WHY CHECK (arrived_qty >= 0) ONLY (no upper-bound CHECK against
+-- `quantity` in this migration): the application layer already caps
+-- arrived_qty at ordered quantity at write time (mirroring
+-- lib/supplier-do.js's existing applyArrivalToItem, which has always
+-- capped the legacy JSON arrivedQty the same way — confirmed 0 rows
+-- with arrivedQty > ordered quantity in the live backfill simulation).
+-- A hard DB-level CHECK (arrived_qty <= quantity) is deliberately NOT
+-- added here because a future amendment could (in principle) reduce a
+-- line's `quantity` in the same transaction that this column is updated,
+-- and enforcing the cap as a blind CROSS-COLUMN CHECK constraint risks a
+-- spurious constraint violation on an unrelated write ordering rather
+-- than a clear, actionable application error. The correct place for that
+-- guard is the amendment RPC itself (apply_active_do_amendment already
+-- has an equivalent guard for delivered_qty — "below_delivered_qty" —
+-- migrations 089/097/098; a symmetrical "below_arrived_qty" guard is a
+-- recommended P1-4D follow-up in the same RPC, not part of this schema
+-- migration).
+--
+-- AMENDMENT LINEAGE — NO RPC CHANGE REQUIRED: apply_active_do_amendment()
+-- (migrations 089/091/097/098) already produces the correct behavior for
+-- this new column with ZERO code changes, because:
+--   - its UPDATE for a carried-forward sales_order_items row never lists
+--     arrived_qty in its SET clause, so the row's existing arrived_qty is
+--     left completely untouched (Postgres UPDATE ... SET only touches
+--     listed columns) — carried-forward items keep their real history.
+--   - its INSERT for a genuinely NEW sales_order_items row has an
+--     explicit column list that does not include arrived_qty, so the new
+--     row takes this column's schema DEFAULT (0) — a new line correctly
+--     starts with zero arrival, never inheriting the old line's quantity.
+-- ══════════════════════════════════════════════════════════════════
+
+ALTER TABLE sales_order_items
+  ADD COLUMN IF NOT EXISTS arrived_qty NUMERIC(12,2) NOT NULL DEFAULT 0
+    CHECK (arrived_qty >= 0);
+
+-- ══════════════════════════════════════════════════════════════════
+-- Verification queries (run after applying)
+-- ══════════════════════════════════════════════════════════════════
+
+-- Expect the column to exist with the right type/default:
+--   SELECT column_name, data_type, numeric_precision, numeric_scale,
+--          is_nullable, column_default
+--   FROM information_schema.columns
+--   WHERE table_name = 'sales_order_items' AND column_name = 'arrived_qty';
+
+-- Expect every existing row at 0 immediately after applying (this
+-- migration adds the column only — it does NOT backfill):
+--   SELECT count(*) FROM sales_order_items WHERE arrived_qty <> 0;
+--   -- expected: 0
+
+-- ══════════════════════════════════════════════════════════════════
+-- Rollback
+-- ══════════════════════════════════════════════════════════════════
+--   ALTER TABLE sales_order_items DROP COLUMN IF EXISTS arrived_qty;

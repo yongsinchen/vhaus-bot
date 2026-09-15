@@ -10712,6 +10712,10 @@ function buildAllocationSummary(so, deliveryOrders, legacyOrder) {
       size: soi.size, color: soi.color,
       ordered_qty: alloc.ordered_qty, allocated_qty: alloc.allocated_qty,
       delivered_qty: alloc.delivered_qty, remaining_qty: alloc.remaining_qty,
+      // P1-4D: physical-arrival-quantity-aware fields (additive — existing
+      // consumers of the fields above are unaffected).
+      arrived_qty: alloc.arrived_qty, available_to_allocate_qty: alloc.available_to_allocate_qty,
+      over_allocated: alloc.over_allocated,
       arrived,
       delivery_status: doLib.deriveItemDeliveryStatus(alloc, arrived),
     };
@@ -11240,9 +11244,9 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
 
     // ── Source 1: active, dated Delivery Orders in the window ──────────
     const { data: activeDos } = await supabase.from("delivery_orders")
-      .select(`id, do_number, order_id, status, delivery_date,
+      .select(`id, do_number, order_id, sales_order_id, status, delivery_date,
         sales_orders(order_number, customer_name),
-        delivery_order_items(id, sales_order_item_id, product_code, product_name, status)`)
+        delivery_order_items(id, sales_order_item_id, product_code, product_name, status, quantity)`)
       .eq("company_id", cid)
       .is("superseded_at", null)
       .not("delivery_date", "is", null)
@@ -11264,16 +11268,56 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
       legacyOrderById = new Map((legacyOrders || []).map(o => [o.id, o]));
     }
 
+    // P1-4D — ARRIVAL ALLOCATION CONFLICT: two active DOs can each hold a
+    // claim on the SAME sales_order_item that together exceed what has
+    // physically arrived (e.g. arrived=4, DO-A qty 3 + DO-B qty 3). Per your
+    // explicit instruction, this is NEVER resolved by picking a "winner" via
+    // creation order or any other priority — every DO sharing the conflicted
+    // item is marked NOT READY with a distinct ARRIVAL ALLOCATION CONFLICT
+    // alert. Detecting this requires each affected SO's FULL active-DO
+    // allocation picture (not just the DOs inside today's date window), so
+    // fetch every operationally-active DO for every distinct SO appearing in
+    // this window and run the same computeAllocations() used by DO creation.
+    const soIdsInWindow = [...new Set((activeDos || []).map(d => d.sales_order_id).filter(Boolean))];
+    let allocationsBySoId = new Map();
+    if (soIdsInWindow.length) {
+      const { data: allDosForTheseSOs } = await supabase.from("delivery_orders")
+        .select("id, sales_order_id, status, superseded_at, delivery_order_items(sales_order_item_id, quantity, status)")
+        .in("sales_order_id", soIdsInWindow);
+      const { data: soiRowsForConflict } = await supabase.from("sales_order_items")
+        .select("id, order_id, quantity, delivered_qty, arrived_qty").in("order_id", soIdsInWindow);
+      const dosBySo = new Map();
+      for (const d of allDosForTheseSOs || []) {
+        if (!dosBySo.has(d.sales_order_id)) dosBySo.set(d.sales_order_id, []);
+        dosBySo.get(d.sales_order_id).push(d);
+      }
+      const soisBySo = new Map();
+      for (const soi of soiRowsForConflict || []) {
+        if (!soisBySo.has(soi.order_id)) soisBySo.set(soi.order_id, []);
+        soisBySo.get(soi.order_id).push(soi);
+      }
+      for (const soId of soIdsInWindow) {
+        allocationsBySoId.set(soId, doLib.computeAllocations(soisBySo.get(soId) || [], dosBySo.get(soId) || []));
+      }
+    }
+
     for (const dord of (activeDos || [])) {
       const doItems = (dord.delivery_order_items || []).filter(i => i.status !== "cancelled");
       const totalItems = doItems.length;
       const legacyOrd = dord.order_id ? legacyOrderById.get(dord.order_id) : null;
       const legacySet = doLib.buildLegacyArrivalSet(legacyOrd?.items);
+      const soAllocations = dord.sales_order_id ? allocationsBySoId.get(dord.sales_order_id) : null;
 
       let arrivedItems = 0;
       const missingItems = [];
+      const conflictedItems = [];
       for (const i of doItems) {
         const soi = i.sales_order_item_id ? soiById.get(i.sales_order_item_id) : null;
+        const allocEntry = i.sales_order_item_id && soAllocations ? soAllocations.get(i.sales_order_item_id) : null;
+        if (allocEntry?.over_allocated) {
+          conflictedItems.push(i.product_name || i.product_code || "item");
+          continue; // a conflicted item is never counted as "arrived" for this DO
+        }
         if (doLib.isItemArrived(soi || { product_code: i.product_code, product_name: i.product_name }, legacySet)) arrivedItems++;
         else missingItems.push(i.product_name || i.product_code || "item");
       }
@@ -11302,11 +11346,16 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
       const hasBalance = parseFloat(legacyOrd?.balance) > 0;
       const alerts = [];
       if (missingItems.length > 0) alerts.push({ type: "missing_items", severity: "high", message: `${missingItems.length} item(s) not arrived`, items: missingItems });
+      // P1-4D: distinct from "not arrived" — these items DID arrive, but
+      // active DOs together claim more than physically exists. Never
+      // silently resolved by picking a winner — every DO sharing the
+      // conflicted item surfaces this same alert.
+      if (conflictedItems.length > 0) alerts.push({ type: "arrival_allocation_conflict", severity: "high", message: `ARRIVAL ALLOCATION CONFLICT — ${conflictedItems.length} item(s) over-claimed by competing Delivery Orders`, items: conflictedItems });
       if (totalItems > 0 && storedCount === 0 && pickedCount === 0 && packedCount === 0) alerts.push({ type: "no_packages", severity: "medium", message: "No items in warehouse (no QR labels)" });
       if (storedCount > 0 && pickedCount === 0) alerts.push({ type: "not_picked", severity: "medium", message: `${storedCount} item(s) stored but not picked yet` });
       if (hasBalance) alerts.push({ type: "balance", severity: "low", message: `Outstanding balance: RM ${legacyOrd.balance}` });
 
-      const isReady = missingItems.length === 0 && alerts.filter(a => a.severity === "high").length === 0;
+      const isReady = missingItems.length === 0 && conflictedItems.length === 0 && alerts.filter(a => a.severity === "high").length === 0;
       const soNumber = dord.sales_orders?.order_number || null;
 
       results.push({
@@ -11314,6 +11363,7 @@ app.get("/delivery-readiness", requireAuth, async (req, res) => {
         so_number: soNumber, customer_name: dord.sales_orders?.customer_name || null,
         delivery_date: dord.delivery_date, status: dord.status,
         total_items: totalItems, arrived_items: arrivedItems, missing_items: missingItems,
+        conflicted_items: conflictedItems,
         packed: packedCount, stored: storedCount, picked: pickedCount,
         balance: legacyOrd?.balance ?? null, is_ready: isReady, alerts,
       });
@@ -13979,17 +14029,43 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
     // — same principle applied to the other P1-4B fixes.
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
-    const { item_index, item_code, arrival_date } = req.body;
+    const { item_index, item_code, arrival_date, arrived_qty } = req.body;
+
+    // P1-4D: arrived_qty is additive — an ABSOLUTE, idempotent quantity
+    // contract (chosen over a delta contract because a retried identical
+    // request must be a safe no-op; see P1-4D final report §manual-arrival
+    // API contract). Omitting arrived_qty entirely preserves the exact
+    // original binary behavior (arrival_date set -> full; absent -> clear),
+    // so no existing caller of this endpoint is affected.
+    let requestedArrivedQty = null;
+    if (arrived_qty !== undefined && arrived_qty !== null) {
+      const n = Number(arrived_qty);
+      if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: "arrived_qty must be a number >= 0" });
+      requestedArrivedQty = n;
+    }
+
     const { data: order } = await supabase.from("orders").select("items, so_number").eq("id", req.params.id).eq("company_id", cid).single();
     if (!order) return res.status(404).json({ error: "Order not found" });
     const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
     if (!Array.isArray(items)) return res.status(400).json({ error: "No items" });
-    // Find item by index or code. Manually setting a date marks the whole line
-    // arrived (arrivedQty = ordered); clearing it resets received to zero. This
-    // keeps the manual control an all-or-nothing override of the DO-driven
-    // partial quantity.
+    // Find item by index or code.
+    //  - Legacy contract (arrived_qty omitted): all-or-nothing — arrival_date
+    //    set marks the whole line arrived (arrivedQty = ordered); absent
+    //    clears it to zero. Unchanged from pre-P1-4D behavior.
+    //  - P1-4D contract (arrived_qty provided): absolute partial quantity.
+    //    0 clears (mirrors the legacy clear, including arrivalDate reset).
+    //    >0 sets arrivedQty to that value (capped at this line's own ordered
+    //    qty, same defensive cap the sync writer applies against the
+    //    canonical sales_order_items.quantity) and preserves the FIRST
+    //    arrival date if one is already set — a later partial correction
+    //    never rewrites when the item first arrived.
+    const todayKL = () => new Date().toLocaleString("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).split(",")[0].trim();
     const stamp = (it) => {
-      if (arrival_date) { it.arrivalDate = arrival_date; it.arrivedQty = supplierDO.orderedQtyOf(it); }
+      if (requestedArrivedQty !== null) {
+        const capped = Math.min(requestedArrivedQty, supplierDO.orderedQtyOf(it));
+        if (capped <= 0) { it.arrivalDate = ""; it.arrivedQty = 0; }
+        else { it.arrivedQty = capped; it.arrivalDate = it.arrivalDate || arrival_date || todayKL(); }
+      } else if (arrival_date) { it.arrivalDate = arrival_date; it.arrivedQty = supplierDO.orderedQtyOf(it); }
       else { it.arrivalDate = ""; it.arrivedQty = 0; }
     };
     let updated = false;
@@ -14149,7 +14225,7 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
       .select("id, company_id, so_number, items").eq("id", legacyOrderId).maybeSingle();
     if (!ord?.so_number) return;
     const { data: so } = await supabase.from("sales_orders")
-      .select("id, sales_order_items(id, product_code, product_name, arrived_at)")
+      .select("id, sales_order_items(id, product_code, product_name, quantity, arrived_at, arrived_qty)")
       .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
     if (!so || !(so.sales_order_items || []).length) return;
 
@@ -14164,6 +14240,9 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
     // Match: code exact (ci), or the composite JSON itemName ("name size
     // color") equals/prefixes the SO item's product_name.
     const usedJson = new Set();
+    // P1-4D: also propagate the physical arrival QUANTITY (previously this
+    // only propagated the arrivalDate presence flag). Returns null when no
+    // JSON line matches at all; otherwise { arrivalDate, arrivedQty }.
     const findArrival = (soi) => {
       // P0-05: prefer the EXACT immutable line id (soiId) that
       // syncSalesOrderToDelivery now stamps on each JSON line — an arrival can
@@ -14174,7 +14253,7 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
         if (usedJson.has(k)) continue;
         const ji = jsonItems[k];
         if (ji && ji.soiId != null && String(ji.soiId) === String(soi.id)) {
-          usedJson.add(k); return ji.arrivalDate || null;
+          usedJson.add(k); return { arrivalDate: ji.arrivalDate || null, arrivedQty: ji.arrivedQty };
         }
       }
       const code = (soi.product_code || "").trim().toLowerCase();
@@ -14187,16 +14266,37 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
         const jName = (ji.itemName || "").trim().toLowerCase();
         const codeHit = code && jCode && code === jCode;
         const nameHit = name && jName && (jName === name || jName.startsWith(name + " "));
-        if (codeHit || nameHit) { usedJson.add(k); return ji.arrivalDate || null; }
+        if (codeHit || nameHit) { usedJson.add(k); return { arrivalDate: ji.arrivalDate || null, arrivedQty: ji.arrivedQty }; }
       }
       return null;
     };
 
     for (const soi of so.sales_order_items) {
-      const arrival = findArrival(soi);
+      const found = findArrival(soi);
+      const arrival = found ? found.arrivalDate : null;
       const current = soi.arrived_at || null;
-      if ((arrival || null) !== current) {
-        await supabase.from("sales_order_items").update({ arrived_at: arrival || null }).eq("id", soi.id);
+
+      // P1-4D: derive the canonical arrived_qty from the same matched JSON
+      // line — a defensive cap against sales_order_items.quantity (the
+      // authoritative ordered qty) even though the JSON's own arrivedQty is
+      // already capped at its own line's `unit` field (lib/supplier-do.js's
+      // applyArrivalToItem). A line predating the arrivedQty field but with an
+      // arrivalDate historically meant "fully arrived" — same fallback used
+      // by the migration-100 backfill.
+      const orderedQty = Number(soi.quantity) || 0;
+      let rawArrivedQty = 0;
+      if (found) {
+        if (found.arrivedQty != null) rawArrivedQty = Number(found.arrivedQty) || 0;
+        else if (found.arrivalDate) rawArrivedQty = orderedQty;
+      }
+      const newArrivedQty = Math.max(0, Math.min(rawArrivedQty, orderedQty));
+      const currentArrivedQty = Number(soi.arrived_qty) || 0;
+
+      const patch = {};
+      if ((arrival || null) !== current) patch.arrived_at = arrival || null;
+      if (newArrivedQty !== currentArrivedQty) patch.arrived_qty = newArrivedQty;
+      if (Object.keys(patch).length > 0) {
+        await supabase.from("sales_order_items").update(patch).eq("id", soi.id);
       }
     }
   } catch (e) { console.error("[syncArrivalsToSalesOrderItems] non-fatal:", e.message); }
