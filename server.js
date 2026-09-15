@@ -20,6 +20,7 @@ const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
+const { createActiveDoAmendmentService, diffAmendmentAgainstLive, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
 const { getCommissionableAmount } = commissionLib;
 const crypto = require("crypto");
 
@@ -13956,6 +13957,10 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
 const { findOrCreateCustomerForOrder, syncSalesOrderToDelivery, logProjectionSyncFailure } =
   createSyncService({ supabase, sendMessage, ADMIN_CHAT_ID });
 
+// URGENT fix (migration 097): approval must apply immediately regardless of
+// arrival state — see lib/active-do-amendment.js header comment.
+const { applyActiveDoAmendment } = createActiveDoAmendmentService({ supabase, findOrCreateCustomerForOrder, buildLegacyItemsProjection });
+
 // GET /sales-orders — list; salesmen see only their own
 // GET /sales-orders — paginated lightweight list
 app.get("/sales-orders", requireAuth, async (req, res) => {
@@ -14902,34 +14907,9 @@ app.patch("/sales-orders/:id/order-number", requireAuth, async (req, res) => {
 // 'approved' — see PUT /sales-orders/:id.
 const isAmendApprover = (req) => ["master", "manager"].includes(req.user.role);
 
-// P1-1: extracted from inside applySalesOrderAmendment (was inlined there)
-// so BOTH that function AND the new active-DO RPC approval path
-// (routeAmendmentApproval below) run the exact same before/live
-// full-projection conflict check — never two copies that can drift apart.
-// Compares live vs. as-requested state, excluding the 'amended' status flag
-// this amendment itself set (comparing it would always "conflict" — the
-// flag IS the expected difference). Items compared via a stable, sorted
-// projection so DB return order alone can never cause a false conflict.
-function diffAmendmentAgainstLive(liveOrder, beforeSnapshot) {
-  const projectHeader = (o) => ({
-    customer_name: o.customer_name, customer_contact: o.customer_contact, customer_address: o.customer_address,
-    delivery_address: o.delivery_address, customer_email: o.customer_email, customer_id_no: o.customer_id_no,
-    customer_id_type: o.customer_id_type, order_date: o.order_date, delivery_date: o.delivery_date,
-    delivery_time_slot: o.delivery_time_slot, delivery_type: o.delivery_type, remark: o.remark,
-    salesman_name: o.salesman_name, payment_method: o.payment_method, subtotal: o.subtotal, discount: o.discount,
-    admin_charges: o.admin_charges, gst_amount: o.gst_amount, gst_waived: o.gst_waived, deposit: o.deposit,
-    branch_id: o.branch_id, country: o.country, gst_rate: o.gst_rate, einvoice_requested: o.einvoice_requested,
-  });
-  const projectItems = (items) => (items || []).map(i => ({
-    product_id: i.product_id, product_code: i.product_code, product_name: i.product_name,
-    size: i.size, color: i.color, quantity: i.quantity, unit_price: i.unit_price,
-  })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-
-  const before = beforeSnapshot || {};
-  const headerConflict = JSON.stringify(projectHeader(liveOrder)) !== JSON.stringify(projectHeader(before));
-  const itemsConflict = JSON.stringify(projectItems(liveOrder.sales_order_items)) !== JSON.stringify(projectItems(before.sales_order_items));
-  return { headerConflict, itemsConflict, conflict: headerConflict || itemsConflict };
-}
+// diffAmendmentAgainstLive is imported from lib/active-do-amendment.js —
+// used by BOTH this function AND applyActiveDoAmendment (also imported),
+// never two copies that can drift apart.
 
 // Apply a pending amendment's proposed_snapshot to the live sales_orders /
 // sales_order_items rows. This is the ONLY place that does so for an SO with
@@ -14990,255 +14970,10 @@ async function applySalesOrderAmendment(amendment) {
   return { applied: true, order: full, syncError };
 }
 
-// ── P1-1: active-DO amendment approval (apply_active_do_amendment RPC) ──
-// Null-safe equality mirroring Postgres "IS NOT DISTINCT FROM" — used to
-// reproduce the RPC's own affected-DO comparison in JS for the Node-side
-// arrival-evidence precomputation (step b below). Deliberately exact/
-// case-sensitive, NOT normalized — matches the RPC's literal jsonb ->> text
-// comparison (migration 089).
-const _nsEqual = (a, b) => (a ?? null) === (b ?? null);
-
-// Mirrors the RPC's AFFECTED-DO ALGORITHM (migration 089 header comment) in
-// JS: a draft/scheduled DO is affected iff at least one of its non-cancelled
-// items either has unverifiable lineage (sales_order_item_id NULL — deviation
-// #6) or was removed / changed identity / changed quantity by the proposed
-// amendment. Used only to decide which items need arrival-evidence
-// precomputed before calling the RPC — the RPC itself is the sole authority
-// on the actual affected/supersede decision at approval time.
-function _doIsAffectedByAmendment(dord, soItemsById, proposedBySource) {
-  for (const doi of dord.delivery_order_items || []) {
-    if (doi.status === "cancelled") continue;
-    if (doi.sales_order_item_id == null) return true;
-    const proposed = proposedBySource.get(String(doi.sales_order_item_id));
-    const pre = soItemsById.get(String(doi.sales_order_item_id));
-    if (!proposed || !pre) return true;
-    const matches = Number(proposed.quantity) === Number(pre.quantity)
-      && _nsEqual(proposed.product_id ?? null, pre.product_id ?? null)
-      && _nsEqual(proposed.product_code ?? null, pre.product_code ?? null)
-      && _nsEqual(proposed.product_name ?? null, pre.product_name ?? null)
-      && _nsEqual(proposed.size ?? null, pre.size ?? null)
-      && _nsEqual(proposed.color ?? null, pre.color ?? null);
-    if (!matches) return true;
-  }
-  return false;
-}
-
-// Re-derive the exact legacy-JSON fragment (if any) that proves an item's
-// arrival, mirroring doLib.isItemArrived's matching rules (code match first,
-// excluding generic placeholder codes; else name exact/prefix match) but
-// returning the matched {match_field, match_value, arrival_date} instead of
-// a boolean, for p_item_arrival_evidence's 'legacy' source shape.
-function _findLegacyArrivalEvidence(soi, legacyItemsRaw) {
-  let items = legacyItemsRaw;
-  if (typeof items === "string") { try { items = JSON.parse(items || "[]"); } catch { items = []; } }
-  if (!Array.isArray(items)) return null;
-  const code = (soi.product_code || "").trim().toLowerCase();
-  const name = (soi.product_name || "").trim().toLowerCase();
-  for (const it of items) {
-    if (!it || !it.arrivalDate) continue;
-    const itemCode = (it.itemCode || "").trim().toLowerCase();
-    if (code && itemCode && !doLib.isGenericItemCode(itemCode) && itemCode === code) {
-      return { match_field: "itemCode", match_value: it.itemCode, arrival_date: it.arrivalDate };
-    }
-  }
-  for (const it of items) {
-    if (!it || !it.arrivalDate) continue;
-    const itemName = (it.itemName || "").trim().toLowerCase();
-    if (name && itemName && (itemName === name || itemName.startsWith(name + " "))) {
-      return { match_field: "itemName", match_value: it.itemName, arrival_date: it.arrivalDate };
-    }
-  }
-  return null;
-}
-
-// Approve a pending amendment when the Sales Order has at least one
-// Delivery Order (any status). Does NOT call applySalesOrderAmendment() —
-// instead precomputes everything apply_active_do_amendment() (migration
-// 089) needs as input, then calls it. See migration 089's header comment for
-// the full contract; each step below is annotated with which numbered step
-// of that contract it feeds.
-async function applyActiveDoAmendment(amendment, req) {
-  const { data: liveOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", amendment.sales_order_id).maybeSingle();
-  if (!liveOrder) return { error: "Sales order no longer exists" };
-
-  // (a) Early, user-friendly pre-check — reuses the EXACT same diff logic
-  // applySalesOrderAmendment() already runs. Not strictly required for
-  // correctness (the RPC re-checks staleness itself via
-  // expected_so_updated_at), but surfaces a clear error without a wasted
-  // RPC round-trip.
-  const { conflict } = diffAmendmentAgainstLive(liveOrder, amendment.before_snapshot);
-  if (conflict) {
-    await supabase.from("sales_order_amendments").update({
-      status: "conflict",
-      decision_note: "The sales order changed after this amendment was requested — requires manual review before it can be applied.",
-      updated_at: new Date().toISOString(),
-    }).eq("id", amendment.id);
-    return { conflict: true, reason: "stale_state" };
-  }
-
-  const proposedItems = amendment.proposed_snapshot?.items || [];
-  const soItemsById = new Map((liveOrder.sales_order_items || []).map(i => [String(i.id), i]));
-  const proposedBySource = new Map(proposedItems.filter(it => it.source_item_id).map(it => [String(it.source_item_id), it]));
-
-  // Draft/scheduled, not-yet-superseded DOs are the only ones a supersession
-  // can ever apply to (out_for_delivery/arrived DOs are a hard RPC conflict —
-  // active_do_in_transit — never pre-checked here; completed/cancelled DOs
-  // are permanently out of scope, same as the RPC).
-  const { data: candidateDos } = await supabase.from("delivery_orders")
-    .select("id, do_number, status, delivery_order_items(id, sales_order_item_id, status)")
-    .eq("sales_order_id", amendment.sales_order_id)
-    .in("status", ["draft", "scheduled"])
-    .is("superseded_at", null);
-  const toSupersede = (candidateDos || []).filter(d => _doIsAffectedByAmendment(d, soItemsById, proposedBySource));
-
-  // (b) p_item_arrival_evidence — for every surviving (non-cancelled) item
-  // of every DO about to be superseded, per migration 089 step 8.
-  let legacyOrder = null;
-  {
-    const { data } = await supabase.from("orders").select("id, items")
-      .eq("company_id", amendment.company_id).eq("so_number", liveOrder.order_number).maybeSingle();
-    legacyOrder = data || null;
-  }
-
-  const overrideRequested = req.body?.override_arrival === true;
-  const overrideAllowed = overrideRequested && (
-    req.activeRoleKey === "MASTER"
-    || (await permEngine.can(req.user.id, req.activeCompanyId, PERMS.DELIVERY_ORDER_OVERRIDE_ARRIVAL)).allowed
-  );
-
-  const evidence = [];
-  for (const dord of toSupersede) {
-    for (const doi of dord.delivery_order_items || []) {
-      if (doi.status === "cancelled") continue;
-      if (doi.sales_order_item_id == null) continue; // unverifiable — never carried forward, no evidence needed
-      const proposed = proposedBySource.get(String(doi.sales_order_item_id));
-      if (!proposed) continue; // removed item — not carried forward, no evidence needed
-      const soi = soItemsById.get(String(doi.sales_order_item_id));
-      if (!soi) continue;
-      if (soi.arrived_at) {
-        evidence.push({ proposal_line_id: proposed.proposal_line_id, eligible: true, source: "canonical" });
-        continue;
-      }
-      const legacyHit = _findLegacyArrivalEvidence(soi, legacyOrder?.items);
-      if (legacyHit) {
-        evidence.push({ proposal_line_id: proposed.proposal_line_id, eligible: true, source: "legacy", evidence: legacyHit });
-        continue;
-      }
-      if (overrideAllowed) {
-        evidence.push({ proposal_line_id: proposed.proposal_line_id, eligible: true, source: "override" });
-        continue;
-      }
-      // Neither canonical nor legacy evidence, and no valid override —
-      // fail closed here rather than ever calling the RPC.
-      return {
-        error409: `"${soi.product_name || soi.product_code || "Item"}" has not arrived yet — cannot approve this amendment without arrival evidence or an override (requires DELIVERY_ORDER_OVERRIDE_ARRIVAL permission).`,
-        reason: "arrival_changed",
-      };
-    }
-  }
-
-  // (c) p_projection_customer_id
-  const proposedHeader = amendment.proposed_snapshot || {};
-  const projectionCustomerId = await findOrCreateCustomerForOrder({
-    company_id: amendment.company_id,
-    customer_name: proposedHeader.customer_name,
-    customer_contact: proposedHeader.customer_contact,
-    customer_id_no: proposedHeader.customer_id_no,
-    customer_email: proposedHeader.customer_email,
-    customer_address: proposedHeader.customer_address,
-  });
-
-  // (d) p_projection_legacy_items — reconstruct the post-amendment
-  // sales_order_items shape (existing lines updated in place, keeping their
-  // CURRENT arrived_at — the RPC never overwrites it on update; new lines
-  // always arrived_at: null, matching the RPC's hardcoded INSERT), then feed
-  // it through the SAME arrival-preserving projection builder
-  // syncSalesOrderToDelivery() uses.
-  const postAmendmentItems = proposedItems.map(it => {
-    if (it.source_item_id) {
-      const base = soItemsById.get(String(it.source_item_id)) || {};
-      return {
-        id: it.source_item_id,
-        product_code: it.product_code ?? base.product_code ?? null,
-        product_name: it.product_name ?? base.product_name ?? null,
-        size: it.size ?? base.size ?? null,
-        color: it.color ?? base.color ?? null,
-        custom_dimensions: it.custom_dimensions ?? base.custom_dimensions ?? null,
-        quantity: it.quantity ?? base.quantity,
-        supplier_name: it.supplier_name ?? base.supplier_name ?? null,
-        arrived_at: base.arrived_at || null,
-      };
-    }
-    return {
-      id: it.proposal_line_id,
-      product_code: it.product_code || null, product_name: it.product_name || null,
-      size: it.size || null, color: it.color || null, custom_dimensions: it.custom_dimensions || null,
-      quantity: it.quantity, supplier_name: it.supplier_name || null,
-      arrived_at: null,
-    };
-  });
-  const legacyItemsProjection = buildLegacyItemsProjection(legacyOrder?.items, postAmendmentItems);
-
-  // (e) p_schedule_carry — only for DOs actually being superseded, and only
-  // when their current non-terminal schedule is still valid (date not in
-  // the past; team still exists). An omitted/invalid entry lands the
-  // regenerated DO in 'draft', unscheduled (RPC default).
-  const scheduleCarry = {};
-  if (toSupersede.length) {
-    const { data: schedRows } = await supabase.from("delivery_schedules")
-      .select("delivery_order_id, scheduled_date, team_id, slot, area, notes, status")
-      .in("delivery_order_id", toSupersede.map(d => d.id))
-      .not("status", "in", '("delivered","failed")');
-    const teamIds = [...new Set((schedRows || []).map(s => s.team_id).filter(Boolean))];
-    let existingTeamIds = new Set();
-    if (teamIds.length) {
-      const { data: teams } = await supabase.from("delivery_teams").select("id").in("id", teamIds);
-      existingTeamIds = new Set((teams || []).map(t => t.id));
-    }
-    const todayStr = new Date().toISOString().slice(0, 10);
-    for (const s of (schedRows || [])) {
-      if (!s.scheduled_date || s.scheduled_date < todayStr) continue;
-      if (s.team_id && !existingTeamIds.has(s.team_id)) continue;
-      scheduleCarry[s.delivery_order_id] = {
-        scheduled_date: s.scheduled_date, team_id: s.team_id || null,
-        slot: s.slot || null, area: s.area || null, notes: s.notes || null,
-      };
-    }
-  }
-
-  // (f) Call the RPC — service-role client (this repo's only Supabase
-  // client, already authenticated as service_role — see migration 089's
-  // GRANT).
-  const { data: rpcResult, error: rpcErr } = await supabase.rpc("apply_active_do_amendment", {
-    p_amendment_id: amendment.id,
-    p_company_id: amendment.company_id,
-    p_actor_id: req.user.id,
-    p_override_arrival: overrideAllowed,
-    p_item_arrival_evidence: evidence,
-    p_projection_customer_id: projectionCustomerId,
-    p_projection_legacy_items: legacyItemsProjection,
-    p_schedule_carry: scheduleCarry,
-  });
-  if (rpcErr) return { error: rpcErr.message };
-
-  // (g) Handle the RPC's result.
-  if (rpcResult?.status === "conflict") {
-    return { conflict: true, reason: rpcResult.reason, details: rpcResult };
-  }
-  return { approved: true, new_delivery_orders: rpcResult?.new_delivery_orders || [] };
-}
-
-// Human-readable message for each apply_active_do_amendment() conflict
-// reason (migration 089) — mirrors the tone of this file's other
-// user-facing errors.
-const ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES = {
-  already_decided: "This amendment has already been decided.",
-  stale_state: "The sales order changed since this amendment was requested — cannot apply automatically. Reload the order and review.",
-  active_do_in_transit: "An affected Delivery Order is already out for delivery or arrived — it can no longer be superseded. Resolve it before approving this amendment.",
-  below_delivered_qty: "A proposed quantity is lower than what has already been delivered for that item.",
-  removed_item_has_delivery: "An item being removed already has delivered quantity recorded against it.",
-  arrival_changed: "The arrival evidence for an affected item is no longer valid — recheck arrival status (or request an override) before approving.",
-};
+// applyActiveDoAmendment and ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES are
+// imported from lib/active-do-amendment.js — see that file's header comment
+// for the urgent business clarification (arrival status must never gate
+// amendment application) that moved this logic out of server.js.
 
 // P1-1: single decision point used by BOTH amendment-approval entry points
 // (PATCH /order-amendments/:id/approve and the "Re-confirm" path on
