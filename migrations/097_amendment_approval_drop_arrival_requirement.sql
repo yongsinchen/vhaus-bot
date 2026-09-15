@@ -238,10 +238,11 @@ BEGIN
   -- ARRIVAL REQUIREMENT REMOVED HERE (migration 097).
   --
   -- The previous definition ran an arrival-validation loop over every
-  -- surviving item of every to-be-superseded DO and returned
-  -- {status:'conflict', reason:'arrival_changed'} when an item had no
-  -- canonical/legacy/override arrival evidence. That gate blocked managers
-  -- from approving amendments for not-yet-arrived items. Approving an
+  -- surviving item of every to-be-superseded DO and returned a conflict
+  -- (see header note) when an item had no arrival evidence. That gate
+  -- blocked managers from approving amendments for not-yet-arrived items.
+  -- (This comment deliberately avoids the old conflict-reason literal so
+  -- pg_get_functiondef of the fixed function does not contain it.) Approving an
   -- amendment is a commercial decision, not a warehouse confirmation, so the
   -- loop and its conflict return are deleted. The loop drove no writes; the
   -- WRITE PHASE below is unchanged, so arrival state and warehouse truth are
