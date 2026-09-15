@@ -14992,19 +14992,19 @@ async function applySalesOrderAmendment(amendment) {
 
 // ── P1-1: active-DO amendment approval (apply_active_do_amendment RPC) ──
 // Null-safe equality mirroring Postgres "IS NOT DISTINCT FROM" — used to
-// reproduce the RPC's own affected-DO comparison in JS for the Node-side
-// arrival-evidence precomputation (step b below). Deliberately exact/
-// case-sensitive, NOT normalized — matches the RPC's literal jsonb ->> text
-// comparison (migration 089).
+// reproduce the RPC's own affected-DO comparison in JS, now only to decide
+// which superseded DOs' schedules to carry forward (step e). Deliberately
+// exact/case-sensitive, NOT normalized — matches the RPC's literal jsonb ->>
+// text comparison (migration 089).
 const _nsEqual = (a, b) => (a ?? null) === (b ?? null);
 
 // Mirrors the RPC's AFFECTED-DO ALGORITHM (migration 089 header comment) in
 // JS: a draft/scheduled DO is affected iff at least one of its non-cancelled
 // items either has unverifiable lineage (sales_order_item_id NULL — deviation
 // #6) or was removed / changed identity / changed quantity by the proposed
-// amendment. Used only to decide which items need arrival-evidence
-// precomputed before calling the RPC — the RPC itself is the sole authority
-// on the actual affected/supersede decision at approval time.
+// amendment. Used only to decide which superseded DOs still have a valid
+// non-terminal schedule to carry forward (step e) — the RPC itself is the
+// sole authority on the actual affected/supersede decision at approval time.
 function _doIsAffectedByAmendment(dord, soItemsById, proposedBySource) {
   for (const doi of dord.delivery_order_items || []) {
     if (doi.status === "cancelled") continue;
@@ -15023,33 +15023,13 @@ function _doIsAffectedByAmendment(dord, soItemsById, proposedBySource) {
   return false;
 }
 
-// Re-derive the exact legacy-JSON fragment (if any) that proves an item's
-// arrival, mirroring doLib.isItemArrived's matching rules (code match first,
-// excluding generic placeholder codes; else name exact/prefix match) but
-// returning the matched {match_field, match_value, arrival_date} instead of
-// a boolean, for p_item_arrival_evidence's 'legacy' source shape.
-function _findLegacyArrivalEvidence(soi, legacyItemsRaw) {
-  let items = legacyItemsRaw;
-  if (typeof items === "string") { try { items = JSON.parse(items || "[]"); } catch { items = []; } }
-  if (!Array.isArray(items)) return null;
-  const code = (soi.product_code || "").trim().toLowerCase();
-  const name = (soi.product_name || "").trim().toLowerCase();
-  for (const it of items) {
-    if (!it || !it.arrivalDate) continue;
-    const itemCode = (it.itemCode || "").trim().toLowerCase();
-    if (code && itemCode && !doLib.isGenericItemCode(itemCode) && itemCode === code) {
-      return { match_field: "itemCode", match_value: it.itemCode, arrival_date: it.arrivalDate };
-    }
-  }
-  for (const it of items) {
-    if (!it || !it.arrivalDate) continue;
-    const itemName = (it.itemName || "").trim().toLowerCase();
-    if (name && itemName && (itemName === name || itemName.startsWith(name + " "))) {
-      return { match_field: "itemName", match_value: it.itemName, arrival_date: it.arrivalDate };
-    }
-  }
-  return null;
-}
+// (Removed with the urgent arrival-requirement fix: _findLegacyArrivalEvidence
+// re-derived a legacy-JSON arrival fragment to feed p_item_arrival_evidence.
+// Amendment approval no longer requires or consults item arrival — the RPC's
+// arrival gate is gone (migration 097) and evidence is passed empty — so this
+// precompute helper is dead and was removed. Arrival state itself is still
+// read/written elsewhere via arrived_at and the DO item statuses; nothing
+// about warehouse truth relied on this function.)
 
 // Approve a pending amendment when the Sales Order has at least one
 // Delivery Order (any status). Does NOT call applySalesOrderAmendment() —
@@ -15091,50 +15071,33 @@ async function applyActiveDoAmendment(amendment, req) {
     .is("superseded_at", null);
   const toSupersede = (candidateDos || []).filter(d => _doIsAffectedByAmendment(d, soItemsById, proposedBySource));
 
-  // (b) p_item_arrival_evidence — for every surviving (non-cancelled) item
-  // of every DO about to be superseded, per migration 089 step 8.
+  // (b) Legacy `orders` row — the projection source for p_projection_legacy_items
+  // below (step d). Read once here.
+  //
+  // URGENT FIX (arrival requirement removed): this block ALSO used to
+  // precompute p_item_arrival_evidence and HARD-FAIL the approval with a 409
+  // ("… has not arrived yet …") whenever a to-be-superseded DO carried an
+  // item with no canonical/legacy arrival evidence and no override. That
+  // arrival REQUIREMENT was wrong: approving an Order Amendment is a
+  // commercial/order decision by a manager, NOT a warehouse arrival
+  // confirmation. It must not depend on whether the affected/new item has
+  // physically arrived. The requirement is removed here AND in the RPC
+  // (migration 097) — the two were twins (the RPC re-blocked with
+  // reason='arrival_changed' when an item had no evidence, see its
+  // validation loop), so removing only one would not have unblocked approval.
+  //
+  // No arrival is manufactured by this removal: the RPC preserves every
+  // surviving item's own arrived_at on UPDATE, mints genuinely-new items with
+  // arrived_at NULL, and inserts the regenerated DO's items as 'pending'.
+  // Arrival lineage and warehouse truth are untouched — a not-arrived item
+  // simply stays not-arrived through the amendment. The arrival-evidence
+  // parameters remain in the RPC signature (passed empty below) purely for
+  // backward compatibility.
   let legacyOrder = null;
   {
     const { data } = await supabase.from("orders").select("id, items")
       .eq("company_id", amendment.company_id).eq("so_number", liveOrder.order_number).maybeSingle();
     legacyOrder = data || null;
-  }
-
-  const overrideRequested = req.body?.override_arrival === true;
-  const overrideAllowed = overrideRequested && (
-    req.activeRoleKey === "MASTER"
-    || (await permEngine.can(req.user.id, req.activeCompanyId, PERMS.DELIVERY_ORDER_OVERRIDE_ARRIVAL)).allowed
-  );
-
-  const evidence = [];
-  for (const dord of toSupersede) {
-    for (const doi of dord.delivery_order_items || []) {
-      if (doi.status === "cancelled") continue;
-      if (doi.sales_order_item_id == null) continue; // unverifiable — never carried forward, no evidence needed
-      const proposed = proposedBySource.get(String(doi.sales_order_item_id));
-      if (!proposed) continue; // removed item — not carried forward, no evidence needed
-      const soi = soItemsById.get(String(doi.sales_order_item_id));
-      if (!soi) continue;
-      if (soi.arrived_at) {
-        evidence.push({ proposal_line_id: proposed.proposal_line_id, eligible: true, source: "canonical" });
-        continue;
-      }
-      const legacyHit = _findLegacyArrivalEvidence(soi, legacyOrder?.items);
-      if (legacyHit) {
-        evidence.push({ proposal_line_id: proposed.proposal_line_id, eligible: true, source: "legacy", evidence: legacyHit });
-        continue;
-      }
-      if (overrideAllowed) {
-        evidence.push({ proposal_line_id: proposed.proposal_line_id, eligible: true, source: "override" });
-        continue;
-      }
-      // Neither canonical nor legacy evidence, and no valid override —
-      // fail closed here rather than ever calling the RPC.
-      return {
-        error409: `"${soi.product_name || soi.product_code || "Item"}" has not arrived yet — cannot approve this amendment without arrival evidence or an override (requires DELIVERY_ORDER_OVERRIDE_ARRIVAL permission).`,
-        reason: "arrival_changed",
-      };
-    }
   }
 
   // (c) p_projection_customer_id
@@ -15213,8 +15176,8 @@ async function applyActiveDoAmendment(amendment, req) {
     p_amendment_id: amendment.id,
     p_company_id: amendment.company_id,
     p_actor_id: req.user.id,
-    p_override_arrival: overrideAllowed,
-    p_item_arrival_evidence: evidence,
+    p_override_arrival: false,        // arrival requirement removed (migration 097) — kept for RPC signature compat
+    p_item_arrival_evidence: [],      // no longer consulted by the RPC; empty for compat
     p_projection_customer_id: projectionCustomerId,
     p_projection_legacy_items: legacyItemsProjection,
     p_schedule_carry: scheduleCarry,
