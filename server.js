@@ -21,6 +21,7 @@ const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliver
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createActiveDoAmendmentService, diffAmendmentAgainstLive, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
+const { createItemArrivalEventService, SOURCES: ARRIVAL_EVENT_SOURCES } = require("./lib/item-arrival-events");
 const { getCommissionableAmount } = commissionLib;
 const crypto = require("crypto");
 
@@ -4548,7 +4549,7 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
   // check (the arrival-stamping side effect below was already correctly
   // scoped via findCandidateOrders(so_number, getActiveCompanyId(req)), but
   // the review row's own status/fields were not).
-  const { data: reviewOwner } = await supabase.from("do_review").select("id, company_id").eq("id", id).maybeSingle();
+  const { data: reviewOwner } = await supabase.from("do_review").select("id, company_id, supplier_delivery_id").eq("id", id).maybeSingle();
   if (!reviewOwner) return res.status(404).json({ error: "Review item not found" });
   const resolveCid = getActiveCompanyId(req);
   if (resolveCid && reviewOwner.company_id && reviewOwner.company_id !== resolveCid) {
@@ -4590,10 +4591,29 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
         if (hit && !supplierDO.isFullyArrived(items[i])) { hitIdx = i; break; }
       }
       if (hitIdx >= 0) {
-        items[hitIdx] = supplierDO.applyArrivalToItem(items[hitIdx], doQty, date);
+        const beforeLine = items[hitIdx];
+        const afterLine = supplierDO.applyArrivalToItem(beforeLine, doQty, date);
+        items[hitIdx] = afterLine;
         await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", order.id);
         await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
         stampedOrderId = order.id;
+        // P1-4C: do_review resolution is a distinct arrival-mutation source
+        // from supplier-do auto-match/manual-fix — it's a human reviewer
+        // resolving an exception queue item, not the automatic matcher.
+        // Idempotent: recordItemArrivalEvent no-ops if this line's arrival
+        // state didn't actually change (e.g. re-resolving an already-Resolved
+        // row would hit isFullyArrived above and never reach this branch).
+        await recordItemArrivalEvent({
+          companyId: order.company_id || resolveCid,
+          legacyOrderId: order.id, legacySoNumber: order.so_number,
+          soiId: afterLine.soiId || beforeLine.soiId || null,
+          source: ARRIVAL_EVENT_SOURCES.DO_REVIEW,
+          previousArrivedAt: beforeLine.arrivalDate || null, newArrivedAt: afterLine.arrivalDate || null,
+          previousArrivedQty: supplierDO.arrivedQtyOf(beforeLine), newArrivedQty: supplierDO.arrivedQtyOf(afterLine),
+          supplierDeliveryId: reviewOwner.supplier_delivery_id || null, doReviewId: reviewOwner.id,
+          actorUserId: req.user?.id || null, actorName: null,
+          metadata: { resolution: "do_review_resolve", item_code: item_code || null },
+        });
         break; // one DO line → one order line
       }
     }
@@ -13960,7 +13980,7 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
     const { item_index, item_code, arrival_date } = req.body;
-    const { data: order } = await supabase.from("orders").select("items").eq("id", req.params.id).eq("company_id", cid).single();
+    const { data: order } = await supabase.from("orders").select("items, so_number").eq("id", req.params.id).eq("company_id", cid).single();
     if (!order) return res.status(404).json({ error: "Order not found" });
     const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
     if (!Array.isArray(items)) return res.status(400).json({ error: "No items" });
@@ -13973,14 +13993,63 @@ app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res
       else { it.arrivalDate = ""; it.arrivedQty = 0; }
     };
     let updated = false;
+    // P1-4C: capture pre-mutation state of every touched line (index or code
+    // can each match more than one physical line) before stamp() overwrites it.
+    const touchedBefore = [];
     items.forEach((it, i) => {
-      if (item_index !== undefined && i === item_index) { stamp(it); updated = true; }
-      else if (item_code && (it.itemCode === item_code || it.itemName === item_code)) { stamp(it); updated = true; }
+      if ((item_index !== undefined && i === item_index) || (item_code && (it.itemCode === item_code || it.itemName === item_code))) {
+        touchedBefore.push({ index: i, before: { ...it } });
+        stamp(it); updated = true;
+      }
     });
     if (!updated) return res.status(404).json({ error: "Item not found" });
     await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", req.params.id);
     await syncArrivalsToSalesOrderItems(req.params.id); // Phase 4 dual-write
+    // One audit event per touched line — covers both setting arrival_date
+    // (arrival_recorded/increased) and clearing it (arrival_reversed).
+    // Idempotent: recordItemArrivalEvent no-ops per line if that specific
+    // line's date/qty didn't actually change (e.g. re-clearing an already-
+    // cleared line).
+    for (const { index, before } of touchedBefore) {
+      const after = items[index];
+      await recordItemArrivalEvent({
+        companyId: cid,
+        legacyOrderId: req.params.id, legacySoNumber: order.so_number,
+        soiId: after.soiId || before.soiId || null,
+        source: ARRIVAL_EVENT_SOURCES.MANUAL,
+        previousArrivedAt: before.arrivalDate || null, newArrivedAt: after.arrivalDate || null,
+        previousArrivedQty: supplierDO.arrivedQtyOf(before), newArrivedQty: supplierDO.arrivedQtyOf(after),
+        supplierDeliveryId: null, doReviewId: null,
+        actorUserId: req.user?.id || null, actorName: null,
+        metadata: { endpoint: "item-arrival", item_code: item_code || null, item_index: item_index !== undefined ? item_index : null },
+      });
+    }
     res.json({ ok: true, items });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /item-arrival-events — P1-4C minimal company-scoped read API for the
+// physical-arrival audit trail. Filter by exactly one of sales_order_item_id
+// (a single line's full history), sales_order_id (every line on one SO), or
+// legacy_order_id (the equivalent legacy-orders.id lookup for callers that
+// don't yet have the sales_order_items link). Always company-scoped —
+// fails closed (400) the same way every other P1-4B-hardened read does.
+app.get("/item-arrival-events", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    const { sales_order_item_id, sales_order_id, legacy_order_id, limit } = req.query;
+    if (!sales_order_item_id && !sales_order_id && !legacy_order_id) {
+      return res.status(400).json({ error: "sales_order_item_id, sales_order_id, or legacy_order_id required" });
+    }
+    let q = supabase.from("item_arrival_events").select("*").eq("company_id", cid);
+    if (sales_order_item_id) q = q.eq("sales_order_item_id", sales_order_item_id);
+    else if (sales_order_id) q = q.eq("sales_order_id", sales_order_id);
+    else q = q.eq("legacy_order_id", legacy_order_id);
+    q = q.order("created_at", { ascending: false }).limit(Math.min(Number(limit) || 100, 500));
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ events: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -14146,6 +14215,14 @@ const { findOrCreateCustomerForOrder, syncSalesOrderToDelivery, logProjectionSyn
 // URGENT fix (migration 097): approval must apply immediately regardless of
 // arrival state — see lib/active-do-amendment.js header comment.
 const { applyActiveDoAmendment } = createActiveDoAmendmentService({ supabase, findOrCreateCustomerForOrder, buildLegacyItemsProjection });
+
+// P1-4C: item_arrival_events audit trail (migration 099) — see
+// lib/item-arrival-events.js header for the boundary/idempotency/atomicity
+// design. Used by the two remaining business-mutation callers below
+// (/do-review/:id/resolve and /orders/:id/item-arrival); the other two
+// callers (supplier-do auto-match, supplier-do manual-fix) already call it
+// from inside createSupplierDOService itself.
+const { recordItemArrivalEvent } = createItemArrivalEventService({ supabase });
 
 // GET /sales-orders — list; salesmen see only their own
 // GET /sales-orders — paginated lightweight list
