@@ -244,8 +244,8 @@ BEGIN
   -- (This comment deliberately avoids the old conflict-reason literal so
   -- pg_get_functiondef of the fixed function does not contain it.) Approving an
   -- amendment is a commercial decision, not a warehouse confirmation, so the
-  -- loop and its conflict return are deleted. The loop drove no writes; the
-  -- WRITE PHASE below is unchanged, so arrival state and warehouse truth are
+  -- loop and its conflict return are deleted. The loop drove no writes, and
+  -- the WRITE PHASE below is unchanged, so arrival state and warehouse truth are
   -- preserved exactly (surviving items keep arrived_at, new items get NULL,
   -- regenerated DO items are 'pending').
   -- ══════════════════════════════════════════════════════════════════
