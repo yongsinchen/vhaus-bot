@@ -9771,7 +9771,7 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     // status (pre-update) for the SEV-2 team-reassignment lock guard below —
     // req.body.status is the caller's REQUESTED status, not what's actually
     // stored, so the guard must read the DB row, not the request.
-    let checkQ = supabase.from("delivery_schedules").select("id, status, delivery_order_id").eq("id", req.params.id);
+    let checkQ = supabase.from("delivery_schedules").select("id, status, delivery_order_id, team_id").eq("id", req.params.id);
     if (cid) checkQ = checkQ.eq("company_id", cid);
     const { data: currentSchedule } = await checkQ.maybeSingle();
     if (cid && !currentSchedule) return res.status(404).json({ error: "Schedule not found" });
@@ -9837,7 +9837,28 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     const updates = {};
     if (team_id !== undefined) updates.team_id = team_id;
     if (sort_order !== undefined) updates.sort_order = sort_order;
-    if (status !== undefined) updates.status = status;
+    if (status !== undefined) {
+      if (currentSchedule?.delivery_order_id) {
+        // P1-3: DO-tied schedules use canonical lowercase vocabulary only.
+        // This office-side "team status" write (e.g. the board's bulk
+        // Pending/Confirmed/Out for Delivery dropdown) is the OTHER writer
+        // that could still corrupt it — it used to persist Title Case onto
+        // every schedule in a team, DO-tied ones included, which is the
+        // confirmed root cause of the 41 stray "Confirmed" DO-tied rows
+        // repaired in this same round. "Confirmed"/"Pending" have no
+        // defined meaning in the canonical DO lifecycle, so — mirroring the
+        // driver endpoint's own rule — they're acknowledgement-only here:
+        // never persisted, the schedule's real status is left untouched.
+        // A recognized canonical value (e.g. "Out for Delivery") is still
+        // written, normalized to its lowercase form. This does not add any
+        // new DO-transition side effect — delivery_orders.status was never
+        // written from this generic path before, and still isn't.
+        const canonical = doLib.normalizeDriverStatusForDeliveryOrder(status);
+        if (canonical) updates.status = canonical;
+      } else {
+        updates.status = status;
+      }
+    }
     if (slot !== undefined) updates.slot = slot;
     if (area !== undefined) updates.area = area;
     if (is_ready !== undefined) updates.is_ready = is_ready;
@@ -9855,6 +9876,23 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
       await syncLegacyDeliveredToSalesOrder(cid, data.orders.so_number);
       // If this order is a Service case's inert order, resolve the case too.
       await resolveServiceOnDelivery(data.orders.id);
+    }
+    // P1-3: log a team-reassignment event for a DO-tied schedule, but only
+    // when the team ACTUALLY changed — never on a same-team/no-op PATCH
+    // (e.g. a save that also touches sort_order/notes without moving teams).
+    if (team_id !== undefined && currentSchedule?.delivery_order_id && String(team_id || "") !== String(currentSchedule.team_id || "")) {
+      const resolveTeamLabel = async (id) => {
+        if (!id) return null;
+        const { data: t } = await supabase.from("delivery_teams")
+          .select("driver:users!delivery_teams_driver_id_fkey(name), delivery_vehicles(vehicle_plate)").eq("id", id).maybeSingle();
+        return t?.driver?.name || t?.delivery_vehicles?.vehicle_plate || id;
+      };
+      const [oldTeamName, newTeamName] = await Promise.all([resolveTeamLabel(currentSchedule.team_id), resolveTeamLabel(team_id)]);
+      await logDoEvent(currentSchedule.delivery_order_id, "team_reassigned", {
+        schedule_id: req.params.id,
+        old_team_id: currentSchedule.team_id || null, old_team_name: oldTeamName,
+        new_team_id: team_id || null, new_team_name: newTeamName,
+      }, req.user.id);
     }
     res.json({ schedule: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -10340,26 +10378,51 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       .select("id, delivery_order_id").eq("id", req.params.id).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Schedule not found" });
 
+    // P1-3: fetch the DO's live status/superseded_at ONCE, up front, so
+    // every branch below (failed / completed-RPC / generic) shares the same
+    // guard — a superseded DO can never transition through ANY driver
+    // action, and no branch trusts a stale read.
+    let dord = null;
+    if (existing.delivery_order_id) {
+      const { data } = await supabase.from("delivery_orders")
+        .select("id, do_number, status, superseded_at").eq("id", existing.delivery_order_id).maybeSingle();
+      if (!data) return res.status(404).json({ error: "Delivery order not found" });
+      dord = data;
+      if (dord.superseded_at) {
+        return res.status(409).json({
+          error: `Delivery order ${dord.do_number} was superseded and can no longer be updated — it has a replacement Delivery Order.`,
+          code: "delivery_order_superseded",
+        });
+      }
+    }
+
     // Phase 2A: DO completion runs as ONE atomic Postgres transaction
     // (complete_delivery_order RPC): DO + items delivered, delivered_qty
     // ledger incremented, item/SO/legacy-order statuses rolled up, schedule
     // rows closed, event logged. Idempotent — a double-tap returns
-    // already_completed without double-incrementing.
+    // already_completed without double-incrementing. Its own guards
+    // (cancelled/superseded/wrong-company) are authoritative — never
+    // duplicated here.
     // Phase 5: failed delivery attempt — closes THIS attempt with a reason and
     // returns the DO to the reschedule pool. The DO document survives intact;
     // rescheduling creates attempt_no+1. Legacy schedules unaffected.
-    if (existing.delivery_order_id && status === "failed") {
+    if (dord && status === "failed") {
+      if (dord.status !== "failed" && !doLib.isAllowedDriverTransition(dord.status, "failed")) {
+        return res.status(409).json({ error: `Delivery order ${dord.do_number} cannot be marked failed from its current state (${dord.status}).`, code: "delivery_order_transition_conflict" });
+      }
       const reason = (req.body.reason || "").trim() || null;
       const { data: failedSched, error: fErr } = await supabase.from("delivery_schedules")
         .update({ status: "failed", failed_reason: reason })
         .eq("id", existing.id).select("*, orders(id, so_number, status)").single();
       if (fErr) throw fErr;
-      await supabase.from("delivery_orders").update({ status: "failed" }).eq("id", existing.delivery_order_id);
-      await logDoEvent(existing.delivery_order_id, "failed", { schedule_id: existing.id, reason }, req.user.id);
+      if (dord.status !== "failed") {
+        await supabase.from("delivery_orders").update({ status: "failed" }).eq("id", existing.delivery_order_id);
+        await logDoEvent(existing.delivery_order_id, "failed", { schedule_id: existing.id, reason }, req.user.id);
+      }
       return res.json({ schedule: failedSched });
     }
 
-    if (existing.delivery_order_id && (status === "delivered" || status === "completed")) {
+    if (dord && (status === "delivered" || status === "completed")) {
       const cid = getActiveCompanyId(req);
       const { data: result, error: rpcErr } = await supabase.rpc("complete_delivery_order", {
         p_delivery_order_id: existing.delivery_order_id,
@@ -10369,6 +10432,7 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       if (rpcErr) {
         const msg = rpcErr.message || "";
         if (msg.includes("cancelled")) return res.status(400).json({ error: "Cannot complete a cancelled delivery order" });
+        if (msg.includes("superseded")) return res.status(409).json({ error: "Cannot complete a superseded delivery order", code: "delivery_order_superseded" });
         if (msg.includes("wrong_company") || msg.includes("not_found")) return res.status(404).json({ error: "Delivery order not found" });
         throw rpcErr;
       }
@@ -10385,26 +10449,47 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       return res.json({ schedule: fresh, delivery_order: result });
     }
 
+    // P1-3: DO-tied schedules translate the driver's raw command at this
+    // ONE boundary (doLib.normalizeDriverStatusForDeliveryOrder) instead of
+    // persisting it literally — see that function's header comment for the
+    // confirmed bug this fixes. Legacy (non-DO) schedules are completely
+    // untouched below: same literal vocabulary, same behavior as before.
+    if (dord) {
+      const canonical = doLib.normalizeDriverStatusForDeliveryOrder(status);
+      if (!canonical) {
+        // Acknowledgement-only (e.g. "Confirmed") — not a real DO-side
+        // transition. Never persisted; the schedule stays exactly as it
+        // was (still "scheduled" until Start Delivery actually moves it).
+        const { data: unchanged } = await supabase.from("delivery_schedules")
+          .select("*, orders(id, so_number, status)").eq("id", req.params.id).single();
+        return res.json({ schedule: unchanged, acknowledged: true });
+      }
+      if (dord.status === canonical) {
+        // Idempotent repeat (retry/double-tap already in this state) —
+        // no-op, no duplicate event.
+        const { data: same } = await supabase.from("delivery_schedules")
+          .select("*, orders(id, so_number, status)").eq("id", req.params.id).single();
+        return res.json({ schedule: same });
+      }
+      if (!doLib.isAllowedDriverTransition(dord.status, canonical)) {
+        return res.status(409).json({ error: `Delivery order ${dord.do_number} cannot move from ${dord.status} to ${canonical}.`, code: "delivery_order_transition_conflict" });
+      }
+      const updates = { status: canonical };
+      if (canonical === "arrived") updates.notes = (updates.notes || "") + `\nArrived: ${new Date().toLocaleString("en-MY", { timeZone: "Asia/Kuala_Lumpur" })}`;
+      const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
+      if (error) throw error;
+      await supabase.from("delivery_orders").update({ status: canonical }).eq("id", existing.delivery_order_id);
+      await logDoEvent(existing.delivery_order_id, canonical, { schedule_id: existing.id }, req.user.id);
+      return res.json({ schedule: data });
+    }
+
+    // ── Legacy (non-DO) schedule — unchanged, byte-for-byte ─────────────
     const updates = { status };
     if (status === "arrived") updates.notes = (updates.notes || "") + `\nArrived: ${new Date().toLocaleString("en-MY", { timeZone: "Asia/Kuala_Lumpur" })}`;
     if (status === "delivered") updates.delivered_at = new Date().toISOString();
     const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
     if (error) throw error;
 
-    // Propagate movement statuses to the DO + its event log
-    if (existing.delivery_order_id) {
-      if (status === "Out for Delivery") {
-        await supabase.from("delivery_orders").update({ status: "out_for_delivery" }).eq("id", existing.delivery_order_id);
-        await logDoEvent(existing.delivery_order_id, "out_for_delivery", { schedule_id: existing.id }, req.user.id);
-      } else if (status === "arrived") {
-        await supabase.from("delivery_orders").update({ status: "arrived" }).eq("id", existing.delivery_order_id);
-        await logDoEvent(existing.delivery_order_id, "arrived", { schedule_id: existing.id }, req.user.id);
-      }
-    }
-
-    // Also update the order status in orders table.
-    // For DO schedules, "Delivered" is unreachable here (blocked above) —
-    // the whole-order flip only ever happens on legacy schedules.
     if (status === "delivered" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
       // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
@@ -10412,7 +10497,7 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       // If this order is a Service case's inert order, resolve the case too.
       await resolveServiceOnDelivery(data.orders.id);
     }
-    if (status === "Out for Delivery" && data.orders?.id && !existing.delivery_order_id) {
+    if (status === "Out for Delivery" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Out for Delivery" }).eq("id", data.orders.id);
     }
     res.json({ schedule: data });
