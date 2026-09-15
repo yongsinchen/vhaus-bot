@@ -1555,10 +1555,15 @@ const saveOrderToSupabase = async (draft) => {
   // ✅ Duplicate SO check — company-scoped to match UNIQUE(company_id, so_number)
   // SO numbers are pre-printed per company, so the same number can legitimately
   // exist across different companies — only a duplicate WITHIN a company is blocked.
-  let dupQuery = supabase
-    .from("orders").select("id").eq("so_number", draft.soNumber).is("deleted_at", null);
-  if (draft.companyId) dupQuery = dupQuery.eq("company_id", draft.companyId);
-  const { data: existing } = await dupQuery.maybeSingle();
+  // P1-4B: fail closed rather than running this check unscoped (which could
+  // both false-block a legitimate cross-company duplicate number AND, more
+  // importantly, is the one guard standing between this save and creating an
+  // order with no known company at all).
+  if (!draft.companyId) {
+    return { ok: false, msg: "❌ Could not determine which company this order belongs to. Please try again." };
+  }
+  const { data: existing } = await supabase
+    .from("orders").select("id").eq("so_number", draft.soNumber).eq("company_id", draft.companyId).is("deleted_at", null).maybeSingle();
 
   if (existing) {
     return {
@@ -2904,13 +2909,15 @@ app.get("/order-trips", requireAuth, async (req, res) => {
 app.get("/order-trips/so/:soNumber", requireAuth, async (req, res) => {
   const { soNumber } = req.params;
   const cid = getActiveCompanyId(req);
-  let q = supabase
+  // P1-4B: fail closed rather than returning every company's trips for this
+  // so_number when no active company can be resolved.
+  if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+  const { data, error } = await supabase
     .from("order_trips")
     .select("*")
+    .eq("company_id", cid)
     .eq("so_number", soNumber)
     .order("trip_no");
-  if (cid) q = q.eq("company_id", cid);
-  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
@@ -4071,12 +4078,15 @@ app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, 
   if (sp.status === "Converted") return res.status(400).json({ error: "Already converted" });
 
   // Get original delivery order for customer info — scoped by the
-  // service_pending row's own company when known (P0-16: so_number alone is
-  // no longer guaranteed unique across companies).
+  // service_pending row's own company (P0-16: so_number alone is no longer
+  // guaranteed unique across companies).
+  // P1-4B: fail closed rather than falling through to an unscoped so_number
+  // match — an unscoped match here could hand this NEW service record a
+  // wrong-company's origOrder.company_id (see companyId fallback below).
   const spCompanyId = sp.company_id || getActiveCompanyId(req);
-  let origOrderQ = supabase.from("orders").select("*").eq("so_number", sp.so_number).eq("type", "Delivery");
-  if (spCompanyId) origOrderQ = origOrderQ.eq("company_id", spCompanyId);
-  const { data: origOrder } = await origOrderQ.maybeSingle();
+  if (!spCompanyId) return res.status(400).json({ error: "Could not determine which company this service case belongs to" });
+  const { data: origOrder } = await supabase.from("orders").select("*")
+    .eq("company_id", spCompanyId).eq("so_number", sp.so_number).eq("type", "Delivery").maybeSingle();
 
   const companyId = origOrder?.company_id || spCompanyId;
 
@@ -4533,6 +4543,18 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
   const { id } = req.params;
   const { so_number, item_code, product_id, arrival_date } = req.body;
 
+  // P1-4B: verify this do_review row belongs to the caller's own company
+  // before mutating it — previously updated by id alone, with no ownership
+  // check (the arrival-stamping side effect below was already correctly
+  // scoped via findCandidateOrders(so_number, getActiveCompanyId(req)), but
+  // the review row's own status/fields were not).
+  const { data: reviewOwner } = await supabase.from("do_review").select("id, company_id").eq("id", id).maybeSingle();
+  if (!reviewOwner) return res.status(404).json({ error: "Review item not found" });
+  const resolveCid = getActiveCompanyId(req);
+  if (resolveCid && reviewOwner.company_id && reviewOwner.company_id !== resolveCid) {
+    return res.status(404).json({ error: "Review item not found" });
+  }
+
   const update = { status: "Resolved", resolved_by: req.user?.id || null, resolved_at: new Date().toISOString() };
   if (product_id) update.product_id = product_id;
 
@@ -4589,6 +4611,14 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
 // PATCH /do-review/:id/dismiss — dismiss (not applicable)
 app.patch("/do-review/:id/dismiss", requireAuth, async (req, res) => {
   const { id } = req.params;
+  // P1-4B: same ownership check as /resolve — previously updated by id
+  // alone with no company check.
+  const { data: reviewOwner } = await supabase.from("do_review").select("id, company_id").eq("id", id).maybeSingle();
+  if (!reviewOwner) return res.status(404).json({ error: "Review item not found" });
+  const dismissCid = getActiveCompanyId(req);
+  if (dismissCid && reviewOwner.company_id && reviewOwner.company_id !== dismissCid) {
+    return res.status(404).json({ error: "Review item not found" });
+  }
   const { error } = await supabase.from("do_review").update({ status: "Dismissed" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
   await autoAdvanceDOStatus(id);
@@ -4615,8 +4645,16 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
     if (!product_id || !warehouse_id) return res.status(400).json({ error: "product_id and warehouse_id required" });
     const { data: review } = await supabase.from("do_review").select("*").eq("id", req.params.id).single();
     if (!review) return res.status(404).json({ error: "Review item not found" });
+    // P1-4B: verify ownership before adjusting stock, and adjust the
+    // REVIEW ROW's OWN company (not necessarily the requester's active
+    // company) — same class of misattribution fix as the supplier-deliveries
+    // DELETE reversal above.
+    const stockCid = getActiveCompanyId(req);
+    if (stockCid && review.company_id && review.company_id !== stockCid) {
+      return res.status(404).json({ error: "Review item not found" });
+    }
     const qty = Number(quantity) || 1;
-    await adjustStock(getActiveCompanyId(req), warehouse_id, product_id, qty, "in", "do", review.supplier_delivery_id, `DO #${review.do_number} — ${review.item_name}`, req.user.id);
+    await adjustStock(review.company_id || stockCid, warehouse_id, product_id, qty, "in", "do", review.supplier_delivery_id, `DO #${review.do_number} — ${review.item_name}`, req.user.id);
     await supabase.from("do_review").update({ status: "Resolved" }).eq("id", req.params.id);
     await autoAdvanceDOStatus(req.params.id);
     res.json({ success: true });
@@ -4967,6 +5005,13 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     const { order_id, so_number, requested_date, remark, delivery_order_id } = req.body || {};
     if (!requested_date) return res.status(400).json({ error: "requested_date is required" });
+    // P1-4B: fail closed rather than resolving `order_id`/`so_number`
+    // unscoped — `ord.company_id` becomes authoritative for everything this
+    // request does downstream (target DO resolution, the actual delivery-
+    // date write), so an unscoped match here would let a caller with no
+    // resolvable company reschedule ANY company's order by guessing/
+    // enumerating a raw order_id.
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
     let ordQ = supabase.from("orders").select("id, so_number, customer_name, company_id, branch_id").limit(1);
     if (order_id) ordQ = ordQ.eq("id", order_id);
     else if (so_number) ordQ = ordQ.eq("so_number", so_number);
@@ -5228,11 +5273,13 @@ app.get("/customers", requireAuth, async (req, res) => {
     // their orders' SO numbers (legacy orders carry the customer link; SOs
     // sync there with so_number = order_number, so both eras are covered).
     let soCustIds = [];
-    if (search) {
-      let soQ = supabase.from("orders").select("customer_id")
-        .ilike("so_number", `%${search}%`).not("customer_id", "is", null).limit(200);
-      if (cid) soQ = soQ.eq("company_id", cid);
-      const { data: soOrders } = await soQ;
+    // P1-4B: fail closed — only widen the search by so_number when a company
+    // is actually known; an unscoped ilike here could surface a customer
+    // from a DIFFERENT company whose only match is a shared/similar SO
+    // number substring.
+    if (search && cid) {
+      const { data: soOrders } = await supabase.from("orders").select("customer_id")
+        .eq("company_id", cid).ilike("so_number", `%${search}%`).not("customer_id", "is", null).limit(200);
       soCustIds = [...new Set((soOrders || []).map(o => o.customer_id))];
     }
     const searchFilter = search
@@ -7598,11 +7645,14 @@ app.get("/service-cases", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     // Optional: restrict to services linked to the legacy order(s) with this
     // so_number — used by the order detail page to list an order's services.
+    // P1-4B: fail closed — a so_number filter with no resolvable company
+    // must never match unscoped (it would return another company's order's
+    // services); treat "no company known" as "nothing matches" rather than
+    // running the lookup across every company.
     let orderIdFilter = null;
     if (so_number) {
-      let oq = supabase.from("orders").select("id").eq("so_number", so_number);
-      if (cid) oq = oq.eq("company_id", cid);
-      const { data: legacyOrders } = await oq;
+      if (!cid) return res.json({ services: [] });
+      const { data: legacyOrders } = await supabase.from("orders").select("id").eq("company_id", cid).eq("so_number", so_number);
       orderIdFilter = (legacyOrders || []).map(o => o.id);
       if (orderIdFilter.length === 0) return res.json({ services: [] });
     }
@@ -8198,6 +8248,12 @@ app.get("/supplier-deliveries/:id", requireAuth, async (req, res) => {
   try {
     const { data: delivery, error } = await supabase.from("supplier_deliveries").select("*").eq("id", req.params.id).single();
     if (error || !delivery) return res.status(404).json({ error: "Not found" });
+    // P1-4B: company ownership check, mirroring the same pattern already
+    // used by GET /supplier-dos/:id — this endpoint had none at all, letting
+    // any authenticated user read another company's supplier delivery (and
+    // its do_review lines) by id.
+    const cid = getActiveCompanyId(req);
+    if (cid && delivery.company_id && delivery.company_id !== cid) return res.status(404).json({ error: "Not found" });
     const { data: reviews } = await supabase.from("do_review").select(SELECTS.DO_REVIEW_SELECT).eq("supplier_delivery_id", delivery.id).order("created_at");
     res.json({ delivery, items: reviews || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -8205,6 +8261,13 @@ app.get("/supplier-deliveries/:id", requireAuth, async (req, res) => {
 
 app.put("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
+    // P1-4B: verify ownership before mutating — this endpoint previously
+    // updated by id alone, with no check that the record belongs to the
+    // caller's own company.
+    const { data: existing } = await supabase.from("supplier_deliveries").select("id, company_id").eq("id", req.params.id).maybeSingle();
+    if (!existing) return res.status(404).json({ error: "Not found" });
+    const cid = getActiveCompanyId(req);
+    if (cid && existing.company_id && existing.company_id !== cid) return res.status(404).json({ error: "Not found" });
     const { do_number, supplier, do_date, supplier_reference } = req.body;
     const { data, error } = await supabase.from("supplier_deliveries")
       .update({ do_number, supplier, do_date, supplier_reference })
@@ -8216,13 +8279,22 @@ app.put("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) 
 
 app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
+    // P1-4B: verify ownership before deleting/reversing stock — this
+    // endpoint previously deleted by id alone with no company check, and
+    // reversed stock using the REQUESTER's own active company rather than
+    // the delivery's actual company, which could misattribute a stock
+    // adjustment to the wrong company entirely.
+    const { data: existing } = await supabase.from("supplier_deliveries").select("id, company_id").eq("id", req.params.id).maybeSingle();
+    if (!existing) return res.status(404).json({ error: "Not found" });
+    const cid = getActiveCompanyId(req);
+    if (cid && existing.company_id && existing.company_id !== cid) return res.status(404).json({ error: "Not found" });
     // Reverse any stock movements from this DO
     const { data: movements } = await supabase.from("stock_movements")
       .select("id, warehouse_id, product_id, quantity")
       .eq("reference_type", "do").eq("reference_id", req.params.id);
     for (const m of (movements || [])) {
       if (m.quantity > 0) {
-        await adjustStock(getActiveCompanyId(req), m.warehouse_id, m.product_id, -m.quantity, "adjustment", "do_reversal", req.params.id, "DO deleted — stock reversed", req.user.id);
+        await adjustStock(existing.company_id || getActiveCompanyId(req), m.warehouse_id, m.product_id, -m.quantity, "adjustment", "do_reversal", req.params.id, "DO deleted — stock reversed", req.user.id);
       }
     }
     await supabase.from("do_review").delete().eq("supplier_delivery_id", req.params.id);
@@ -8514,7 +8586,10 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
           : null;
         const { error } = await supabase.from("orders").update({ delivery_date: null, remark: updatedRemark }).eq("id", orderId);
         if (error) return reply(`❌ Failed to update: ${error.message}`);
-        if (isMultiTrip) await supabase.from("order_trips").update({ scheduled_date: null }).eq("so_number", soNumber).eq("trip_no", 1);
+        // P1-4B: so_number alone is not a safe identity (unique only per
+        // company, per migration 078) — scope by the resolved companyId too,
+        // or a same-numbered trip in a different company could be nulled.
+        if (isMultiTrip) await supabase.from("order_trips").update({ scheduled_date: null }).eq("company_id", companyId).eq("so_number", soNumber).eq("trip_no", 1);
         await logDeliveryActivity({
           companyId, branchId: existingOrder?.branch_id || null, soNumber, orderId, tripNo: isMultiTrip ? 1 : null,
           action: "set_tbc", fromDate: currentDate || null, toDate: null, source: "web",
@@ -9295,11 +9370,15 @@ app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), 
     const packingsCid = getActiveCompanyId(req);
     for (const item of items) {
       // Try to find the order_item to link
+      // P1-4B: fail closed — only attempt the so_number-based link when the
+      // requester's company is known; an unscoped match here would create a
+      // packing row whose order_item_id FK points at a DIFFERENT company's
+      // order. Leaves orderItemId null (this line simply isn't linked) rather
+      // than risking a wrong-company link.
       let orderItemId = item.order_item_id || null;
-      if (!orderItemId && item.so_number) {
-        let orderQ = supabase.from("orders").select("id").eq("so_number", item.so_number);
-        if (packingsCid) orderQ = orderQ.eq("company_id", packingsCid);
-        const { data: order } = await orderQ.maybeSingle();
+      if (!orderItemId && item.so_number && packingsCid) {
+        const { data: order } = await supabase.from("orders").select("id")
+          .eq("company_id", packingsCid).eq("so_number", item.so_number).maybeSingle();
         if (order) {
           const { data: oi } = await supabase.from("order_items").select("id")
             .eq("order_id", order.id).ilike("product_name", `%${item.product_name || item.item_name || ""}%`).limit(1).maybeSingle();
@@ -10106,10 +10185,11 @@ async function addPickItemsForOrder(orderId, companyId, soNumber, customerName, 
   }
   // Fallback to package_labels — scoped by company_id (P0-16: so_number alone
   // is no longer guaranteed unique across companies).
-  if (!found) {
-    let labelQ = supabase.from("package_labels").select("*").eq("so_number", soNumber).in("status", ["stored", "put_away"]);
-    if (companyId) labelQ = labelQ.eq("company_id", companyId);
-    const { data: labels } = await labelQ;
+  // P1-4B: fail closed — skip this fallback entirely when companyId is
+  // unknown, rather than matching so_number across every company.
+  if (!found && companyId) {
+    const { data: labels } = await supabase.from("package_labels").select("*")
+      .eq("company_id", companyId).eq("so_number", soNumber).in("status", ["stored", "put_away"]);
     for (const l of (labels || [])) {
       if (matches && !matches(l.product_code, l.product_name)) continue;
       pickItems.push({ id: l.id, qr_code: l.qr_code, status: l.status, zone_id: l.zone_id, rack_id: l.rack_id, location_code: l.location_code, _product_name: l.product_name, _product_code: l.product_code, _customer: customerName, _so_number: soNumber, _delivery_date: deliveryDate, _source: "package_labels", ...doTag });
@@ -10252,6 +10332,9 @@ app.get("/loading-list", requireAuth, async (req, res) => {
     const { route_id, date } = req.query;
     const cid = getActiveCompanyId(req);
     if (!route_id && !date) return res.status(400).json({ error: "route_id or date required" });
+    // P1-4B: fail closed rather than silently returning an unscoped,
+    // cross-company package-label list when no active company can be resolved.
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
     // Get orders on this route
     let orderIds = [];
     if (route_id) {
@@ -10269,10 +10352,13 @@ app.get("/loading-list", requireAuth, async (req, res) => {
       soNumbers = (orders || []).map(o => ({ so: o.so_number, customer: o.customer_name }));
     }
     // Get picked packages for these SOs
+    // P1-4B: so_number alone is not a safe identity — scope by the active
+    // company too, or a same-numbered order in a different company could
+    // leak its package labels into this list.
     const labels = [];
     for (const { so, customer } of soNumbers) {
       const { data: pkgs } = await supabase.from("package_labels").select("*")
-        .eq("so_number", so).in("status", ["picked", "loaded"]);
+        .eq("company_id", cid).eq("so_number", so).in("status", ["picked", "loaded"]);
       for (const p of (pkgs || [])) labels.push({ ...p, customer_name: customer });
     }
     res.json({ items: labels, route_id });
@@ -10286,8 +10372,14 @@ app.patch("/package-labels/:id/load", ...requirePerm(PERMS.WAREHOUSE_LOAD), asyn
     const { data: label } = await supabase.from("package_labels").select("*").eq("id", req.params.id).single();
     if (!label) return res.status(404).json({ error: "Package not found" });
     // Validate: does this package belong to the given route?
+    // P1-4B: label.so_number alone is not a safe identity — anchor to the
+    // label's OWN company_id (immutable, already fetched above) rather than
+    // re-deriving the requester's active company, and rather than matching
+    // so_number across every company.
     if (route_id && label.so_number) {
-      const { data: order } = await supabase.from("orders").select("id").eq("so_number", label.so_number).single();
+      let orderQ = supabase.from("orders").select("id").eq("so_number", label.so_number);
+      if (label.company_id) orderQ = orderQ.eq("company_id", label.company_id);
+      const { data: order } = await orderQ.maybeSingle();
       if (order) {
         const { data: onRoute } = await supabase.from("delivery_route_orders").select("id").eq("route_id", route_id).eq("order_id", order.id).maybeSingle();
         if (!onRoute) return res.json({ label, warning: `This item (SO: ${label.so_number}) is NOT on this route` });
@@ -13858,8 +13950,17 @@ app.post("/do-upload", requireRole(["master", "manager", "company_admin", "sales
 // ── Order Item Arrival Date ──────────────────────────────────────
 app.patch("/orders/:id/item-arrival", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
+    // P1-4B company isolation fix: this fetch used to have no company scope
+    // at all — any MANAGE_ROLES user who knew (or guessed) an order id could
+    // mutate arrival on an order belonging to a DIFFERENT company. Scoped
+    // here the same way every other secured order endpoint in this file
+    // resolves and enforces company ownership. Fails closed (400) rather
+    // than falling through unscoped when no active company can be resolved
+    // — same principle applied to the other P1-4B fixes.
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
     const { item_index, item_code, arrival_date } = req.body;
-    const { data: order } = await supabase.from("orders").select("items").eq("id", req.params.id).single();
+    const { data: order } = await supabase.from("orders").select("items").eq("id", req.params.id).eq("company_id", cid).single();
     if (!order) return res.status(404).json({ error: "Order not found" });
     const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
     if (!Array.isArray(items)) return res.status(400).json({ error: "No items" });
