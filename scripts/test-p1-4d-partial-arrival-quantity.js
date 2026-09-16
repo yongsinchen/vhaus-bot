@@ -512,6 +512,38 @@ async function runPartC() {
     for (const id of created.deliveryOrders) { await supabase.from("delivery_order_items").delete().eq("delivery_order_id", id); await supabase.from("delivery_orders").delete().eq("id", id); }
     for (const id of created.orders) await supabase.from("orders").delete().eq("id", id);
     for (const id of created.salesOrders) { await supabase.from("sales_order_items").delete().eq("order_id", id); await supabase.from("sales_orders").delete().eq("id", id); }
+    // P1-6: defense-in-depth broad sweep — the same class of per-id tracking
+    // gap found in two other suites this phase (a FK-blocked child row left
+    // untracked forever leaks its parent too) can affect this suite as well.
+    // Safe to run every time: matches ONLY this suite's own TEST-P14D- marker.
+    const { data: staleSo } = await supabase.from("sales_orders").select("id").ilike("order_number", "TEST-P14D-%");
+    if (staleSo?.length) {
+      const staleSoIds = staleSo.map(r => r.id);
+      const { data: staleOrders } = await supabase.from("orders").select("id").ilike("so_number", "TEST-P14D-%");
+      const staleOrderIds = (staleOrders || []).map(r => r.id);
+      // By sales_order_id, NOT do_number pattern — an amendment can create a
+      // REPLACEMENT DO with a real-format auto-generated do_number (e.g.
+      // "DO2609-0180"), which a TEST-P14D- do_number filter would miss
+      // entirely, leaving it FK-blocking the sales_orders delete below forever
+      // (confirmed: this exact gap left 6 sales_orders/orders sets leaked in
+      // production before this fix).
+      const { data: staleDords } = await supabase.from("delivery_orders").select("id").in("sales_order_id", staleSoIds);
+      const staleDordIds = (staleDords || []).map(r => r.id);
+      if (staleDordIds.length) {
+        await supabase.from("delivery_date_requests").delete().in("delivery_order_id", staleDordIds);
+        await supabase.from("delivery_order_items").delete().in("delivery_order_id", staleDordIds);
+        await supabase.from("delivery_orders").delete().in("id", staleDordIds);
+      }
+      if (staleOrderIds.length) {
+        await supabase.from("delivery_date_requests").delete().in("order_id", staleOrderIds);
+        await supabase.from("item_arrival_events").delete().in("order_id", staleOrderIds);
+        await supabase.from("orders").delete().in("id", staleOrderIds);
+      }
+      await supabase.from("sales_order_amendments").delete().in("sales_order_id", staleSoIds);
+      await supabase.from("sales_order_items").delete().in("order_id", staleSoIds);
+      await supabase.from("sales_orders").delete().in("id", staleSoIds);
+      console.log(`  (+ broad TEST-P14D- sweep: salesOrders:${staleSoIds.length} orders:${staleOrderIds.length} deliveryOrders:${staleDordIds.length})`);
+    }
     console.log(`\n── Cleanup ── salesOrders:${created.salesOrders.length} orders:${created.orders.length} events:${created.events.length} amendments:${created.amendments.length} deliveryOrders:${created.deliveryOrders.length}`);
   }
 })();

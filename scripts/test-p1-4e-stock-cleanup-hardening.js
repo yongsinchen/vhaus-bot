@@ -552,6 +552,29 @@ async function runIsolationAndSafetyTests() {
     for (const id of created.amendments) await supabase.from("sales_order_amendments").delete().eq("id", id);
     for (const id of created.orders) await supabase.from("orders").delete().eq("id", id);
     for (const id of created.salesOrders) { await supabase.from("sales_order_items").delete().eq("order_id", id); await supabase.from("sales_orders").delete().eq("id", id); }
-    console.log(`\n── Cleanup ── salesOrders:${created.salesOrders.length} orders:${created.orders.length} amendments:${created.amendments.length} events:${created.events.length}`);
+    // P1-6 discovery: per-id cleanup above only handles THIS run's own
+    // created.* arrays — if a run ever crashes/is interrupted before reaching
+    // this block (confirmed to have actually happened: 181 supplier_deliveries
+    // + 81 do_review + 18 sales_orders/orders rows tagged TEST-P14E- were found
+    // still live in production, cleaned up manually), those fixtures leak
+    // forever since nothing else ever re-sweeps them. This broad pattern-based
+    // sweep is a defense-in-depth backstop, safe to run every time (matches
+    // ONLY this suite's own TEST-P14E- naming marker, never real data).
+    const { data: staleSd } = await supabase.from("supplier_deliveries").select("id").ilike("do_number", "TEST-P14E-%");
+    if (staleSd?.length) await supabase.from("supplier_deliveries").delete().in("id", staleSd.map(r => r.id));
+    await supabase.from("do_review").delete().ilike("do_number", "TEST-P14E-%");
+    const { data: staleOrders } = await supabase.from("orders").select("id").ilike("so_number", "TEST-P14E-%");
+    if (staleOrders?.length) {
+      await supabase.from("item_arrival_events").delete().in("order_id", staleOrders.map(r => r.id));
+      await supabase.from("orders").delete().in("id", staleOrders.map(r => r.id));
+    }
+    const { data: staleSo } = await supabase.from("sales_orders").select("id").ilike("order_number", "TEST-P14E-%");
+    if (staleSo?.length) {
+      const staleSoIds = staleSo.map(r => r.id);
+      await supabase.from("sales_order_amendments").delete().in("sales_order_id", staleSoIds);
+      await supabase.from("sales_order_items").delete().in("order_id", staleSoIds);
+      await supabase.from("sales_orders").delete().in("id", staleSoIds);
+    }
+    console.log(`\n── Cleanup ── salesOrders:${created.salesOrders.length} orders:${created.orders.length} amendments:${created.amendments.length} events:${created.events.length} (+ broad TEST-P14E- sweep: supplierDeliveries:${staleSd?.length || 0} orders:${staleOrders?.length || 0} salesOrders:${staleSo?.length || 0})`);
   }
 })();

@@ -143,10 +143,16 @@ async function runPartB() {
     }).select().single();
     if (dordErr) die("DO insert failed: " + dordErr.message);
     created.deliveryOrders.push(dord.id);
-    const { decision } = await insertAndMaybeApply({
+    const { decision, created: req7 } = await insertAndMaybeApply({
       company_id: COMPANY_A, order_id: fx.legacy.id, sales_order_id: fx.so.id, so_number: fx.orderNumber,
       delivery_order_id: dord.id, requested_date: "2026-10-10", original_date: "2026-09-19", requested_by: SOME_USER_ID, requested_via: "web",
     });
+    // Bug found P1-6: this request's id was never tracked for cleanup, and it
+    // FK-blocks deleting the delivery_orders row above (delivery_date_requests
+    // .delivery_order_id references it) — every run of this test leaked both
+    // rows into production forever. Confirmed via direct delete: Postgres
+    // error 23503 "still referenced from table delivery_date_requests".
+    if (req7?.id) created.requests.push(req7.id);
     assert("7. DO-scoped request: current DO date (19 Sep, inside window) forces approval even though requested (10 Oct) is safely outside", decision.requiresApproval === true, JSON.stringify(decision));
   }
 
@@ -348,6 +354,24 @@ async function runPartC() {
     for (const id of created.deliveryOrders) await supabase.from("delivery_orders").delete().eq("id", id);
     for (const id of created.orders) await supabase.from("orders").delete().eq("id", id);
     for (const id of created.salesOrders) await supabase.from("sales_orders").delete().eq("id", id);
+    // P1-6: defense-in-depth broad sweep — a per-id tracking gap (found and
+    // fixed in test 7 above) can leave a FK-blocked delivery_orders/
+    // delivery_date_requests pair leaked forever otherwise. Safe to run every
+    // time: matches ONLY this suite's own TEST-URGENT-RS- naming marker.
+    const { data: staleSo } = await supabase.from("sales_orders").select("id").ilike("order_number", "TEST-URGENT-RS-%");
+    if (staleSo?.length) {
+      const staleSoIds = staleSo.map(r => r.id);
+      const { data: staleOrders } = await supabase.from("orders").select("id").ilike("so_number", "TEST-URGENT-RS-%");
+      const staleOrderIds = (staleOrders || []).map(r => r.id);
+      const { data: staleDords } = await supabase.from("delivery_orders").select("id").ilike("do_number", "TEST-URGENT-RS-%");
+      const staleDordIds = (staleDords || []).map(r => r.id);
+      if (staleDordIds.length) await supabase.from("delivery_date_requests").delete().in("delivery_order_id", staleDordIds);
+      if (staleOrderIds.length) await supabase.from("delivery_date_requests").delete().in("order_id", staleOrderIds);
+      if (staleDordIds.length) await supabase.from("delivery_orders").delete().in("id", staleDordIds);
+      if (staleOrderIds.length) await supabase.from("orders").delete().in("id", staleOrderIds);
+      await supabase.from("sales_orders").delete().in("id", staleSoIds);
+      console.log(`  (+ broad TEST-URGENT-RS- sweep: salesOrders:${staleSoIds.length} orders:${staleOrderIds.length} deliveryOrders:${staleDordIds.length})`);
+    }
     console.log(`\n── Cleanup ── salesOrders:${created.salesOrders.length} orders:${created.orders.length} deliveryOrders:${created.deliveryOrders.length} requests:${created.requests.length} services:${created.services.length} schedules:${created.schedules.length}`);
   }
 })();

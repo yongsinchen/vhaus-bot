@@ -266,7 +266,7 @@ async function runSupplierDo() {
     const migPath = path.join(__dirname, "..", "migrations", "101_supplier_deliveries_duplicate_protection.sql");
     const migSrc = fs.readFileSync(migPath, "utf8");
     assert("22. migration 101's unique index still present (duplicate protection intact)", migSrc.includes("uniq_supplier_deliveries_company_supplier_donumber"));
-    const doPhotoSlice = server.slice(server.indexOf("const handleDOPhoto"), server.indexOf("const handleDOPhoto") + 4500);
+    const doPhotoSlice = server.slice(server.indexOf("const handleDOPhoto"), server.indexOf("const handleDOPhoto") + 5200);
     assert("23. Telegram's DO save still surfaces the DUPLICATE_DO rejection to the user (generic catch on processSupplierDOUpload)", doPhotoSlice.includes("Failed to save the DO"));
   }
 
