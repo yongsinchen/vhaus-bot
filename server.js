@@ -1926,13 +1926,27 @@ Example: /${isApprove ? "approve" : "reject"} 11576`);
     return;
   }
 
-  const approval = pendingApprovals.get(soNumber);
-  if (!approval) {
+  // P1-6: pendingApprovals is now keyed by the immutable orderId (SO numbers
+  // are not guaranteed unique across companies), so a bare typed SO number
+  // must be matched by searching values rather than a direct key lookup. If
+  // more than one pending request shares this SO number text (two different
+  // companies), never guess which one — ask the OM to disambiguate.
+  const matches = [...pendingApprovals.entries()].filter(([, v]) => v.soNumber === soNumber);
+  if (matches.length === 0) {
     await sendMessage(chatId, `❌ No pending reschedule request found for SO *${soNumber}*.`);
     return;
   }
-
-  pendingApprovals.delete(soNumber);
+  if (matches.length > 1) {
+    await sendMessage(chatId,
+      `⚠️ *Ambiguous SO number*\n\n` +
+      `${matches.length} pending reschedule requests share SO number *${soNumber}* across different companies:\n\n` +
+      matches.map(([, v], i) => `${i + 1}. ${v.customerName || "(no customer)"} — requested by ${v.salesmanName}, date ${fmtDate(v.newDate)}`).join("\n") +
+      `\n\nPlease ask each salesman to confirm, or contact admin — this cannot be approved by SO number alone.`
+    );
+    return;
+  }
+  const [approvalKey, approval] = matches[0];
+  pendingApprovals.delete(approvalKey);
 
   if (isApprove) {
     // Apply the reschedule
@@ -2046,7 +2060,19 @@ const logDeliveryActivity = async ({
 
 // ── Apply a reschedule date ───────────────────────────────────────
 // Shared by the reschedule waiting_date step and the busy-date confirm step.
-// Keeps the 2-working-day / confirmed-route OM approval gate.
+//
+// P1-6: this used to gate on a Telegram-only "2 working days + a live
+// Confirmed route" rule (isWithinWorkingDays), completely separate from the
+// centralized evaluateDeliveryDateApproval 10-calendar-day rule every other
+// delivery-date write path uses (PATCH /service-cases/:id, POST
+// /delivery-date-requests, the web assistant chat) — the same business
+// action ("can this order's date be changed") could get a DIFFERENT
+// approval outcome depending on channel. Now uses the SAME centralized
+// decision. The OM-approval delivery mechanism itself (pendingApprovals +
+// /approve /reject) is unchanged — only the gating THRESHOLD/DECISION is
+// centralized; replatforming the delivery mechanism onto delivery_date_requests
+// is out of this narrow phase's scope (order_trips has no equivalent in that
+// table today).
 const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null) => {
   const { soNumber, tripNo, tripId, orderId, currentDate, customerName, isTrip } = data;
   const isTbc = newDate === "TBC";
@@ -2054,10 +2080,10 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
   const displayDate = isTbc ? "TBC (no date set)" : fmtDate(newDate);
   const loadLine = load ? `📊 That day: ${load.total} order${load.total === 1 ? "" : "s"} booked, ${load.unassigned} unassigned (before this one).\n` : "";
 
-  // Fix #7: a blocked date is at least as sensitive as the 2-working-day
-  // window — route it through the same OM-approval gate below rather than
-  // silently applying. SOFT block: this only adds an approval step, it
-  // never hard-rejects (matches the write-path behavior on the web/API side).
+  // Fix #7: a blocked date is at least as sensitive as the approval window —
+  // route it through the same OM-approval gate below rather than silently
+  // applying. SOFT block: this only adds an approval step, it never
+  // hard-rejects (matches the write-path behavior on the web/API side).
   let isBlockedDate = false;
   // Hoisted (not just block-local) — reused below to log delivery_activity
   // without a second lookup when this branch already ran.
@@ -2070,55 +2096,80 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
     if (orderCompanyId) isBlockedDate = !!(await getBlockedDateReason(orderCompanyId, newDate, null));
   }
 
-  // ── 2-working-day rule check ──────────────────────────────
-  if (!isTbc && (isWithinWorkingDays(newDate, 2) || isBlockedDate)) {
-    // Check if date has a Confirmed route
-    const { data: confirmedRoutes } = await supabase
-      .from("delivery_routes")
-      .select("id, lorry_plate, driver_name")
-      .eq("delivery_date", newDate)
-      .eq("status", "Confirmed");
-
-    if (confirmedRoutes && confirmedRoutes.length > 0) {
-      const salesmanName = from?.first_name
-        ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
-        : (from?.username || "Unknown");
-
-      // Store pending approval
-      pendingApprovals.set(soNumber, {
-        isTrip, tripId, tripNo, orderId, newDate,
-        soNumber, customerName, salesmanName,
-        salesmanChatId: chatId,
-      });
-
-      clearSession(key);
-
-      // Tell salesman request is pending
-      await sendMessage(chatId,
-        `⚠️ *Approval Required*\n\n` +
-        `${fmtDate(newDate)} is within the next 2 working days and already has a *Confirmed* route.\n\n` +
-        `Your reschedule request for SO *${soNumber}* has been sent to the Operation Manager for approval.\n\n` +
-        `_You will be notified once approved or rejected._`
-      );
-
-      // Notify Operation Manager
-      const routeInfo = confirmedRoutes.map(r => `${r.lorry_plate || ""} ${r.driver_name || ""}`.trim()).join(", ");
-      await sendMessage(OPERATION_MANAGER_ID,
-        `🔔 *Reschedule Approval Needed*\n\n` +
-        `👤 Salesman: ${salesmanName}\n` +
-        `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
-        (isTrip ? `🔄 Trip ${tripNo}\n` : "") +
-        `📅 Requested date: *${fmtDate(newDate)}*\n\n` +
-        `⚠️ This date already has a Confirmed route: ${routeInfo}\n\n` +
-        `Reply:\n` +
-        `✅ /approve ${soNumber} — to approve\n` +
-        `❌ /reject ${soNumber} — to reject`
-      );
-      return;
+  // P1-6: reschedule must remain DO-scoped once a DO exists (never guess
+  // which DO to modify, never write the legacy whole-order date underneath
+  // an active DO). Telegram has no DO-selection UI, so the safe behavior
+  // when one or more active DOs exist is to refuse and defer to the web
+  // app/Delivery Schedule board rather than mutate orders/order_trips blind
+  // to the DO layer.
+  if (!isTbc && orderCompanyId && soNumber) {
+    const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", orderCompanyId).eq("order_number", soNumber).maybeSingle();
+    if (soRow?.id) {
+      const activeDOs = await resolveActiveDeliveryOrders({ supabase, companyId: orderCompanyId, salesOrderId: soRow.id });
+      if (activeDOs.length > 0) {
+        clearSession(key);
+        await sendMessage(chatId,
+          `⚠️ *Please use the web app for this reschedule*\n\n` +
+          `SO *${soNumber}* already has ${activeDOs.length > 1 ? "multiple active Delivery Orders" : `an active Delivery Order (${activeDOs[0].do_number})`}.\n\n` +
+          `Rescheduling here isn't supported once a Delivery Order exists — please use the Delivery Schedule board so you can pick the exact DO.`
+        );
+        return;
+      }
     }
   }
 
-  // No confirmed route conflict — apply directly
+  // ── Centralized 10-calendar-day approval decision (same rule every
+  // other delivery-date path uses) ──────────────────────────────
+  const dateDecision = isTbc ? null : evaluateDeliveryDateApproval({ requestedDate: newDate, currentDate: currentDate || null });
+  if (dateDecision && !dateDecision.valid) {
+    await sendMessage(chatId, dateDecision.reason === "past_date" ? "❌ That date is in the past — please pick a future date." : "❌ That date isn't valid — please try again.");
+    return;
+  }
+
+  if (!isTbc && ((dateDecision && dateDecision.requiresApproval) || isBlockedDate)) {
+    const salesmanName = from?.first_name
+      ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
+      : (from?.username || "Unknown");
+
+    // Store pending approval, keyed by the immutable resolved orderId — never
+    // a bare so_number, which is not guaranteed unique across companies and
+    // would let two companies' pending requests silently overwrite each
+    // other in this shared in-memory Map.
+    pendingApprovals.set(orderId, {
+      isTrip, tripId, tripNo, orderId, newDate,
+      soNumber, customerName, salesmanName,
+      salesmanChatId: chatId,
+    });
+
+    clearSession(key);
+
+    // Tell salesman request is pending
+    const windowReason = isBlockedDate && !(dateDecision && dateDecision.requiresApproval)
+      ? "that date is blocked for scheduling"
+      : "that date falls within the protected 10-day reschedule window";
+    await sendMessage(chatId,
+      `⚠️ *Approval Required*\n\n` +
+      `${fmtDate(newDate)} needs Operation Manager approval — ${windowReason}.\n\n` +
+      `Your reschedule request for SO *${soNumber}* has been sent to the Operation Manager for approval.\n\n` +
+      `_You will be notified once approved or rejected._`
+    );
+
+    // Notify Operation Manager
+    await sendMessage(OPERATION_MANAGER_ID,
+      `🔔 *Reschedule Approval Needed*\n\n` +
+      `👤 Salesman: ${salesmanName}\n` +
+      `📋 SO: *${soNumber}*${customerName ? ` — ${customerName}` : ""}\n` +
+      (isTrip ? `🔄 Trip ${tripNo}\n` : "") +
+      `📅 Requested date: *${fmtDate(newDate)}*\n\n` +
+      `⚠️ ${windowReason === "that date is blocked for scheduling" ? "This date is blocked for scheduling." : "This date falls within the protected 10-day reschedule window."}\n\n` +
+      `Reply:\n` +
+      `✅ /approve ${soNumber} — to approve\n` +
+      `❌ /reject ${soNumber} — to reject`
+    );
+    return;
+  }
+
+  // No approval needed — apply directly
   if (isTrip) {
     const updatePayload = { scheduled_date: dbDate };
     if (isTbc) updatePayload.status = "Scheduled";
@@ -3699,21 +3750,24 @@ const handleDOPhoto = async (chatId, base64Image, fromTelegramId = null) => {
   }
 
   // Attribute the DO to the company it is billed to (from OCR), when
-  // recognisable — same rule as the webapp upload. Match among companies in the
-  // uploader's organization (or all companies if the uploader has none), and
-  // fall back to the uploader's own company / the order-match post-step.
-  if (doData.billTo) {
+  // recognisable — same rule as the webapp upload. Match ONLY among companies
+  // in the uploader's own organization — never across the whole system.
+  //
+  // P1-6: this used to fall back to searching EVERY company in the system
+  // whenever the uploader's own company/org was unresolved, with no
+  // authorization check at all — a document's OCR'd letterhead text alone
+  // could silently steer which (potentially unrelated) company's data got
+  // mutated. That fallback is removed. It was also the confirmed causal
+  // mechanism behind the P1-4F do_review/supplier_deliveries cross-company
+  // lineage anomaly: with company_id null, item-matching ran unscoped across
+  // every company's sales orders. Company isolation is mandatory — an
+  // unresolvable company now fails closed (below) instead of guessing.
+  if (doData.billTo && companyId) {
     try {
       let orgCompanies = [];
-      if (companyId) {
-        const { data: co } = await supabase.from("companies").select("organization_id").eq("id", companyId).maybeSingle();
-        if (co?.organization_id) {
-          const { data: cos } = await supabase.from("companies").select("id, name").eq("organization_id", co.organization_id);
-          orgCompanies = cos || [];
-        }
-      }
-      if (orgCompanies.length === 0) {
-        const { data: cos } = await supabase.from("companies").select("id, name");
+      const { data: co } = await supabase.from("companies").select("organization_id").eq("id", companyId).maybeSingle();
+      if (co?.organization_id) {
+        const { data: cos } = await supabase.from("companies").select("id, name").eq("organization_id", co.organization_id);
         orgCompanies = cos || [];
       }
       const billMatch = matchBillToCompany(doData.billTo, orgCompanies);
@@ -3721,18 +3775,34 @@ const handleDOPhoto = async (chatId, base64Image, fromTelegramId = null) => {
     } catch { /* keep the uploader's company */ }
   }
 
+  // P1-6: never proceed into matching/mutation with an unresolved company —
+  // that null previously reached processSupplierDOUpload and let
+  // findCandidateOrders search unscoped across every company. Fail closed:
+  // tell the user to contact admin instead of guessing.
+  if (!companyId) {
+    await sendMessage(chatId,
+      `❌ *Could not determine which company this DO belongs to.*\n\n` +
+      `Your Telegram account isn't linked to a company, and the document's Bill To didn't resolve one either.\n\n` +
+      `Please contact admin to link your account, or upload this DO via the web app instead.`
+    );
+    return;
+  }
+
   const doPhotoUrl = await supplierDO.storeDOPhoto(base64Image, doData.supplier);
 
   let arrivalDate, results;
   try {
-    // Telegram behavior preserved for matching (NOT company-scoped, no PO
-    // receiving, no product-master check) — rejectDuplicate is still not
-    // explicitly set here (defaults false), but P1-4E closed the duplicate
-    // bypass at the true enforcement layer: migration 101's DB-level unique
-    // index on supplier_deliveries now rejects an exact (company, supplier,
-    // do_number) repeat regardless of this flag, for every caller including
-    // this one. The generic catch below already surfaces that rejection's
-    // message to the chat — no Telegram-specific handling needed.
+    // P1-6: companyId is guaranteed non-null above, so processSupplierDOUpload's
+    // matchCompanyId is always the resolved company regardless of the
+    // scopeMatchingToCompany flag's default (lib/supplier-do.js only falls
+    // back to unscoped matching when companyId itself is falsy) — no PO
+    // receiving, no product-master check, same as before. rejectDuplicate is
+    // still not explicitly set here (defaults false), but P1-4E closed the
+    // duplicate bypass at the true enforcement layer: migration 101's DB-level
+    // unique index on supplier_deliveries now rejects an exact (company,
+    // supplier, do_number) repeat regardless of this flag, for every caller
+    // including this one. The generic catch below already surfaces that
+    // rejection's message to the chat — no Telegram-specific handling needed.
     ({ arrivalDate, results } = await supplierDO.processSupplierDOUpload({
       source: "telegram",
       extractedPayload: doData,
