@@ -1,0 +1,96 @@
+-- ══════════════════════════════════════════════════════════════════
+-- Migration 101: supplier_deliveries — DB-level duplicate-identity guard.
+--
+-- P1-4E. Re-audited the current live state of Supplier DO duplicate
+-- protection (lib/supplier-do.js's processSupplierDOUpload) before writing
+-- this: it is a pure application-level "SELECT then INSERT" check
+-- (`.eq("do_number", ...)`, optionally `.eq("company_id", ...)`), with NO
+-- backing DB constraint anywhere (confirmed: the only index on this table
+-- is the plain non-unique idx_supplier_deliveries_do_number, migration
+-- 022). This has a real TOCTOU race — two concurrent uploads of the
+-- identical DO (a Telegram photo double-tap, two browser tabs) can both
+-- pass the SELECT before either finishes its INSERT, both create rows, and
+-- (since the header insert happens before any per-item arrival mutation —
+-- confirmed in lib/supplier-do.js) both would go on to apply arrival
+-- quantities from what is really the same physical document.
+--
+-- SAFE DUPLICATE IDENTITY (explicitly NOT do_number alone, per this phase's
+-- own instruction not to assume different suppliers can't reuse the same DO
+-- number): (company_id, supplier, do_number). Company-scoped — never a
+-- global do_number uniqueness. Supplier-scoped — two different suppliers
+-- issuing the coincidentally-same do_number within one company are NOT
+-- treated as duplicates of each other.
+--
+-- NORMALIZATION (mechanically safe only, per this phase's explicit
+-- instruction not to fuzzy-match do_number): `lower(trim(supplier))` — case
+-- and incidental whitespace differences between two OCR/manual entries of
+-- the SAME physical supplier name must not defeat the uniqueness check; a
+-- NULL supplier is folded to '' so two deliveries that both genuinely have
+-- no recorded supplier are still compared consistently. `trim(do_number)`
+-- similarly strips only incidental whitespace — the do_number's actual
+-- characters are never altered, reinterpreted, or fuzzy-matched.
+--
+-- BLANK DO NUMBER: intentionally EXCLUDED from this constraint via the
+-- partial WHERE clause (`do_number IS NOT NULL AND trim(do_number) <> ''`).
+-- Per this phase's explicit instruction: "do not invent a number and do not
+-- merge deliveries based only on supplier/date/item similarity" — a blank
+-- do_number remains completely unprotected at the DB level, exactly as it
+-- is today application-side (lib/supplier-do.js's own check already
+-- short-circuits on a falsy doNumber). This is a reported, not a silently
+-- "fixed", remaining gap — see the P1-4E final report.
+--
+-- CONCURRENCY: this single UNIQUE index is sufficient on its own (no
+-- advisory lock / SELECT FOR UPDATE needed) because supplier_deliveries'
+-- header row is INSERTed before ANY per-item arrival mutation in
+-- processSupplierDOUpload (lib/supplier-do.js) — a second concurrent
+-- upload's header INSERT now fails atomically at the DB layer the instant
+-- both requests race, and Node's supplier-do.js throws before ever reaching
+-- the arrival-mutation loop for that request. This closes "two simultaneous
+-- uploads of the same Supplier DO must not both apply arrival quantities"
+-- without any larger redesign.
+--
+-- PARTIAL ARRIVALS PRESERVED: this constraint is keyed on
+-- (company_id, supplier, do_number) — the SUPPLIER DOCUMENT's own identity
+-- — never on so_number/item/quantity. Two genuinely DIFFERENT Supplier DOs
+-- (different do_number) against the SAME sales_order_item continue to work
+-- exactly as before (lib/supplier-do.js's applyArrivalToItem accumulation,
+-- unmodified) — this migration cannot and does not affect that.
+--
+-- EVIDENCE HASH: none exists anywhere in this codebase today (no
+-- hash/fingerprint/checksum concept for Supplier DO photos — confirmed via
+-- exhaustive grep). Not built here — out of this phase's "narrow and
+-- mechanical" scope; reported as a possible future enhancement only.
+--
+-- BEHAVIOR CHANGE, STATED EXPLICITLY: today, Telegram-sourced Supplier DO
+-- uploads process with rejectDuplicate defaulting false (server.js's own
+-- comment: "Telegram behavior preserved: duplicates allowed") — the
+-- application-level check never even runs for that channel. This DB
+-- constraint applies universally, to every INSERT regardless of caller, so
+-- an EXACT (company_id, supplier, do_number) repeat via Telegram will, after
+-- this migration, fail at the database with a unique-violation instead of
+-- silently succeeding a second time. The accompanying Node-side change
+-- (implemented only after this migration is confirmed live) catches that
+-- specific error and returns the SAME friendly DUPLICATE_DO shape the
+-- webapp path already produces, for every caller including Telegram — this
+-- is an intentional closure of a documented weakness, not a side effect.
+--
+-- Verification (after applying):
+--   SELECT indexname, indexdef FROM pg_indexes
+--   WHERE tablename = 'supplier_deliveries' AND indexname = 'uniq_supplier_deliveries_company_supplier_donumber';
+--
+--   -- Expect this to succeed (different supplier, same do_number, same company):
+--   -- two INSERTs with company_id=X, do_number='1001', supplier='Acme' vs supplier='Beta'
+--
+--   -- Expect the SECOND of these to fail with a unique violation:
+--   -- two INSERTs with identical company_id/supplier(normalized)/do_number
+--
+--   -- Expect this to always succeed regardless of repetition (blank do_number exempt):
+--   -- any number of INSERTs with do_number NULL or ''
+--
+-- Rollback:
+--   DROP INDEX IF EXISTS uniq_supplier_deliveries_company_supplier_donumber;
+-- ══════════════════════════════════════════════════════════════════
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_supplier_deliveries_company_supplier_donumber
+  ON supplier_deliveries (company_id, lower(trim(COALESCE(supplier, ''))), trim(do_number))
+  WHERE do_number IS NOT NULL AND trim(do_number) <> '';

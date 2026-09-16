@@ -3725,8 +3725,14 @@ const handleDOPhoto = async (chatId, base64Image, fromTelegramId = null) => {
 
   let arrivalDate, results;
   try {
-    // Telegram behavior preserved: duplicates allowed, matching NOT
-    // company-scoped, no PO receiving, no product-master check.
+    // Telegram behavior preserved for matching (NOT company-scoped, no PO
+    // receiving, no product-master check) — rejectDuplicate is still not
+    // explicitly set here (defaults false), but P1-4E closed the duplicate
+    // bypass at the true enforcement layer: migration 101's DB-level unique
+    // index on supplier_deliveries now rejects an exact (company, supplier,
+    // do_number) repeat regardless of this flag, for every caller including
+    // this one. The generic catch below already surfaces that rejection's
+    // message to the chat — no Telegram-specific handling needed.
     ({ arrivalDate, results } = await supplierDO.processSupplierDOUpload({
       source: "telegram",
       extractedPayload: doData,
@@ -4577,6 +4583,7 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
     const doQty = supplierDO.parseQty(reviewRow?.quantity);
     const orders = await supplierDO.findCandidateOrders(so_number, getActiveCompanyId(req));
     let stampedOrderId = null;
+    let stampedSoiId = null;
     for (const order of (orders || [])) {
       const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
       // Stamp only the FIRST matching line that still needs units — one DO line
@@ -4597,6 +4604,7 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
         await supabase.from("orders").update({ items: JSON.stringify(items) }).eq("id", order.id);
         await syncArrivalsToSalesOrderItems(order.id); // Phase 4 dual-write
         stampedOrderId = order.id;
+        stampedSoiId = afterLine.soiId || beforeLine.soiId || null;
         // P1-4C: do_review resolution is a distinct arrival-mutation source
         // from supplier-do auto-match/manual-fix — it's a human reviewer
         // resolving an exception queue item, not the automatic matcher.
@@ -4620,6 +4628,11 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
     update.so_number = so_number;
     update.arrival_date = date;
     if (stampedOrderId) update.matched_order_id = stampedOrderId;
+    // P1-4E: persist the immutable do_review -> sales_order_items lineage
+    // (migration 022, ON DELETE SET NULL) whenever this resolution
+    // deterministically stamped one exact line — the same soiId already
+    // used above for recordItemArrivalEvent, never a fresh fuzzy guess.
+    if (stampedSoiId) update.sales_order_item_id = stampedSoiId;
   }
 
   const { error } = await supabase.from("do_review").update(update).eq("id", id);
@@ -8570,6 +8583,11 @@ app.post("/supplier-dos", requireRole(SUPPLIER_DO_ROLES), async (req, res) => {
         companyId: targetCid,
         branchId: req.body.branch_id || null,
         photoUrl: photo_url,
+        // P1-4E: allow_duplicate=true only skips the fast app-level
+        // pre-check now — it can no longer defeat duplicate protection.
+        // Migration 101's DB-level unique index (company_id, supplier,
+        // do_number) is enforced on the insert unconditionally; the catch
+        // below still returns the same DUPLICATE_DO shape either way.
         rejectDuplicate: !allow_duplicate,
         scopeMatchingToCompany: true,
         receivePOItems: true,
@@ -15180,6 +15198,42 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       // with what the test actually covers.
       const { matchedIds, removedRows } = classifySalesOrderItemEdit(existing.sales_order_items, expandedItems);
       const _identityKey = soItemIdentityKey;
+
+      // P1-4E: this direct-upsert path (reached only for a draft SO with no
+      // Delivery Order yet — apply_active_do_amendment() handles the
+      // confirmed/amended/has-a-DO case separately) had NO arrived_qty guard
+      // at all. delivered_qty is structurally impossible here (it is only
+      // ever written by complete_delivery_order(), which requires a DO to
+      // exist and complete — excluded by this branch's own gate), but
+      // arrived_qty is populated independently of any DO (via the manual/
+      // Supplier-DO arrival endpoints), so a draft SO can already carry real
+      // physical arrival history. Never let a plain item edit silently
+      // rewrite that history by shrinking quantity below it, or by removing
+      // the line outright. Validated before any mutation below.
+      const existingById = new Map((existing.sales_order_items || []).map(soi => [String(soi.id), soi]));
+      const arrivedQtyViolations = [];
+      for (const it of expandedItems) {
+        if (it.id == null || !matchedIds.has(String(it.id))) continue;
+        const prior = existingById.get(String(it.id));
+        const priorArrivedQty = Number(prior?.arrived_qty) || 0;
+        const newQty = Number(it.quantity) || 0;
+        if (priorArrivedQty > 0 && newQty < priorArrivedQty) {
+          arrivedQtyViolations.push({ sales_order_item_id: it.id, product_name: prior?.product_name || null, arrived_qty: priorArrivedQty, proposed_quantity: newQty });
+        }
+      }
+      for (const removed of removedRows) {
+        const arrivedQty = Number(removed.arrived_qty) || 0;
+        if (arrivedQty > 0) {
+          arrivedQtyViolations.push({ sales_order_item_id: removed.id, product_name: removed.product_name || null, arrived_qty: arrivedQty, proposed_quantity: 0, removed: true });
+        }
+      }
+      if (arrivedQtyViolations.length > 0) {
+        return res.status(400).json({
+          error: "Cannot reduce quantity or remove an item below its already-arrived quantity. Physical receipt history cannot be rewritten by an order edit.",
+          reason: "below_arrived_qty", items: arrivedQtyViolations,
+        });
+      }
+
       // Only a line that is truly disappearing (matched by no submitted
       // item) frees up its arrival for a genuinely new line to inherit — a
       // still-matched line keeps its own row, and its own arrived_at,
