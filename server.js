@@ -7789,19 +7789,27 @@ async function createServiceCaseFull({ companyId, actorUser, body }) {
   const scheduleDate = isTbc ? null : (delivery_date || due_date || null);
 
   let custName = customer_name, custPhone = customer_phone, custAddr = customer_address, sourceSoNumber = null;
+  let resolvedOrderId = order_id || null;
   if (order_id) {
+    // Company-scoped: a cross-company order_id must never leak that order's
+    // customer/SO details into a Service Case, and must never become the
+    // linked order of a Service Case in a different company. If it doesn't
+    // resolve within this company, treat it as if none was given (fail
+    // closed) rather than silently linking/leaking across companies.
     const { data: o } = await supabase.from("orders")
       .select("id, so_number, customer_name, contact, address")
-      .eq("id", order_id).maybeSingle();
+      .eq("id", order_id).eq("company_id", companyId).maybeSingle();
     if (o) {
       sourceSoNumber = o.so_number || null;
       if (!custName) { custName = o.customer_name; custPhone = o.contact; custAddr = o.address; }
+    } else {
+      resolvedOrderId = null;
     }
   }
 
   const { data: result, error } = await supabase.rpc("create_service_case", {
     p_company_id: companyId, p_service_type: svcType, p_created_by: actorUser.id,
-    p_order_id: order_id || null, p_description: description || null,
+    p_order_id: resolvedOrderId, p_description: description || null,
     p_assigned_to: assigned_to || null,
     p_customer_name: custName || null, p_customer_phone: custPhone || null, p_customer_address: custAddr || null,
     p_priority: priority || "normal", p_schedule_date: scheduleDate,
@@ -7821,7 +7829,7 @@ async function createServiceCaseFull({ companyId, actorUser, body }) {
     await supabase.from("orders").update({ delivery_date: "TBC" }).eq("id", result.order.id);
     if (result.order) result.order.delivery_date = "TBC";
   }
-  if (!order_id && result.order?.id) {
+  if (!resolvedOrderId && result.order?.id) {
     const creatorSalesman = actorUser.salesman_name || actorUser.name || null;
     if (creatorSalesman) {
       await supabase.from("orders").update({ salesman: creatorSalesman }).eq("id", result.order.id);
@@ -7992,7 +8000,9 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     // decision, which needs the CURRENT operational date, not just the
     // requested one.
     const cid = getActiveCompanyId(req);
-    const { data: cur } = await supabase.from("services").select("status, due_date, company_id, legacy_order_id").eq("id", req.params.id).maybeSingle();
+    let curQ = supabase.from("services").select("status, due_date, company_id, legacy_order_id").eq("id", req.params.id);
+    if (cid) curQ = curQ.eq("company_id", cid);
+    const { data: cur } = await curQ.maybeSingle();
     if (!cur) return res.status(404).json({ error: "Service case not found" });
 
     // Schedule date. TBC clears the date but stamps the order 'TBC' (out of the
@@ -8045,7 +8055,9 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
       else if (!hasRealDate && cur.status === "scheduled") updates.status = "open";
     }
 
-    const { data, error } = await supabase.from("services").update(updates).eq("id", req.params.id).select().single();
+    let updQ = supabase.from("services").update(updates).eq("id", req.params.id);
+    if (cid) updQ = updQ.eq("company_id", cid);
+    const { data, error } = await updQ.select().single();
     if (error) throw error;
 
     // Keep the linked legacy Service order in step: date/TBC sync, and status
@@ -8154,6 +8166,12 @@ app.delete("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => 
     if (svc.legacy_order_id) {
       await supabase.from("delivery_schedules").delete().eq("order_id", svc.legacy_order_id);
       await supabase.from("orders").update({ status: "Cancelled" }).eq("id", svc.legacy_order_id);
+      // P1-5: close out any open date-approval request for this case rather
+      // than leaving it pointing at a now-cancelled/deleted case forever.
+      await supabase.from("delivery_date_requests")
+        .update({ status: "rejected", decision_note: "Service case deleted", updated_at: new Date().toISOString() })
+        .in("status", ["pending", "needs_reschedule"])
+        .eq("order_id", svc.legacy_order_id).is("delivery_order_id", null);
     }
     await supabase.from("services").delete().eq("id", req.params.id);
     res.json({ ok: true });
