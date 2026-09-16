@@ -4992,7 +4992,10 @@ async function resolveDeliveryDateRequestTarget({ companyId, salesOrderId, clien
 // falls back to "pending" for a human to review rather than standing as a
 // falsely-approved row with zero real effect.
 async function createDeliveryDateRequestAndMaybeAutoApprove(insertPayload, actorId) {
-  const decision = evaluateDeliveryDateApproval({ requestedDate: insertPayload.requested_date });
+  // URGENT FIX: the current/original date (already resolved by every caller
+  // via resolveOriginalDeliveryDate, stored as insertPayload.original_date)
+  // must also gate approval — see evaluateDeliveryDateApproval's header.
+  const decision = evaluateDeliveryDateApproval({ requestedDate: insertPayload.requested_date, currentDate: insertPayload.original_date || null });
   if (!decision.valid) {
     return { status: 400, error: decision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" };
   }
@@ -7971,25 +7974,62 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     const isTbc = schedule_tbc === true || schedule_tbc === "true";
     if (tbcProvided) updates.schedule_tbc = isTbc;
 
+    // Need the case's state BEFORE mutating it — both for the existing
+    // auto-status-transition check AND (URGENT FIX) for the 10-day approval
+    // decision, which needs the CURRENT operational date, not just the
+    // requested one.
+    const cid = getActiveCompanyId(req);
+    const { data: cur } = await supabase.from("services").select("status, due_date, company_id, legacy_order_id").eq("id", req.params.id).maybeSingle();
+    if (!cur) return res.status(404).json({ error: "Service case not found" });
+
     // Schedule date. TBC clears the date but stamps the order 'TBC' (out of the
     // unassigned pool); a real/blank date syncs to the linked order. Accept
     // either field name. orderDeliveryDate === undefined means "don't touch".
     const newDate = delivery_date !== undefined ? delivery_date : (due_date !== undefined ? due_date : undefined);
     let orderDeliveryDate;
-    if (isTbc) { updates.due_date = null; orderDeliveryDate = "TBC"; }
-    else if (newDate !== undefined) { updates.due_date = newDate || null; orderDeliveryDate = newDate || null; }
-    else if (tbcProvided) { updates.due_date = null; orderDeliveryDate = null; } // TBC toggled off, no date → unscheduled
+    // URGENT FIX: a real, CHANGED date must go through the same centralized
+    // 10-day approval rule (evaluateDeliveryDateApproval) as every other
+    // delivery-date write path — considering BOTH the case's current due_date
+    // and the requested date, exactly like the SO/DO reschedule flow. This
+    // endpoint previously wrote due_date/orders.delivery_date directly and
+    // unconditionally — a silent bypass of Delivery Date Approval. TBC and
+    // clearing the date are not a "move to a specific date" and are left
+    // ungated, matching prior behavior.
+    let dateChangeGated = false;
+    let dateDecision = null;
+    if (isTbc) {
+      updates.due_date = null; orderDeliveryDate = "TBC";
+    } else if (newDate !== undefined) {
+      const cleanNewDate = newDate || null;
+      const currentDueDate = cur.due_date || null;
+      if (!cleanNewDate) {
+        // Explicit clear (blank, not TBC) — never gated, matches prior behavior.
+        updates.due_date = null; orderDeliveryDate = null;
+      } else if (cleanNewDate === currentDueDate) {
+        // Re-sent, unchanged — nothing to gate or write.
+      } else {
+        dateDecision = evaluateDeliveryDateApproval({ requestedDate: cleanNewDate, currentDate: currentDueDate });
+        if (!dateDecision.valid) {
+          return res.status(400).json({ error: dateDecision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
+        }
+        if (dateDecision.requiresApproval) {
+          dateChangeGated = true; // handled after the services update below — do NOT write due_date/orders.delivery_date here
+        } else {
+          updates.due_date = cleanNewDate; orderDeliveryDate = cleanNewDate;
+        }
+      }
+    } else if (tbcProvided) {
+      updates.due_date = null; orderDeliveryDate = null; // TBC toggled off, no date → unscheduled
+    }
 
-    // Auto status transition on (un)scheduling — only when the caller didn't set
-    // status explicitly. Setting a concrete date moves an 'open' case to
-    // 'scheduled' (so it leaves the Open tab for the Scheduled list); clearing
-    // the date (blank or TBC) moves a still-'scheduled' case back to 'open'.
-    // Cases already further along (in_progress / resolved / closed) are left as-is.
-    if (status === undefined && (newDate !== undefined || tbcProvided)) {
-      const { data: cur } = await supabase.from("services").select("status").eq("id", req.params.id).maybeSingle();
+    // Auto status transition on (un)scheduling — only when the caller didn't
+    // set status explicitly, and only for a date that's actually being
+    // applied now (a gated/pending change hasn't moved the operational date
+    // yet, so the case shouldn't flip to "scheduled" for it).
+    if (status === undefined && !dateChangeGated && (newDate !== undefined || tbcProvided)) {
       const hasRealDate = !isTbc && newDate !== undefined && !!newDate;
-      if (hasRealDate && cur?.status === "open") updates.status = "scheduled";
-      else if (!hasRealDate && cur?.status === "scheduled") updates.status = "open";
+      if (hasRealDate && cur.status === "open") updates.status = "scheduled";
+      else if (!hasRealDate && cur.status === "scheduled") updates.status = "open";
     }
 
     const { data, error } = await supabase.from("services").update(updates).eq("id", req.params.id).select().single();
@@ -8006,7 +8046,61 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
       if (customer_name !== undefined) orderPatch.customer_name = customer_name || null;
       if (customer_phone !== undefined) orderPatch.contact = customer_phone || null;
       if (customer_address !== undefined) orderPatch.address = customer_address || null;
+
+      // URGENT FIX — Service Note / Delivery Schedule sync: the Delivery
+      // Schedule board reads orders.remark/orders.service_note LIVE
+      // (lib/selects.js DELIVERY_SCHEDULE_LIST_SELECT), but these were only
+      // ever copied ONCE at creation time (migration 019's v_note) and never
+      // resynced on update — an edited note silently never reached the
+      // board. Recompose the SAME "Linked to SO: X | description" format
+      // used at creation (reading the order's own immutable linked_so,
+      // never itself changed here) so create and update produce identical
+      // formatting.
+      if (description !== undefined) {
+        const { data: linkedOrder } = await supabase.from("orders").select("linked_so").eq("id", data.legacy_order_id).maybeSingle();
+        const composedNote = [
+          linkedOrder?.linked_so ? `Linked to SO: ${linkedOrder.linked_so}` : null,
+          description || null,
+        ].filter(Boolean).join(" | ") || "Service case";
+        orderPatch.remark = composedNote;
+        orderPatch.service_note = composedNote;
+      }
+
       if (Object.keys(orderPatch).length > 0) await supabase.from("orders").update(orderPatch).eq("id", data.legacy_order_id);
+    }
+
+    // URGENT FIX: the gated date change funnels through the SAME
+    // delivery_date_requests queue every other reschedule uses — never a
+    // second, bypass mutation path. Mirrors POST /delivery-date-requests'
+    // supersede-then-insert exactly (migration 094's uniq_ddr_open_per_order_so_level
+    // applies identically here: a Service Note's legacy order has no DO, so
+    // this is always the SO-level/legacy shape — order_id set, delivery_order_id
+    // and sales_order_id both null).
+    let pendingDateRequest = null;
+    if (dateChangeGated && data?.legacy_order_id) {
+      await supabase.from("delivery_date_requests")
+        .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
+        .in("status", ["pending", "needs_reschedule"])
+        .eq("order_id", data.legacy_order_id).is("delivery_order_id", null);
+
+      const { status: ddrStatus, request: ddr, error: ddrErr } = await createDeliveryDateRequestAndMaybeAutoApprove({
+        company_id: cur.company_id || cid, branch_id: null, order_id: data.legacy_order_id,
+        sales_order_id: null, so_number: null, customer_name: data.customer_name || null,
+        delivery_order_id: null, requested_date: dateDecision.requestedDate, original_date: dateDecision.currentDate,
+        original_team_id: null, original_team_name: null, schedule_id: null,
+        remark: `Service Note date change (case ${req.params.id})`,
+        requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null, requested_via: "service_case",
+      }, req.user.id);
+      if (ddrErr) return res.status(ddrStatus || 500).json({ error: ddrErr });
+      pendingDateRequest = ddr;
+      if (ddr?.status === "approved") {
+        // Defensive only — the decision above already computed
+        // requiresApproval=true with the identical inputs, so this branch
+        // should not normally be reached; kept so services.due_date can
+        // never silently drift from an applied date if it ever is.
+        await supabase.from("services").update({ due_date: ddr.requested_date }).eq("id", req.params.id);
+        orderDeliveryDate = ddr.requested_date;
+      }
     }
 
     // Move the service's team assignment + legs onto the new date too. Editing
@@ -8014,7 +8108,8 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     // but an assigned service (delivery_schedules keyed by legacy_order_id,
     // delivery_order_id NULL) and its service_legs stayed on the OLD date — so
     // the service kept showing on its old day on the delivery route / note.
-    // Only when a real (non-TBC) date is set.
+    // Only when a real (non-TBC) date is set AND actually applied (not a
+    // gated change still awaiting approval).
     if (data?.legacy_order_id && orderDeliveryDate !== undefined && orderDeliveryDate !== "TBC" && orderDeliveryDate) {
       const { data: svScheds } = await supabase.from("delivery_schedules")
         .select("id, status, team_id, delivery_order_id").eq("order_id", data.legacy_order_id).is("delivery_order_id", null);
@@ -8029,7 +8124,7 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
         .eq("service_id", req.params.id)
         .not("status", "in", "(completed,cancelled)");
     }
-    res.json({ service: data });
+    res.json({ service: data, pending_date_request: pendingDateRequest });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

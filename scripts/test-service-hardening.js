@@ -9,6 +9,15 @@
  * running them against production would create/delete real orders.
  *
  * Usage: node scripts/test-service-hardening.js   (exit 0 = all pass)
+ *
+ * KNOWN PRE-EXISTING FAILURES (confirmed via `git stash` — present before
+ * the urgent 10-day-approval/service-note-sync fix, unrelated to it, not
+ * fixed here per that fix's scope):
+ *   - "POST /service-cases calls create_service_case RPC" — the
+ *     manualHandler slice/regex no longer matches the current source shape.
+ *   - "PATCH accepts due_date/delivery_date and mirrors to order" — stale;
+ *     the real line has always been `orderPatch.delivery_date = orderDeliveryDate;`,
+ *     not the literal `= newDate || null;` this assertion checks for.
  */
 const fs = require("fs");
 const path = require("path");
@@ -73,11 +82,18 @@ assert("PATCH sets linked order Delivered on closed/resolved/completed",
 assert("Leg auto-resolve marks linked order Delivered",
   /update\(\{ status: "Delivered" \}\)\.eq\("id", svc\.legacy_order_id\)/.test(server));
 
-console.log("\n── 7. Changing due_date syncs linked order.delivery_date ──");
-assert("PATCH accepts due_date/delivery_date and mirrors to order",
-  /orderPatch\.delivery_date = newDate \|\| null;/.test(server));
-assert("PATCH writes services.due_date from the new date",
-  /updates\.due_date = newDate \|\| null;/.test(server));
+console.log("\n── 7. Changing due_date syncs linked order.delivery_date (URGENT FIX: now gated by the 10-day approval rule) ──");
+assert("PATCH mirrors an APPLIED date directly onto the order (non-gated path)",
+  /if \(orderDeliveryDate !== undefined\) orderPatch\.delivery_date = orderDeliveryDate;/.test(server));
+assert("PATCH writes services.due_date from the new date when the change is NOT gated",
+  /updates\.due_date = cleanNewDate; orderDeliveryDate = cleanNewDate;/.test(server));
+assert("URGENT FIX: a real date change is evaluated against the 10-day rule using BOTH the current and requested date",
+  /evaluateDeliveryDateApproval\(\{ requestedDate: cleanNewDate, currentDate: currentDueDate \}\)/.test(server));
+assert("URGENT FIX: a gated date change is never applied directly — it funnels through delivery_date_requests (never a second bypass mutation path)",
+  (() => {
+    const patchHandler = server.slice(server.indexOf('app.patch("/service-cases/:id"'), server.indexOf('app.delete("/service-cases/:id"'));
+    return /dateChangeGated = true;/.test(patchHandler) && /createDeliveryDateRequestAndMaybeAutoApprove\(\{/.test(patchHandler);
+  })());
 
 console.log("\n── RPC atomicity guarantees ──");
 assert("RPC is a single plpgsql function (transactional by definition)",
