@@ -142,7 +142,8 @@ assert("14. active whole-order schedules re-homed (not terminal); guarded by rea
 console.log("\n── Part 4: reschedule approval path unchanged (21) ──");
 const approvalSrc = fs.readFileSync(path.join(__dirname, "..", "lib", "delivery-date-approval.js"), "utf8");
 assert("21. approval still syncs services.due_date + service_legs (applyApprovedDeliveryDate)",
-  /from\("services"\)\.update\(\{ due_date: newDate \}\)/.test(approvalSrc) &&
+  /const svcUpdate = \{ due_date: newDate \};/.test(approvalSrc) &&
+  /from\("services"\)\.update\(svcUpdate\)/.test(approvalSrc) &&
   /from\("service_legs"\)\.update\(\{ scheduled_date: newDate \}\)/.test(approvalSrc),
   "approval-time service sync changed");
 

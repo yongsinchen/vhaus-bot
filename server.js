@@ -20,6 +20,7 @@ const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
+const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
@@ -8144,8 +8145,12 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
     // yet, so the case shouldn't flip to "scheduled" for it).
     if (status === undefined && !dateChangeGated && (newDate !== undefined || tbcProvided)) {
       const hasRealDate = !isTbc && newDate !== undefined && !!newDate;
-      if (hasRealDate && cur.status === "open") updates.status = "scheduled";
-      else if (!hasRealDate && cur.status === "scheduled") updates.status = "open";
+      // Centralized lifecycle transition (lib/service-lifecycle.js): open ->
+      // scheduled when a real date is applied now, scheduled -> open when it is
+      // cleared; every other state preserved. A gated (still-pending) change
+      // never reaches here, so a pending approval never flips the status.
+      const nextStatus = serviceStatusAfterDateChange(cur.status, hasRealDate);
+      if (nextStatus !== cur.status) updates.status = nextStatus;
     }
 
     let updQ = supabase.from("services").update(updates).eq("id", req.params.id);
@@ -8229,9 +8234,13 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
       if (ddr?.status === "approved") {
         // Defensive only — the decision above already computed
         // requiresApproval=true with the identical inputs, so this branch
-        // should not normally be reached; kept so services.due_date can
-        // never silently drift from an applied date if it ever is.
-        await supabase.from("services").update({ due_date: ddr.requested_date }).eq("id", req.params.id);
+        // should not normally be reached; kept so services.due_date (and the
+        // open -> scheduled lifecycle transition) can never silently drift from
+        // an applied date if it ever is.
+        const svcPatch2 = { due_date: ddr.requested_date };
+        const nextStatus = serviceStatusAfterDateChange(cur.status, true);
+        if (nextStatus !== cur.status) svcPatch2.status = nextStatus;
+        await supabase.from("services").update(svcPatch2).eq("id", req.params.id);
         orderDeliveryDate = ddr.requested_date;
       }
     }

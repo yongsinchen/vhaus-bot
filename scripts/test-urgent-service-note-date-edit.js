@@ -123,8 +123,9 @@ assert("endpoint returns pending_date_request to the client",
 console.log("\n── Part 3: approval-time service sync (applyApprovedDeliveryDate) ──");
 const approvalSrc = fs.readFileSync(path.join(__dirname, "..", "lib", "delivery-date-approval.js"), "utf8");
 assert("on approval, services.due_date is synced for a service-originated request",
-  /from\("services"\)\.select\("id"\)\.eq\("legacy_order_id", reqRow\.order_id\)/.test(approvalSrc) &&
-  /from\("services"\)\.update\(\{ due_date: newDate \}\)/.test(approvalSrc),
+  /from\("services"\)\.select\("id, status"\)\.eq\("legacy_order_id", reqRow\.order_id\)/.test(approvalSrc) &&
+  /const svcUpdate = \{ due_date: newDate \};/.test(approvalSrc) &&
+  /from\("services"\)\.update\(svcUpdate\)/.test(approvalSrc),
   "services.due_date not synced on approval");
 assert("on approval, active service_legs.scheduled_date is synced (completed/cancelled preserved)",
   /from\("service_legs"\)\.update\(\{ scheduled_date: newDate \}\)[\s\S]*\.not\("status", "in", "\(completed,cancelled\)"\)/.test(approvalSrc),
