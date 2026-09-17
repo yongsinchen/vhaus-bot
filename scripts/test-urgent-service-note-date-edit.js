@@ -89,9 +89,9 @@ const patchBody = patchStart < 0 ? "" : serverSrc.slice(patchStart, serverSrc.in
 
 console.log("\n── Part 2: backend gate shape (PATCH /service-cases/:id) ──");
 
-assert("gate exists — service date routed through evaluateDeliveryDateApproval",
-  /evaluateDeliveryDateApproval\(\{\s*requestedDate:\s*cleanNewDate,\s*currentDate:\s*currentDueDate\s*\}\)/.test(patchBody),
-  "gate call not found");
+assert("gate exists — service date routed through the centralized decision helper",
+  /decideServiceDateChange\(\{\s*currentDueDate,\s*requestedDate:\s*cleanNewDate,\s*serviceStatus:\s*cur\.status\s*\}\)/.test(patchBody),
+  "gate call not found (decideServiceDateChange)");
 
 assert("gated change does NOT write due_date/orders date inline (no bypass)",
   /dateChangeGated = true;[^\n]*do NOT write due_date/.test(patchBody),

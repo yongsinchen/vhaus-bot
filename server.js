@@ -19,6 +19,7 @@ const commissionLib = require("./lib/commission");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
+const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
@@ -8114,13 +8115,22 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
       } else if (cleanNewDate === currentDueDate) {
         // Re-sent, unchanged — nothing to gate or write.
       } else {
-        dateDecision = evaluateDeliveryDateApproval({ requestedDate: cleanNewDate, currentDate: currentDueDate });
-        if (!dateDecision.valid) {
-          return res.status(400).json({ error: dateDecision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
+        // Centralized Service-date decision (lib/service-schedule-decision.js):
+        // FIRST SCHEDULING (services.due_date was NULL) applies directly and is
+        // NEVER gated — there is no committed date to protect; a real
+        // RESCHEDULE (existing due_date being moved) follows the unchanged
+        // 10-day evaluateDeliveryDateApproval rule. Scoped to Service Cases;
+        // DO/normal-delivery paths are untouched.
+        const svcDateDecision = decideServiceDateChange({ currentDueDate, requestedDate: cleanNewDate, serviceStatus: cur.status });
+        dateDecision = svcDateDecision.approval; // reused below for original_date/requested_date on the queued request
+        if (!svcDateDecision.valid) {
+          return res.status(400).json({ error: svcDateDecision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
         }
-        if (dateDecision.requiresApproval) {
+        if (svcDateDecision.action === "gated") {
           dateChangeGated = true; // handled after the services update below — do NOT write due_date/orders.delivery_date here
         } else {
+          // Direct apply: either first scheduling (no prior date), or a
+          // reschedule that the 10-day rule auto-approved (both dates 10+ out).
           updates.due_date = cleanNewDate; orderDeliveryDate = cleanNewDate;
         }
       }
@@ -8175,6 +8185,21 @@ app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
       }
 
       if (Object.keys(orderPatch).length > 0) await supabase.from("orders").update(orderPatch).eq("id", data.legacy_order_id);
+    }
+
+    // Self-heal: when a real Service date is applied DIRECTLY (first
+    // scheduling, or a reschedule the 10-day rule auto-approved), any still-
+    // open SO-level delivery_date_request for this legacy order is now
+    // obsolete — retire it so it can't linger as actionable in the approval
+    // queue (the gated branch below already supersedes before inserting; this
+    // is the same supersede for the non-gated case, so a direct apply never
+    // leaves a stranded pending/needs_reschedule request behind). Audit
+    // history is preserved — the row is transitioned, not deleted.
+    if (!dateChangeGated && data?.legacy_order_id && orderDeliveryDate && orderDeliveryDate !== "TBC") {
+      await supabase.from("delivery_date_requests")
+        .update({ status: "rejected", decision_note: "Superseded — date applied directly (no approval required).", updated_at: new Date().toISOString() })
+        .in("status", ["pending", "needs_reschedule"])
+        .eq("order_id", data.legacy_order_id).is("delivery_order_id", null);
     }
 
     // URGENT FIX: the gated date change funnels through the SAME
