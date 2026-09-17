@@ -16128,7 +16128,20 @@ app.get("/auth/effective-permissions", requireAuth, async (req, res) => {
 });
 
 // ── Health Check ──────────────────────────────────────────────────
+const startedAt = new Date().toISOString(); // process/deploy start time (module load)
 app.get("/", (req, res) => res.json({ status: "ok", message: "V Haus Telegram Bot Server" }));
+
+// Deployment provenance — lets a deploy be proven live by the actual running
+// commit, not just an HTTP 200. Railway injects RAILWAY_GIT_COMMIT_SHA at build
+// time; fall back to other common CI/env vars. Read-only, no secrets.
+app.get("/version", (req, res) => res.json({
+  status: "ok",
+  commit: process.env.RAILWAY_GIT_COMMIT_SHA
+    || process.env.GIT_COMMIT_SHA || process.env.SOURCE_VERSION || process.env.COMMIT_SHA || null,
+  branch: process.env.RAILWAY_GIT_BRANCH || null,
+  deployed_at: process.env.RAILWAY_DEPLOYMENT_CREATED_AT || null,
+  started_at: startedAt,
+}));
 
 // ── Global error handler ─────────────────────────────────────────
 app.use((err, req, res, _next) => {
