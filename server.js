@@ -1873,6 +1873,14 @@ const resolveOrderTripBySoNumber = async (soNumber, tripNo, companyId) => {
 
 // Order status lookup ("where is SO 31006") shared by both channels.
 // Returns null when the SO is not found.
+// URGENT FIX (Issue 2, false TBC report): same root cause as beginSchedule()
+// above — orders.delivery_date is historical/reference-only once an active
+// Delivery Order exists (see the P1-2 design note atop resolveActiveDeliveryOrders()
+// in lib/delivery-date-approval.js). This reply used to show o.delivery_date
+// unconditionally, so a delivery-date edit that only touched the historical
+// orders/sales_orders record (never the DO) could make a genuinely-scheduled
+// order report as TBC here. Resolves active DOs and prefers the DO's own date
+// when exactly one is active; with 2+, lists each rather than guessing.
 const buildOrderStatusReply = async (soToken, companyId = null) => {
   const o = await findOrderBySoToken(soToken, { companyId, select: "id, so_number, customer_name, status, delivery_date, time_slot, balance, items, type, salesman" });
   if (!o) return null;
@@ -1881,10 +1889,23 @@ const buildOrderStatusReply = async (soToken, companyId = null) => {
   try { items = typeof o.items === "string" ? JSON.parse(o.items || "[]") : (o.items || []); } catch { items = []; }
   const arrived = items.filter(i => i.arrivalDate).length;
   const pending = items.filter(i => !i.arrivalDate).map(i => i.itemName).filter(Boolean);
+
+  let deliveryLine = `Delivery: ${fmtScheduleDate(o.delivery_date)}${o.time_slot ? ` (${o.time_slot})` : ""}`;
+  const resolvedCompanyId = companyId || (await supabase.from("orders").select("company_id").eq("id", o.id).maybeSingle()).data?.company_id || null;
+  if (resolvedCompanyId) {
+    const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", resolvedCompanyId).eq("order_number", o.so_number).maybeSingle();
+    const activeDeliveryOrders = soRow?.id ? await resolveActiveDeliveryOrders({ supabase, companyId: resolvedCompanyId, salesOrderId: soRow.id }) : [];
+    if (activeDeliveryOrders.length === 1) {
+      deliveryLine = `Delivery: ${fmtDate(activeDeliveryOrders[0].delivery_date)} (${activeDeliveryOrders[0].do_number})`;
+    } else if (activeDeliveryOrders.length > 1) {
+      deliveryLine = `Delivery: multiple — ${activeDeliveryOrders.map(d => `${d.do_number}: ${fmtDate(d.delivery_date)}`).join(", ")}`;
+    }
+  }
+
   return [
     `📋 SO ${o.so_number} — ${o.customer_name || "-"}${o.type === "Service" ? " (Service)" : ""}`,
     `Status: ${o.status || "-"}`,
-    `Delivery: ${o.delivery_date ? fmtDate(o.delivery_date) : "TBC"}${o.time_slot ? ` (${o.time_slot})` : ""}`,
+    deliveryLine,
     o.salesman ? `Salesman: ${o.salesman}` : null,
     items.length ? `Items arrived: ${arrived}/${items.length}${pending.length ? ` — pending: ${pending.slice(0, 3).join(", ")}${pending.length > 3 ? "…" : ""}` : ""}` : null,
     parseFloat(o.balance) > 0 ? `🔴 Outstanding balance: RM ${o.balance}` : null,
@@ -2010,6 +2031,13 @@ const parseDateInput = (text) => {
 };
 
 const fmtDate = (d) => d ? new Date(d + "T00:00:00").toLocaleDateString("en-MY", { weekday: "short", day: "numeric", month: "short", year: "numeric" }) : "-";
+// Some delivery_date writers (e.g. the SO edit/amendment path) store the
+// literal string "TBC" rather than NULL — fmtDate() has no TBC case, so
+// fmtDate("TBC") silently renders "Invalid Date". Use this wherever a
+// "current schedule" value being displayed might legitimately be that
+// sentinel string (a Delivery Order's own delivery_date never is, so plain
+// fmtDate stays correct there).
+const fmtScheduleDate = (d) => (!d || d === "TBC") ? "TBC" : fmtDate(d);
 
 // ── Create order trips ────────────────────────────────────────────
 const createTrips = async (soNumber, svNumber, totalTrips, deliveryDate = null) => {
@@ -8940,24 +8968,54 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
 
     // Look up an SO and open a scheduling session. Replies + returns null on
     // failure; returns the session data when ready for a date.
+    //
+    // URGENT FIX (Issue 2, false TBC report): sales_orders.delivery_date /
+    // orders.delivery_date become historical/reference fields once ANY active
+    // Delivery Order exists for the SO (see the P1-2 design note atop
+    // resolveActiveDeliveryOrders() in lib/delivery-date-approval.js — the DO's
+    // own delivery_date is canonical from then on; a later non-critical edit to
+    // the SO's delivery_date, e.g. via an amendment, never touches the DO and
+    // can legitimately diverge from it). This function used to read
+    // order.delivery_date unconditionally, so once that historical field drifted
+    // to "TBC" while an active DO still carried a real date, the assistant
+    // reported a false TBC even though the order was genuinely scheduled.
+    // Now it resolves active DOs the same way processDate()/finalizeDeliveryDateRequest()
+    // already do downstream, and prefers the DO's date whenever exactly one is
+    // active. Never guesses across 2+ active DOs — see currentDateNote below.
     const beginSchedule = async (soToken) => {
       const order = await findOrderBySoToken(soToken, { companyId, select: "id, so_number, customer_name, delivery_date, type, status, is_multi_trip", types: ["Delivery", "Service"] });
       if (!order) { reply(`SO ${soToken} not found. Check the number and try again, or type "help".`); return null; }
       if (order.ambiguous) { reply(`SO ${soToken} exists in more than one company. Please use the web Sales Order search to find the right one.`); return null; }
       if (["Delivered", "Cancelled"].includes(order.status)) { reply(`SO ${order.so_number} is already ${order.status} — it can't be rescheduled.`); return null; }
+
+      const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", companyId).eq("order_number", order.so_number).maybeSingle();
+      const activeDeliveryOrders = soRow?.id ? await resolveActiveDeliveryOrders({ supabase, companyId, salesOrderId: soRow.id }) : [];
+
+      let currentDate = order.delivery_date;
+      let currentDateNote = null;
+      if (activeDeliveryOrders.length === 1) {
+        currentDate = activeDeliveryOrders[0].delivery_date;
+      } else if (activeDeliveryOrders.length > 1) {
+        // Never assert a single "current" date when more than one active DO
+        // exists — list each one instead of guessing (same fail-safe rule
+        // resolveDeliveryDateRequestTarget already applies on the write side).
+        currentDate = null;
+        currentDateNote = activeDeliveryOrders.map(d => `${d.do_number}: ${fmtDate(d.delivery_date)}`).join(", ");
+      }
+
       const data = {
-        soNumber: order.so_number, orderId: order.id, currentDate: order.delivery_date,
+        soNumber: order.so_number, orderId: order.id, currentDate,
         customerName: order.customer_name, isMultiTrip: order.is_multi_trip === true,
       };
       setSession(key, "web_schedule", "waiting_date", data);
-      return data;
+      return { ...data, currentDateNote };
     };
 
     const askForDate = async (data) => {
       const upcoming = (await suggestDeliveryDates(companyId, 7)).slice(0, 3);
       return reply([
         `SO ${data.soNumber} — ${data.customerName || ""}`,
-        `Currently scheduled: ${fmtDate(data.currentDate)}`,
+        data.currentDateNote ? `Currently scheduled: multiple deliveries — ${data.currentDateNote}` : `Currently scheduled: ${fmtScheduleDate(data.currentDate)}`,
         "",
         "When should it be delivered? (e.g. 15/7, tmr, TBC)",
         "",
@@ -11441,19 +11499,29 @@ app.get("/sales-orders/:id/delivery-recommendation", ...requirePerm(PERMS.DELIVE
     if (!ctx) return res.status(404).json({ error: "Sales order not found" });
     const summary = buildAllocationSummary(ctx.so, ctx.deliveryOrders, ctx.legacyOrder);
 
-    const ready_items = summary.filter(i => i.arrived && i.remaining_qty > 0);
-    const waiting_items = summary.filter(i => !i.arrived && i.remaining_qty > 0);
+    // URGENT FIX (Issue 3): this used to gate "ready" on the boolean `arrived`
+    // flag and suggest `remaining_qty` (ordered − delivered − allocated,
+    // arrival-blind) as the quantity to prefill. For a partially-arrived item
+    // (e.g. ordered 2, arrived 1) that suggested the FULL ordered quantity —
+    // the exact same number validateDoRequest()'s non-override gate correctly
+    // rejects, since it enforces `available_to_allocate_qty` (arrival-capped;
+    // see lib/delivery-orders.js computeAllocations). The Create DO modal
+    // prefills its quantity picker straight from suggested_items_for_next_do,
+    // so this recommendation must agree with the guard it feeds into rather
+    // than recommending a quantity the backend will then refuse.
+    const ready_items = summary.filter(i => i.available_to_allocate_qty > 0);
+    const waiting_items = summary.filter(i => i.available_to_allocate_qty <= 0 && i.remaining_qty > 0);
     const already_allocated_items = summary.filter(i => i.allocated_qty > 0);
     const blockers = [];
     if (ctx.legacyOrder?.is_multi_trip) blockers.push("Order uses Telegram multi-trip flow — DO creation blocked until Phase 2");
     if (ctx.so.status === "cancelled") blockers.push("Sales order is cancelled");
-    if (waiting_items.length > 0) blockers.push(`${waiting_items.length} item(s) not arrived: ${waiting_items.map(i => i.product_name).join(", ")}`);
+    if (waiting_items.length > 0) blockers.push(`${waiting_items.length} item(s) not yet available for delivery: ${waiting_items.map(i => i.product_name).join(", ")}`);
 
     res.json({
       sales_order_id: ctx.so.id,
       order_number: ctx.so.order_number,
       ready_items, waiting_items, already_allocated_items,
-      suggested_items_for_next_do: ready_items.map(i => ({ sales_order_item_id: i.sales_order_item_id, product_name: i.product_name, quantity: i.remaining_qty })),
+      suggested_items_for_next_do: ready_items.map(i => ({ sales_order_item_id: i.sales_order_item_id, product_name: i.product_name, quantity: i.available_to_allocate_qty })),
       blockers,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
