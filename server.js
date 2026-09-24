@@ -24,6 +24,7 @@ const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
+const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { createActiveDoAmendmentService, diffAmendmentAgainstLive, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
 const { createItemArrivalEventService, SOURCES: ARRIVAL_EVENT_SOURCES } = require("./lib/item-arrival-events");
 const { getCommissionableAmount } = commissionLib;
@@ -5526,10 +5527,10 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
     const { data: customer } = await supabase.from("customers").select("*").eq("id", req.params.id).single();
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     // Load all orders for this customer
-    const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, created_at, type")
+    const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, order_date, created_at, type")
       .eq("customer_id", customer.id).order("created_at", { ascending: false });
     // Also find orders by phone match if customer_id not linked
-    const { data: phoneOrders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, created_at, type")
+    const { data: phoneOrders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, order_date, created_at, type")
       .eq("company_id", customer.company_id).ilike("contact", `%${customer.phone || "NOMATCH"}%`).is("customer_id", null);
     const allOrders = [...(orders || []), ...(phoneOrders || [])];
     // Load payments (the ledger — on-delivery collections, recorded payments).
@@ -5657,7 +5658,34 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
 // is exact and fully reversible: recording or deleting a payment always lands
 // on the correct total, so a capped over-/double-payment can never wipe the
 // original deposit. Clamped to [0, order total].
+//
+// computeOrderLedgerBalance is the read-only half (no writes): it returns the
+// authoritative { ord, so, ids, paid, balance }, or nothing when there is no
+// sales order to derive from (no so_number, Service order, SO not found).
+// /payments/record uses it to validate a legacy orders row whose stored
+// balance is still NULL (never recomputed) against this same source.
 async function recomputeOrderPaid(orderId) {
+  const ledger = await computeOrderLedgerBalance(orderId);
+  if (!ledger) return;
+  const { ord, so, ids, paid, balance } = ledger;
+  await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
+  for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
+
+  // Auto-confirm: a "pending_deposit" order becomes a real, confirmed sale the
+  // moment any deposit lands. Forward-only — never revert a confirmed/delivered
+  // order if its paid amount later drops back to zero (refund / edit). This is
+  // the single choke point every payment path flows through, so recording a
+  // deposit anywhere (customer screen, driver collection, reconciliation) flips
+  // the order and (re)calculates commission.
+  if (so.status === "pending_deposit" && paid > 0) {
+    await supabase.from("sales_orders").update({ status: "confirmed" }).eq("id", so.id);
+    for (const id of ids) await supabase.from("orders").update({ status: deliveryStatusFromSO("confirmed") }).eq("id", id);
+    try { for (const id of ids) await calculateCommission(id, ord.company_id); }
+    catch (e) { console.error("[recomputeOrderPaid] auto-confirm commission:", e.message); }
+  }
+}
+
+async function computeOrderLedgerBalance(orderId) {
   const { data: ord } = await supabase.from("orders")
     .select("so_number, company_id, type").eq("id", orderId).single();
   if (!ord?.so_number) return;
@@ -5733,21 +5761,7 @@ async function recomputeOrderPaid(orderId) {
   const totalWithAdmin = total + (Number(so.admin_charges) || 0) + adminPayments;
   const paid = Math.max(0, Math.min(totalWithAdmin, initial + paidFromPayments));
   const balance = Math.max(0, totalWithAdmin - paid);
-  await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
-  for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
-
-  // Auto-confirm: a "pending_deposit" order becomes a real, confirmed sale the
-  // moment any deposit lands. Forward-only — never revert a confirmed/delivered
-  // order if its paid amount later drops back to zero (refund / edit). This is
-  // the single choke point every payment path flows through, so recording a
-  // deposit anywhere (customer screen, driver collection, reconciliation) flips
-  // the order and (re)calculates commission.
-  if (so.status === "pending_deposit" && paid > 0) {
-    await supabase.from("sales_orders").update({ status: "confirmed" }).eq("id", so.id);
-    for (const id of ids) await supabase.from("orders").update({ status: deliveryStatusFromSO("confirmed") }).eq("id", id);
-    try { for (const id of ids) await calculateCommission(id, ord.company_id); }
-    catch (e) { console.error("[recomputeOrderPaid] auto-confirm commission:", e.message); }
-  }
+  return { ord, so, ids, paid, balance };
 }
 
 // ── Cross-Order Payments ────────────────────────────────────────
@@ -5764,49 +5778,32 @@ async function nextOrNumber(companyId) {
   return Math.max(Number(p?.or_number) || 0, Number(s?.deposit_or_number) || 0) + 1;
 }
 
+// URGENT FIX — Finance cross-order payment allocation. Money movement, so the
+// backend is authoritative regardless of what the frontend previewed:
+// company ownership, customer relationship, and outstanding balance are all
+// re-verified against LIVE data immediately before posting, using
+// integer-cents arithmetic (never floating-point equality) for every amount
+// comparison. See the URGENT FINANCE forensic/design report for the full
+// architecture trace — payment_allocations already existed and is reused
+// as-is; no migration was needed for this fix. The actual validation/write
+// logic lives in lib/payment-allocation.js (extracted so the dedicated test
+// suite can exercise it directly, not a mirror — recomputeOrderPaid/
+// calculateCommission/nextOrNumber are hoisted function declarations, safe to
+// reference here regardless of their textual position in this file).
+const paymentAllocationService = createPaymentAllocationService({ supabase, recomputeOrderPaid, calculateCommission, nextOrNumber, computeOrderLedgerBalance });
+
 app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   try {
-    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind } = req.body;
-    if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
     const cid = getActiveCompanyId(req);
-    // "deposit" vs "balance" is descriptive only — the money math is identical
-    // (recomputeOrderPaid derives paid/balance from the full ledger). Reject
-    // anything else so the column stays clean; unspecified stays NULL (legacy).
-    const paymentKind = kind === "deposit" || kind === "balance" ? kind : null;
-    // The payment starts PENDING Finance approval (migration 065). The Official
-    // Receipt number IS assigned now so the salesman can print the OR at
-    // collection; approval only governs whether the money counts toward
-    // balance/commission, not whether a receipt exists.
-    const orNumber = await nextOrNumber(cid);
-    const { data: payment, error } = await supabase.from("payments").insert({
-      order_id: order_id || (allocations?.[0]?.order_id) || null,
-      customer_id: customer_id || null,
-      amount: Number(amount), payment_method: payment_method || "cash",
-      reference_no: reference_no || null, recorded_by: req.user.id,
-      proof_url: proof_url || null,
-      admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
-      kind: paymentKind, or_number: orNumber, approval_status: "pending",
-      company_id: cid,
-    }).select().single();
-    if (error) throw error;
-    // Allocate to orders. Balance is not adjusted by hand — recomputeOrderPaid
-    // below derives it from the full ledger (initial deposit + all payments).
-    const affectedOrders = new Set();
-    if (Array.isArray(allocations) && allocations.length > 0) {
-      const rows = allocations.filter(a => a.order_id && Number(a.amount) > 0).map(a => ({
-        payment_id: payment.id, order_id: a.order_id, amount: Number(a.amount),
-      }));
-      if (rows.length > 0) await supabase.from("payment_allocations").insert(rows);
-      for (const a of rows) affectedOrders.add(a.order_id);
-    } else if (order_id) {
-      affectedOrders.add(order_id);
+    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind } = req.body;
+    const result = await paymentAllocationService.recordPaymentWithAllocations({
+      cid, actorUserId: req.user.id, customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind,
+    });
+    if (!result.ok) {
+      const { ok, status, error, code, ...extra } = result;
+      return res.status(status).json({ error, code, ...extra });
     }
-    // Recompute paid/deposit + balance from the ledger, then recalc commissions.
-    for (const oid of affectedOrders) {
-      try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
-      try { await calculateCommission(oid, getActiveCompanyId(req), { cascade: false }); } catch (e) { console.error("commission recalc error:", e.message); }
-    }
-    res.json({ payment });
+    res.json({ payment: result.payment, allocations: result.allocations });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -7862,16 +7859,26 @@ app.patch("/statement-transactions/:id", requireRole(MANAGE_ROLES), async (req, 
 // Confirm all matches and record payments
 app.post("/statements/:id/reconcile", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
+    const cid = getActiveCompanyId(req);
     const { data: txns } = await supabase.from("statement_transactions").select("*")
       .eq("upload_id", req.params.id).in("match_status", ["auto_matched", "confirmed"]);
     let recorded = 0;
     for (const txn of (txns || [])) {
       if (!txn.matched_order_id) continue;
+      // URGENT FIX P0: verify the matched order actually belongs to the
+      // caller's company before recording a payment against it, and stamp
+      // company_id — both were previously missing (same class of defect
+      // found in /payments/record and driver collection).
+      if (cid) {
+        const { data: matchedOrder } = await supabase.from("orders").select("id, company_id").eq("id", txn.matched_order_id).maybeSingle();
+        if (!matchedOrder || String(matchedOrder.company_id) !== String(cid)) continue;
+      }
       // Create payment
       const { data: payment } = await supabase.from("payments").insert({
         order_id: txn.matched_order_id, amount: txn.amount,
         payment_method: "Bank Transfer", reference_no: txn.reference || null,
         recorded_by: req.user.id, notes: `Statement reconciliation: ${txn.description || ""}`.trim(),
+        company_id: cid,
       }).select().single();
       if (payment) {
         // Recompute paid/deposit + balance from the ledger (payment now recorded).
@@ -11156,12 +11163,21 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
   try {
     const { amount, method, reference_no } = req.body;
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
-    const { data: sched } = await supabase.from("delivery_schedules").select("order_id").eq("id", req.params.id).single();
+    const cid = getActiveCompanyId(req);
+    // URGENT FIX P0: company-scope the schedule lookup and stamp company_id on
+    // the payment — this insert previously had neither, a real cross-company
+    // money-movement gap (found while auditing every payment-writing endpoint
+    // for the same class of defect as /payments/record). Narrow fix only —
+    // multi-order allocation for driver collection stays explicitly deferred.
+    let schedQ = supabase.from("delivery_schedules").select("order_id").eq("id", req.params.id);
+    if (cid) schedQ = schedQ.eq("company_id", cid);
+    const { data: sched } = await schedQ.single();
     if (!sched?.order_id) return res.status(404).json({ error: "Schedule not found" });
     // Record payment
     await supabase.from("payments").insert({
       order_id: sched.order_id, amount: Number(amount), payment_method: method || "cash",
       reference_no: reference_no || null, recorded_by: req.user.id, notes: `Collected on delivery`,
+      company_id: cid,
     });
     // Recompute paid/deposit + balance from the ledger (payment now recorded).
     try { await recomputeOrderPaid(sched.order_id); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
