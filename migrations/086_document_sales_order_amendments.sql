@@ -1,0 +1,77 @@
+-- ══════════════════════════════════════════════════════════════════
+-- 086: document sales_order_amendments (the REAL, currently-used
+-- amendment table) directly in the database schema.
+--
+-- P0-19 (migration 079) already documented that order_amendments
+-- (migration 073) is an orphaned, empty table from an earlier
+-- superseded design, and that the Sales Order amendment workflow
+-- (P0-18) actually uses a DIFFERENT table, sales_order_amendments —
+-- created directly in the database with NO corresponding CREATE TABLE
+-- migration anywhere in this repo's history (confirmed: grepping every
+-- migrations/*.sql file for "CREATE TABLE" + "sales_order_amendments"
+-- returns nothing). Migration 079 flagged this gap as "worth a follow-up
+-- to add one purely for schema-history reproducibility" — this is that
+-- follow-up.
+--
+-- This migration performs ZERO DDL. It cannot CREATE TABLE a table that
+-- already exists in production with real, live data (every P0-18
+-- amendment ever submitted lives here) without risking a destructive
+-- collision, and it cannot reverse-engineer the exact original DDL
+-- (column defaults, index names, etc.) with certainty. Instead — exactly
+-- like migration 079's treatment of order_amendments — it only attaches
+-- a COMMENT ON TABLE so the table's real shape and purpose are visible
+-- directly via \d+ or information_schema, not just inferred from
+-- scattered server.js call sites.
+--
+-- Columns below were enumerated by reading every
+-- supabase.from("sales_order_amendments") call site in server.js
+-- (.insert/.select/.update — the two writers around line 14193/14391,
+-- the reader/patch endpoints ~14498-14562, and the pending-count probe
+-- at line 3814) as of HEAD d477ed2, immediately before writing this file:
+--
+--   id                 — primary key (UUID, inferred from every .eq("id", ...) usage)
+--   company_id         — multi-company scoping (filtered on every list/read)
+--   branch_id          — nullable, carried from the sales order at insert time
+--   sales_order_id     — FK to sales_orders(id); the order this amendment targets
+--   order_number       — denormalized sales_orders.order_number, for display without a join
+--   customer_name      — denormalized, for display without a join
+--   category           — 'critical' (items/SKU/qty/price/discount/amount — needs
+--                        approval) | 'customer_detail' (non-critical, auto-approved)
+--   status             — 'pending' | 'approved' | 'rejected' | 'conflict'
+--   before_snapshot    — full sales_orders (+ sales_order_items) row as it stood
+--                        when the amendment was requested; used by
+--                        applySalesOrderAmendment() to detect drift before applying
+--   proposed_snapshot   — the exact header + items the amendment would write on
+--                        approval (header fields identical in shape to the
+--                        sales_orders UPDATE payload, plus an `items` array)
+--   changes            — human-readable before/after diff list, shown in the
+--                        approval UI
+--   requested_by       — user id who submitted the amendment
+--   requested_by_name  — denormalized display name at submission time
+--   reviewed_by        — user id who approved/rejected (NULL while pending)
+--   reviewed_by_name   — denormalized display name of the reviewer
+--   reviewed_at        — timestamp of the approve/reject decision
+--   decision_note      — optional free-text note attached to the decision
+--   created_at         — row creation timestamp
+--   updated_at         — last-modified timestamp (already written by existing
+--                        code, e.g. conflict-marking and approve/reject handlers)
+--
+-- Extended by migration 087 (active_do_snapshot, expected_so_updated_at)
+-- as part of P1-1 — Active Delivery Order Amendment.
+--
+-- Canonical table remains, and must remain, sales_order_amendments —
+-- order_amendments (migration 073) stays orphaned per migration 079.
+-- ══════════════════════════════════════════════════════════════════
+
+COMMENT ON TABLE sales_order_amendments IS
+  'Canonical Sales Order amendment queue (P0-18). Created directly in the database with no corresponding CREATE TABLE migration in this repo — see migrations/086_document_sales_order_amendments.sql for the full enumerated column list and rationale. A CRITICAL edit (items/SKU/qty/price/discount/amount) to a confirmed/delivered/amended order is recorded here as status=''pending'' with before_snapshot/proposed_snapshot, WITHOUT touching the live sales_orders/sales_order_items rows; the live order flips to status=''amended'' only as a pending-review flag. A manager approval applies proposed_snapshot via applySalesOrderAmendment() (server.js) — or, for a critical amendment submitted while the order had an active Delivery Order, via the apply_active_do_amendment() RPC (migration 089, P1-1). Rejection restores the order''s pre-amendment status with nothing ever applied. A non-critical (customer_detail) edit is recorded here already status=''approved'' (auto-approved, no gate). status also takes the value ''conflict'' when the live order drifted since the amendment was requested and it could not be applied automatically. NOT to be confused with order_amendments (migration 073), which is orphaned — see migrations/079_document_order_amendments_deprecated.sql.';
+
+-- Verification:
+--   SELECT obj_description('sales_order_amendments'::regclass, 'pg_class');
+--   SELECT column_name, data_type FROM information_schema.columns
+--   WHERE table_name = 'sales_order_amendments' ORDER BY ordinal_position;
+--   -- Confirm the column list above matches the enumerated set (plus
+--   -- migration 087's two additions once applied).
+
+-- Rollback:
+--   COMMENT ON TABLE sales_order_amendments IS NULL;
