@@ -8230,6 +8230,67 @@ app.patch("/service-requests/:id/reject", requireRole(DATE_APPROVER_ROLES), asyn
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Requester-only changes to a still-PENDING service request. Nothing exists
+// operationally until approval (no case, legs, order or items), so a pending
+// request can be amended or withdrawn freely; approved/rejected are history.
+async function loadOwnPendingServiceRequest(req) {
+  const companyId = getActiveCompanyId(req);
+  let rq = supabase.from("service_requests").select("*").eq("id", req.params.id);
+  if (companyId) rq = rq.eq("company_id", companyId);
+  const { data: r } = await rq.maybeSingle();
+  if (!r) return { status: 404, error: "Request not found" };
+  if (r.requested_by !== req.user.id) return { status: 403, error: "Only the person who made this request can change it" };
+  if (r.status !== "pending") return { status: 409, error: `Request already ${r.status}` };
+  return { r };
+}
+
+// PATCH /service-requests/:id — requester amends a pending request. Same
+// fields as POST /service-requests; the linked order stays as submitted.
+app.patch("/service-requests/:id", requireRole(ORDER_ROLES), async (req, res) => {
+  try {
+    const { r, status, error } = await loadOwnPendingServiceRequest(req);
+    if (error) return res.status(status).json({ error });
+    const b = req.body || {};
+    const updates = { updated_at: new Date().toISOString() };
+    if (b.service_type !== undefined) {
+      if (!Number(b.service_type)) return res.status(400).json({ error: "service_type required" });
+      updates.service_type = Number(b.service_type);
+    }
+    if (b.description !== undefined) updates.description = b.description || null;
+    if (b.service_date !== undefined) updates.service_date = b.service_date || null;
+    if (b.delivery_date !== undefined) updates.delivery_date = b.delivery_date || null;
+    if (b.schedule_tbc !== undefined) updates.schedule_tbc = b.schedule_tbc === true || b.schedule_tbc === "true";
+    if (b.items !== undefined) updates.items = Array.isArray(b.items) ? b.items : [];
+    if (b.amount !== undefined) updates.amount = (b.amount !== null && b.amount !== "") ? (Number(b.amount) || 0) : null;
+    // Customer details only matter when no order is linked (approval pulls
+    // them from the order otherwise) — same as creation.
+    if (!r.order_id) {
+      if (b.customer_name !== undefined) updates.customer_name = b.customer_name || null;
+      if (b.customer_phone !== undefined) updates.customer_phone = b.customer_phone || null;
+      if (b.customer_address !== undefined) updates.customer_address = b.customer_address || null;
+    }
+    // Compare-and-swap on "pending" so an approval at the same moment wins.
+    const { data: rows, error: upErr } = await supabase.from("service_requests")
+      .update(updates).eq("id", r.id).eq("status", "pending").select();
+    if (upErr) throw upErr;
+    if (!rows?.[0]) return res.status(409).json({ error: "Request is already decided" });
+    res.json({ request: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /service-requests/:id — requester withdraws a pending request.
+app.delete("/service-requests/:id", requireRole(ORDER_ROLES), async (req, res) => {
+  try {
+    const { r, status, error } = await loadOwnPendingServiceRequest(req);
+    if (error) return res.status(status).json({ error });
+    const { data: rows, error: delErr } = await supabase.from("service_requests")
+      .delete().eq("id", r.id).eq("status", "pending").select("id");
+    if (delErr) throw delErr;
+    if (!rows?.[0]) return res.status(409).json({ error: "Request is already decided" });
+    res.json({ deleted: true, id: r.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 app.patch("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
