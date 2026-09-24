@@ -16,6 +16,7 @@ const { classifySalesOrderItemEdit, identityKey: soItemIdentityKey } = require("
 const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
+const commissionLifecycle = require("./lib/commission-lifecycle");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
@@ -72,6 +73,10 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
 const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
+
+// Cancelled-order commission clawback — the one write path for it (cancel
+// route + SO edit). Paid rows are never touched; see lib/commission-lifecycle.js.
+const { clawbackCancelledSalesOrder } = commissionLifecycle.createCommissionLifecycle({ supabase });
 
 // Supplier DO intake service — single write path shared by the Telegram
 // Group-C flow and the webapp upload endpoints. Deps are lambda-wrapped
@@ -3949,10 +3954,11 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
     const month = `${new Date().toISOString().slice(0, 7)}-01`;
     const commissionPromise = (isSalesman && cid) ? (async () => {
       const [{ data: elig }, { data: pend }] = await Promise.all([
-        supabase.from("commissions").select("id, commission_amt, status").eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid).eq("user_id", req.user.id),
-        supabase.from("commissions").select("id, commission_amt, status").eq("status", "pending").eq("company_id", cid).eq("user_id", req.user.id),
+        supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)").eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid).eq("user_id", req.user.id),
+        supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)").eq("status", "pending").eq("company_id", cid).eq("user_id", req.user.id),
       ]);
-      const comms = [...(elig || []), ...(pend || [])];
+      // Same Cancelled-order exclusion as GET /commission-payout.
+      const { payable: comms } = commissionLifecycle.splitPayoutRows([...(elig || []), ...(pend || [])], c => c.orders?.status);
       const ids = comms.map(c => c.id);
       let adjustments = [], holds = [];
       if (ids.length > 0) {
@@ -6692,7 +6698,7 @@ async function enrichItemsWithProductId(items, orderCtx = null) {
 // they either already visit every order or don't change the month total.
 async function calculateCommission(orderId, companyId, opts = {}) {
   const cascade = opts.cascade !== false;
-  const { data: order, error: orderErr } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type, country, address, incentive_excluded_ids")
+  const { data: order, error: orderErr } = await supabase.from("orders").select("id, so_number, order_amount, balance, salesman, company_id, branch_id, created_at, order_date, items, sales_channel, type, country, address, incentive_excluded_ids, status")
     .eq("id", orderId).single();
   // A failed read must not look like "order not found" — that would return quietly
   // and skip the commission entirely, with nothing to show it had happened. This is
@@ -6702,6 +6708,13 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   if (!order) return;
   // Service orders are logistics-only and financially inert — never commissionable.
   if (order.type === "Service") return;
+  // A Cancelled order never generates payable commission. Deliberately a NO-OP
+  // (no insert, no update, no purge): the cancellation itself claws the rows
+  // back (clawbackOrderCommissions), and any later recalculation — payment,
+  // SO edit, a sibling order's monthly re-tier, Recalculate All — must not
+  // rewrite a clawback row as pending/eligible or create a new payable row.
+  // Historical bad rows are cleaned up by an explicit, reviewed clawback.
+  if (commissionLifecycle.isCancelledStatus(order.status)) return;
 
   // Which month an order belongs to is driven by the order's own date, not when the
   // commission record happened to be created. Editing an order's date (e.g. back-dating
@@ -6791,7 +6804,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
       if (monthlySales === undefined) {
         const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
         const dStart = monthStart.toISOString().slice(0, 10), dEnd = monthEnd.toISOString().slice(0, 10);
-        const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman, country, address")
+        const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman, country, address, status")
           .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
           .gte("order_date", dStart).lt("order_date", dEnd);
         // Orders shared between multiple sales assistants count only this salesman's
@@ -6799,7 +6812,9 @@ async function calculateCommission(orderId, companyId, opts = {}) {
         // tier matching) — not the full order amount for every assistant on it.
         // Singapore orders count GST-exclusive here too, so tier matching uses the
         // same commissionable base as the commission itself.
-        monthlySales = (monthOrders || []).reduce((s, o) => {
+        // Cancelled sales never count toward the monthly total / tier (filtered
+        // here, null-safe — a SQL status filter would also drop NULL statuses).
+        monthlySales = (monthOrders || []).filter(o => !commissionLifecycle.isCancelledStatus(o.status)).reduce((s, o) => {
           const namesOnOrder = (o.salesman || "").split("/").map(nm => nm.trim()).filter(Boolean);
           const commissionable = getCommissionableAmount(o);
           const share = namesOnOrder.length > 0 ? commissionable / namesOnOrder.length : commissionable;
@@ -7044,10 +7059,12 @@ async function calculateCommission(orderId, companyId, opts = {}) {
     const dStart = ms.toISOString().slice(0, 10), dEnd = me.toISOString().slice(0, 10);
     const siblingIds = new Set();
     for (const name of salesmanNames) {
-      const { data: sibs } = await supabase.from("orders").select("id")
+      const { data: sibs } = await supabase.from("orders").select("id, status")
         .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
         .gte("order_date", dStart).lt("order_date", dEnd);
-      for (const s of (sibs || [])) if (Number(s.id) !== Number(orderId)) siblingIds.add(s.id);
+      // Never re-tier a Cancelled sibling (calculateCommission would no-op on
+      // it anyway — skipping it here keeps the cascade from even trying).
+      for (const s of (sibs || [])) if (Number(s.id) !== Number(orderId) && !commissionLifecycle.isCancelledStatus(s.status)) siblingIds.add(s.id);
     }
     for (const sid of siblingIds) {
       try { await calculateCommission(sid, companyId, { cascade: false }); }
@@ -7601,9 +7618,14 @@ app.patch("/wrong-item-holds/:id", requireRole(MANAGE_ROLES), async (req, res) =
     if (status === "released") { updates.released_at = new Date().toISOString(); updates.override_by = req.user.id; }
     const { data, error } = await supabase.from("wrong_item_holds").update(updates).eq("id", req.params.id).select().single();
     if (error) throw error;
-    // If released, update commission back to eligible
+    // If released, update commission back to eligible — but only a row that is
+    // still "held", and never on a Cancelled order (that would resurrect a
+    // clawback / stale row as payable).
     if (status === "released" && data.commission_id) {
-      await supabase.from("commissions").update({ status: "eligible" }).eq("id", data.commission_id);
+      const { data: comm } = await supabase.from("commissions").select("id, status, orders(status)").eq("id", data.commission_id).maybeSingle();
+      if (comm && comm.status === "held" && !commissionLifecycle.isCancelledStatus(comm.orders?.status)) {
+        await supabase.from("commissions").update({ status: "eligible" }).eq("id", data.commission_id).eq("status", "held");
+      }
     }
     res.json({ hold: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -7632,7 +7654,10 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     if (user_id) pq = pq.eq("user_id", user_id);
     if (cid) pq = pq.eq("company_id", cid);
     const { data: pendingComms } = await pq;
-    const comms = [...(eligibleComms || []), ...(pendingComms || [])];
+    // Defense in depth: a stale pending/eligible/held row on a Cancelled order is
+    // never payable, whatever its own status says (paid rows stay as history).
+    const { payable: comms, excludedCancelled } = commissionLifecycle.splitPayoutRows(
+      [...(eligibleComms || []), ...(pendingComms || [])], c => c.orders?.status);
     // Get adjustments
     const commIds = (comms || []).map(c => c.id);
     let adjustments = [];
@@ -7660,7 +7685,10 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
       byUser[uid].holds.push(...userHolds);
       byUser[uid].total += (Number(c.commission_amt) || 0) + adjTotal - holdTotal;
     }
-    res.json({ payout_month: month, users: Object.values(byUser), total: Object.values(byUser).reduce((s, u) => s + u.total, 0) });
+    res.json({
+      payout_month: month, users: Object.values(byUser), total: Object.values(byUser).reduce((s, u) => s + u.total, 0),
+      excluded_cancelled: excludedCancelled.map(c => ({ id: c.id, order_id: c.order_id, so_number: c.orders?.so_number || null, user_id: c.user_id, status: c.status, commission_amt: Number(c.commission_amt) || 0 })),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -7678,14 +7706,15 @@ app.get("/commission-summary", requireAuth, async (req, res) => {
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
 
-    let eq = supabase.from("commissions").select("id, commission_amt, status")
+    let eq = supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)")
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid);
     if (user_id) eq = eq.eq("user_id", user_id);
-    let pq = supabase.from("commissions").select("id, commission_amt, status")
+    let pq = supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)")
       .eq("status", "pending").eq("company_id", cid);
     if (user_id) pq = pq.eq("user_id", user_id);
     const [{ data: eligibleComms }, { data: pendingComms }] = await Promise.all([eq, pq]);
-    const comms = [...(eligibleComms || []), ...(pendingComms || [])];
+    // Same Cancelled-order exclusion as GET /commission-payout.
+    const { payable: comms } = commissionLifecycle.splitPayoutRows([...(eligibleComms || []), ...(pendingComms || [])], c => c.orders?.status);
 
     const commIds = comms.map(c => c.id);
     let adjustments = [], holds = [];
@@ -15553,6 +15582,23 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // month (order in June → payout July; back-dated to April → payout May), and
     // amounts follow any total change. Fire when the order already has a
     // commission, or whenever the order date changed (even if the row is missing).
+    // Cancelling through the edit form (Status dropdown) is a cancellation too:
+    // same clawback + driver-commission reversal as PATCH /sales-orders/:id/status.
+    // (calculateCommission below no-ops on the now-Cancelled order.) Same
+    // company-scoped list lookup as the status route — duplicates, a missing
+    // link and lookup errors all come back as an explicit warning.
+    let clawbackWarning = null;
+    if (finalStatus === "cancelled" && existing.status !== "cancelled") {
+      try {
+        const clawback = await clawbackCancelledSalesOrder({ companyId: company_id, orderNumber: full?.order_number || existing.order_number, reason: notes || "sales order cancelled (edit)" });
+        clawbackWarning = clawback.warning;
+      } catch (e) {
+        clawbackWarning = `commission clawback failed: ${e.message}`;
+        console.error("commission clawback on order edit:", e.message);
+      }
+      try { await reverseDeliveryCommission(id, notes || "sales order cancelled"); }
+      catch (e) { console.error("driver commission reversal on order edit:", e.message); }
+    }
     if (deliveryOrderId) {
       try {
         const { data: existingComm } = await supabase.from("commissions").select("id").eq("order_id", deliveryOrderId).limit(1).maybeSingle();
@@ -15599,6 +15645,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     res.json({
       order: full,
       ...(projectionSyncError ? { projection_sync_warning: "Sales order saved, but it may not yet be visible in Delivery/Telegram/Driver. An admin has been notified — retry or check scripts/audit-data-consistency.js." } : {}),
+      ...(clawbackWarning ? { commission_clawback_warning: clawbackWarning } : {}),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -15896,26 +15943,33 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
       .select("*, sales_order_items(*)").single();
     if (error) throw error;
     const { syncError: statusSyncError } = await syncSalesOrderToDelivery(data, data.sales_order_items);
-    // Recalculate commission on status change (cancel claws back, confirm may enable)
-    if (["cancelled", "confirmed", "amended"].includes(status)) {
+    // Cancel claws back; confirm/amended may enable.
+    let clawbackWarning = null;
+    if (status === "cancelled") {
+      try {
+        // Company-scoped LIST lookup of the linked order(s): exactly one → claw
+        // back; duplicates → claw back every one + warn; none / lookup error →
+        // explicit warning (never a silent skip). Paid rows are never touched.
+        const clawback = await clawbackCancelledSalesOrder({ companyId: data.company_id, orderNumber: data.order_number, reason: cancel_reason || "sales order cancelled" });
+        clawbackWarning = clawback.warning;
+      } catch (e) {
+        clawbackWarning = `commission clawback failed: ${e.message}`;
+        console.error("commission clawback on cancel:", e.message);
+      }
+      // Driver (delivery) commission reverses on the same event — keyed on the
+      // sales order (data.id), unpaid rows only.
+      try { await reverseDeliveryCommission(data.id, cancel_reason || "sales order cancelled"); }
+      catch (e) { console.error("driver commission reversal on cancel:", e.message); }
+    } else if (["confirmed", "amended"].includes(status)) {
       try {
         const { data: legacyOrder } = await supabase.from("orders").select("id, company_id").eq("company_id", data.company_id).eq("so_number", data.order_number).maybeSingle();
-        if (legacyOrder) {
-          if (status === "cancelled") {
-            // Clawback: set all commissions for this order to status "clawback"
-            await supabase.from("commissions").update({ status: "clawback", commission_amt: 0 }).eq("order_id", legacyOrder.id);
-            // Driver (delivery) commission reverses on the same event —
-            // keyed on the sales order (data.id), unpaid rows only.
-            await reverseDeliveryCommission(data.id, cancel_reason || "sales order cancelled");
-          } else {
-            await calculateCommission(legacyOrder.id, data.company_id);
-          }
-        }
+        if (legacyOrder) await calculateCommission(legacyOrder.id, data.company_id);
       } catch (e) { console.error("commission recalc on status change:", e.message); }
     }
     res.json({
       order: { id: data.id, status: data.status },
       ...(statusSyncError ? { projection_sync_warning: "Status updated, but the operational projection sync failed. An admin has been notified — check scripts/audit-data-consistency.js." } : {}),
+      ...(clawbackWarning ? { commission_clawback_warning: clawbackWarning } : {}),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
