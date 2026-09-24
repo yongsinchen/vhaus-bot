@@ -17,6 +17,7 @@ const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
 const commissionLifecycle = require("./lib/commission-lifecycle");
+const { salespersonTokens, orderHasSalesperson, escapeLike } = require("./lib/salesperson-tokens");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
@@ -6689,6 +6690,30 @@ async function enrichItemsWithProductId(items, orderCtx = null) {
   return out;
 }
 
+// Orders counting toward ONE salesperson's monthly tier total: same company,
+// sales month (order_date in [dStart, dEnd)) and non-Service scope as before,
+// but matched by EXACT salesperson token — never substring (so "Jim" does not
+// count "Jimmy" sales). The escaped ILIKE is only a server-side pre-filter: it
+// is a guaranteed superset of the exact-token matches (a token equal to the
+// name is a literal substring), bounded by one person's month. The shared
+// token rule decides membership. Paged by id so PostgREST's row cap can never
+// silently truncate the month, and a read failure throws instead of silently
+// becoming a RM0 month total.
+async function fetchSalespersonMonthOrders(companyId, name, cols, dStart, dEnd) {
+  const out = [];
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase.from("orders").select(cols)
+      .eq("company_id", companyId).ilike("salesman", `%${escapeLike(name)}%`).or("type.is.null,type.neq.Service")
+      .gte("order_date", dStart).lt("order_date", dEnd)
+      .order("id", { ascending: true }).range(from, from + PAGE - 1);
+    if (error) throw new Error(`could not read monthly sales for "${name}": ${error.message}`);
+    for (const o of (data || [])) if (orderHasSalesperson(o.salesman, name)) out.push(o);
+    if (!data || data.length < PAGE) break;
+  }
+  return out;
+}
+
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
 // opts.cascade (default true): after computing THIS order, recompute the
 // salesman's other orders in the same business month so a newly-reached tier
@@ -6768,7 +6793,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   const totalPackageIncentive = clearanceCtx ? clearanceCtx.packageIncentives.reduce((s, p) => s + p.amount, 0) : 0;
 
   // Find salesman users (no DB query — uses cached users)
-  const salesmanNames = (order.salesman || "").split("/").map(s => s.trim()).filter(Boolean);
+  const salesmanNames = salespersonTokens(order.salesman);
   const n = salesmanNames.length || 1;
 
   // Resolve every salesman's own matched tier rate FIRST (same lookup as
@@ -6804,9 +6829,9 @@ async function calculateCommission(orderId, companyId, opts = {}) {
       if (monthlySales === undefined) {
         const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
         const dStart = monthStart.toISOString().slice(0, 10), dEnd = monthEnd.toISOString().slice(0, 10);
-        const { data: monthOrders } = await supabase.from("orders").select("order_amount, salesman, country, address, status")
-          .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
-          .gte("order_date", dStart).lt("order_date", dEnd);
+        // Exact-token match (lib/salesperson-tokens.js): "Jim" never counts
+        // "Jimmy" sales. Same company / sales-month / non-Service scope as before.
+        const monthOrders = await fetchSalespersonMonthOrders(companyId, name, "order_amount, salesman, country, address, status", dStart, dEnd);
         // Orders shared between multiple sales assistants count only this salesman's
         // fractional share toward their own monthly cumulative sales (and therefore
         // tier matching) — not the full order amount for every assistant on it.
@@ -6815,7 +6840,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
         // Cancelled sales never count toward the monthly total / tier (filtered
         // here, null-safe — a SQL status filter would also drop NULL statuses).
         monthlySales = (monthOrders || []).filter(o => !commissionLifecycle.isCancelledStatus(o.status)).reduce((s, o) => {
-          const namesOnOrder = (o.salesman || "").split("/").map(nm => nm.trim()).filter(Boolean);
+          const namesOnOrder = salespersonTokens(o.salesman);
           const commissionable = getCommissionableAmount(o);
           const share = namesOnOrder.length > 0 ? commissionable / namesOnOrder.length : commissionable;
           return s + share;

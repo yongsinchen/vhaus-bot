@@ -125,7 +125,7 @@ const commissionCode = lines.slice(startIdx, endIdx + 1).join("\n");
 
 function loadCalc(db) {
   const ctx = vm.createContext({
-    supabase: db, commissionLib, commissionLifecycle: lifecycle, getCommissionableAmount: commissionLib.getCommissionableAmount,
+    supabase: db, commissionLib, commissionLifecycle: lifecycle, ...require("../lib/salesperson-tokens"), getCommissionableAmount: commissionLib.getCommissionableAmount,
     SALES_COMMISSION_ROLES: ["salesman", "part_time", "short_term_part_time"],
     console: { log() {}, warn() {}, error() {} }, Date, Math, JSON, Number, String, Array, Object, Set, Map, Promise, Boolean, isNaN, parseFloat, parseInt, Error,
   });
@@ -301,7 +301,7 @@ const commsFor = (db, oid) => db.tables.commissions.filter(c => c.order_id === o
   const calcSrc = commissionCode.slice(commissionCode.indexOf("async function calculateCommission("));
   const svcIdx = calcSrc.indexOf('if (order.type === "Service") return;'), canIdx = calcSrc.indexOf("if (commissionLifecycle.isCancelledStatus(order.status)) return;");
   assert("E1. calculateCommission reads orders.status and returns before any commission read/write when Cancelled", /incentive_excluded_ids, status"\)/.test(calcSrc) && canIdx > svcIdx && canIdx < calcSrc.indexOf('from("commissions")'));
-  assert("E2. monthly tier total filters Cancelled orders (null-safe, in JS)", /select\("order_amount, salesman, country, address, status"\)/.test(calcSrc) && /monthOrders \|\| \[\]\)\.filter\(o => !commissionLifecycle\.isCancelledStatus\(o\.status\)\)/.test(calcSrc));
+  assert("E2. monthly tier total filters Cancelled orders (null-safe, in JS)", /"order_amount, salesman, country, address, status"/.test(calcSrc) && /monthOrders \|\| \[\]\)\.filter\(o => !commissionLifecycle\.isCancelledStatus\(o\.status\)\)/.test(calcSrc));
   assert("E3. re-tier cascade skips Cancelled siblings", /!commissionLifecycle\.isCancelledStatus\(s\.status\)\) siblingIds\.add/.test(calcSrc));
   const statusRoute = block('app.patch("/sales-orders/:id/status"');
   const cancelBranch = statusRoute.slice(statusRoute.indexOf('if (status === "cancelled") {'), statusRoute.indexOf('} else if (["confirmed", "amended"]'));
