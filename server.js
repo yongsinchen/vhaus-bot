@@ -5376,6 +5376,72 @@ app.patch("/delivery-date-requests/:id/pick", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Requester-only edits of a still-OPEN request (pending / needs_reschedule).
+// An open request has had no effect on the order/DO yet, so it can be amended
+// or withdrawn freely; once approved/rejected it is history and stays as-is.
+const OPEN_DDR_STATUSES = ["pending", "needs_reschedule"];
+async function loadOwnOpenDeliveryDateRequest(req) {
+  const cid = getActiveCompanyId(req);
+  const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
+  if (!r || (cid && r.company_id !== cid)) return { status: 404, error: "Request not found" };
+  if (r.requested_by !== req.user.id) return { status: 403, error: "Only the person who made this request can change it" };
+  if (!OPEN_DDR_STATUSES.includes(r.status)) return { status: 400, error: `Request is already ${r.status}` };
+  return { r };
+}
+
+// PATCH /delivery-date-requests/:id — requester amends date and/or remark.
+// Re-runs the same 10-day rule as creation (evaluateDeliveryDateApproval): a
+// date that now qualifies auto-approves through the canonical claim+apply
+// path; otherwise the request goes back to "pending" for review, clearing any
+// alternatives the reviewer proposed for the old date.
+app.patch("/delivery-date-requests/:id", requireAuth, async (req, res) => {
+  try {
+    const { r, status, error } = await loadOwnOpenDeliveryDateRequest(req);
+    if (error) return res.status(status).json({ error });
+    const requestedDate = req.body?.requested_date || r.requested_date;
+    const remark = req.body?.remark !== undefined ? (String(req.body.remark || "").trim() || null) : r.remark;
+    const decision = evaluateDeliveryDateApproval({ requestedDate, currentDate: r.original_date || null });
+    if (!decision.valid) {
+      return res.status(400).json({ error: decision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
+    }
+    if (decision.autoApproved) {
+      const outcome = await claimAndApplyDeliveryDateRequest(r, {
+        actorId: req.user.id, newRequestedDate: requestedDate,
+        extraUpdateFields: { remark, decision_note: "Auto-approved — requested date is 10+ calendar days out" },
+      });
+      if (outcome.error) return res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
+      // Flag only once applied — a conflict revert above doesn't restore extra fields.
+      await supabase.from("delivery_date_requests").update({ auto_approved: true }).eq("id", r.id);
+      return res.json({ request: { ...outcome.request, auto_approved: true } });
+    }
+    // Compare-and-swap on the open status so a reviewer deciding at the same
+    // moment wins cleanly instead of being overwritten.
+    const { data: rows, error: upErr } = await supabase.from("delivery_date_requests").update({
+      requested_date: requestedDate, remark, status: "pending", auto_approved: false,
+      alternative_dates: null, decision_note: null,
+      reviewed_by: null, reviewed_by_name: null, reviewed_at: null, updated_at: new Date().toISOString(),
+    }).eq("id", r.id).in("status", OPEN_DDR_STATUSES).select();
+    if (upErr) throw upErr;
+    if (!rows?.[0]) return res.status(400).json({ error: "Request is already decided" });
+    res.json({ request: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /delivery-date-requests/:id — requester withdraws an open request.
+// Hard delete: an open request never touched the order/DO, so there is
+// nothing to reverse (the status CHECK has no "withdrawn" value either).
+app.delete("/delivery-date-requests/:id", requireAuth, async (req, res) => {
+  try {
+    const { r, status, error } = await loadOwnOpenDeliveryDateRequest(req);
+    if (error) return res.status(status).json({ error });
+    const { data: rows, error: delErr } = await supabase.from("delivery_date_requests")
+      .delete().eq("id", r.id).in("status", OPEN_DDR_STATUSES).select("id");
+    if (delErr) throw delErr;
+    if (!rows?.[0]) return res.status(400).json({ error: "Request is already decided" });
+    res.json({ deleted: true, id: r.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /orders — legacy orders for linking (e.g. the Service create "Link to
 // Order" search). Company-scoped, excludes Service orders, optional ?search=
 // on so_number/customer_name. Returns the bigint id services.order_id expects.
