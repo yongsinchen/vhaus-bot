@@ -14551,7 +14551,10 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
     // Load legacy order for arrival data
     let legacyOrder = null;
     if (data.order_number) {
-      const { data: leg } = await supabase.from("orders").select("id, items").eq("company_id", data.company_id).eq("so_number", data.order_number).maybeSingle();
+      // balance/customer_id: the Orders page records payments against this
+      // legacy row (payments.order_id) and shows its authoritative balance,
+      // which includes instalment admin charges (see recomputeOrderPaid).
+      const { data: leg } = await supabase.from("orders").select("id, items, balance, customer_id").eq("company_id", data.company_id).eq("so_number", data.order_number).maybeSingle();
       legacyOrder = leg;
     }
     // P1-1: the most recent sales_order_amendments row for this SO, in ANY
