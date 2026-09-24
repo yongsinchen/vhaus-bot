@@ -5918,9 +5918,21 @@ app.post("/product-incentives", requireRole(COMMISSION_ROLES), async (req, res) 
   try {
     const { product_id, product_code, product_name, incentive_amount, start_date, end_date } = req.body;
     if (!incentive_amount || Number(incentive_amount) <= 0) return res.status(400).json({ error: "incentive_amount required" });
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved" });
+    // Incentives are matched EXACTLY by product_id (lib/commission.js), so a
+    // config without one can never pay — reject it rather than store a dead row.
+    if (!product_id) return res.status(400).json({ error: "product_id is required — choose an exact product/variant" });
+    // The product must belong to this company's catalog (company isolation +
+    // catalog integrity: never configure an incentive against another company's
+    // or a non-existent product).
+    const { data: prod } = await supabase.from("products").select("id, code, name").eq("id", product_id).eq("company_id", cid).maybeSingle();
+    if (!prod) return res.status(400).json({ error: "product_id not found in this company's catalogue" });
     const { data, error } = await supabase.from("product_incentives").insert({
-      company_id: getActiveCompanyId(req), product_id: product_id || null,
-      product_code: product_code || null, product_name: product_name || null,
+      company_id: cid, product_id,
+      // product_code/product_name are display-only labels; product_id is the
+      // accounting identity. Default them from the catalogue when not supplied.
+      product_code: product_code || prod.code || null, product_name: product_name || prod.name || null,
       incentive_amount: Number(incentive_amount), start_date: start_date || null,
       end_date: end_date || null, is_active: true, created_by: req.user.id,
     }).select().single();
@@ -5937,15 +5949,28 @@ app.put("/product-incentives/:id", requireRole(COMMISSION_ROLES), async (req, re
     if (start_date !== undefined) updates.start_date = start_date || null;
     if (end_date !== undefined) updates.end_date = end_date || null;
     if (is_active !== undefined) updates.is_active = is_active;
-    const { data, error } = await supabase.from("product_incentives").update(updates).eq("id", req.params.id).select().single();
+    // P0 company isolation: scope by company so a caller cannot edit another
+    // company's incentive by knowing its UUID.
+    const cid = getActiveCompanyId(req);
+    let uq = supabase.from("product_incentives").update(updates).eq("id", req.params.id);
+    if (cid) uq = uq.eq("company_id", cid);
+    const { data, error } = await uq.select().maybeSingle();
     if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Incentive not found" });
     res.json({ incentive: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete("/product-incentives/:id", requireRole(COMMISSION_ROLES), async (req, res) => {
   try {
-    await supabase.from("product_incentives").delete().eq("id", req.params.id);
+    // P0 company isolation: delete exactly this company's row by id — never
+    // another company's incentive by UUID, and (delete is by id) never siblings.
+    const cid = getActiveCompanyId(req);
+    let dq = supabase.from("product_incentives").delete().eq("id", req.params.id);
+    if (cid) dq = dq.eq("company_id", cid);
+    const { data, error } = await dq.select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Incentive not found" });
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6511,6 +6536,27 @@ async function buildClearanceCommissionContext(order, companyId, cache, net) {
   return { remainderSell, clearanceLines, packageIncentives, sotOrderId: sot.id };
 }
 
+// Resolve each legacy-items entry's exact product_id via its soiId
+// (soiId → sales_order_items.product_id), batched to avoid N+1. Product
+// incentive matching is EXACT on product_id (lib/commission.js), so every
+// path that matches incentives enriches its items through here first — an
+// item with no soiId / unresolvable product_id gets product_id:null and
+// therefore earns no incentive (fail closed). Never used for anything but
+// incentive identity.
+async function enrichItemsWithProductId(items) {
+  const arr = Array.isArray(items) ? items : [];
+  const soiIds = [...new Set(arr.map(it => it && it.soiId).filter(Boolean).map(String))];
+  const byId = new Map();
+  if (soiIds.length) {
+    const { data } = await supabase.from("sales_order_items").select("id, product_id").in("id", soiIds);
+    for (const r of (data || [])) byId.set(String(r.id), r.product_id || null);
+  }
+  return arr.map(it => ({
+    ...it,
+    product_id: (it && it.soiId != null) ? (byId.get(String(it.soiId)) || null) : null,
+  }));
+}
+
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
 // opts.cascade (default true): after computing THIS order, recompute the
 // salesman's other orders in the same business month so a newly-reached tier
@@ -6569,7 +6615,8 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // to every salesman on it and survives recalculation without any special handling
   // here — this function simply reads the current exclusion list.
   const orderItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-  const incentiveRows = commissionLib.matchProductIncentives(orderItems, cache.incentives, order.incentive_excluded_ids || []);
+  const enrichedItems = await enrichItemsWithProductId(orderItems);
+  const incentiveRows = commissionLib.matchProductIncentives(enrichedItems, cache.incentives, order.incentive_excluded_ids || []);
   const productIncentiveTotal = commissionLib.payableProductIncentiveTotal(incentiveRows);
 
   // Phase C: resolve clearance/bundle context once for the whole order (not
@@ -7090,7 +7137,8 @@ async function loadOrderIncentiveItems(orderId, cid) {
   if (!order) return null;
   const cache = await getCommCache(cid);
   const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-  return { order, rows: commissionLib.matchProductIncentives(items, cache.incentives, order.incentive_excluded_ids || []) };
+  const enriched = await enrichItemsWithProductId(items);
+  return { order, rows: commissionLib.matchProductIncentives(enriched, cache.incentives, order.incentive_excluded_ids || []) };
 }
 
 // Which product incentives a sales order earns, and whether each is switched on.
