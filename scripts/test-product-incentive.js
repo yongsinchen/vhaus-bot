@@ -118,5 +118,55 @@ console.log("Product Incentive — exact product_id matching\n");
   assert("no product_name substring fallback → RM0", rows.length === 0, JSON.stringify(rows));
 }
 
+// ── Deterministic legacy-item → product_id fallback (soiId is primary) ──────
+// Reuses the real production key: product_code + composed name + qty, unique-only.
+const { buildDeterministicPidIndex, resolveLegacyItemProductId } = C;
+console.log("\nDeterministic fallback (code + composed name + qty), unique-only\n");
+
+// sales_order_items-shaped rows for one order (Queen + King + a Super Single).
+const SOI = [
+  { product_id: QUEEN, product_code: "ALESSIO", product_name: "ALESSIO 12.5\"", size: "Queen", color: null, custom_dimensions: "152cm x 190cm", quantity: 1 },
+  { product_id: KING,  product_code: "ALESSIO", product_name: "ALESSIO 12.5\"", size: "King",  color: null, custom_dimensions: "183cm x 190cm", quantity: 1 },
+  { product_id: SS,    product_code: "ALESSIO", product_name: "ALESSIO 12.5\"", size: "Super Single", color: null, custom_dimensions: "107cm x 190cm", quantity: 2 },
+];
+const idx = buildDeterministicPidIndex(SOI);
+// legacy items carry the composed name in itemName (name+size+color+dims joined).
+const legacy = (code, name, unit) => ({ itemCode: code, itemName: name, unit: String(unit) });
+
+// 16. Unique match on code+composed-name+qty → resolves to the RIGHT variant.
+assert("16. Queen legacy item → QUEEN product_id (unique)",
+  resolveLegacyItemProductId(legacy("ALESSIO", "ALESSIO 12.5\" Queen 152cm x 190cm", 1), idx) === QUEEN);
+assert("17. King legacy item → KING product_id (unique, distinguished by size)",
+  resolveLegacyItemProductId(legacy("ALESSIO", "ALESSIO 12.5\" King 183cm x 190cm", 1), idx) === KING);
+// 18. Whitespace/case differences are normalized.
+assert("18. name whitespace/case normalized → still resolves",
+  resolveLegacyItemProductId(legacy("alessio", "  ALESSIO 12.5\"   Queen   152cm x 190cm ", 1), idx) === QUEEN);
+// 19. Qty must match — right product, wrong qty → no resolve (fail closed).
+assert("19. qty mismatch → null (never resolve on code+name alone)",
+  resolveLegacyItemProductId(legacy("ALESSIO", "ALESSIO 12.5\" Super Single 107cm x 190cm", 1), idx) === null);
+assert("19b. Super Single qty2 → resolves (qty matches)",
+  resolveLegacyItemProductId(legacy("ALESSIO", "ALESSIO 12.5\" Super Single 107cm x 190cm", 2), idx) === SS);
+// 20. No candidate → null.
+assert("20. unknown item → null (stays RM0)",
+  resolveLegacyItemProductId(legacy("VICTORIA", "VICTORIA 15\" Queen 152cm x 190cm", 1), idx) === null);
+// 21. AMBIGUOUS: two DIFFERENT product_ids share one key → NEVER guess (null).
+{
+  const dupIdx = buildDeterministicPidIndex([
+    { product_id: QUEEN, product_code: "DUP", product_name: "DUP", size: null, color: null, custom_dimensions: null, quantity: 1 },
+    { product_id: KING,  product_code: "DUP", product_name: "DUP", size: null, color: null, custom_dimensions: null, quantity: 1 },
+  ]);
+  assert("21. ambiguous key (2 distinct product_ids) → null (never positional/first)",
+    resolveLegacyItemProductId(legacy("DUP", "DUP", 1), dupIdx) === null);
+}
+// 22. Same product_id appearing twice under one key is NOT ambiguous → resolves.
+{
+  const sameIdx = buildDeterministicPidIndex([
+    { product_id: QUEEN, product_code: "Q", product_name: "Q", size: null, color: null, custom_dimensions: null, quantity: 1 },
+    { product_id: QUEEN, product_code: "Q", product_name: "Q", size: null, color: null, custom_dimensions: null, quantity: 1 },
+  ]);
+  assert("22. duplicate rows, same product_id → resolves (set size 1)",
+    resolveLegacyItemProductId(legacy("Q", "Q", 1), sameIdx) === QUEEN);
+}
+
 console.log(`\n${fail === 0 ? "✅ ALL PASS" : "❌ FAILURES"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

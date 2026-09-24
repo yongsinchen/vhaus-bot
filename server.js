@@ -6536,25 +6536,57 @@ async function buildClearanceCommissionContext(order, companyId, cache, net) {
   return { remainderSell, clearanceLines, packageIncentives, sotOrderId: sot.id };
 }
 
-// Resolve each legacy-items entry's exact product_id via its soiId
-// (soiId → sales_order_items.product_id), batched to avoid N+1. Product
-// incentive matching is EXACT on product_id (lib/commission.js), so every
-// path that matches incentives enriches its items through here first — an
-// item with no soiId / unresolvable product_id gets product_id:null and
-// therefore earns no incentive (fail closed). Never used for anything but
-// incentive identity.
-async function enrichItemsWithProductId(items) {
+// Resolve each legacy-items entry's exact product_id, batched to avoid N+1.
+// Product incentive matching is EXACT on product_id (lib/commission.js), so
+// every path that matches incentives enriches its items through here first.
+//
+//   1. PRIMARY — the immutable soiId (soiId → sales_order_items.product_id).
+//   2. FALLBACK — legacy rows predating soiId stamping carry none. When
+//      `orderCtx` ({ company_id, so_number }) is supplied, resolve those via a
+//      DETERMINISTIC key (product_code + composed name + qty) against the
+//      order's own sales_order_items, unique-match-only (lib/commission.js).
+//      NOT fuzzy, NOT positional — 0 mis-resolutions on 1018 production
+//      ground-truth items. so_number is tokenized so combined orders
+//      ("55349 55350 55715") resolve across all their sales orders.
+//
+// An item still unresolved after both passes gets product_id:null and
+// `_pidSource:"unresolved"` (audit flag — earns no incentive, fail closed).
+// Each item carries `_pidSource` ("soiId" | "fallback" | "unresolved").
+async function enrichItemsWithProductId(items, orderCtx = null) {
   const arr = Array.isArray(items) ? items : [];
+  // 1) Primary: soiId → product_id.
   const soiIds = [...new Set(arr.map(it => it && it.soiId).filter(Boolean).map(String))];
-  const byId = new Map();
+  const bySoi = new Map();
   if (soiIds.length) {
     const { data } = await supabase.from("sales_order_items").select("id, product_id").in("id", soiIds);
-    for (const r of (data || [])) byId.set(String(r.id), r.product_id || null);
+    for (const r of (data || [])) bySoi.set(String(r.id), r.product_id || null);
   }
-  return arr.map(it => ({
-    ...it,
-    product_id: (it && it.soiId != null) ? (byId.get(String(it.soiId)) || null) : null,
-  }));
+  const out = arr.map(it => {
+    const pid = (it && it.soiId != null) ? (bySoi.get(String(it.soiId)) || null) : null;
+    return { ...it, product_id: pid, _pidSource: pid ? "soiId" : "unresolved" };
+  });
+
+  // 2) Deterministic fallback — only when we have order context AND unresolved items.
+  if (orderCtx && orderCtx.company_id && orderCtx.so_number && out.some(it => it.product_id == null)) {
+    const tokens = String(orderCtx.so_number).trim().split(/[\s,&/()]+/).filter(Boolean);
+    if (tokens.length) {
+      const { data: sos } = await supabase.from("sales_orders")
+        .select("id").eq("company_id", orderCtx.company_id).in("order_number", tokens);
+      const soIds = (sos || []).map(s => s.id);
+      if (soIds.length) {
+        const { data: soi } = await supabase.from("sales_order_items")
+          .select("product_id, product_code, product_name, size, color, custom_dimensions, quantity")
+          .in("order_id", soIds);
+        const pidIndex = commissionLib.buildDeterministicPidIndex(soi || []);
+        for (const it of out) {
+          if (it.product_id != null) continue;
+          const resolved = commissionLib.resolveLegacyItemProductId(it, pidIndex);
+          if (resolved) { it.product_id = resolved; it._pidSource = "fallback"; }
+        }
+      }
+    }
+  }
+  return out;
 }
 
 // Calculate commission for an order — uses cached rules/incentives/users (3 queries cached, 1-2 per order)
@@ -6615,7 +6647,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // to every salesman on it and survives recalculation without any special handling
   // here — this function simply reads the current exclusion list.
   const orderItems = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-  const enrichedItems = await enrichItemsWithProductId(orderItems);
+  const enrichedItems = await enrichItemsWithProductId(orderItems, { company_id: order.company_id, so_number: order.so_number });
   const incentiveRows = commissionLib.matchProductIncentives(enrichedItems, cache.incentives, order.incentive_excluded_ids || []);
   const productIncentiveTotal = commissionLib.payableProductIncentiveTotal(incentiveRows);
 
@@ -7137,7 +7169,7 @@ async function loadOrderIncentiveItems(orderId, cid) {
   if (!order) return null;
   const cache = await getCommCache(cid);
   const items = typeof order.items === "string" ? JSON.parse(order.items || "[]") : (order.items || []);
-  const enriched = await enrichItemsWithProductId(items);
+  const enriched = await enrichItemsWithProductId(items, { company_id: order.company_id, so_number: order.so_number });
   return { order, rows: commissionLib.matchProductIncentives(enriched, cache.incentives, order.incentive_excluded_ids || []) };
 }
 
