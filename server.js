@@ -17,6 +17,7 @@ const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
 const commissionLifecycle = require("./lib/commission-lifecycle");
+const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { salespersonTokens, orderHasSalesperson, escapeLike } = require("./lib/salesperson-tokens");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
@@ -5771,88 +5772,73 @@ async function nextOrNumber(companyId) {
   return Math.max(Number(p?.or_number) || 0, Number(s?.deposit_or_number) || 0) + 1;
 }
 
+// URGENT FIX — migration 105's transactional RPCs are now the canonical
+// financial write for every payment mutation (record/approve/reject/
+// reverse). This service is a thin wrapper: it never inserts a payment,
+// inserts an allocation, or updates a balance itself — see
+// lib/payment-allocation.js's own header for the full contract.
+// calculateCommission is a hoisted function declaration (defined later in
+// this file), safe to reference here regardless of textual position.
+const paymentAllocationService = createPaymentAllocationService({ supabase, calculateCommission });
+
+// Recalculate commission for every order an RPC reported as affected —
+// best-effort, exactly like every other call site in this file (a failure
+// here never fails the financial write that already committed).
+async function recalcCommissionForAffectedOrders(orderIds, companyId) {
+  for (const oid of orderIds || []) {
+    try { await calculateCommission(oid, companyId, { cascade: false }); }
+    catch (e) { console.error("commission recalc error:", e.message); }
+  }
+}
+
 app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
   try {
-    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind } = req.body;
-    if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
     const cid = getActiveCompanyId(req);
-    // "deposit" vs "balance" is descriptive only — the money math is identical
-    // (recomputeOrderPaid derives paid/balance from the full ledger). Reject
-    // anything else so the column stays clean; unspecified stays NULL (legacy).
-    const paymentKind = kind === "deposit" || kind === "balance" ? kind : null;
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    const { customer_id, order_id, amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind, idempotency_key } = req.body;
     // The payment starts PENDING Finance approval (migration 065). The Official
     // Receipt number IS assigned now so the salesman can print the OR at
     // collection; approval only governs whether the money counts toward
-    // balance/commission, not whether a receipt exists.
+    // balance/commission, not whether a receipt exists. Computed here (not
+    // inside the RPC) to keep OR-number minting exactly as it was before
+    // this port — see the design report's "remaining risks" note on this
+    // being a separate, smaller, still-open race, out of scope for this fix.
     const orNumber = await nextOrNumber(cid);
-    const { data: payment, error } = await supabase.from("payments").insert({
-      order_id: order_id || (allocations?.[0]?.order_id) || null,
-      customer_id: customer_id || null,
-      amount: Number(amount), payment_method: payment_method || "cash",
-      reference_no: reference_no || null, recorded_by: req.user.id,
-      proof_url: proof_url || null,
-      admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
-      kind: paymentKind, or_number: orNumber, approval_status: "pending",
-      company_id: cid,
-    }).select().single();
-    if (error) throw error;
-    // Allocate to orders. Balance is not adjusted by hand — recomputeOrderPaid
-    // below derives it from the full ledger (initial deposit + all payments).
-    const affectedOrders = new Set();
-    if (Array.isArray(allocations) && allocations.length > 0) {
-      const rows = allocations.filter(a => a.order_id && Number(a.amount) > 0).map(a => ({
-        payment_id: payment.id, order_id: a.order_id, amount: Number(a.amount),
-      }));
-      if (rows.length > 0) await supabase.from("payment_allocations").insert(rows);
-      for (const a of rows) affectedOrders.add(a.order_id);
-    } else if (order_id) {
-      affectedOrders.add(order_id);
-    }
-    // Recompute paid/deposit + balance from the ledger, then recalc commissions.
-    for (const oid of affectedOrders) {
-      try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
-      try { await calculateCommission(oid, getActiveCompanyId(req), { cascade: false }); } catch (e) { console.error("commission recalc error:", e.message); }
-    }
-    res.json({ payment });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const result = await paymentAllocationService.recordPaymentWithAllocations({
+      cid, actorUserId: req.user.id, customer_id, order_id, amount, payment_method,
+      reference_no, proof_url, allocations, admin_charges, kind, idempotency_key, or_number: orNumber,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
+    // Commission recalculation ONLY after the RPC has committed — never on a
+    // failed/rejected write, and never as part of the same transaction (see
+    // migration 105's header on why commission stays outside the RPC).
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    res.status(result.status).json({ payment: result.payment, allocations: result.allocations });
+  } catch (err) { console.error("POST /payments/record error:", err); res.status(500).json({ error: "Failed to record payment" }); }
 });
 
 // Finance approval of collected payments (migration 065). Only these roles may
 // approve/reject; the salesman who recorded it cannot self-approve.
 const FINANCE_APPROVE_ROLES = ["master", "finance"];
 
-// Orders touched by a payment = its own order_id plus every allocation target.
-async function paymentAffectedOrders(payment) {
-  const set = new Set();
-  if (payment.order_id) set.add(payment.order_id);
-  const { data: allocs } = await supabase.from("payment_allocations").select("order_id").eq("payment_id", payment.id);
-  for (const a of (allocs || [])) if (a.order_id) set.add(a.order_id);
-  return [...set];
-}
-async function reprocessPaymentOrders(payment, companyId) {
-  for (const oid of await paymentAffectedOrders(payment)) {
-    try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
-    try { await calculateCommission(oid, companyId, { cascade: false }); } catch (e) { console.error("commission recalc error:", e.message); }
-  }
-}
-
 // PATCH /payments/:id/approve — Finance approves; the money now counts, the
 // order (re)computes paid/balance + commission, and an OR number is minted.
 app.patch("/payments/:id/approve", requireRole(FINANCE_APPROVE_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { data: payment } = await supabase.from("payments").select("*").eq("id", req.params.id).maybeSingle();
-    if (!payment || (cid && payment.company_id !== cid)) return res.status(404).json({ error: "Payment not found" });
-    if (payment.approval_status === "approved") return res.status(400).json({ error: "Payment is already approved" });
-    const orNumber = payment.or_number != null ? payment.or_number : await nextOrNumber(payment.company_id || cid);
-    const { data: updated, error } = await supabase.from("payments").update({
-      approval_status: "approved", approved_by: req.user.id, approved_at: new Date().toISOString(),
-      approval_note: req.body?.note || null, or_number: orNumber,
-    }).eq("id", payment.id).select().single();
-    if (error) throw error;
-    await reprocessPaymentOrders(updated, payment.company_id || cid);
-    res.json({ payment: updated });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    // or_number is only actually used by the RPC when the payment's own
+    // or_number is still NULL (legacy rows created before OR numbers were
+    // assigned at record-time) — computed unconditionally here, same as
+    // before this port, to avoid a second round trip to check first.
+    const orNumber = await nextOrNumber(cid);
+    const result = await paymentAllocationService.approvePayment({
+      cid, actorUserId: req.user.id, paymentId: req.params.id, note: req.body?.note, or_number: orNumber,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    res.json({ payment: result.payment });
+  } catch (err) { console.error("PATCH /payments/:id/approve error:", err); res.status(500).json({ error: "Failed to approve payment" }); }
 });
 
 // PATCH /payments/:id/reject — Finance rejects; the row is kept (marked
@@ -5861,17 +5847,14 @@ app.patch("/payments/:id/approve", requireRole(FINANCE_APPROVE_ROLES), async (re
 app.patch("/payments/:id/reject", requireRole(FINANCE_APPROVE_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { data: payment } = await supabase.from("payments").select("*").eq("id", req.params.id).maybeSingle();
-    if (!payment || (cid && payment.company_id !== cid)) return res.status(404).json({ error: "Payment not found" });
-    if (payment.approval_status === "rejected") return res.status(400).json({ error: "Payment is already rejected" });
-    const { data: updated, error } = await supabase.from("payments").update({
-      approval_status: "rejected", approved_by: req.user.id, approved_at: new Date().toISOString(),
-      approval_note: req.body?.note || null,
-    }).eq("id", payment.id).select().single();
-    if (error) throw error;
-    await reprocessPaymentOrders(updated, payment.company_id || cid);
-    res.json({ payment: updated });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    const result = await paymentAllocationService.rejectPayment({
+      cid, actorUserId: req.user.id, paymentId: req.params.id, note: req.body?.note,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    res.json({ payment: result.payment });
+  } catch (err) { console.error("PATCH /payments/:id/reject error:", err); res.status(500).json({ error: "Failed to reject payment" }); }
 });
 
 app.get("/payments", requireAuth, async (req, res) => {
@@ -5947,59 +5930,35 @@ app.get("/payments", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// DELETE /payments/:id — master-only. Removes a recorded payment and reverses
-// every effect it had: restores each delivery order's outstanding balance,
-// rolls back the linked sales order's paid/deposit total, and recalculates
-// commissions (which may drop back to "pending" if the deposit gate is no
-// longer met). Keeps the customer payment history and Orders screen in sync.
+// DELETE /payments/:id — master-only. Reverses a recorded payment atomically
+// (migration 105's reverse_allocated_payment): allocations and the payment
+// row are removed and every affected order's paid/deposit/balance is
+// recomputed from the remaining ledger inside ONE transaction — never as
+// separate deletes followed by a separate recompute loop. Commission
+// recalculation (may drop a commission back to "pending" if the deposit gate
+// is no longer met) and best-effort proof-image cleanup both happen AFTER
+// the RPC has committed, never before and never in a way that could roll
+// back the already-successful financial reversal.
 app.delete("/payments/:id", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { id } = req.params;
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    const result = await paymentAllocationService.reversePayment({ cid, actorUserId: req.user.id, paymentId: req.params.id });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
 
-    // Load the payment (company-scoped) with its per-order allocations.
-    let q = supabase.from("payments").select("*, payment_allocations(order_id, amount)").eq("id", id);
-    if (cid) q = q.eq("company_id", cid);
-    const { data: payment, error: fetchErr } = await q.maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!payment) return res.status(404).json({ error: "Payment not found" });
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
 
-    // Orders this payment touched (from explicit allocations, else its single
-    // linked order). We recompute their paid/balance from the ledger AFTER the
-    // payment is gone — so the reversal is exact, never a fragile delta.
-    const affectedOrders = new Set();
-    const allocs = Array.isArray(payment.payment_allocations) ? payment.payment_allocations : [];
-    for (const a of allocs) { if (a.order_id) affectedOrders.add(a.order_id); }
-    if (affectedOrders.size === 0 && payment.order_id) affectedOrders.add(payment.order_id);
-
-    // If this payment came from bank-statement reconciliation, unlink the
-    // statement transaction so it is no longer marked reconciled to a deleted
-    // payment (leaves it matched to the order, ready to reconcile again).
-    await supabase.from("statement_transactions")
-      .update({ matched_payment_id: null, match_status: "confirmed" })
-      .eq("matched_payment_id", id);
-
-    // Clean up any uploaded proof image(s) from storage (best-effort — never
-    // blocks the deletion). proof_url may hold a comma-separated list of URLs.
-    if (payment.proof_url) {
-      try { await deleteStorageObjectsByPublicUrl(payment.proof_url); }
-      catch (e) { console.error("proof cleanup error:", e.message); }
+    // Best-effort storage cleanup — AFTER the financial reversal already
+    // committed. A cleanup failure is logged and reported separately; it
+    // never undoes the reversal, which has already succeeded.
+    let proofCleanupWarning = null;
+    if (result.proofUrl) {
+      try { await deleteStorageObjectsByPublicUrl(result.proofUrl); }
+      catch (e) { console.error("proof cleanup error:", e.message); proofCleanupWarning = "Payment was reversed, but cleaning up its proof image failed — it may need manual removal from storage."; }
     }
 
-    // Remove allocation rows first (FK), then the payment itself.
-    await supabase.from("payment_allocations").delete().eq("payment_id", id);
-    const { error: delErr } = await supabase.from("payments").delete().eq("id", id);
-    if (delErr) throw delErr;
-
-    // Now the payment is gone, recompute each affected order's paid/deposit +
-    // balance from the remaining ledger and re-bucket commissions.
-    for (const oid of affectedOrders) {
-      try { await recomputeOrderPaid(oid); } catch (e) { console.error("recomputeOrderPaid error:", e.message); }
-      try { await calculateCommission(oid, cid, { cascade: false }); } catch (e) { console.error("commission recalc error:", e.message); }
-    }
-
-    res.json({ ok: true, reversed_orders: affectedOrders.size });
-  } catch (err) { console.error("DELETE /payments error:", err); res.status(500).json({ error: err.message }); }
+    res.json({ ok: true, reversed_orders: result.affectedOrderIds.length, ...(proofCleanupWarning ? { proof_cleanup_warning: proofCleanupWarning } : {}) });
+  } catch (err) { console.error("DELETE /payments error:", err); res.status(500).json({ error: "Failed to reverse payment" }); }
 });
 
 // ── Product Incentives ──────────────────────────────────────────
