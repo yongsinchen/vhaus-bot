@@ -14868,6 +14868,67 @@ const { recordItemArrivalEvent } = createItemArrivalEventService({ supabase });
 
 // GET /sales-orders — list; salesmen see only their own
 // GET /sales-orders — paginated lightweight list
+// GET /upcoming-deliveries?from=YYYY-MM-DD&to=YYYY-MM-DD — the Orders page
+// "Upcoming deliveries" panel. The EFFECTIVE date is what's actually going
+// out: an SO with active Delivery Orders delivers on its DOs' dates (a
+// DO-scoped reschedule moves only delivery_orders.delivery_date, never the
+// SO's own date); an SO without one on sales_orders.delivery_date. One row
+// per active DO in the window, plus one per DO-less SO in the window.
+// Salesmen see only their own SOs (same exact split-name rule as the list).
+app.get("/upcoming-deliveries", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const from = String(req.query.from || ""), to = String(req.query.to || "");
+    if (!cid || !/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return res.json({ deliveries: [] });
+    const ACTIVE_DO = ["draft", "scheduled", "out_for_delivery", "arrived"];
+    const SKIP_SO = ["draft", "cancelled", "delivered"];
+    const soCols = "id, order_number, customer_name, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, delivery_date, delivery_time_slot, delivery_type";
+
+    const [{ data: windowDos, error: doErr }, { data: windowSos, error: soErr }] = await Promise.all([
+      supabase.from("delivery_orders").select("id, do_number, status, delivery_date, sales_order_id")
+        .eq("company_id", cid).in("status", ACTIVE_DO).is("superseded_at", null)
+        .gte("delivery_date", from).lte("delivery_date", to).limit(1000),
+      supabase.from("sales_orders").select(soCols)
+        .eq("company_id", cid).not("status", "in", `(${SKIP_SO.join(",")})`)
+        .gte("delivery_date", from).lte("delivery_date", to).limit(1000),
+    ]);
+    if (doErr) throw doErr;
+    if (soErr) throw soErr;
+
+    // SOs in the date window that ship per-DO must not also appear on their
+    // (possibly stale) SO date — find which of them have ANY active DO.
+    const windowSoIds = (windowSos || []).map(s => s.id);
+    const { data: soDos } = windowSoIds.length
+      ? await supabase.from("delivery_orders").select("sales_order_id").in("sales_order_id", windowSoIds).in("status", ACTIVE_DO).is("superseded_at", null)
+      : { data: [] };
+    const shipsPerDo = new Set((soDos || []).map(d => d.sales_order_id));
+
+    // SO details for the DO rows.
+    const doSoIds = [...new Set((windowDos || []).map(d => d.sales_order_id).filter(Boolean))];
+    const known = new Map((windowSos || []).map(s => [s.id, s]));
+    const missing = doSoIds.filter(id => !known.has(id));
+    if (missing.length) {
+      const { data: more } = await supabase.from("sales_orders").select(soCols).in("id", missing).eq("company_id", cid);
+      for (const s of (more || [])) known.set(s.id, s);
+    }
+
+    const { role, salesman_name } = req.user || {};
+    const visible = (so) => so && !SKIP_SO.includes(so.status) && (role !== "salesman" || !salesman_name || orderHasSalesperson(so.salesman_name, salesman_name));
+    const rows = [];
+    for (const d of (windowDos || [])) {
+      const so = known.get(d.sales_order_id);
+      if (!visible(so)) continue;
+      rows.push({ ...so, delivery_date: d.delivery_date, delivery_order_id: d.id, do_number: d.do_number, do_status: d.status });
+    }
+    for (const so of (windowSos || [])) {
+      if (shipsPerDo.has(so.id) || !visible(so)) continue;
+      rows.push({ ...so, delivery_order_id: null, do_number: null, do_status: null });
+    }
+    rows.sort((a, b) => String(a.delivery_date).localeCompare(String(b.delivery_date)) || String(a.delivery_time_slot || "").localeCompare(String(b.delivery_time_slot || "")));
+    res.json({ deliveries: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
     const company_id = getActiveCompanyId(req);
