@@ -14738,6 +14738,40 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
         (items || []).forEach(i => { countMap[i.order_id] = (countMap[i.order_id] || 0) + 1; });
         finalData = finalData.map(o => ({ ...o, _item_count: countMap[o.id] || 0 }));
       } catch (e) { console.error("item count error:", e.message); }
+
+      // Delivery-readiness hints for the Orders list illustration, batched per
+      // page (never per order). Presentation-only; failures leave them unset.
+      //   _all_arrived      every legacy item line has an arrivalDate (null = no lines)
+      //   _delivery_request latest non-rejected delivery_date_requests status for the SO
+      //   _has_do           an active (not cancelled / superseded) Delivery Order exists
+      try {
+        const soNumbers = [...new Set(finalData.map(o => o.order_number).filter(Boolean))];
+        const [{ data: legs }, { data: ddrs }, { data: dos }] = await Promise.all([
+          soNumbers.length
+            ? supabase.from("orders").select("so_number, items").eq("company_id", company_id).in("so_number", soNumbers).or("type.is.null,type.neq.Service")
+            : Promise.resolve({ data: [] }),
+          supabase.from("delivery_date_requests").select("sales_order_id, status, created_at").in("sales_order_id", orderIds).neq("status", "rejected").order("created_at", { ascending: false }),
+          supabase.from("delivery_orders").select("sales_order_id").in("sales_order_id", orderIds).neq("status", "cancelled").is("superseded_at", null),
+        ]);
+        const arrivedBySo = new Map();
+        for (const leg of (legs || [])) {
+          let items = leg.items;
+          if (typeof items === "string") { try { items = JSON.parse(items || "[]"); } catch { items = []; } }
+          if (!Array.isArray(items) || items.length === 0) continue;
+          const all = items.every(it => !!it?.arrivalDate);
+          // Several legacy rows can share an SO number — all must be arrived.
+          arrivedBySo.set(leg.so_number, arrivedBySo.has(leg.so_number) ? (arrivedBySo.get(leg.so_number) && all) : all);
+        }
+        const latestReq = new Map(); // rows are newest-first
+        for (const r of (ddrs || [])) if (!latestReq.has(r.sales_order_id)) latestReq.set(r.sales_order_id, r.status);
+        const withDo = new Set((dos || []).map(d => d.sales_order_id));
+        finalData = finalData.map(o => ({
+          ...o,
+          _all_arrived: arrivedBySo.has(o.order_number) ? arrivedBySo.get(o.order_number) : null,
+          _delivery_request: latestReq.get(o.id) || null,
+          _has_do: withDo.has(o.id),
+        }));
+      } catch (e) { console.error("delivery readiness hints error:", e.message); }
     }
 
     const totalPages = Math.ceil(finalCount / lim);
