@@ -5741,7 +5741,8 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
       .eq("company_id", customer.company_id).ilike("contact", `%${customer.phone || "NOMATCH"}%`).is("customer_id", null);
     const allOrders = [...(orders || []), ...(phoneOrders || [])];
     // Load payments (the ledger — on-delivery collections, recorded payments).
-    const { data: payments } = await supabase.from("payments").select("*")
+    // payment_allocations: the Customers page Amend form pre-fills from them.
+    const { data: payments } = await supabase.from("payments").select("*, payment_allocations(order_id, amount)")
       .or(`customer_id.eq.${customer.id}${allOrders.length > 0 ? `,order_id.in.(${allOrders.map(o => o.id).join(",")})` : ""}`)
       .order("paid_at", { ascending: false });
 
@@ -6139,11 +6140,54 @@ app.get("/payments", requireAuth, async (req, res) => {
 // is no longer met) and best-effort proof-image cleanup both happen AFTER
 // the RPC has committed, never before and never in a way that could roll
 // back the already-successful financial reversal.
-app.delete("/payments/:id", requireRole(MANAGE_ROLES), async (req, res) => {
+// Migration 107: who may change a payment before Finance decides on it.
+//   MANAGE_ROLES — DELETE reverses any payment (unchanged); PATCH amends any pending one.
+//   finance      — any PENDING payment (amend / withdraw).
+//   other ORDER_ROLES (salesman, …) — only a PENDING payment they recorded.
+// Pending-ness and ownership are re-checked under the row lock in the RPC.
+const PAYMENT_CHANGE_ROLES = [...new Set([...ORDER_ROLES, ...MANAGE_ROLES, "finance"])];
+const pendingPaymentOwnerScope = (req) => (MANAGE_ROLES.includes(req.user.role) || req.user.role === "finance") ? null : req.user.id;
+
+// Best-effort proof-image cleanup AFTER a committed reversal/amend; never
+// undoes the financial write. Returns a warning string or null.
+async function cleanupRemovedProofs(oldProofUrl, keepProofUrl) {
+  const keep = new Set(String(keepProofUrl || "").split(",").map(s => s.trim()).filter(Boolean));
+  const removed = String(oldProofUrl || "").split(",").map(s => s.trim()).filter(u => u && !keep.has(u));
+  if (removed.length === 0) return null;
+  try { await deleteStorageObjectsByPublicUrl(removed.join(", ")); return null; }
+  catch (e) { console.error("proof cleanup error:", e.message); return "The payment was updated, but cleaning up a removed proof image failed — it may need manual removal from storage."; }
+}
+
+// PATCH /payments/:id — amend a PENDING payment (amount, method, reference,
+// proof, admin charges, kind, allocations) atomically via
+// amend_pending_payment: reversed and re-recorded in one savepoint, keeping
+// its OR number. Approved / rejected payments can't be amended.
+app.patch("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
-    const result = await paymentAllocationService.reversePayment({ cid, actorUserId: req.user.id, paymentId: req.params.id });
+    const { amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind } = req.body || {};
+    if (!Array.isArray(allocations) || allocations.length === 0) return res.status(400).json({ error: "At least one order allocation is required", code: "no_allocation" });
+    const result = await paymentAllocationService.amendPendingPayment({
+      cid, actorUserId: req.user.id, paymentId: req.params.id, requireRecordedBy: pendingPaymentOwnerScope(req),
+      amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    const proofCleanupWarning = await cleanupRemovedProofs(result.oldProofUrl, result.payment?.proof_url);
+    res.json({ payment: result.payment, replaced_payment_id: result.replacedPaymentId, ...(proofCleanupWarning ? { proof_cleanup_warning: proofCleanupWarning } : {}) });
+  } catch (err) { console.error("PATCH /payments/:id error:", err); res.status(500).json({ error: "Failed to amend payment" }); }
+});
+
+app.delete("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    // Managers keep the existing any-status reversal; everyone else may only
+    // withdraw a still-pending payment (their own, unless Finance).
+    const result = MANAGE_ROLES.includes(req.user.role)
+      ? await paymentAllocationService.reversePayment({ cid, actorUserId: req.user.id, paymentId: req.params.id })
+      : await paymentAllocationService.withdrawPendingPayment({ cid, actorUserId: req.user.id, paymentId: req.params.id, requireRecordedBy: pendingPaymentOwnerScope(req) });
     if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
 
     await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
