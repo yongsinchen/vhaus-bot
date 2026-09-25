@@ -16,6 +16,7 @@ const { classifySalesOrderItemEdit, identityKey: soItemIdentityKey } = require("
 const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
+const scheduleTeamDate = require("./lib/schedule-team-date");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
@@ -10118,6 +10119,24 @@ app.delete("/delivery-blocked-dates/:id", ...requirePerm(PERMS.DELIVERY_EDIT), a
 });
 
 // ── Delivery Schedules ──────────────────────────────────────────
+// Team-date invariant guard (prevention for the DO team-view invisibility bug):
+// delivery_teams are PER-DATE (one row per vehicle per team_date), and the team
+// board renders a stop under a date's column only when a team row matches BOTH
+// id = schedule.team_id AND team_date = schedule.scheduled_date. A team_id whose
+// team_date differs from the stop's scheduled_date orphans it — visible on its
+// DO card but under no team column. Every writer of a non-null team_id MUST pass
+// through here. Fail closed — never auto-remap to another same-vehicle team row,
+// never accept a cross-company or unresolvable team. Returns null when OK, or
+// { status, body } for the caller to return unchanged.
+async function checkScheduleTeamDate(teamId, effectiveScheduledDate, cid) {
+  if (teamId == null) return null; // unassigned is always allowed
+  const { data: team, error } = await supabase.from("delivery_teams")
+    .select("id, team_date, company_id").eq("id", teamId).maybeSingle();
+  if (error) return { status: 500, body: { error: error.message } };
+  // Pure decision lives in lib/schedule-team-date.js (unit-tested).
+  return scheduleTeamDate.evaluateTeamDateInvariant(team, effectiveScheduledDate, cid);
+}
+
 app.get("/delivery-schedules", requireAuth, async (req, res) => {
   try {
     const { date, team_id } = req.query;
@@ -10183,6 +10202,10 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
         return res.status(400).json({ error: blockReason, blocked_date: true });
       }
 
+      // Team-date invariant: a supplied team must run on the scheduled_date.
+      const doTeamGuard = await checkScheduleTeamDate(team_id || null, scheduled_date, cid);
+      if (doTeamGuard) return res.status(doTeamGuard.status).json(doTeamGuard.body);
+
       const isReattempt = dord.status === "failed";
       const { data: prevAttempts } = await supabase.from("delivery_schedules")
         .select("attempt_no").eq("delivery_order_id", dord.id).order("attempt_no", { ascending: false }).limit(1);
@@ -10224,6 +10247,11 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
       return res.status(400).json({ error: legacyBlockReason, blocked_date: true });
     }
 
+    // Team-date invariant: a supplied team must run on the scheduled_date
+    // (guards both the dup-update and the insert below — same team_id/date).
+    const legacyTeamGuard = await checkScheduleTeamDate(team_id || null, scheduled_date, cid);
+    if (legacyTeamGuard) return res.status(legacyTeamGuard.status).json(legacyTeamGuard.body);
+
     // If already scheduled for this date, update the team instead of blocking.
     // Only NULL-DO rows participate — a DO schedule must never be hijacked.
     let dupQ = supabase.from("delivery_schedules").select("id").eq("order_id", order_id).eq("scheduled_date", scheduled_date).is("delivery_order_id", null);
@@ -10256,11 +10284,20 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     // status (pre-update) for the SEV-2 team-reassignment lock guard below —
     // req.body.status is the caller's REQUESTED status, not what's actually
     // stored, so the guard must read the DB row, not the request.
-    let checkQ = supabase.from("delivery_schedules").select("id, status, delivery_order_id, team_id").eq("id", req.params.id);
+    let checkQ = supabase.from("delivery_schedules").select("id, status, delivery_order_id, team_id, scheduled_date").eq("id", req.params.id);
     if (cid) checkQ = checkQ.eq("company_id", cid);
     const { data: currentSchedule } = await checkQ.maybeSingle();
     if (cid && !currentSchedule) return res.status(404).json({ error: "Schedule not found" });
     const { team_id, sort_order, status, slot, area, is_ready, notes } = req.body;
+
+    // Team-date invariant: a (re)assigned non-null team must run on the stop's
+    // effective scheduled_date (incoming if supplied, else the stored one).
+    // Fail closed — never persist a cross-date / cross-company / unresolvable team.
+    if (team_id !== undefined && team_id !== null) {
+      const effectiveDate = req.body.scheduled_date != null ? req.body.scheduled_date : currentSchedule?.scheduled_date;
+      const patchTeamGuard = await checkScheduleTeamDate(team_id, effectiveDate, cid);
+      if (patchTeamGuard) return res.status(patchTeamGuard.status).json(patchTeamGuard.body);
+    }
 
     // QA SEV-2: block team reassignment once the schedule is already
     // out_for_delivery/arrived/delivered — see isLockedScheduleStatus.
