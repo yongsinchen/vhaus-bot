@@ -5125,7 +5125,9 @@ async function resolveDeliveryDateRequestTarget({ companyId, salesOrderId, clien
 // caller already validated the DO/date before reaching here), the row
 // falls back to "pending" for a human to review rather than standing as a
 // falsely-approved row with zero real effect.
-async function createDeliveryDateRequestAndMaybeAutoApprove(insertPayload, actorId) {
+// opts.forcePending: a LINKED group moves as one, so if any member needs a
+// human review the whole group stays pending (never half auto-approved).
+async function createDeliveryDateRequestAndMaybeAutoApprove(insertPayload, actorId, opts = {}) {
   // URGENT FIX: the current/original date (already resolved by every caller
   // via resolveOriginalDeliveryDate, stored as insertPayload.original_date)
   // must also gate approval — see evaluateDeliveryDateApproval's header.
@@ -5133,17 +5135,18 @@ async function createDeliveryDateRequestAndMaybeAutoApprove(insertPayload, actor
   if (!decision.valid) {
     return { status: 400, error: decision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" };
   }
+  const autoApproved = decision.autoApproved && !opts.forcePending;
 
   const { data: created, error } = await supabase.from("delivery_date_requests").insert({
     ...insertPayload,
-    status: decision.autoApproved ? "approved" : "pending",
-    auto_approved: decision.autoApproved,
-    reviewed_at: decision.autoApproved ? new Date().toISOString() : null,
-    decision_note: decision.autoApproved ? "Auto-approved — requested date is 10+ calendar days out" : null,
+    status: autoApproved ? "approved" : "pending",
+    auto_approved: autoApproved,
+    reviewed_at: autoApproved ? new Date().toISOString() : null,
+    decision_note: autoApproved ? "Auto-approved — requested date is 10+ calendar days out" : null,
   }).select().single();
   if (error) return { status: 500, error: error.message };
 
-  if (decision.autoApproved) {
+  if (autoApproved) {
     const result = await deliveryDateApprovalService.applyApprovedDeliveryDate(created, actorId);
     if (result.conflict) {
       await supabase.from("delivery_date_requests").update({
@@ -5156,11 +5159,88 @@ async function createDeliveryDateRequestAndMaybeAutoApprove(insertPayload, actor
   return { status: 201, request: created };
 }
 
-// POST /delivery-date-requests — salesman requests a date for an existing order.
+// ── Linked delivery date requests (migration 106) ─────────────────
+// Other undelivered SOs of the SAME customer (same phone) can be linked to a
+// request so they are delivered together. Each SO keeps its own request row
+// and its own DO (a DO still belongs to exactly one SO); the rows share a
+// link_group_id and every decision / change applies to the whole group.
+
+// Same-customer phone match: digits only, with a leading MY (60 → 0) or SG
+// (65) country code folded so "+60 12-345 6789" matches "012-3456789".
+function canonicalPhone(v) {
+  let d = normalizePhone(v);
+  if (d.startsWith("60") && d.length >= 11) d = "0" + d.slice(2);
+  else if (d.startsWith("65") && d.length === 10) d = d.slice(2);
+  return d.length >= 7 ? d : "";
+}
+// SO statuses that can't take part in a linked delivery.
+const LINK_EXCLUDED_SO_STATUSES = ["draft", "cancelled", "delivered"];
+// A salesman may only link SOs they could see in the Orders list (same exact
+// split-name rule as GET /sales-orders); every other role sees the company.
+function soVisibleToRequester(req, so) {
+  const { role, salesman_name } = req.user || {};
+  if (role !== "salesman" || !salesman_name) return true;
+  return orderHasSalesperson(so?.salesman_name, salesman_name);
+}
+
+// Resolve + validate one SO as a delivery-date request target: its
+// company-scoped legacy order, its sales order and which DO (if any) the
+// request targets. Shared by the requested SO and each linked SO.
+async function prepareDeliveryDateTarget(cid, { order_id, so_number, delivery_order_id }) {
+  let ordQ = supabase.from("orders").select("id, so_number, customer_name, contact, company_id, branch_id").eq("company_id", cid).limit(1);
+  if (order_id) ordQ = ordQ.eq("id", order_id);
+  else if (so_number) ordQ = ordQ.eq("so_number", so_number);
+  else return { status: 400, error: "order_id or so_number is required" };
+  const { data: ords } = await ordQ;
+  const ord = ords?.[0];
+  if (!ord) return { status: 404, error: "Order not found" };
+  const { data: so } = await supabase.from("sales_orders").select("id, status, salesman_name, customer_contact").eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
+  // P1-2: resolve/validate which Delivery Order (if any) this targets —
+  // never trust a client delivery_order_id directly.
+  const target = await resolveDeliveryDateRequestTarget({ companyId: ord.company_id, salesOrderId: so?.id || null, clientDeliveryOrderId: delivery_order_id || null });
+  if (!target.ok) {
+    return {
+      status: 400, code: target.code, active_delivery_orders: target.activeDeliveryOrders,
+      error: target.code === "delivery_order_selection_required"
+        ? "This order has multiple deliveries — select which Delivery Order to reschedule."
+        : "The selected Delivery Order is not valid for this order.",
+    };
+  }
+  return { ord, so, target };
+}
+
+// The request row a prepared target would insert (original date/team resolved).
+async function buildDeliveryDateRequestPayload(req, { ord, so, target }, { requested_date, remark }) {
+  const originalDate = await resolveOriginalDeliveryDate(ord.company_id, { salesOrderId: so?.id || null, orderId: ord.id, deliveryOrderId: target.deliveryOrderId });
+  const targetDo = target.activeDeliveryOrders.find(d => d.id === target.deliveryOrderId) || null;
+  return {
+    company_id: ord.company_id, branch_id: ord.branch_id || null, order_id: ord.id,
+    sales_order_id: so?.id || null, so_number: ord.so_number, customer_name: ord.customer_name,
+    delivery_order_id: target.deliveryOrderId, requested_date, original_date: originalDate,
+    original_team_id: targetDo?.team_id || null, original_team_name: targetDo?.team_name || null,
+    schedule_id: targetDo?.schedule_id || null, remark: remark || null,
+    requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null, requested_via: "web",
+  };
+}
+
+// One open request per target — DO-scoped and SO-level are independent
+// (see migration 094's two partial unique indexes). Supersede any existing
+// open one for the SAME target only.
+async function supersedeOpenDeliveryDateRequest({ ord, target }) {
+  let q = supabase.from("delivery_date_requests")
+    .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
+    .in("status", ["pending", "needs_reschedule"]);
+  q = target.deliveryOrderId ? q.eq("delivery_order_id", target.deliveryOrderId) : q.eq("order_id", ord.id).is("delivery_order_id", null);
+  await q;
+}
+
+// POST /delivery-date-requests — salesman requests a date for an existing
+// order, optionally linking other undelivered SOs of the same customer
+// (link_so_numbers) so they are delivered together.
 app.post("/delivery-date-requests", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
-    const { order_id, so_number, requested_date, remark, delivery_order_id } = req.body || {};
+    const { order_id, so_number, requested_date, remark, delivery_order_id, link_so_numbers } = req.body || {};
     if (!requested_date) return res.status(400).json({ error: "requested_date is required" });
     // P1-4B: fail closed rather than resolving `order_id`/`so_number`
     // unscoped — `ord.company_id` becomes authoritative for everything this
@@ -5169,48 +5249,129 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
     // resolvable company reschedule ANY company's order by guessing/
     // enumerating a raw order_id.
     if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
-    let ordQ = supabase.from("orders").select("id, so_number, customer_name, company_id, branch_id").limit(1);
-    if (order_id) ordQ = ordQ.eq("id", order_id);
-    else if (so_number) ordQ = ordQ.eq("so_number", so_number);
-    else return res.status(400).json({ error: "order_id or so_number is required" });
-    if (cid) ordQ = ordQ.eq("company_id", cid);
-    const { data: ords } = await ordQ;
-    const ord = ords?.[0];
-    if (!ord) return res.status(404).json({ error: "Order not found" });
-    const { data: so } = await supabase.from("sales_orders").select("id").eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
+    const main = await prepareDeliveryDateTarget(cid, { order_id, so_number, delivery_order_id });
+    if (main.error) return res.status(main.status).json({ error: main.error, code: main.code, active_delivery_orders: main.active_delivery_orders });
 
-    // P1-2: resolve/validate which Delivery Order (if any) this targets —
-    // never trust req.body.delivery_order_id directly.
-    const target = await resolveDeliveryDateRequestTarget({ companyId: ord.company_id, salesOrderId: so?.id || null, clientDeliveryOrderId: delivery_order_id || null });
-    if (!target.ok) {
-      return res.status(400).json({
-        error: target.code === "delivery_order_selection_required"
-          ? "This order has multiple deliveries — select which Delivery Order to reschedule."
-          : "The selected Delivery Order is not valid for this order.",
-        code: target.code, active_delivery_orders: target.activeDeliveryOrders,
-      });
+    // Validate EVERY linked SO before writing anything — never a half-made group.
+    const members = [main];
+    const linkNos = [...new Set((Array.isArray(link_so_numbers) ? link_so_numbers : [])
+      .map(s => String(s || "").trim()).filter(s => s && s !== main.ord.so_number))];
+    if (linkNos.length) {
+      const mainPhone = canonicalPhone(main.so?.customer_contact || main.ord.contact);
+      if (!mainPhone) return res.status(400).json({ error: "This order has no phone number to match linked orders by" });
+      for (const no of linkNos) {
+        const m = await prepareDeliveryDateTarget(cid, { so_number: no });
+        if (m.error) {
+          return res.status(m.status).json({ error: m.code === "delivery_order_selection_required"
+            ? `SO ${no} has several active deliveries — request its date separately.`
+            : `SO ${no}: ${m.error}` });
+        }
+        if (!m.so || LINK_EXCLUDED_SO_STATUSES.includes(m.so.status)) return res.status(400).json({ error: `SO ${no} can't be linked (${m.so?.status || "no sales order"})` });
+        if (canonicalPhone(m.so.customer_contact || m.ord.contact) !== mainPhone) return res.status(400).json({ error: `SO ${no} is not for the same customer phone` });
+        if (!soVisibleToRequester(req, m.so)) return res.status(403).json({ error: `You can't request a delivery date for SO ${no}` });
+        members.push(m);
+      }
     }
-    // One open request per target — DO-scoped and SO-level are independent
-    // (see migration 094's two partial unique indexes). Supersede any
-    // existing open one for the SAME target only.
-    let supersedeQ = supabase.from("delivery_date_requests")
-      .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
-      .in("status", ["pending", "needs_reschedule"]);
-    supersedeQ = target.deliveryOrderId ? supersedeQ.eq("delivery_order_id", target.deliveryOrderId) : supersedeQ.eq("order_id", ord.id).is("delivery_order_id", null);
-    await supersedeQ;
 
-    const originalDate = await resolveOriginalDeliveryDate(ord.company_id, { salesOrderId: so?.id || null, orderId: ord.id, deliveryOrderId: target.deliveryOrderId });
-    const targetDo = target.activeDeliveryOrders.find(d => d.id === target.deliveryOrderId) || null;
-    const { status, request, error } = await createDeliveryDateRequestAndMaybeAutoApprove({
-      company_id: ord.company_id, branch_id: ord.branch_id || null, order_id: ord.id,
-      sales_order_id: so?.id || null, so_number: ord.so_number, customer_name: ord.customer_name,
-      delivery_order_id: target.deliveryOrderId, requested_date, original_date: originalDate,
-      original_team_id: targetDo?.team_id || null, original_team_name: targetDo?.team_name || null,
-      schedule_id: targetDo?.schedule_id || null, remark: remark || null,
-      requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null, requested_via: "web",
-    }, req.user.id);
-    if (error) return res.status(status).json({ error });
-    res.status(status).json({ request });
+    const payloads = [];
+    for (const m of members) payloads.push(await buildDeliveryDateRequestPayload(req, m, { requested_date, remark }));
+    // The group moves as one: auto-approve only if EVERY member qualifies.
+    const decisions = payloads.map(p => evaluateDeliveryDateApproval({ requestedDate: p.requested_date, currentDate: p.original_date || null }));
+    const invalid = decisions.find(d => !d.valid);
+    if (invalid) return res.status(400).json({ error: invalid.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
+    const linked = members.length > 1;
+    const forcePending = linked && !decisions.every(d => d.autoApproved);
+    // link_group_id is only written for a real group, so unlinked requests
+    // keep working even before migration 106 is applied.
+    const linkGroupId = linked ? crypto.randomUUID() : null;
+
+    const created = [];
+    for (let i = 0; i < members.length; i++) {
+      await supersedeOpenDeliveryDateRequest(members[i]);
+      const out = await createDeliveryDateRequestAndMaybeAutoApprove(
+        linkGroupId ? { ...payloads[i], link_group_id: linkGroupId } : payloads[i], req.user.id, { forcePending });
+      if (out.error) {
+        // Roll back any group members already created (still pending when
+        // forcePending; an applied auto-approval is left as a real decision).
+        const pendingIds = created.filter(r => r.status === "pending").map(r => r.id);
+        if (pendingIds.length) await supabase.from("delivery_date_requests").delete().in("id", pendingIds);
+        return res.status(out.status).json({ error: i === 0 ? out.error : `Linking SO ${payloads[i].so_number} failed: ${out.error}` });
+      }
+      created.push(out.request);
+    }
+    res.status(201).json({ request: created[0], linked_requests: created.slice(1) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-date-requests/linkable?so_number= — other undelivered SOs of
+// the same customer (same phone) that could be delivered together with it.
+// Salesmen only see SOs they could see in the Orders list.
+app.get("/delivery-date-requests/linkable", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    const soNumber = String(req.query.so_number || "").trim();
+    if (!cid || !soNumber) return res.json({ phone: null, orders: [] });
+    const { data: mainSo } = await supabase.from("sales_orders").select("id, order_number, customer_contact")
+      .eq("company_id", cid).eq("order_number", soNumber).maybeSingle();
+    let phone = canonicalPhone(mainSo?.customer_contact);
+    if (!phone) {
+      const { data: leg } = await supabase.from("orders").select("contact").eq("company_id", cid).eq("so_number", soNumber).limit(1);
+      phone = canonicalPhone(leg?.[0]?.contact);
+    }
+    if (!phone) return res.json({ phone: null, orders: [] });
+    // Phones are stored formatted, so match in JS on the canonical form over
+    // the company's open SOs (bounded, light columns).
+    const { data: open } = await supabase.from("sales_orders")
+      .select("id, order_number, customer_name, customer_contact, salesman_name, status, delivery_date")
+      .eq("company_id", cid).not("status", "in", `(${LINK_EXCLUDED_SO_STATUSES.join(",")})`)
+      .neq("order_number", soNumber).order("created_at", { ascending: false }).limit(3000);
+    const matches = (open || []).filter(o => canonicalPhone(o.customer_contact) === phone && soVisibleToRequester(req, o));
+    if (matches.length === 0) return res.json({ phone, orders: [] });
+    const ids = matches.map(o => o.id);
+    const [{ data: items }, { data: dos }, { data: openReqs }] = await Promise.all([
+      supabase.from("sales_order_items").select("order_id").in("order_id", ids),
+      supabase.from("delivery_orders").select("sales_order_id, status, superseded_at").in("sales_order_id", ids),
+      supabase.from("delivery_date_requests").select("sales_order_id, requested_date, status").in("sales_order_id", ids).in("status", OPEN_DDR_STATUSES),
+    ]);
+    const count = (rows, key, pred = () => true) => (rows || []).reduce((m, r) => (pred(r) ? m.set(r[key], (m.get(r[key]) || 0) + 1) : m), new Map());
+    const itemCount = count(items, "order_id");
+    const activeDos = count(dos, "sales_order_id", d => !d.superseded_at && ["draft", "scheduled", "out_for_delivery", "arrived"].includes(d.status));
+    const openReqBySo = new Map((openReqs || []).map(r => [r.sales_order_id, r]));
+    res.json({
+      phone,
+      orders: matches.map(o => ({
+        so_number: o.order_number, customer_name: o.customer_name, status: o.status,
+        delivery_date: o.delivery_date || null, item_count: itemCount.get(o.id) || 0,
+        active_do_count: activeDos.get(o.id) || 0,
+        // 2+ active DOs need an explicit DO choice, so they can't be linked here.
+        linkable: (activeDos.get(o.id) || 0) <= 1,
+        open_request: openReqBySo.get(o.id) ? { requested_date: openReqBySo.get(o.id).requested_date, status: openReqBySo.get(o.id).status } : null,
+      })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-links — linked-delivery groups for the Delivery Schedule
+// board, so it can badge linked stops and keep them together on one team.
+// Only live groups (not rejected) around current dates. Read-only; returns an
+// empty list if migration 106 isn't applied yet.
+app.get("/delivery-links", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.json({ groups: [] });
+    const since = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+    const { data, error } = await supabase.from("delivery_date_requests")
+      .select("link_group_id, status, requested_date, so_number, customer_name, order_id, sales_order_id, delivery_order_id")
+      .eq("company_id", cid).not("link_group_id", "is", null)
+      .in("status", ["pending", "needs_reschedule", "approved"]).gte("requested_date", since)
+      .limit(2000);
+    if (error) return res.json({ groups: [] });
+    const byGroup = new Map();
+    for (const r of (data || [])) {
+      if (!byGroup.has(r.link_group_id)) byGroup.set(r.link_group_id, { link_group_id: r.link_group_id, requested_date: r.requested_date, status: r.status, members: [] });
+      byGroup.get(r.link_group_id).members.push({ so_number: r.so_number, customer_name: r.customer_name, order_id: r.order_id, sales_order_id: r.sales_order_id, delivery_order_id: r.delivery_order_id, status: r.status });
+    }
+    res.json({ groups: [...byGroup.values()].filter(g => g.members.length > 1) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5312,7 +5473,34 @@ async function claimAndApplyDeliveryDateRequest(r, { actorId, newRequestedDate, 
   return { status: 200, request: claimed, result };
 }
 
+const OPEN_DDR_STATUSES = ["pending", "needs_reschedule"];
+
+// The still-open members of r's linked group, r first. An unlinked request is
+// a group of one, so every route below behaves exactly as before for it.
+async function openDeliveryDateGroup(r) {
+  if (!r.link_group_id) return [r];
+  const { data } = await supabase.from("delivery_date_requests").select("*")
+    .eq("link_group_id", r.link_group_id).eq("company_id", r.company_id).in("status", OPEN_DDR_STATUSES);
+  const others = (data || []).filter(m => m.id !== r.id);
+  return [r, ...others];
+}
+// Claim + apply each member. The first member's outcome is the response; a
+// later member that fails (e.g. its DO was superseded) is reported, not fatal,
+// because the members already applied are real decisions.
+async function claimAndApplyGroup(members, perMemberOpts) {
+  const first = await claimAndApplyDeliveryDateRequest(members[0], perMemberOpts(members[0]));
+  if (first.error) return { first };
+  const linked = [];
+  for (const m of members.slice(1)) {
+    const out = await claimAndApplyDeliveryDateRequest(m, perMemberOpts(m));
+    linked.push(out.error ? { so_number: m.so_number, error: out.error } : { so_number: m.so_number, request: out.request });
+  }
+  return { first, linked };
+}
+const linkedFailures = (linked) => (linked || []).filter(l => l.error).map(l => `SO ${l.so_number}: ${l.error}`);
+
 // PATCH /delivery-date-requests/:id/approve — PIC approves; date lands on order/DO.
+// A linked request approves its whole group on the same date.
 app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) => {
   try {
     if (!isDateApprover(req)) return res.status(403).json({ error: "Not allowed to approve delivery dates" });
@@ -5320,51 +5508,56 @@ app.patch("/delivery-date-requests/:id/approve", requireAuth, async (req, res) =
     const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
     if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
     if (!["pending", "needs_reschedule"].includes(r.status)) return res.status(400).json({ error: `Request is already ${r.status}` });
-    const outcome = await claimAndApplyDeliveryDateRequest(r, {
-      actorId: req.user.id,
+    const members = await openDeliveryDateGroup(r);
+    const { first, linked } = await claimAndApplyGroup(members, () => ({
+      actorId: req.user.id, newRequestedDate: r.requested_date,
       extraUpdateFields: { reviewed_by: req.user.id, reviewed_by_name: req.user.name || null, decision_note: req.body?.note || null },
-    });
-    if (outcome.error) return res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
-    res.json({ request: outcome.request });
+    }));
+    if (first.error) return res.status(first.status).json({ error: first.error, code: first.code });
+    res.json({ request: first.request, linked_results: linked, linked_failures: linkedFailures(linked) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PATCH /delivery-date-requests/:id/propose — PIC proposes alternative dates.
+// PATCH /delivery-date-requests/:id/propose — PIC proposes alternative dates
+// (to the whole linked group).
 app.patch("/delivery-date-requests/:id/propose", requireAuth, async (req, res) => {
   try {
     if (!isDateApprover(req)) return res.status(403).json({ error: "Not allowed" });
     const cid = getActiveCompanyId(req);
     const alts = (req.body?.alternative_dates || []).filter(Boolean);
     if (alts.length === 0) return res.status(400).json({ error: "Provide at least one alternative date" });
-    const { data: r } = await supabase.from("delivery_date_requests").select("company_id").eq("id", req.params.id).maybeSingle();
+    const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
     if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
+    const ids = r.link_group_id ? (await openDeliveryDateGroup(r)).map(m => m.id) : [r.id];
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "needs_reschedule", alternative_dates: alts, decision_note: req.body?.note || null,
       reviewed_by: req.user.id, reviewed_by_name: req.user.name || null, reviewed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-    }).eq("id", req.params.id).select().single();
+    }).in("id", ids).select();
     if (error) throw error;
-    res.json({ request: data });
+    res.json({ request: (data || []).find(x => x.id === r.id) || data?.[0] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PATCH /delivery-date-requests/:id/reject — PIC rejects.
+// PATCH /delivery-date-requests/:id/reject — PIC rejects (the whole linked group).
 app.patch("/delivery-date-requests/:id/reject", requireAuth, async (req, res) => {
   try {
     if (!isDateApprover(req)) return res.status(403).json({ error: "Not allowed" });
     const cid = getActiveCompanyId(req);
-    const { data: r } = await supabase.from("delivery_date_requests").select("company_id").eq("id", req.params.id).maybeSingle();
+    const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
     if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
+    const ids = r.link_group_id ? (await openDeliveryDateGroup(r)).map(m => m.id) : [r.id];
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "rejected", decision_note: req.body?.note || null,
       reviewed_by: req.user.id, reviewed_by_name: req.user.name || null, reviewed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-    }).eq("id", req.params.id).select().single();
+    }).in("id", ids).select();
     if (error) throw error;
-    res.json({ request: data });
+    res.json({ request: (data || []).find(x => x.id === r.id) || data?.[0] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // PATCH /delivery-date-requests/:id/pick — salesman picks a proposed alternative;
-// it's pre-vetted by the PIC, so it auto-approves and applies.
+// it's pre-vetted by the PIC, so it auto-approves and applies (to the whole
+// linked group).
 app.patch("/delivery-date-requests/:id/pick", requireAuth, async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
@@ -5375,19 +5568,19 @@ app.patch("/delivery-date-requests/:id/pick", requireAuth, async (req, res) => {
     if (r.status !== "needs_reschedule") return res.status(400).json({ error: "No alternatives to pick from" });
     const alts = Array.isArray(r.alternative_dates) ? r.alternative_dates : [];
     if (!alts.includes(picked)) return res.status(400).json({ error: "Pick one of the proposed dates" });
-    const outcome = await claimAndApplyDeliveryDateRequest(r, {
+    const members = await openDeliveryDateGroup(r);
+    const { first, linked } = await claimAndApplyGroup(members, (m) => ({
       actorId: req.user.id, newRequestedDate: picked,
-      extraUpdateFields: { decision_note: (r.decision_note ? r.decision_note + " · " : "") + "Salesman picked a proposed date" },
-    });
-    if (outcome.error) return res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
-    res.json({ request: outcome.request });
+      extraUpdateFields: { decision_note: (m.decision_note ? m.decision_note + " · " : "") + "Salesman picked a proposed date" },
+    }));
+    if (first.error) return res.status(first.status).json({ error: first.error, code: first.code });
+    res.json({ request: first.request, linked_results: linked, linked_failures: linkedFailures(linked) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Requester-only edits of a still-OPEN request (pending / needs_reschedule).
 // An open request has had no effect on the order/DO yet, so it can be amended
 // or withdrawn freely; once approved/rejected it is history and stays as-is.
-const OPEN_DDR_STATUSES = ["pending", "needs_reschedule"];
 async function loadOwnOpenDeliveryDateRequest(req) {
   const cid = getActiveCompanyId(req);
   const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
@@ -5408,19 +5601,23 @@ app.patch("/delivery-date-requests/:id", requireAuth, async (req, res) => {
     if (error) return res.status(status).json({ error });
     const requestedDate = req.body?.requested_date || r.requested_date;
     const remark = req.body?.remark !== undefined ? (String(req.body.remark || "").trim() || null) : r.remark;
-    const decision = evaluateDeliveryDateApproval({ requestedDate, currentDate: r.original_date || null });
-    if (!decision.valid) {
-      return res.status(400).json({ error: decision.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
+    // A linked group is amended as one (same date + remark on every member).
+    const members = await openDeliveryDateGroup(r);
+    const decisions = members.map(m => evaluateDeliveryDateApproval({ requestedDate, currentDate: m.original_date || null }));
+    const invalid = decisions.find(d => !d.valid);
+    if (invalid) {
+      return res.status(400).json({ error: invalid.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
     }
-    if (decision.autoApproved) {
-      const outcome = await claimAndApplyDeliveryDateRequest(r, {
+    if (decisions.every(d => d.autoApproved)) {
+      const { first, linked } = await claimAndApplyGroup(members, () => ({
         actorId: req.user.id, newRequestedDate: requestedDate,
         extraUpdateFields: { remark, decision_note: "Auto-approved — requested date is 10+ calendar days out" },
-      });
-      if (outcome.error) return res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
-      // Flag only once applied — a conflict revert above doesn't restore extra fields.
-      await supabase.from("delivery_date_requests").update({ auto_approved: true }).eq("id", r.id);
-      return res.json({ request: { ...outcome.request, auto_approved: true } });
+      }));
+      if (first.error) return res.status(first.status).json({ error: first.error, code: first.code });
+      // Flag only once applied — a conflict revert doesn't restore extra fields.
+      const appliedIds = [r.id, ...(linked || []).filter(l => l.request).map(l => l.request.id)];
+      await supabase.from("delivery_date_requests").update({ auto_approved: true }).in("id", appliedIds);
+      return res.json({ request: { ...first.request, auto_approved: true }, linked_results: linked, linked_failures: linkedFailures(linked) });
     }
     // Compare-and-swap on the open status so a reviewer deciding at the same
     // moment wins cleanly instead of being overwritten.
@@ -5428,10 +5625,11 @@ app.patch("/delivery-date-requests/:id", requireAuth, async (req, res) => {
       requested_date: requestedDate, remark, status: "pending", auto_approved: false,
       alternative_dates: null, decision_note: null,
       reviewed_by: null, reviewed_by_name: null, reviewed_at: null, updated_at: new Date().toISOString(),
-    }).eq("id", r.id).in("status", OPEN_DDR_STATUSES).select();
+    }).in("id", members.map(m => m.id)).in("status", OPEN_DDR_STATUSES).select();
     if (upErr) throw upErr;
-    if (!rows?.[0]) return res.status(400).json({ error: "Request is already decided" });
-    res.json({ request: rows[0] });
+    const mine = (rows || []).find(x => x.id === r.id);
+    if (!mine) return res.status(400).json({ error: "Request is already decided" });
+    res.json({ request: mine });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5442,11 +5640,13 @@ app.delete("/delivery-date-requests/:id", requireAuth, async (req, res) => {
   try {
     const { r, status, error } = await loadOwnOpenDeliveryDateRequest(req);
     if (error) return res.status(status).json({ error });
+    // A linked request is withdrawn with its whole (still-open) group.
+    const ids = (await openDeliveryDateGroup(r)).map(m => m.id);
     const { data: rows, error: delErr } = await supabase.from("delivery_date_requests")
-      .delete().eq("id", r.id).in("status", OPEN_DDR_STATUSES).select("id");
+      .delete().in("id", ids).in("status", OPEN_DDR_STATUSES).select("id");
     if (delErr) throw delErr;
-    if (!rows?.[0]) return res.status(400).json({ error: "Request is already decided" });
-    res.json({ deleted: true, id: r.id });
+    if (!(rows || []).some(x => x.id === r.id)) return res.status(400).json({ error: "Request is already decided" });
+    res.json({ deleted: true, id: r.id, deleted_ids: rows.map(x => x.id) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
