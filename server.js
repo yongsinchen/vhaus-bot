@@ -15684,7 +15684,8 @@ const isAmendApprover = (req) => ["master", "manager"].includes(req.user.role);
 // refuses to apply and marks the amendment 'conflict' for manual review
 // instead of blindly overwriting unrelated changes.
 async function applySalesOrderAmendment(amendment) {
-  const { data: liveOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", amendment.sales_order_id).maybeSingle();
+  const { data: liveOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
+    .eq("id", amendment.sales_order_id).eq("company_id", amendment.company_id).maybeSingle();
   if (!liveOrder) return { error: "Sales order no longer exists" };
 
   const { conflict } = diffAmendmentAgainstLive(liveOrder, amendment.before_snapshot);
@@ -15704,17 +15705,58 @@ async function applySalesOrderAmendment(amendment) {
   if (updErr) return { error: updErr.message };
 
   if (Array.isArray(proposedItems)) {
-    await supabase.from("sales_order_items").delete().eq("order_id", amendment.sales_order_id);
-    // P1-1: proposed items now also carry source_item_id/proposal_line_id
-    // (lineage fields read only by apply_active_do_amendment(), migration
-    // 089) — neither is a real sales_order_items column, so strip them
-    // before insert here. This delete+reinsert path always mints brand-new
-    // row ids regardless (unaffected by lineage — no DO exists to preserve
-    // FK continuity against).
-    const rows = proposedItems.map(({ source_item_id, proposal_line_id, ...it }) => ({ ...it, order_id: amendment.sales_order_id, line_total: (Number(it.unit_price) || 0) * (Number(it.quantity) || 1) }));
-    if (rows.length) {
-      const { error: itemsErr } = await supabase.from("sales_order_items").insert(rows);
-      if (itemsErr) return { error: itemsErr.message };
+    // Amendment Conflict Resolution — Phase 1 foundation: identity-preserving
+    // write, mirroring apply_active_do_amendment()'s exact semantics
+    // (migration 102) instead of the previous delete-all/insert-all, which
+    // silently discarded sales_order_item.id on every approval. Confirmed
+    // concretely against SO21668 itself during the current-main audit: not
+    // one of the four items amendment #3 left completely unchanged kept its
+    // pre-approval id. Existing line (source_item_id set) -> UPDATE in
+    // place, id survives. New line (source_item_id null) -> INSERT using
+    // proposal_line_id as the real id, exactly like the RPC path. Existing
+    // line omitted from the proposal -> DELETE only that specific line.
+    // Never fuzzy-matched: every source_item_id is validated up front
+    // against THIS order's own current items (already scoped to this
+    // amendment's company via the liveOrder fetch above) and fails closed —
+    // no write happens at all — on anything that doesn't belong here.
+    const existingIds = new Set((liveOrder.sales_order_items || []).map(i => String(i.id)));
+    const seenSourceIds = new Set();
+    for (const it of proposedItems) {
+      if (it.source_item_id == null) continue;
+      const sid = String(it.source_item_id);
+      if (!existingIds.has(sid)) return { error: `Item ${sid} does not belong to this order`, code: "invalid_source_item_id" };
+      if (seenSourceIds.has(sid)) return { error: `Item ${sid} was referenced more than once`, code: "ambiguous_lineage" };
+      seenSourceIds.add(sid);
+    }
+
+    const keepIds = new Set();
+    for (const it of proposedItems) {
+      // arrived_at is physical warehouse state — never touched by a
+      // commercial amendment (the RPC path's UPDATE omits it identically);
+      // only a genuinely NEW line ever sets it, carrying forward a matched
+      // removed line's arrival stamp per the arrival-preservation logic in
+      // PUT /sales-orders/:id.
+      const { source_item_id, proposal_line_id, arrived_at, ...fields } = it;
+      const line_total = (Number(fields.unit_price) || 0) * (Number(fields.quantity) || 1);
+      if (source_item_id != null) {
+        const sid = String(source_item_id);
+        const { error } = await supabase.from("sales_order_items").update({ ...fields, line_total })
+          .eq("id", sid).eq("order_id", amendment.sales_order_id);
+        if (error) return { error: error.message };
+        keepIds.add(sid);
+      } else {
+        const newId = proposal_line_id || crypto.randomUUID();
+        const { error } = await supabase.from("sales_order_items")
+          .insert({ ...fields, arrived_at: arrived_at || null, id: newId, order_id: amendment.sales_order_id, line_total });
+        if (error) return { error: error.message };
+        keepIds.add(String(newId));
+      }
+    }
+    const toDelete = (liveOrder.sales_order_items || []).map(i => String(i.id)).filter(id => !keepIds.has(id));
+    if (toDelete.length) {
+      const { error } = await supabase.from("sales_order_items").delete()
+        .eq("order_id", amendment.sales_order_id).in("id", toDelete);
+      if (error) return { error: error.message };
     }
   }
 
@@ -15728,6 +15770,17 @@ async function applySalesOrderAmendment(amendment) {
       if (existingComm) await calculateCommission(deliveryOrderId, amendment.company_id);
     } catch (e) { console.error("commission recalc on amendment approval:", e.message); }
   }
+
+  // Amendment Conflict Resolution — Phase 1 foundation (migration 106):
+  // records what was ACTUALLY applied, distinct from proposed_snapshot (the
+  // original ask) — identical to it today, but this is what a future
+  // Phase 2 rebase would make diverge. Best-effort and non-fatal: the
+  // column doesn't exist in production until migration 106 is applied, so
+  // a missing-column error here must never fail the apply that already
+  // succeeded above.
+  const { error: snapshotErr } = await supabase.from("sales_order_amendments")
+    .update({ final_applied_snapshot: full }).eq("id", amendment.id);
+  if (snapshotErr) console.error("[applySalesOrderAmendment] final_applied_snapshot write (non-fatal, pre-migration-106 safe):", snapshotErr.message);
 
   return { applied: true, order: full, syncError };
 }
