@@ -15014,13 +15014,13 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
   try {
     const company_id = getActiveCompanyId(req);
     const { role, salesman_name } = req.user;
-    const { status, search, salesman, date_from, date_to, order_from, order_to, branch_id, month, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
+    const { status, search, salesman, date_from, date_to, order_from, order_to, branch_id, month, archived, sort_by = "created_at", sort_order = "desc", page = 1, limit = 50 } = req.query;
     const lim = Math.min(Number(limit) || 50, 100);
     const pg = Math.max(Number(page) || 1, 1);
     const ascending = sort_order === "asc";
 
     // Lightweight columns — NO items, payment_proofs, customer_signature
-    const listCols = "id, company_id, order_number, customer_name, customer_contact, customer_id_type, customer_id_no, customer_email, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, order_date, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark";
+    const listCols = "id, company_id, order_number, customer_name, customer_contact, customer_id_type, customer_id_no, customer_email, salesman_name, status, subtotal, discount, deposit, gst_amount, gst_waived, order_date, delivery_date, delivery_time_slot, delivery_type, country, sales_channel, branch_id, created_at, notes, remark, archived_at, archive_reason";
 
     // Build count query + data query in parallel
     let countQ = supabase.from("sales_orders").select("id", { count: "exact", head: true }).eq("company_id", company_id);
@@ -15028,6 +15028,10 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
 
     // Apply filters to both queries
     if (status) { countQ = countQ.eq("status", status); dataQ = dataQ.eq("status", status); }
+    // Archive filter (migration 108). Omitted = all rows, so existing callers
+    // (SO-number lookups, upcoming fallback) are unaffected.
+    if (archived === "exclude") { countQ = countQ.is("archived_at", null); dataQ = dataQ.is("archived_at", null); }
+    else if (archived === "only") { countQ = countQ.not("archived_at", "is", null); dataQ = dataQ.not("archived_at", "is", null); }
     if (branch_id) { countQ = countQ.eq("branch_id", branch_id); dataQ = dataQ.eq("branch_id", branch_id); }
     if (/^\d{4}-\d{2}$/.test(month || "")) {
       // Filter by ORDER date month (order_date is TEXT YYYY-MM-DD; string range works).
@@ -16384,6 +16388,37 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
       ...(statusSyncError ? { projection_sync_warning: "Status updated, but the operational projection sync failed. An admin has been notified — check scripts/audit-data-consistency.js." } : {}),
       ...(clawbackWarning ? { commission_clawback_warning: clawbackWarning } : {}),
     });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /sales-orders/:id/archive — body { archived: true|false }
+// Presentation-only flag for the Orders list (migration 108): no status,
+// delivery, commission or legacy `orders` change. Delivered orders are also
+// auto-archived by the trg_sales_orders_auto_archive trigger.
+app.patch("/sales-orders/:id/archive", requireAuth, async (req, res) => {
+  try {
+    if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
+    const { archived } = req.body || {};
+    if (typeof archived !== "boolean") return res.status(400).json({ error: "archived must be true or false" });
+    const company_id = getActiveCompanyId(req);
+    const { data: existing, error: exErr } = await supabase.from("sales_orders")
+      .select("id, salesman_name, archived_at").eq("id", req.params.id).eq("company_id", company_id).maybeSingle();
+    if (exErr) throw exErr;
+    if (!existing) return res.status(404).json({ error: "Order not found" });
+    // Salesmen may only archive their own orders (same exact-name match as the list).
+    if (req.user.role === "salesman") {
+      const name = String(req.user.salesman_name || "").toLowerCase().trim();
+      const owners = String(existing.salesman_name || "").toLowerCase().split("/").map(s => s.trim());
+      if (!name || !owners.includes(name)) return res.status(403).json({ error: "You can only archive your own orders" });
+    }
+    const updates = archived
+      ? { archived_at: existing.archived_at || new Date().toISOString(), archived_by: req.user.id, archived_by_name: req.user.name || null, archive_reason: "manual" }
+      : { archived_at: null, archived_by: null, archived_by_name: null, archive_reason: null };
+    const { data, error } = await supabase.from("sales_orders").update(updates)
+      .eq("id", req.params.id).eq("company_id", company_id)
+      .select("id, archived_at, archived_by_name, archive_reason").single();
+    if (error) throw error;
+    res.json({ order: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
