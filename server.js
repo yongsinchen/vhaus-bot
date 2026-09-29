@@ -8468,6 +8468,7 @@ app.patch("/service-requests/:id/approve", requireRole(DATE_APPROVER_ROLES), asy
       decision_note: (req.body?.note || "").trim() || null,
       created_service_id: result.service.id, updated_at: new Date().toISOString(),
     }).eq("id", reqRow.id).select().single();
+    await moveRequestPhotosToService(reqRow.id, result.service.id, reqRow.company_id || companyId);
     res.json({ request: updated, service: result.service });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -8542,10 +8543,12 @@ app.delete("/service-requests/:id", requireRole(ORDER_ROLES), async (req, res) =
   try {
     const { r, status, error } = await loadOwnPendingServiceRequest(req);
     if (error) return res.status(status).json({ error });
+    const photoFiles = await listParentPhotoFiles("service_request_photos", "request_id", r.id);
     const { data: rows, error: delErr } = await supabase.from("service_requests")
       .delete().eq("id", r.id).eq("status", "pending").select("id");
     if (delErr) throw delErr;
     if (!rows?.[0]) return res.status(409).json({ error: "Request is already decided" });
+    await removePhotoFiles(photoFiles);
     res.json({ deleted: true, id: r.id });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -16549,7 +16552,7 @@ const salesmanOwnsOrder = (user, order) => {
   return !!name && owners.includes(name);
 };
 
-function registerPhotoRoutes({ base, table, fkColumn, parentTable, parentSelect, folder, writeRoles, canWrite }) {
+function registerPhotoRoutes({ base, table, fkColumn, parentTable, parentSelect, folder, writeRoles, canWrite, canRead }) {
   const loadParent = async (req) => {
     const { data, error } = await supabase.from(parentTable).select(parentSelect)
       .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).maybeSingle();
@@ -16565,7 +16568,9 @@ function registerPhotoRoutes({ base, table, fkColumn, parentTable, parentSelect,
 
   app.get(`${base}/:id/photos`, requireAuth, async (req, res) => {
     try {
-      if (!(await loadParent(req))) return res.status(404).json({ error: "Record not found" });
+      const parent = await loadParent(req);
+      if (!parent) return res.status(404).json({ error: "Record not found" });
+      if (canRead && !canRead(req, parent)) return res.status(403).json({ error: "You cannot view photos on this record" });
       const { data, error } = await supabase.from(table).select(PHOTO_COLS)
         .eq(fkColumn, req.params.id).eq("company_id", getActiveCompanyId(req)).order("created_at");
       if (error) throw error;
@@ -16672,6 +16677,33 @@ registerPhotoRoutes({
   parentTable: "services", parentSelect: "id", folder: "service-photos",
   writeRoles: [...MANAGE_ROLES, "driver", "operation"],
 });
+// Service approval requests (migration 110): the requester manages photos on
+// their own pending request; approvers (same set as GET /service-requests'
+// queue) can view them. Approval moves them onto the new case.
+registerPhotoRoutes({
+  base: "/service-requests", table: "service_request_photos", fkColumn: "request_id",
+  parentTable: "service_requests", parentSelect: "id, requested_by, status", folder: "service-photos",
+  writeRoles: ORDER_ROLES,
+  canWrite: (user, r) => r.requested_by === user.id && r.status === "pending",
+  canRead: (req, r) => r.requested_by === req.user.id || isDateApprover(req),
+});
+
+// Approval: re-point a request's photos at the case it created. Same files —
+// only the rows move. Best-effort: a failure here must not undo an approval
+// (the photos stay visible on the request and can be re-added to the case).
+async function moveRequestPhotosToService(requestId, serviceId, companyId) {
+  try {
+    const { data: rows, error } = await supabase.from("service_request_photos")
+      .select("url, storage_path, description, uploaded_by, uploaded_by_name, created_at")
+      .eq("request_id", requestId).eq("company_id", companyId);
+    if (error) throw error;
+    if (!rows?.length) return;
+    const { error: insErr } = await supabase.from("service_photos")
+      .insert(rows.map(r => ({ ...r, service_id: serviceId, company_id: companyId })));
+    if (insErr) throw insErr;
+    await supabase.from("service_request_photos").delete().eq("request_id", requestId).eq("company_id", companyId);
+  } catch (e) { console.error(`Moving photos from service request ${requestId}:`, e.message); }
+}
 
 // PATCH /sales-orders/:id/signature — save customer signature data URL
 app.patch("/sales-orders/:id/signature", requireAuth, async (req, res) => {
