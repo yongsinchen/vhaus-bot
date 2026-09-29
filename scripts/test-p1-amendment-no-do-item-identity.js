@@ -193,21 +193,40 @@ async function makeAmendment(companyId, so, items, { corruptSourceId } = {}) {
     }
 
     // ── 8. Existing conflict detection still blocks stale approval ────
-    console.log("\n── Conflict detection unchanged: live drift still blocks apply ──");
+    console.log("\n── Post-migration-108: operational-only drift no longer conflicts (the SO21668 fix, now live) ──");
     {
+      // UPDATED after migration 108 was applied to production: routeAmendmentApproval
+      // now calls the real apply_sales_order_amendment() RPC, whose staleness
+      // check compares CANONICAL/commercial fields only (see migrations/108 +
+      // lib/amendment-three-way-merge.js) — a deposit-only drift, the exact
+      // SO21668 #2 shape, is no longer treated as a conflict. This replaces the
+      // old assertion here (which expected 409/conflict, matching the pre-
+      // Phase-2 whole-snapshot diffAmendmentAgainstLive() behavior) — that was
+      // correct for Phase 1 and is now intentionally superseded, not a
+      // regression. See scripts/test-phase2-transactional-apply-rpc.js tests
+      // H/I for the full direct-RPC proof of both halves (relevant drift still
+      // conflicts; operational-only drift does not).
       const { so, items } = await makeOrderWithItems(companyId);
       const amendment = await makeAmendment(companyId, so, items);
-      // Simulate an unrelated live edit landing after submission — exactly
-      // the SO21668 shape (a deposit/other-field change), which
-      // diffAmendmentAgainstLive still catches unchanged by this phase.
       await admin.from("sales_orders").update({ deposit: 999 }).eq("id", so.id);
       const res = await http.patch(`/order-amendments/${amendment.id}/approve`);
-      ok("8. approve returns 409 on live drift", res.status === 409, { status: res.status, body: res.data });
+      ok("8. approve succeeds despite deposit-only drift (post-migration-108)", res.status === 200, { status: res.status, body: res.data });
       const { data: amendAfter } = await admin.from("sales_order_amendments").select("status").eq("id", amendment.id).maybeSingle();
-      ok("8b. amendment marked conflict, not approved", amendAfter?.status === "conflict", amendAfter);
-      const { data: itemsAfter } = await admin.from("sales_order_items").select("id, unit_price").eq("order_id", so.id);
-      ok("8c. items never touched — still the original 4, original prices", (itemsAfter || []).length === 4
-        && itemsAfter.every(i => [100, 200, 300, 400].includes(Number(i.unit_price)) || [100,200,300].includes(Number(i.unit_price))));
+      ok("8b. amendment approved, not conflict", amendAfter?.status === "approved", amendAfter);
+      // The RPC itself never touches deposit (proven with subtotal held constant
+      // in test-phase2-transactional-apply-rpc.js H/I). THIS fixture's amendment
+      // also changes subtotal 1000->950 (every makeAmendment() does), so the
+      // post-apply recomputeOrderPaid() call (server.js, the pre-existing
+      // single choke point for every commercial edit) correctly reconciles
+      // paid against the NEW total: clamp(initial_deposit‖deposit(999) +
+      // payments(0), 0, newTotal(950)) = 950. That clamp is intentional,
+      // documented design (server.js ~5864-5870), unrelated to migration 108.
+      // The actual regression this guards against is deposit reverting to the
+      // amendment's STALE before-snapshot value (0, captured pre-drift) --
+      // asserted by 8d below.
+      const { data: soAfter } = await admin.from("sales_orders").select("deposit").eq("id", so.id).maybeSingle();
+      ok("8c. deposit reconciled against live drift + new total (999 clamped to new subtotal 950), not the stale before-snapshot value", Number(soAfter?.deposit) === 950, soAfter?.deposit);
+      ok("8d. deposit did NOT revert to the amendment's stale before-snapshot value (0)", Number(soAfter?.deposit) !== 0, soAfter?.deposit);
     }
 
     console.log(`\n═══ RESULT: ${pass} passed, ${fail} failed ═══\n`);

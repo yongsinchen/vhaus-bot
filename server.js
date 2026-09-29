@@ -29,6 +29,7 @@ const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
 const { createActiveDoAmendmentService, diffAmendmentAgainstLive, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
+const { threeWayMerge, applyResolutions, canonicalConflictPath } = require("./lib/amendment-three-way-merge");
 const { createItemArrivalEventService, SOURCES: ARRIVAL_EVENT_SOURCES } = require("./lib/item-arrival-events");
 const { getCommissionableAmount } = commissionLib;
 const crypto = require("crypto");
@@ -16049,6 +16050,16 @@ const isAmendApprover = (req) => ["master", "manager"].includes(req.user.role);
 // used by BOTH this function AND applyActiveDoAmendment (also imported),
 // never two copies that can drift apart.
 
+// Phase 2A/2D (migration 108): the CANONICAL no-DO apply path is now the
+// apply_sales_order_amendment() transactional RPC — see
+// applySalesOrderAmendmentTransactional() below, which calls it and falls
+// back to THIS function only if the RPC doesn't exist yet in this
+// environment (pre-migration-108 deploy-order safety, same pattern as the
+// Kulai reserve_branch_order_number() fallback). Once migration 108 is
+// applied everywhere, this function becomes dead code kept only as that
+// fallback's implementation — do not add new behavior here; add it to the
+// RPC and to lib/amendment-three-way-merge.js instead.
+//
 // Apply a pending amendment's proposed_snapshot to the live sales_orders /
 // sales_order_items rows. This is the ONLY place that does so for an SO with
 // NO Delivery Order at all — never at request time (PUT /sales-orders/:id
@@ -16058,8 +16069,11 @@ const isAmendApprover = (req) => ["master", "manager"].includes(req.user.role);
 // Conflict protection: if the live order has drifted from the amendment's
 // before_snapshot since it was requested (another edit landed in between),
 // refuses to apply and marks the amendment 'conflict' for manual review
-// instead of blindly overwriting unrelated changes.
-async function applySalesOrderAmendment(amendment) {
+// instead of blindly overwriting unrelated changes. NOTE: this legacy path
+// still uses the OLD whole-snapshot diffAmendmentAgainstLive() check (the
+// exact thing that falsely blocked SO21668 #2) — the canonical-field-only
+// fix lives in the RPC's _amendment_canonical_fields_changed(), not here.
+async function applySalesOrderAmendmentLegacy(amendment) {
   const { data: liveOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
     .eq("id", amendment.sales_order_id).eq("company_id", amendment.company_id).maybeSingle();
   if (!liveOrder) return { error: "Sales order no longer exists" };
@@ -16161,6 +16175,49 @@ async function applySalesOrderAmendment(amendment) {
   return { applied: true, order: full, syncError };
 }
 
+const _isMissingFunctionError = (err) => !!err && (err.code === "42883" || err.code === "PGRST202" || /function .* does not exist/i.test(err.message || ""));
+
+// Phase 2A/2D: the canonical no-DO apply path. Calls apply_sales_order_
+// amendment() — one atomic transaction covering header + items + audit +
+// final_applied_snapshot + status, per migration 108. Passes
+// amendment.rebased_proposed_snapshot when a Phase 2C rebase has already
+// been prepared (Manager resolved all conflicts) — the RPC re-validates
+// that live still matches rebase_base_snapshot before ever applying it, so
+// a rebase that went stale between preview and this call is caught inside
+// the RPC itself, never silently applied. Falls back to the pre-Phase-2
+// Node implementation (applySalesOrderAmendmentLegacy) if the RPC doesn't
+// exist yet in this environment — deploy-order safety, identical in spirit
+// to the Kulai reserve_branch_order_number() fallback: this code must never
+// break amendment approval just because migration 108 hasn't landed yet.
+async function applySalesOrderAmendmentTransactional(amendment, actorId) {
+  const { data, error } = await supabase.rpc("apply_sales_order_amendment", {
+    p_amendment_id: amendment.id,
+    p_company_id: amendment.company_id,
+    p_actor_id: actorId,
+    p_rebased_proposed_snapshot: amendment.rebased_proposed_snapshot || null,
+  });
+  if (error) {
+    if (_isMissingFunctionError(error)) {
+      console.error("[applySalesOrderAmendmentTransactional] apply_sales_order_amendment RPC not found (migration 108 not applied) — falling back to legacy Node apply");
+      return applySalesOrderAmendmentLegacy(amendment);
+    }
+    return { error: error.message };
+  }
+  if (data?.status === "conflict") return { conflict: true, reason: data.reason };
+  const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", amendment.sales_order_id).maybeSingle();
+  await attachLinkedProducts(full?.sales_order_items);
+  const { syncError } = await syncSalesOrderToDelivery(full, full?.sales_order_items);
+  const deliveryOrderId = full ? (await supabase.from("orders").select("id").eq("company_id", amendment.company_id).eq("so_number", full.order_number).maybeSingle()).data?.id : null;
+  if (deliveryOrderId) {
+    try { await recomputeOrderPaid(deliveryOrderId); } catch (e) { console.error("recomputeOrderPaid on amendment approval:", e.message); }
+    try {
+      const { data: existingComm } = await supabase.from("commissions").select("id").eq("order_id", deliveryOrderId).limit(1).maybeSingle();
+      if (existingComm) await calculateCommission(deliveryOrderId, amendment.company_id);
+    } catch (e) { console.error("commission recalc on amendment approval:", e.message); }
+  }
+  return { applied: true, order: full, syncError };
+}
+
 // applyActiveDoAmendment and ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES are
 // imported from lib/active-do-amendment.js — see that file's header comment
 // for the urgent business clarification (arrival status must never gate
@@ -16177,7 +16234,7 @@ async function routeAmendmentApproval(amendment, req) {
   const { data: doRows } = await supabase.from("delivery_orders").select("id").eq("sales_order_id", amendment.sales_order_id).limit(1);
   const anyDo = (doRows || []).length > 0;
   if (!anyDo) {
-    const result = await applySalesOrderAmendment(amendment);
+    const result = await applySalesOrderAmendmentTransactional(amendment, req.user.id);
     return { path: "legacy", ...result };
   }
   const result = await applyActiveDoAmendment(amendment, req);
@@ -16219,7 +16276,9 @@ app.patch("/order-amendments/:id/approve", requireAuth, async (req, res) => {
     if (result.conflict) {
       const message = result.path === "rpc"
         ? (ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES[result.reason] || "This amendment could not be applied — it is in conflict and needs manual review.")
-        : "The sales order changed since this amendment was requested — cannot apply automatically. Reload the order and review.";
+        : result.reason === "rebase_stale"
+          ? "The sales order changed again since this amendment was rebased — the prepared rebase is no longer valid. Run Rebase & Review again."
+          : "The sales order changed since this amendment was requested — cannot apply automatically. Reload the order and review.";
       return res.status(409).json({ error: message, amendment_status: "conflict", reason: result.reason });
     }
 
@@ -16267,6 +16326,125 @@ app.patch("/order-amendments/:id/reject", requireAuth, async (req, res) => {
     }).eq("id", req.params.id).select().single();
     if (error) throw error;
     res.json({ amendment: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Amendment Conflict Resolution — Phase 2C: rebase preview + resolve.
+// Manager/Admin only (master/manager — same as isAmendApprover, company_admin
+// deliberately NOT added, unchanged from Phase 1). Both endpoints ALWAYS
+// re-fetch current live state fresh — never trust a client-supplied
+// snapshot, never trust a previous preview's response.
+
+// PREVIEW FIRST — zero mutation. Computes the canonical three-way merge
+// against current live state and returns it in full: original before,
+// original proposed, current live, the auto-merged/rebased result, and a
+// structured (never human-readable-only) conflict list the frontend can
+// render deterministically. Never persists anything — a manager can open
+// this repeatedly, or abandon it, with zero side effects. Only valid on a
+// 'conflict' amendment (this is what Rebase & Review is FOR).
+app.post("/order-amendments/:id/rebase-preview", requireAuth, async (req, res) => {
+  try {
+    if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can review a conflict" });
+    const cid = getActiveCompanyId(req);
+    const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
+    if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
+    if (a.status !== "conflict") return res.status(400).json({ error: `Amendment is '${a.status}', not 'conflict' — nothing to rebase` });
+
+    const { data: liveSo } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
+      .eq("id", a.sales_order_id).eq("company_id", a.company_id).maybeSingle();
+    if (!liveSo) return res.status(404).json({ error: "Sales order no longer exists" });
+
+    const result = threeWayMerge(a.before_snapshot, a.proposed_snapshot, liveSo);
+    const conflicts = result.conflicts.map(c => ({ ...c, path: canonicalConflictPath(c) }));
+    res.json({
+      original_before: a.before_snapshot,
+      original_proposed: a.proposed_snapshot,
+      current_live: liveSo,
+      rebased_proposed_snapshot: result.rebased_proposed_snapshot,
+      conflicts,
+      has_conflicts: result.has_conflicts,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// RESOLVE — persists the Manager's explicit per-conflict choices. Re-fetches
+// live AND re-runs the merge fresh (never trusts whatever the client saw in
+// its earlier preview call — the live order may have moved in between).
+// Requires EVERY true conflict to have an explicit resolution (proposed |
+// live) — never a silent default, per applyResolutions()'s own guarantee.
+// Does NOT change amendment.status (stays 'conflict' — Phase 1 explicitly
+// does not introduce a second terminal/intermediate status); the presence
+// of a non-null rebased_proposed_snapshot + rebased_at is what signals
+// "this conflict has a ready rebase, awaiting final apply".
+app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) => {
+  try {
+    if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can resolve a conflict" });
+    const cid = getActiveCompanyId(req);
+    const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
+    if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
+    if (a.status !== "conflict") return res.status(400).json({ error: `Amendment is '${a.status}', not 'conflict' — nothing to rebase` });
+
+    const fieldResolutions = req.body?.field_resolutions;
+    if (!fieldResolutions || typeof fieldResolutions !== "object") return res.status(400).json({ error: "field_resolutions is required" });
+
+    const { data: liveSo } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
+      .eq("id", a.sales_order_id).eq("company_id", a.company_id).maybeSingle();
+    if (!liveSo) return res.status(404).json({ error: "Sales order no longer exists" });
+
+    const result = threeWayMerge(a.before_snapshot, a.proposed_snapshot, liveSo);
+    let rebasedSnapshot;
+    try {
+      rebasedSnapshot = applyResolutions(result, fieldResolutions);
+    } catch (e) {
+      return res.status(400).json({ error: e.message, code: "unresolved_conflict" });
+    }
+
+    const { data: updated, error } = await supabase.from("sales_order_amendments").update({
+      rebase_base_snapshot: liveSo,
+      rebase_base_fingerprint: liveSo.updated_at,
+      rebased_proposed_snapshot: rebasedSnapshot,
+      field_resolutions: fieldResolutions,
+      rebased_by: req.user.id,
+      rebased_by_name: req.user.name || null,
+      rebased_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }).eq("id", a.id).select().single();
+    if (error) throw error;
+    res.json({ amendment: updated, rebased_proposed_snapshot: rebasedSnapshot });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Amendment Conflict Resolution — Phase 2: explicit supersede lifecycle.
+// Never inferred automatically merely because a newer amendment exists on
+// the same SO — a human (Manager/Admin) must explicitly say "this older
+// conflicted amendment's business intent was replaced by that newer,
+// already-approved one". Only a 'conflict' amendment can be marked
+// superseded (an amendment that's still 'pending' should be resolved on
+// its own merits; one already 'approved'/'rejected' is already terminal).
+// The target must be 'approved' — superseding by something not yet decided
+// would misrepresent what actually happened.
+app.post("/order-amendments/:id/supersede", requireAuth, async (req, res) => {
+  try {
+    if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can mark an amendment superseded" });
+    const cid = getActiveCompanyId(req);
+    const { superseded_by } = req.body || {};
+    if (!superseded_by) return res.status(400).json({ error: "superseded_by (the replacing amendment's id) is required" });
+
+    const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
+    if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
+    if (a.status !== "conflict") return res.status(400).json({ error: `Amendment is '${a.status}', not 'conflict' — supersede only applies to an unresolved conflict` });
+
+    const { data: replacement } = await supabase.from("sales_order_amendments").select("id, status, sales_order_id, company_id").eq("id", superseded_by).maybeSingle();
+    if (!replacement || replacement.company_id !== a.company_id) return res.status(404).json({ error: "Replacement amendment not found" });
+    if (replacement.sales_order_id !== a.sales_order_id) return res.status(400).json({ error: "Replacement amendment is not for the same sales order" });
+    if (replacement.status !== "approved") return res.status(400).json({ error: "Replacement amendment must be 'approved' to supersede an older conflict with it" });
+
+    const { data: updated, error } = await supabase.from("sales_order_amendments").update({
+      status: "superseded", superseded_by, superseded_at: new Date().toISOString(),
+      superseded_by_name: req.user.name || null, updated_at: new Date().toISOString(),
+    }).eq("id", a.id).select().single();
+    if (error) throw error;
+    res.json({ amendment: updated });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
