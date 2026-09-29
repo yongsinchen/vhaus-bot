@@ -8783,7 +8783,9 @@ app.delete("/service-cases/:id", requireRole(MANAGE_ROLES), async (req, res) => 
         .in("status", ["pending", "needs_reschedule"])
         .eq("order_id", svc.legacy_order_id).is("delivery_order_id", null);
     }
-    await supabase.from("services").delete().eq("id", req.params.id);
+    const photoFiles = await listParentPhotoFiles("service_photos", "service_id", req.params.id);
+    const { error: delErr } = await supabase.from("services").delete().eq("id", req.params.id);
+    if (!delErr) await removePhotoFiles(photoFiles);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -16444,8 +16446,10 @@ app.delete("/sales-orders/:id", requireAuth, async (req, res) => {
       const { error: doErr } = await supabase.from("delivery_orders").delete().in("id", doIds);
       if (doErr) throw doErr;
     }
+    const photoFiles = existing ? await listParentPhotoFiles("sales_order_photos", "sales_order_id", req.params.id) : [];
     const { error } = await supabase.from("sales_orders").delete().eq("id", req.params.id).eq("company_id", company_id);
     if (error) throw error;
+    await removePhotoFiles(photoFiles);
     if (existing?.order_number) {
       await supabase.from("orders").delete().eq("company_id", company_id).eq("so_number", existing.order_number);
     }
@@ -16472,6 +16476,157 @@ app.post("/sales-orders/upload-attachment", requireAuth, upload.single("file"), 
     const { data } = supabase.storage.from("order-attachments").getPublicUrl(path);
     res.json({ url: data?.publicUrl || null });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// Photos on sales orders and service cases (migration 109). Each photo has
+// an optional description. Same four routes for both parents:
+//   GET    /<base>/:id/photos
+//   POST   /<base>/:id/photos            multipart: photos[] + descriptions (JSON array, same order)
+//   PATCH  /<base>/:id/photos/:photoId   { description }
+//   DELETE /<base>/:id/photos/:photoId
+// The parent must belong to the active company; files go to the
+// order-attachments bucket under <folder>/<company_id>/.
+// ══════════════════════════════════════════════════════════════════
+const PHOTO_MAX_BYTES = 15 * 1024 * 1024;
+const PHOTO_MAX_PER_UPLOAD = 10;
+const PHOTO_DESC_MAX = 1000;
+const PHOTO_COLS = "id, url, description, uploaded_by, uploaded_by_name, created_at, updated_at";
+const cleanPhotoDescription = v => {
+  const s = String(v ?? "").trim();
+  return s ? s.slice(0, PHOTO_DESC_MAX) : null;
+};
+
+// Salesmen may only change their own orders (same exact-name match as the
+// Orders list and PATCH /sales-orders/:id/archive).
+const salesmanOwnsOrder = (user, order) => {
+  const name = String(user.salesman_name || "").toLowerCase().trim();
+  const owners = String(order.salesman_name || "").toLowerCase().split("/").map(s => s.trim());
+  return !!name && owners.includes(name);
+};
+
+function registerPhotoRoutes({ base, table, fkColumn, parentTable, parentSelect, folder, writeRoles, canWrite }) {
+  const loadParent = async (req) => {
+    const { data, error } = await supabase.from(parentTable).select(parentSelect)
+      .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).maybeSingle();
+    if (error) throw error;
+    return data;
+  };
+  const writeGuard = async (req, res) => {
+    const parent = await loadParent(req);
+    if (!parent) { res.status(404).json({ error: "Record not found" }); return null; }
+    if (canWrite && !canWrite(req.user, parent)) { res.status(403).json({ error: "You cannot change photos on this record" }); return null; }
+    return parent;
+  };
+
+  app.get(`${base}/:id/photos`, requireAuth, async (req, res) => {
+    try {
+      if (!(await loadParent(req))) return res.status(404).json({ error: "Record not found" });
+      const { data, error } = await supabase.from(table).select(PHOTO_COLS)
+        .eq(fkColumn, req.params.id).eq("company_id", getActiveCompanyId(req)).order("created_at");
+      if (error) throw error;
+      res.json({ photos: data || [] });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post(`${base}/:id/photos`, requireRole(writeRoles), upload.array("photos", PHOTO_MAX_PER_UPLOAD), async (req, res) => {
+    try {
+      const files = req.files || [];
+      if (files.length === 0) return res.status(400).json({ error: "No photos uploaded" });
+      const bad = files.find(f => !/^image\//.test(f.mimetype || ""));
+      if (bad) return res.status(400).json({ error: `${bad.originalname} is not an image` });
+      const big = files.find(f => f.size > PHOTO_MAX_BYTES);
+      if (big) return res.status(400).json({ error: `${big.originalname} is larger than 15 MB` });
+      let descriptions = [];
+      try { descriptions = JSON.parse(req.body?.descriptions || "[]"); } catch { descriptions = []; }
+      if (!Array.isArray(descriptions)) descriptions = [];
+
+      if (!(await writeGuard(req, res))) return;
+      const company_id = getActiveCompanyId(req);
+
+      const uploaded = [];
+      try {
+        for (const file of files) {
+          const ext = (file.originalname.split(".").pop() || "jpg").toLowerCase().replace(/[^a-z0-9]/g, "") || "jpg";
+          const path = `${folder}/${company_id}/${req.params.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+          const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+          if (upErr) throw new Error("Upload failed: " + upErr.message);
+          const { data: urlData } = supabase.storage.from("order-attachments").getPublicUrl(path);
+          uploaded.push({ path, url: urlData?.publicUrl || null });
+        }
+        const rows = uploaded.map((u, i) => ({
+          [fkColumn]: req.params.id, company_id, url: u.url, storage_path: u.path,
+          description: cleanPhotoDescription(descriptions[i]),
+          uploaded_by: req.user.id, uploaded_by_name: req.user.name || null,
+        }));
+        const { data, error } = await supabase.from(table).insert(rows).select(PHOTO_COLS);
+        if (error) throw error;
+        res.status(201).json({ photos: data || [] });
+      } catch (err) {
+        // Don't leave orphaned files behind when a later file or the insert fails.
+        if (uploaded.length) await supabase.storage.from("order-attachments").remove(uploaded.map(u => u.path)).catch(() => {});
+        throw err;
+      }
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.patch(`${base}/:id/photos/:photoId`, requireRole(writeRoles), async (req, res) => {
+    try {
+      if (!(await writeGuard(req, res))) return;
+      const { data, error } = await supabase.from(table)
+        .update({ description: cleanPhotoDescription(req.body?.description), updated_at: new Date().toISOString() })
+        .eq("id", req.params.photoId).eq(fkColumn, req.params.id).eq("company_id", getActiveCompanyId(req))
+        .select(PHOTO_COLS).maybeSingle();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: "Photo not found" });
+      res.json({ photo: data });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.delete(`${base}/:id/photos/:photoId`, requireRole(writeRoles), async (req, res) => {
+    try {
+      if (!(await writeGuard(req, res))) return;
+      const { data, error } = await supabase.from(table).delete()
+        .eq("id", req.params.photoId).eq(fkColumn, req.params.id).eq("company_id", getActiveCompanyId(req))
+        .select("storage_path, url").maybeSingle();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: "Photo not found" });
+      await removePhotoFiles([data]);
+      res.json({ ok: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+}
+
+// Best-effort storage cleanup for photo rows ({ storage_path, url }).
+async function removePhotoFiles(rows) {
+  const paths = (rows || []).map(r => r.storage_path).filter(Boolean);
+  if (paths.length) {
+    const { error } = await supabase.storage.from("order-attachments").remove(paths).catch(e => ({ error: e }));
+    if (error) console.error("Photo storage cleanup error:", error.message);
+  }
+  const urlOnly = (rows || []).filter(r => !r.storage_path && r.url).map(r => r.url);
+  if (urlOnly.length) await deleteStorageObjectsByPublicUrl(urlOnly);
+}
+
+// Parent delete: read the photo rows first (the FK cascade removes them with
+// the parent), then pass them to removePhotoFiles once the delete succeeded.
+async function listParentPhotoFiles(table, fkColumn, parentId) {
+  try {
+    const { data } = await supabase.from(table).select("storage_path, url").eq(fkColumn, parentId);
+    return data || [];
+  } catch (e) { console.error("Photo lookup error:", e.message); return []; }
+}
+
+registerPhotoRoutes({
+  base: "/sales-orders", table: "sales_order_photos", fkColumn: "sales_order_id",
+  parentTable: "sales_orders", parentSelect: "id, salesman_name", folder: "order-photos",
+  writeRoles: ORDER_ROLES,
+  canWrite: (user, order) => user.role !== "salesman" || salesmanOwnsOrder(user, order),
+});
+registerPhotoRoutes({
+  base: "/service-cases", table: "service_photos", fkColumn: "service_id",
+  parentTable: "services", parentSelect: "id", folder: "service-photos",
+  writeRoles: [...MANAGE_ROLES, "driver", "operation"],
 });
 
 // PATCH /sales-orders/:id/signature — save customer signature data URL
