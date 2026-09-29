@@ -16688,6 +16688,61 @@ registerPhotoRoutes({
   canRead: (req, r) => r.requested_by === req.user.id || isDateApprover(req),
 });
 
+// ══════════════════════════════════════════════════════════════════
+// Sales order notes (migration 111) — a running log on the SO. Never touches
+// sales_orders, so no amendment and no order-edit permission: anyone who can
+// open the SO in the active company can read and add. Delete: the author, or
+// master/manager/company_admin (same set that may delete an SO).
+// ══════════════════════════════════════════════════════════════════
+const SO_NOTE_MAX = 4000;
+const SO_NOTE_COLS = "id, body, created_by, created_by_name, created_at";
+const soInActiveCompany = async (req) => {
+  const { data, error } = await supabase.from("sales_orders").select("id")
+    .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).maybeSingle();
+  if (error) throw error;
+  return !!data;
+};
+
+app.get("/sales-orders/:id/notes", requireAuth, async (req, res) => {
+  try {
+    if (!(await soInActiveCompany(req))) return res.status(404).json({ error: "Order not found" });
+    const { data, error } = await supabase.from("sales_order_notes").select(SO_NOTE_COLS)
+      .eq("sales_order_id", req.params.id).eq("company_id", getActiveCompanyId(req)).order("created_at");
+    if (error) throw error;
+    res.json({ notes: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/sales-orders/:id/notes", requireAuth, async (req, res) => {
+  try {
+    const body = String(req.body?.body ?? "").trim();
+    if (!body) return res.status(400).json({ error: "Note cannot be empty" });
+    if (body.length > SO_NOTE_MAX) return res.status(400).json({ error: `Note is too long (max ${SO_NOTE_MAX} characters)` });
+    if (!(await soInActiveCompany(req))) return res.status(404).json({ error: "Order not found" });
+    const { data, error } = await supabase.from("sales_order_notes").insert({
+      sales_order_id: req.params.id, company_id: getActiveCompanyId(req), body,
+      created_by: req.user.id, created_by_name: req.user.name || req.user.salesman_name || null,
+    }).select(SO_NOTE_COLS).single();
+    if (error) throw error;
+    res.status(201).json({ note: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/sales-orders/:id/notes/:noteId", requireAuth, async (req, res) => {
+  try {
+    const company_id = getActiveCompanyId(req);
+    const { data: note, error } = await supabase.from("sales_order_notes").select("id, created_by")
+      .eq("id", req.params.noteId).eq("sales_order_id", req.params.id).eq("company_id", company_id).maybeSingle();
+    if (error) throw error;
+    if (!note) return res.status(404).json({ error: "Note not found" });
+    const isAdmin = ["master", "manager", "company_admin"].includes(req.user.role);
+    if (note.created_by !== req.user.id && !isAdmin) return res.status(403).json({ error: "You can only delete your own notes" });
+    const { error: delErr } = await supabase.from("sales_order_notes").delete().eq("id", note.id).eq("company_id", company_id);
+    if (delErr) throw delErr;
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Approval: re-point a request's photos at the case it created. Same files —
 // only the rows move. Best-effort: a failure here must not undo an approval
 // (the photos stay visible on the request and can be re-added to the case).
