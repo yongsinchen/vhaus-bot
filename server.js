@@ -29,7 +29,7 @@ const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
 const { createActiveDoAmendmentService, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
-const { threeWayMerge, applyResolutions, canonicalConflictPath } = require("./lib/amendment-three-way-merge");
+const { threeWayMerge, applyResolutions, canonicalConflictPath, canonicalStateChanged } = require("./lib/amendment-three-way-merge");
 const { createItemArrivalEventService, SOURCES: ARRIVAL_EVENT_SOURCES } = require("./lib/item-arrival-events");
 const { getCommissionableAmount } = commissionLib;
 const crypto = require("crypto");
@@ -16217,6 +16217,22 @@ app.patch("/order-amendments/:id/reject", requireAuth, async (req, res) => {
 // render deterministically. Never persists anything — a manager can open
 // this repeatedly, or abandon it, with zero side effects. Only valid on a
 // 'conflict' amendment (this is what Rebase & Review is FOR).
+// Phase 2C completion: apply_active_do_amendment() (the Active-DO RPC,
+// migrations 097/102/103) has no p_rebased_proposed_snapshot parameter at
+// all and always applies amendment.proposed_snapshot verbatim — there is
+// currently no mechanism to feed it a Manager-resolved rebase. Routing an
+// Active-DO conflict through the NO-DO transactional RPC instead would be
+// actively wrong (it never touches delivery_orders/schedules at all).
+// Fail closed with an honest, specific message rather than silently
+// mis-routing or guessing at a merge the RPC can't consume — this is a
+// known, reported gap (see the Phase 2C completion report), not an
+// oversight.
+async function _hasActiveDo(salesOrderId) {
+  const { data: doRows } = await supabase.from("delivery_orders").select("id").eq("sales_order_id", salesOrderId).limit(1);
+  return (doRows || []).length > 0;
+}
+const ACTIVE_DO_REBASE_UNSUPPORTED = "This order has an active Delivery Order — conflict resolution for Active-DO amendments isn't supported yet. Reject this amendment and ask the salesperson to resubmit, or resolve the Delivery Order state first.";
+
 app.post("/order-amendments/:id/rebase-preview", requireAuth, async (req, res) => {
   try {
     if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can review a conflict" });
@@ -16224,6 +16240,7 @@ app.post("/order-amendments/:id/rebase-preview", requireAuth, async (req, res) =
     const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
     if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
     if (a.status !== "conflict") return res.status(400).json({ error: `Amendment is '${a.status}', not 'conflict' — nothing to rebase` });
+    if (await _hasActiveDo(a.sales_order_id)) return res.status(400).json({ error: ACTIVE_DO_REBASE_UNSUPPORTED, code: "active_do_rebase_unsupported" });
 
     const { data: liveSo } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
       .eq("id", a.sales_order_id).eq("company_id", a.company_id).maybeSingle();
@@ -16242,15 +16259,45 @@ app.post("/order-amendments/:id/rebase-preview", requireAuth, async (req, res) =
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// RESOLVE — persists the Manager's explicit per-conflict choices. Re-fetches
-// live AND re-runs the merge fresh (never trusts whatever the client saw in
-// its earlier preview call — the live order may have moved in between).
+// RESOLVE & APPLY (Phase 2C completion, migration 112) — the terminal
+// operation for a conflicted amendment. Re-fetches live AND re-runs the
+// merge fresh (never trusts whatever the client saw in an earlier preview
+// call), persists the Manager's resolution as an audit trail, then
+// invokes the SAME canonical transactional apply path normal /approve
+// uses (applySalesOrderAmendmentTransactional -> apply_sales_order_
+// amendment RPC) — never a second implementation of amendment
+// application. The frontend never needs a separate /approve call after
+// this succeeds.
+//
+// Two layers of staleness protection, for two different races:
+//   1. rebase-preview <-> rebase-resolve (the human-review gap, can be
+//      minutes): rebase-preview is explicitly zero-mutation, so it never
+//      refreshes conflict_live_snapshot — that snapshot is frozen at the
+//      moment this amendment FIRST flipped to 'conflict'. If canonical
+//      state has moved AT ALL since then, canonicalStateChanged() catches
+//      it here and returns rebase_stale with zero mutation, before the
+//      resolution is even computed. This is deliberately coarse (any
+//      relevant drift blocks, regardless of whether the Manager's specific
+//      choices would still resolve fine) — the Manager must review the
+//      newest state, not have a stale decision silently honored.
+//   2. rebase-resolve -> the RPC call moments later (a tiny race, network/
+//      scheduling jitter only): the RPC re-validates rebase_base_snapshot
+//      (which we set to what we just fetched) against live UNDER ITS OWN
+//      ROW LOCK at the actual moment of apply (migration 108/112) — this
+//      is what actually closes that gap, unchanged from Phase 2C's
+//      original design.
+//
 // Requires EVERY true conflict to have an explicit resolution (proposed |
 // live) — never a silent default, per applyResolutions()'s own guarantee.
-// Does NOT change amendment.status (stays 'conflict' — Phase 1 explicitly
-// does not introduce a second terminal/intermediate status); the presence
-// of a non-null rebased_proposed_snapshot + rebased_at is what signals
-// "this conflict has a ready rebase, awaiting final apply".
+// Failure atomicity: the rebase audit fields (rebase_base_snapshot,
+// rebased_proposed_snapshot, field_resolutions, rebased_by/_name/_at) are
+// written BEFORE the RPC call as a durable record of the Manager's
+// decision — but amendment.status only ever changes to 'approved', and
+// final_applied_snapshot only ever gets written, INSIDE the RPC's own
+// transaction. If the RPC fails or reports conflict/rebase_stale, the
+// amendment correctly stays 'conflict' with no fabricated approval and no
+// fake final snapshot — the audit fields simply record what was tried,
+// and a subsequent rebase-preview + rebase-resolve overwrites them cleanly.
 app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) => {
   try {
     if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can resolve a conflict" });
@@ -16258,6 +16305,7 @@ app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) =
     const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
     if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
     if (a.status !== "conflict") return res.status(400).json({ error: `Amendment is '${a.status}', not 'conflict' — nothing to rebase` });
+    if (await _hasActiveDo(a.sales_order_id)) return res.status(400).json({ error: ACTIVE_DO_REBASE_UNSUPPORTED, code: "active_do_rebase_unsupported" });
 
     const fieldResolutions = req.body?.field_resolutions;
     if (!fieldResolutions || typeof fieldResolutions !== "object") return res.status(400).json({ error: "field_resolutions is required" });
@@ -16265,6 +16313,14 @@ app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) =
     const { data: liveSo } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
       .eq("id", a.sales_order_id).eq("company_id", a.company_id).maybeSingle();
     if (!liveSo) return res.status(404).json({ error: "Sales order no longer exists" });
+
+    // Layer 1 staleness guard — see header comment. Zero mutation on trip.
+    if (canonicalStateChanged(a.conflict_live_snapshot, liveSo)) {
+      return res.status(409).json({
+        error: "The sales order changed again after this conflict was detected — the prepared review is no longer valid. Run Rebase & Review again.",
+        reason: "rebase_stale",
+      });
+    }
 
     const result = threeWayMerge(a.before_snapshot, a.proposed_snapshot, liveSo);
     let rebasedSnapshot;
@@ -16274,18 +16330,32 @@ app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) =
       return res.status(400).json({ error: e.message, code: "unresolved_conflict" });
     }
 
-    const { data: updated, error } = await supabase.from("sales_order_amendments").update({
+    const nowIso = new Date().toISOString();
+    const { error: rebaseWriteErr } = await supabase.from("sales_order_amendments").update({
       rebase_base_snapshot: liveSo,
       rebase_base_fingerprint: liveSo.updated_at,
       rebased_proposed_snapshot: rebasedSnapshot,
       field_resolutions: fieldResolutions,
       rebased_by: req.user.id,
       rebased_by_name: req.user.name || null,
-      rebased_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }).eq("id", a.id).select().single();
-    if (error) throw error;
-    res.json({ amendment: updated, rebased_proposed_snapshot: rebasedSnapshot });
+      rebased_at: nowIso,
+      updated_at: nowIso,
+    }).eq("id", a.id);
+    if (rebaseWriteErr) throw rebaseWriteErr;
+
+    // Shared apply mechanics — the exact same function normal /approve
+    // calls for a NO-DO amendment. Re-fetch first: it needs the
+    // just-written rebased_proposed_snapshot on the row it's given.
+    const { data: freshAmendment } = await supabase.from("sales_order_amendments").select("*").eq("id", a.id).maybeSingle();
+    const applyResult = await applySalesOrderAmendmentTransactional(freshAmendment, req.user.id);
+    if (applyResult.error) return res.status(500).json({ error: applyResult.error });
+    if (applyResult.conflict) {
+      const message = applyResult.reason === "rebase_stale"
+        ? "The sales order changed again since this amendment was rebased — the prepared rebase is no longer valid. Run Rebase & Review again."
+        : "This amendment could not be applied — it is in conflict and needs manual review.";
+      return res.status(409).json({ error: message, amendment_status: "conflict", reason: applyResult.reason });
+    }
+    res.json({ amendment_status: "approved", order: applyResult.order, rebased_proposed_snapshot: rebasedSnapshot });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
