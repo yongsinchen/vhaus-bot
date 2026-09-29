@@ -16188,7 +16188,12 @@ app.patch("/order-amendments/:id/reject", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
     if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
-    if (a.status !== "pending") return res.status(400).json({ error: `Amendment is already ${a.status}` });
+    // A conflicted amendment can also be rejected outright — that's a valid
+    // terminal decision (the Manager reviewed it and decided not to pursue
+    // it further, rather than rebasing it), same as reject already is for
+    // 'pending'. Only approved/rejected/superseded (already terminal) are
+    // blocked.
+    if (a.status !== "pending" && a.status !== "conflict") return res.status(400).json({ error: `Amendment is already ${a.status}` });
     // Canonical rule: reject = the live order was never touched, so restore
     // its status to what it was before this amendment was requested (never
     // leave it stuck at 'amended' for someone to manually correct).
