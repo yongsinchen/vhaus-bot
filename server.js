@@ -28,7 +28,7 @@ const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
-const { createActiveDoAmendmentService, diffAmendmentAgainstLive, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
+const { createActiveDoAmendmentService, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
 const { threeWayMerge, applyResolutions, canonicalConflictPath } = require("./lib/amendment-three-way-merge");
 const { createItemArrivalEventService, SOURCES: ARRIVAL_EVENT_SOURCES } = require("./lib/item-arrival-events");
 const { getCommissionableAmount } = commissionLib;
@@ -16050,149 +16050,18 @@ app.patch("/sales-orders/:id/order-number", requireAuth, async (req, res) => {
 // 'approved' — see PUT /sales-orders/:id.
 const isAmendApprover = (req) => ["master", "manager"].includes(req.user.role);
 
-// diffAmendmentAgainstLive is imported from lib/active-do-amendment.js —
-// used by BOTH this function AND applyActiveDoAmendment (also imported),
-// never two copies that can drift apart.
-
-// Phase 2A/2D (migration 108): the CANONICAL no-DO apply path is now the
-// apply_sales_order_amendment() transactional RPC — see
-// applySalesOrderAmendmentTransactional() below, which calls it and falls
-// back to THIS function only if the RPC doesn't exist yet in this
-// environment (pre-migration-108 deploy-order safety, same pattern as the
-// Kulai reserve_branch_order_number() fallback). Once migration 108 is
-// applied everywhere, this function becomes dead code kept only as that
-// fallback's implementation — do not add new behavior here; add it to the
-// RPC and to lib/amendment-three-way-merge.js instead.
-//
-// Apply a pending amendment's proposed_snapshot to the live sales_orders /
-// sales_order_items rows. This is the ONLY place that does so for an SO with
-// NO Delivery Order at all — never at request time (PUT /sales-orders/:id
-// only ever stores the proposal). See routeAmendmentApproval below for the
-// P1-1 branch (an SO WITH a Delivery Order routes to
-// apply_active_do_amendment() instead of this function).
-// Conflict protection: if the live order has drifted from the amendment's
-// before_snapshot since it was requested (another edit landed in between),
-// refuses to apply and marks the amendment 'conflict' for manual review
-// instead of blindly overwriting unrelated changes. NOTE: this legacy path
-// still uses the OLD whole-snapshot diffAmendmentAgainstLive() check (the
-// exact thing that falsely blocked SO21668 #2) — the canonical-field-only
-// fix lives in the RPC's _amendment_canonical_fields_changed(), not here.
-async function applySalesOrderAmendmentLegacy(amendment) {
-  const { data: liveOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
-    .eq("id", amendment.sales_order_id).eq("company_id", amendment.company_id).maybeSingle();
-  if (!liveOrder) return { error: "Sales order no longer exists" };
-
-  const { conflict } = diffAmendmentAgainstLive(liveOrder, amendment.before_snapshot);
-  if (conflict) {
-    await supabase.from("sales_order_amendments").update({
-      status: "conflict",
-      decision_note: "The sales order changed after this amendment was requested — requires manual review before it can be applied.",
-      updated_at: new Date().toISOString(),
-    }).eq("id", amendment.id);
-    return { conflict: true };
-  }
-
-  const proposed = amendment.proposed_snapshot || {};
-  const { items: proposedItems, ...proposedHeader } = proposed;
-  const { error: updErr } = await supabase.from("sales_orders").update(proposedHeader)
-    .eq("id", amendment.sales_order_id).eq("company_id", amendment.company_id);
-  if (updErr) return { error: updErr.message };
-
-  if (Array.isArray(proposedItems)) {
-    // Amendment Conflict Resolution — Phase 1 foundation: identity-preserving
-    // write, mirroring apply_active_do_amendment()'s exact semantics
-    // (migration 102) instead of the previous delete-all/insert-all, which
-    // silently discarded sales_order_item.id on every approval. Confirmed
-    // concretely against SO21668 itself during the current-main audit: not
-    // one of the four items amendment #3 left completely unchanged kept its
-    // pre-approval id. Existing line (source_item_id set) -> UPDATE in
-    // place, id survives. New line (source_item_id null) -> INSERT using
-    // proposal_line_id as the real id, exactly like the RPC path. Existing
-    // line omitted from the proposal -> DELETE only that specific line.
-    // Never fuzzy-matched: every source_item_id is validated up front
-    // against THIS order's own current items (already scoped to this
-    // amendment's company via the liveOrder fetch above) and fails closed —
-    // no write happens at all — on anything that doesn't belong here.
-    const existingIds = new Set((liveOrder.sales_order_items || []).map(i => String(i.id)));
-    const seenSourceIds = new Set();
-    for (const it of proposedItems) {
-      if (it.source_item_id == null) continue;
-      const sid = String(it.source_item_id);
-      if (!existingIds.has(sid)) return { error: `Item ${sid} does not belong to this order`, code: "invalid_source_item_id" };
-      if (seenSourceIds.has(sid)) return { error: `Item ${sid} was referenced more than once`, code: "ambiguous_lineage" };
-      seenSourceIds.add(sid);
-    }
-
-    const keepIds = new Set();
-    for (const it of proposedItems) {
-      // arrived_at is physical warehouse state — never touched by a
-      // commercial amendment (the RPC path's UPDATE omits it identically);
-      // only a genuinely NEW line ever sets it, carrying forward a matched
-      // removed line's arrival stamp per the arrival-preservation logic in
-      // PUT /sales-orders/:id.
-      const { source_item_id, proposal_line_id, arrived_at, ...fields } = it;
-      const line_total = (Number(fields.unit_price) || 0) * (Number(fields.quantity) || 1);
-      if (source_item_id != null) {
-        const sid = String(source_item_id);
-        const { error } = await supabase.from("sales_order_items").update({ ...fields, line_total })
-          .eq("id", sid).eq("order_id", amendment.sales_order_id);
-        if (error) return { error: error.message };
-        keepIds.add(sid);
-      } else {
-        const newId = proposal_line_id || crypto.randomUUID();
-        const { error } = await supabase.from("sales_order_items")
-          .insert({ ...fields, arrived_at: arrived_at || null, id: newId, order_id: amendment.sales_order_id, line_total });
-        if (error) return { error: error.message };
-        keepIds.add(String(newId));
-      }
-    }
-    const toDelete = (liveOrder.sales_order_items || []).map(i => String(i.id)).filter(id => !keepIds.has(id));
-    if (toDelete.length) {
-      const { error } = await supabase.from("sales_order_items").delete()
-        .eq("order_id", amendment.sales_order_id).in("id", toDelete);
-      if (error) return { error: error.message };
-    }
-  }
-
-  const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", amendment.sales_order_id).maybeSingle();
-  await attachLinkedProducts(full?.sales_order_items);
-  const { orderId: deliveryOrderId, syncError } = await syncSalesOrderToDelivery(full, full.sales_order_items);
-  if (deliveryOrderId) {
-    try { await recomputeOrderPaid(deliveryOrderId); } catch (e) { console.error("recomputeOrderPaid on amendment approval:", e.message); }
-    try {
-      const { data: existingComm } = await supabase.from("commissions").select("id").eq("order_id", deliveryOrderId).limit(1).maybeSingle();
-      if (existingComm) await calculateCommission(deliveryOrderId, amendment.company_id);
-    } catch (e) { console.error("commission recalc on amendment approval:", e.message); }
-  }
-
-  // Amendment Conflict Resolution — Phase 1 foundation (migration 106):
-  // records what was ACTUALLY applied, distinct from proposed_snapshot (the
-  // original ask) — identical to it today, but this is what a future
-  // Phase 2 rebase would make diverge. Best-effort and non-fatal: the
-  // column doesn't exist in production until migration 106 is applied, so
-  // a missing-column error here must never fail the apply that already
-  // succeeded above.
-  const { error: snapshotErr } = await supabase.from("sales_order_amendments")
-    .update({ final_applied_snapshot: full }).eq("id", amendment.id);
-  if (snapshotErr) console.error("[applySalesOrderAmendment] final_applied_snapshot write (non-fatal, pre-migration-106 safe):", snapshotErr.message);
-
-  return { applied: true, order: full, syncError };
-}
-
-const _isMissingFunctionError = (err) => !!err && (err.code === "42883" || err.code === "PGRST202" || /function .* does not exist/i.test(err.message || ""));
-
-// Phase 2A/2D: the canonical no-DO apply path. Calls apply_sales_order_
-// amendment() — one atomic transaction covering header + items + audit +
-// final_applied_snapshot + status, per migration 108. Passes
-// amendment.rebased_proposed_snapshot when a Phase 2C rebase has already
-// been prepared (Manager resolved all conflicts) — the RPC re-validates
-// that live still matches rebase_base_snapshot before ever applying it, so
-// a rebase that went stale between preview and this call is caught inside
-// the RPC itself, never silently applied. Falls back to the pre-Phase-2
-// Node implementation (applySalesOrderAmendmentLegacy) if the RPC doesn't
-// exist yet in this environment — deploy-order safety, identical in spirit
-// to the Kulai reserve_branch_order_number() fallback: this code must never
-// break amendment approval just because migration 108 hasn't landed yet.
+// Phase 2A/2D (migration 108): the ONLY no-DO apply path. Calls
+// apply_sales_order_amendment() — one atomic SECURITY DEFINER transaction
+// covering header + items + audit + final_applied_snapshot + status. See
+// routeAmendmentApproval below for the P1-1 branch (an SO WITH a Delivery
+// Order routes to apply_active_do_amendment() instead of this function).
+// Migration 108 is now live in production and this path is confirmed
+// working end-to-end via a real deployed-backend HTTP smoke test — the
+// pre-Phase-2 Node fallback (delete-all/insert-all, whole-snapshot
+// staleness check) has been removed entirely. If this RPC is ever missing
+// or broken, approval must fail closed (a hard error back to the caller),
+// never silently fall back to the old non-transactional, identity-losing
+// implementation.
 async function applySalesOrderAmendmentTransactional(amendment, actorId) {
   const { data, error } = await supabase.rpc("apply_sales_order_amendment", {
     p_amendment_id: amendment.id,
@@ -16201,10 +16070,7 @@ async function applySalesOrderAmendmentTransactional(amendment, actorId) {
     p_rebased_proposed_snapshot: amendment.rebased_proposed_snapshot || null,
   });
   if (error) {
-    if (_isMissingFunctionError(error)) {
-      console.error("[applySalesOrderAmendmentTransactional] apply_sales_order_amendment RPC not found (migration 108 not applied) — falling back to legacy Node apply");
-      return applySalesOrderAmendmentLegacy(amendment);
-    }
+    console.error("[applySalesOrderAmendmentTransactional] apply_sales_order_amendment RPC failed — failing closed, no fallback:", error.message);
     return { error: error.message };
   }
   if (data?.status === "conflict") return { conflict: true, reason: data.reason };
