@@ -15210,7 +15210,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const company_id = getActiveCompanyId(req);
     const { id: created_by, salesman_name, name } = req.user;
     const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges, einvoice_requested,
+            delivery_date, delivery_time_slot, delivery_type, remark, internal_remark, discount, deposit, payment_method, payment_proofs, admin_charges, einvoice_requested,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, order_number: customOrderNumber, sales_channel, order_date } = req.body;
     if (!customer_name) return res.status(400).json({ error: "customer_name is required" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required" });
@@ -15273,7 +15273,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         branch_id: branch_id || null,
         order_date: order_date || getMalaysiaDate(),
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
-        delivery_type: delivery_type || "Delivery", remark: remark || null,
+        delivery_type: delivery_type || "Delivery", remark: remark || null, internal_remark: internal_remark || null,
         discount: Number(discount) || 0, deposit: Number(deposit) || 0, initial_deposit: Number(deposit) || 0, deposit_or_number: depositOrNumber, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
         admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
         einvoice_requested: einvoice_requested === true,
@@ -15373,7 +15373,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const company_id = getActiveCompanyId(req);
     const { id } = req.params;
     const { customer_name, customer_contact, customer_address, delivery_address, customer_id_type, customer_id_no, customer_email, status, notes, items,
-            delivery_date, delivery_time_slot, delivery_type, remark, discount, deposit, payment_method, payment_proofs, admin_charges, einvoice_requested,
+            delivery_date, delivery_time_slot, delivery_type, remark, internal_remark, discount, deposit, payment_method, payment_proofs, admin_charges, einvoice_requested,
             branch_id, salesman_names, country, gst_rate, gst_amount, gst_waived, sales_channel, order_date } = req.body;
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
@@ -15595,7 +15595,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       branch_id: branch_id || null,
       order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
-      delivery_type: delivery_type || "Delivery", remark: remark || null,
+      delivery_type: delivery_type || "Delivery", remark: remark || null, internal_remark: internal_remark || null,
       discount: Number(discount) || 0, deposit: depositForUpdate, initial_deposit: initialDepositForUpdate, deposit_or_number: depositOrNumberUpd, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
       einvoice_requested: einvoice_requested !== undefined ? einvoice_requested === true : existing.einvoice_requested,
