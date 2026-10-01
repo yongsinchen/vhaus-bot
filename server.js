@@ -11718,6 +11718,25 @@ app.post("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDE
       throw itemsErr;
     }
 
+    // Concurrency guard: validateDoRequest ran on a snapshot, so two users
+    // who both saw "1 available" could both get here. Re-read the COMMITTED
+    // DOs (this one included) and back out if any line it allocated is now
+    // over its ceiling (doLib.allocationOverflow — never both succeed).
+    const { data: committedDos, error: recheckErr } = await supabase.from("delivery_orders")
+      .select("id, status, superseded_at, delivery_order_items(sales_order_item_id, quantity, status)")
+      .eq("sales_order_id", so.id).eq("company_id", companyId);
+    const overflow = recheckErr ? null : doLib.allocationOverflow(so.sales_order_items || [], committedDos || [],
+      check.normalized.map(({ soi }) => soi.id), { overrideArrival: overrideAllowed });
+    if (overflow === null || overflow.length > 0) {
+      await supabase.from("delivery_order_items").delete().eq("delivery_order_id", dord.id);
+      await supabase.from("delivery_orders").delete().eq("id", dord.id);
+      if (overflow === null) throw new Error("could not re-check allocations: " + recheckErr.message);
+      return res.status(409).json({
+        error: `Another Delivery Order was just created for the same stock — ${overflow.map(o => `${o.product_name || "item"}: ${o.allocated_qty} allocated, only ${o.ceiling_qty} available`).join("; ")}. Nothing was created; refresh and try again.`,
+        allocation_conflict: overflow,
+      });
+    }
+
     // Refresh each touched SO item's stored delivery_status
     const newAllocations = doLib.computeAllocations(so.sales_order_items || [],
       [...deliveryOrders, { ...dord, delivery_order_items: doItems }]);
@@ -14946,7 +14965,7 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
       .select("id, company_id, so_number, items").eq("id", legacyOrderId).maybeSingle();
     if (!ord?.so_number) return;
     const { data: so } = await supabase.from("sales_orders")
-      .select("id, sales_order_items(id, product_code, product_name, quantity, arrived_at, arrived_qty)")
+      .select("id, sales_order_items(id, product_code, product_name, size, color, custom_dimensions, quantity, arrived_at, arrived_qty)")
       .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
     if (!so || !(so.sales_order_items || []).length) return;
 
@@ -14960,40 +14979,15 @@ async function syncArrivalsToSalesOrderItems(legacyOrderId) {
     // ONE supplier-DO line must mark exactly ONE of them arrived — not both.
     // Match: code exact (ci), or the composite JSON itemName ("name size
     // color") equals/prefixes the SO item's product_name.
-    const usedJson = new Set();
-    // P1-4D: also propagate the physical arrival QUANTITY (previously this
-    // only propagated the arrivalDate presence flag). Returns null when no
-    // JSON line matches at all; otherwise { arrivalDate, arrivedQty }.
-    const findArrival = (soi) => {
-      // P0-05: prefer the EXACT immutable line id (soiId) that
-      // syncSalesOrderToDelivery now stamps on each JSON line — an arrival can
-      // then only ever land on its own order line, never a sibling that shares a
-      // code/name. Fall back to the 1:1 consuming code/name match for legacy
-      // JSON written before soiId existed.
-      for (let k = 0; k < jsonItems.length; k++) {
-        if (usedJson.has(k)) continue;
-        const ji = jsonItems[k];
-        if (ji && ji.soiId != null && String(ji.soiId) === String(soi.id)) {
-          usedJson.add(k); return { arrivalDate: ji.arrivalDate || null, arrivedQty: ji.arrivedQty };
-        }
-      }
-      const code = (soi.product_code || "").trim().toLowerCase();
-      const name = (soi.product_name || "").trim().toLowerCase();
-      for (let k = 0; k < jsonItems.length; k++) {
-        if (usedJson.has(k)) continue;
-        const ji = jsonItems[k];
-        if (ji && ji.soiId != null) continue; // id-bearing lines only match by id (above)
-        const jCode = (ji.itemCode || "").trim().toLowerCase();
-        const jName = (ji.itemName || "").trim().toLowerCase();
-        const codeHit = code && jCode && code === jCode;
-        const nameHit = name && jName && (jName === name || jName.startsWith(name + " "));
-        if (codeHit || nameHit) { usedJson.add(k); return { arrivalDate: ji.arrivalDate || null, arrivedQty: ji.arrivedQty }; }
-      }
-      return null;
-    };
+    // P1-4D: also propagate the physical arrival QUANTITY. P0-05: an
+    // id-bearing JSON line (soiId) only ever lands on its own order line.
+    // Matching (id → exact option → guarded legacy fallback, each pass over
+    // every line) is doLib.matchLegacyArrivalLines — see there for why
+    // item-by-item code matching swapped SO03297's King / Super Single.
+    const matched = doLib.matchLegacyArrivalLines(so.sales_order_items, jsonItems);
 
     for (const soi of so.sales_order_items) {
-      const found = findArrival(soi);
+      const found = matched.get(soi.id) || null;
       const arrival = found ? found.arrivalDate : null;
       const current = soi.arrived_at || null;
 
