@@ -20,6 +20,7 @@ const scheduleTeamDate = require("./lib/schedule-team-date");
 const commissionLifecycle = require("./lib/commission-lifecycle");
 const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { validatePaymentDate } = require("./lib/payment-date");
+const businessMonth = require("./lib/business-month");
 const { parseServiceItemQuantity, validateServiceItemQuantities, displayServiceItemQuantity } = require("./lib/service-item-quantity");
 const { salespersonTokens, orderHasSalesperson, escapeLike } = require("./lib/salesperson-tokens");
 const productSearch = require("./lib/product-search");
@@ -3957,7 +3958,7 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
 
     // 3. Commission summary — only computed for salesmen (the only role whose
     //    dashboard shows the stat card); same math as GET /commission-summary
-    const month = `${new Date().toISOString().slice(0, 7)}-01`;
+    const month = businessMonth.currentBusinessMonthStart();
     const commissionPromise = (isSalesman && cid) ? (async () => {
       const [{ data: elig }, { data: pend }] = await Promise.all([
         supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)").eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid).eq("user_id", req.user.id),
@@ -7070,14 +7071,15 @@ async function calculateCommission(orderId, companyId, opts = {}) {
       // get today's created_at), which undercounted the month and dropped the
       // salesman into a lower tier. orders.order_date is always populated by
       // syncSalesOrderToDelivery, so order_date is the correct, stable basis.
+      // Business-month window (Malaysia calendar; lib/business-month.js) —
+      // identical whatever the process TZ. The old local-time Date arithmetic
+      // dropped month-end orders under UTC+8.
       const monthBasis = order.order_date || order.created_at || new Date();
-      const monthStart = new Date(monthBasis);
-      monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
-      const monthKey = `${salesUser.id}-${monthStart.toISOString().slice(0, 7)}`;
+      const win = businessMonth.businessMonthWindow(monthBasis);
+      const monthKey = `${salesUser.id}-${win.key}`;
       let monthlySales = cache.monthlySales[monthKey];
       if (monthlySales === undefined) {
-        const monthEnd = new Date(monthStart); monthEnd.setMonth(monthEnd.getMonth() + 1);
-        const dStart = monthStart.toISOString().slice(0, 10), dEnd = monthEnd.toISOString().slice(0, 10);
+        const dStart = win.start, dEnd = win.end;
         // Exact-token match (lib/salesperson-tokens.js): "Jim" never counts
         // "Jimmy" sales. Same company / sales-month / non-Service scope as before.
         const monthOrders = await fetchSalespersonMonthOrders(companyId, name, "order_amount, salesman, country, address, status", dStart, dEnd);
@@ -7328,9 +7330,7 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // cascade:false on the sibling calls fans this out exactly one level.
   if (cascade) {
     const monthBasis = order.order_date || order.created_at || new Date();
-    const ms = new Date(monthBasis); ms.setDate(1); ms.setHours(0, 0, 0, 0);
-    const me = new Date(ms); me.setMonth(me.getMonth() + 1);
-    const dStart = ms.toISOString().slice(0, 10), dEnd = me.toISOString().slice(0, 10);
+    const { start: dStart, end: dEnd } = businessMonth.businessMonthWindow(monthBasis);
     const siblingIds = new Set();
     for (const name of salesmanNames) {
       const { data: sibs } = await supabase.from("orders").select("id, status")
@@ -7352,16 +7352,11 @@ async function calculateCommission(orderId, companyId, opts = {}) {
 // of which day in June the order falls on, and regardless of when the commission is
 // actually calculated (so historical/backfilled orders bucket correctly by their own
 // date, not by today's date).
+// Business calendar (lib/business-month.js): a date-only order_date is used
+// verbatim; a timestamp (created_at / completed_at) is read as its Malaysia
+// date. String arithmetic — no month-end overflow, no process-TZ dependence.
 function getPayoutMonth(orderDate) {
-  const d = orderDate ? new Date(orderDate) : new Date();
-  // Build the 1st of the NEXT month from year/month directly. Using
-  // d.setMonth(d.getMonth()+1) while the day-of-month is 31 overflowed for a
-  // month-end order — "Aug 31" + 1 month becomes "Sep 31", which JS rolls to
-  // Oct 1, bucketing the payout a month too late. Date.UTC(y, m+1, 1)
-  // normalizes the month (and year) correctly with the day pinned to 1, and
-  // matches the UTC basis of toISOString below.
-  const next = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
-  return next.toISOString().slice(0, 10);
+  return businessMonth.payoutMonthOf(orderDate || new Date());
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -7911,7 +7906,7 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     const { payout_month } = req.query;
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company context required" });
-    const month = payout_month || `${new Date().toISOString().slice(0, 7)}-01`;
+    const month = payout_month || businessMonth.currentBusinessMonthStart();
     // A salesman can only ever see their own payout — never trust a client-supplied
     // user_id; managers/admins/finance may optionally filter via user_id, defaulting
     // to everyone in the company if omitted.
@@ -7976,7 +7971,7 @@ app.get("/commission-summary", requireAuth, async (req, res) => {
     const { payout_month } = req.query;
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "company context required" });
-    const month = payout_month || `${new Date().toISOString().slice(0, 7)}-01`;
+    const month = payout_month || businessMonth.currentBusinessMonthStart();
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
 
