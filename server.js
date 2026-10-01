@@ -6000,9 +6000,14 @@ const paymentAllocationService = createPaymentAllocationService({ supabase, calc
 // Recalculate commission for every order an RPC reported as affected —
 // best-effort, exactly like every other call site in this file (a failure
 // here never fails the financial write that already committed).
-async function recalcCommissionForAffectedOrders(orderIds, companyId) {
+// cascadeOrderIds: orders the write auto-confirmed — computed WITH the monthly
+// re-tier cascade (lifts the month's earlier rows when confirming crosses a
+// tier); every other affected order stays cascade:false (a payment alone
+// doesn't change any month's sales total).
+async function recalcCommissionForAffectedOrders(orderIds, companyId, cascadeOrderIds = []) {
+  const cascadeSet = new Set((cascadeOrderIds || []).map(String));
   for (const oid of orderIds || []) {
-    try { await calculateCommission(oid, companyId, { cascade: false }); }
+    try { await calculateCommission(oid, companyId, { cascade: cascadeSet.has(String(oid)) }); }
     catch (e) { console.error("commission recalc error:", e.message); }
   }
 }
@@ -6052,7 +6057,7 @@ app.post("/payments/record", requireRole(ORDER_ROLES), async (req, res) => {
     // Commission recalculation ONLY after the RPC has committed — never on a
     // failed/rejected write, and never as part of the same transaction (see
     // migration 105's header on why commission stays outside the RPC).
-    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid, result.autoConfirmedOrderIds);
     const dateWarning = await stampPaymentDate(result.payment, cid, pd.value, { onlyIfEmpty: true });
     res.status(result.status).json({ payment: result.payment, allocations: result.allocations, ...(dateWarning ? { payment_date_warning: dateWarning } : {}) });
   } catch (err) { console.error("POST /payments/record error:", err); res.status(500).json({ error: "Failed to record payment" }); }
@@ -6077,7 +6082,7 @@ app.patch("/payments/:id/approve", requireRole(FINANCE_APPROVE_ROLES), async (re
       cid, actorUserId: req.user.id, paymentId: req.params.id, note: req.body?.note, or_number: orNumber,
     });
     if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
-    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid, result.autoConfirmedOrderIds);
     res.json({ payment: result.payment });
   } catch (err) { console.error("PATCH /payments/:id/approve error:", err); res.status(500).json({ error: "Failed to approve payment" }); }
 });
@@ -6093,7 +6098,7 @@ app.patch("/payments/:id/reject", requireRole(FINANCE_APPROVE_ROLES), async (req
       cid, actorUserId: req.user.id, paymentId: req.params.id, note: req.body?.note,
     });
     if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
-    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid, result.autoConfirmedOrderIds);
     res.json({ payment: result.payment });
   } catch (err) { console.error("PATCH /payments/:id/reject error:", err); res.status(500).json({ error: "Failed to reject payment" }); }
 });
@@ -6219,7 +6224,7 @@ app.patch("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) =
       amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind,
     });
     if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
-    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid, result.autoConfirmedOrderIds);
     const proofCleanupWarning = await cleanupRemovedProofs(result.oldProofUrl, result.payment?.proof_url);
     const dateWarning = await stampPaymentDate(result.payment, cid, pdProvided && pd.value ? pd.value : (before?.payment_date || null));
     res.json({ payment: result.payment, replaced_payment_id: result.replacedPaymentId, ...(proofCleanupWarning ? { proof_cleanup_warning: proofCleanupWarning } : {}), ...(dateWarning ? { payment_date_warning: dateWarning } : {}) });
@@ -6237,7 +6242,7 @@ app.delete("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) 
       : await paymentAllocationService.withdrawPendingPayment({ cid, actorUserId: req.user.id, paymentId: req.params.id, requireRecordedBy: pendingPaymentOwnerScope(req) });
     if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
 
-    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid);
+    await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid, result.autoConfirmedOrderIds);
 
     // Best-effort storage cleanup — AFTER the financial reversal already
     // committed. A cleanup failure is logged and reported separately; it
