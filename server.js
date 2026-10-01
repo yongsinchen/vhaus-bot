@@ -20,6 +20,7 @@ const scheduleTeamDate = require("./lib/schedule-team-date");
 const commissionLifecycle = require("./lib/commission-lifecycle");
 const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { validatePaymentDate } = require("./lib/payment-date");
+const { parseServiceItemQuantity, validateServiceItemQuantities, displayServiceItemQuantity } = require("./lib/service-item-quantity");
 const { salespersonTokens, orderHasSalesperson, escapeLike } = require("./lib/salesperson-tokens");
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
@@ -8409,6 +8410,8 @@ app.post("/service-cases", requireRole(MANAGE_ROLES), async (req, res) => {
   try {
     const { service_type } = req.body;
     if (!service_type) return res.status(400).json({ error: "service_type required (1=warranty, 2=assembly, 3=exchange, 4=delivery missing item, 5=delivery)" });
+    const qtyErr = validateServiceItemQuantities(req.body?.items);
+    if (qtyErr) return res.status(qtyErr.status).json(qtyErr);
     const companyId = getActiveCompanyId(req);
     const result = await createServiceCaseFull({ companyId, actorUser: req.user, body: req.body });
     return res.status(201).json(result);
@@ -8427,6 +8430,8 @@ app.post("/service-requests", requireRole(ORDER_ROLES), async (req, res) => {
     const { order_id, service_type, description, customer_name, customer_phone, customer_address,
             service_date, delivery_date, schedule_tbc, items, amount } = req.body || {};
     if (!service_type) return res.status(400).json({ error: "service_type required" });
+    const qtyErr = validateServiceItemQuantities(items);
+    if (qtyErr) return res.status(qtyErr.status).json(qtyErr);
     // Pull the source SO number + customer defaults from the linked order.
     let soNumber = null, cName = customer_name, cPhone = customer_phone, cAddr = customer_address;
     if (order_id) {
@@ -8501,6 +8506,8 @@ app.patch("/service-requests/:id/approve", requireRole(DATE_APPROVER_ROLES), asy
       service_date: chosenServiceDate, delivery_date: chosenDeliveryDate, schedule_tbc: chosenScheduleTbc,
       items: reqRow.items || [], amount: reqRow.amount,
     };
+    const reqQtyErr = validateServiceItemQuantities(body.items);
+    if (reqQtyErr) return res.status(400).json({ ...reqQtyErr, error: `${reqQtyErr.error} — amend the request before approving.` });
     const result = await createServiceCaseFull({ companyId: reqRow.company_id || companyId, actorUser, body });
 
     const { data: updated } = await supabase.from("service_requests").update({
@@ -8563,7 +8570,11 @@ app.patch("/service-requests/:id", requireRole(ORDER_ROLES), async (req, res) =>
     if (b.service_date !== undefined) updates.service_date = b.service_date || null;
     if (b.delivery_date !== undefined) updates.delivery_date = b.delivery_date || null;
     if (b.schedule_tbc !== undefined) updates.schedule_tbc = b.schedule_tbc === true || b.schedule_tbc === "true";
-    if (b.items !== undefined) updates.items = Array.isArray(b.items) ? b.items : [];
+    if (b.items !== undefined) {
+      const qtyErr = validateServiceItemQuantities(b.items);
+      if (qtyErr) return res.status(qtyErr.status).json(qtyErr);
+      updates.items = Array.isArray(b.items) ? b.items : [];
+    }
     if (b.amount !== undefined) updates.amount = (b.amount !== null && b.amount !== "") ? (Number(b.amount) || 0) : null;
     // Customer details only matter when no order is linked (approval pulls
     // them from the order otherwise) — same as creation.
@@ -8930,7 +8941,7 @@ async function syncServiceItemsToOrder(serviceId) {
       .select("*").eq("service_id", serviceId).order("item_no");
     const rows = (items || []).map(it => ({
       itemName: it.description || "",
-      unit: it.quantity != null ? String(Number(it.quantity)) : "1",
+      unit: String(displayServiceItemQuantity(it.quantity)),
       action_type: it.action_type,
       action_label: SERVICE_ITEM_ACTIONS[it.action_type] || "Service",
       item_status: it.status || "pending",
@@ -8959,7 +8970,8 @@ async function insertServiceItems(serviceId, companyId, items) {
     item_no: i.item_no != null ? Number(i.item_no) : next++,
     description: String(i.description).trim(),
     action_type: cleanServiceItemAction(i.action_type),
-    quantity: i.quantity != null && Number(i.quantity) > 0 ? Number(i.quantity) : 1,
+    // Callers validate first (validateServiceItemQuantities); missing → 1.
+    quantity: (() => { const q = parseServiceItemQuantity(i.quantity); if (!q.ok) throw Object.assign(new Error(q.error), { status: 400, code: "invalid_quantity" }); return q.value; })(),
     status: cleanServiceItemStatus(i.status),
     // Only Claim items use arrival; a blank/empty value stays NULL.
     arrival_date: i.arrival_date || null,
@@ -8980,6 +8992,8 @@ app.post("/service-cases/:id/items", requireRole(MANAGE_ROLES), async (req, res)
     if (!svc) return res.status(404).json({ error: "Service not found" });
     // Accept either a single item body or { items: [...] }.
     const payload = Array.isArray(req.body?.items) ? req.body.items : [req.body];
+    const qtyErr = validateServiceItemQuantities(payload);
+    if (qtyErr) return res.status(qtyErr.status).json(qtyErr);
     const created = await insertServiceItems(svc.id, svc.company_id || cid, payload);
     if (created.length === 0) return res.status(400).json({ error: "description required" });
     await syncServiceItemsToOrder(svc.id);
@@ -9005,7 +9019,12 @@ app.patch("/service-items/:id", requireRole([...MANAGE_ROLES, "driver", "operati
       updates.description = String(description).trim();
     }
     if (action_type !== undefined) updates.action_type = cleanServiceItemAction(action_type);
-    if (quantity !== undefined) updates.quantity = Number(quantity) > 0 ? Number(quantity) : 1;
+    if (quantity !== undefined) {
+      // An edit must carry a valid quantity — no silent 0/2.5/"" → 1.
+      const q = parseServiceItemQuantity(quantity, { allowMissing: false });
+      if (!q.ok) return res.status(400).json({ error: q.error, code: "invalid_quantity" });
+      updates.quantity = q.value;
+    }
     if (status !== undefined) updates.status = cleanServiceItemStatus(status);
     if (arrival_date !== undefined) updates.arrival_date = arrival_date || null;
     if (notes !== undefined) updates.notes = notes || null;
