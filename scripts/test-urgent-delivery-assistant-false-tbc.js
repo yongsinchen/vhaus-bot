@@ -201,7 +201,7 @@ async function cleanup() {
       const { data: soRow } = await admin.from("sales_orders").select("id").eq("company_id", order.company_id).eq("order_number", soNumber).maybeSingle();
       const active = await resolveActiveDeliveryOrders({ supabase: admin, companyId: order.company_id, salesOrderId: soRow.id });
       console.log(`SO ${soNumber}: legacy orders.delivery_date=${order.delivery_date}, active DOs=${JSON.stringify(active.map(d => ({ do: d.do_number, date: d.delivery_date })))}`);
-      ok(`SO ${soNumber} has exactly one active DO with a real date (the assistant will now show this, not the historical "${order.delivery_date}")`, active.length === 1 && active[0].delivery_date === "2026-09-25", active);
+      ok(`SO ${soNumber} has exactly one active DO with a real date (the assistant will now show this, not the historical "${order.delivery_date}")`, active.length === 1 && /^\d{4}-\d{2}-\d{2}$/.test(active[0].delivery_date || ""), active); // originally 2026-09-25; since rescheduled via approved DO-scoped requests
     }
   }
 

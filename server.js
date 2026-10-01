@@ -26,6 +26,7 @@ const { salespersonTokens, orderHasSalesperson, escapeLike } = require("./lib/sa
 const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
+const effectiveDelivery = require("./lib/effective-delivery");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
@@ -1907,10 +1908,11 @@ const buildOrderStatusReply = async (soToken, companyId = null) => {
   if (resolvedCompanyId) {
     const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", resolvedCompanyId).eq("order_number", o.so_number).maybeSingle();
     const activeDeliveryOrders = soRow?.id ? await resolveActiveDeliveryOrders({ supabase, companyId: resolvedCompanyId, salesOrderId: soRow.id }) : [];
-    if (activeDeliveryOrders.length === 1) {
-      deliveryLine = `Delivery: ${fmtDate(activeDeliveryOrders[0].delivery_date)} (${activeDeliveryOrders[0].do_number})`;
-    } else if (activeDeliveryOrders.length > 1) {
-      deliveryLine = `Delivery: multiple — ${activeDeliveryOrders.map(d => `${d.do_number}: ${fmtDate(d.delivery_date)}`).join(", ")}`;
+    const eff = effectiveDelivery.effectiveDeliveryState({ soDeliveryDate: o.delivery_date, activeDeliveryOrders });
+    if (eff.source === "delivery_order") {
+      deliveryLine = `Delivery: ${fmtScheduleDate(eff.date)} (${eff.do_number})`;
+    } else if (eff.source === "multiple_delivery_orders") {
+      deliveryLine = `Delivery: multiple — ${eff.deliveries.map(d => `${d.do_number}: ${fmtScheduleDate(d.date)}`).join(", ")}`;
     }
   }
 
@@ -2121,11 +2123,11 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
   // without a second lookup when this branch already ran.
   let orderCompanyId = null;
   let orderBranchId = null;
-  if (!isTbc) {
+  if (orderId) {
     const { data: ordForBlock } = await supabase.from("orders").select("company_id, branch_id").eq("id", orderId).maybeSingle();
     orderCompanyId = ordForBlock?.company_id || null;
     orderBranchId = ordForBlock?.branch_id || null;
-    if (orderCompanyId) isBlockedDate = !!(await getBlockedDateReason(orderCompanyId, newDate, null));
+    if (orderCompanyId && !isTbc) isBlockedDate = !!(await getBlockedDateReason(orderCompanyId, newDate, null));
   }
 
   // P1-6: reschedule must remain DO-scoped once a DO exists (never guess
@@ -2133,8 +2135,9 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
   // an active DO). Telegram has no DO-selection UI, so the safe behavior
   // when one or more active DOs exist is to refuse and defer to the web
   // app/Delivery Schedule board rather than mutate orders/order_trips blind
-  // to the DO layer.
-  if (!isTbc && orderCompanyId && soNumber) {
+  // to the DO layer. TBC included: clearing only the legacy date under a
+  // dated active DO is exactly what made the SO read a false "TBC".
+  if (orderCompanyId && soNumber) {
     const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", orderCompanyId).eq("order_number", soNumber).maybeSingle();
     if (soRow?.id) {
       const activeDOs = await resolveActiveDeliveryOrders({ supabase, companyId: orderCompanyId, salesOrderId: soRow.id });
@@ -2420,7 +2423,7 @@ Reply YES / CANCEL or correct again.`);
       } else {
         // Find order — check both Delivery and Service types
         const { order, ambiguous, error } = await resolveOrderBySoNumber(soNumber, companyId, {
-          select: "id, so_number, customer_name, delivery_date, type", types: ["Delivery", "Service"],
+          select: "id, so_number, customer_name, delivery_date, type, company_id", types: ["Delivery", "Service"],
         });
         if (error) { await sendMessage(chatId, `❌ Database error: ${error.message}`); return true; }
         if (ambiguous) { await sendMessage(chatId, `⚠️ SO *${soNumber}* exists in more than one company. Please contact admin.`); return true; }
@@ -2429,10 +2432,30 @@ Reply YES / CANCEL or correct again.`);
           return true;
         }
         const label = order.type === "Service" ? "🔧 Service" : "🚚 Delivery";
+        // Once an active DO exists its date is the delivery date (lib/
+        // effective-delivery) and Telegram can't reschedule it (see
+        // applyRescheduleDate) — say so now, with the real date, rather than
+        // showing the historical order date and refusing after the reply.
+        const { data: soRowTg } = order.company_id
+          ? await supabase.from("sales_orders").select("id").eq("company_id", order.company_id).eq("order_number", order.so_number).maybeSingle()
+          : { data: null };
+        const activeDOsTg = soRowTg?.id ? await resolveActiveDeliveryOrders({ supabase, companyId: order.company_id, salesOrderId: soRowTg.id }) : [];
+        if (activeDOsTg.length > 0) {
+          const eff = effectiveDelivery.effectiveDeliveryState({ soDeliveryDate: order.delivery_date, activeDeliveryOrders: activeDOsTg });
+          clearSession(key);
+          await sendMessage(chatId,
+            `📋 *SO ${soNumber}* — ${order.customer_name || ""} _(${label})_\n` +
+            (eff.source === "delivery_order"
+              ? `📅 Currently scheduled: *${fmtScheduleDate(eff.date)}* (${eff.do_number})\n\n`
+              : `📅 Currently scheduled: multiple — ${eff.deliveries.map(d => `${d.do_number}: ${fmtScheduleDate(d.date)}`).join(", ")}\n\n`) +
+            `⚠️ Rescheduling here isn't supported once a Delivery Order exists — please use the Delivery Schedule board so you can pick the exact DO.`
+          );
+          return true;
+        }
         setSession(key, "reschedule", "waiting_date", { soNumber, orderId: order.id, currentDate: order.delivery_date, customerName: order.customer_name, isTrip: false });
         await sendMessage(chatId,
           `📋 *SO ${soNumber}* — ${order.customer_name || ""} _(${label})_\n` +
-          `📅 Currently scheduled: *${fmtDate(order.delivery_date)}*\n\n` +
+          `📅 Currently scheduled: *${fmtScheduleDate(order.delivery_date)}*\n\n` +
           `What is the new date?\n_e.g. 5/3, 5/3/2026, tmr, TBC_`
         );
       }
@@ -9410,6 +9433,16 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       // Clearing a date (TBC) applies directly — it's a de-schedule, not a
       // booking that needs approval.
       if (isTbc) {
+        // Once an active DO exists its date is the delivery date — clearing
+        // only the legacy order's field here would leave the DO scheduled
+        // while the SO reads "TBC" (the false-TBC state). The DO is
+        // de-scheduled per DO on the Delivery Schedule board instead.
+        const { data: tbcSo } = await supabase.from("sales_orders").select("id").eq("company_id", companyId).eq("order_number", soNumber).maybeSingle();
+        const tbcDos = tbcSo?.id ? await resolveActiveDeliveryOrders({ supabase, companyId, salesOrderId: tbcSo.id }) : [];
+        if (tbcDos.length > 0) {
+          clearSession(key);
+          return reply(`SO ${soNumber} is scheduled through ${tbcDos.length > 1 ? `${tbcDos.length} Delivery Orders (${tbcDos.map(d => d.do_number).join(", ")})` : `Delivery Order ${tbcDos[0].do_number}`} — nothing was changed. To set it to TBC, use "TBC" on that Delivery Order in the Delivery Schedule.`, ["best date"]);
+        }
         const updatedRemark = existingOrder
           ? (existingOrder.remark ? `${existingOrder.remark} | Delivery date: TBC` : "Delivery date: TBC")
           : null;
@@ -9524,17 +9557,14 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", companyId).eq("order_number", order.so_number).maybeSingle();
       const activeDeliveryOrders = soRow?.id ? await resolveActiveDeliveryOrders({ supabase, companyId, salesOrderId: soRow.id }) : [];
 
-      let currentDate = order.delivery_date;
-      let currentDateNote = null;
-      if (activeDeliveryOrders.length === 1) {
-        currentDate = activeDeliveryOrders[0].delivery_date;
-      } else if (activeDeliveryOrders.length > 1) {
-        // Never assert a single "current" date when more than one active DO
-        // exists — list each one instead of guessing (same fail-safe rule
-        // resolveDeliveryDateRequestTarget already applies on the write side).
-        currentDate = null;
-        currentDateNote = activeDeliveryOrders.map(d => `${d.do_number}: ${fmtDate(d.delivery_date)}`).join(", ");
-      }
+      // lib/effective-delivery: 1 active DO → its date; 2+ → never assert a
+      // single "current" date, list each (same fail-safe rule
+      // resolveDeliveryDateRequestTarget applies on the write side); none → SO.
+      const eff = effectiveDelivery.effectiveDeliveryState({ soDeliveryDate: order.delivery_date, activeDeliveryOrders });
+      const currentDate = eff.source === "sales_order" ? order.delivery_date : eff.date;
+      const currentDateNote = eff.source === "multiple_delivery_orders"
+        ? eff.deliveries.map(d => `${d.do_number}: ${fmtScheduleDate(d.date)}`).join(", ")
+        : null;
 
       const data = {
         soNumber: order.so_number, orderId: order.id, currentDate,
@@ -15158,6 +15188,8 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
       //   _all_arrived      every legacy item line has an arrivalDate (null = no lines)
       //   _delivery_request latest non-rejected delivery_date_requests status for the SO
       //   _has_do           an active (not cancelled / superseded) Delivery Order exists
+      //   _effective_delivery  lib/effective-delivery: the active DO's date when
+      //                     exactly one exists, else the SO's own (see that file)
       try {
         const soNumbers = [...new Set(finalData.map(o => o.order_number).filter(Boolean))];
         const [{ data: legs }, { data: ddrs }, { data: dos }] = await Promise.all([
@@ -15186,6 +15218,10 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
           _has_do: withDo.has(o.id),
         }));
       } catch (e) { console.error("delivery readiness hints error:", e.message); }
+      try {
+        const eff = await effectiveDelivery.resolveEffectiveDeliveryForSalesOrders({ supabase, companyId: company_id, salesOrders: finalData });
+        finalData = finalData.map(o => ({ ...o, _effective_delivery: eff.get(o.id) || null }));
+      } catch (e) { console.error("effective delivery error:", e.message); }
     }
 
     const totalPages = Math.ceil(finalCount / lim);
@@ -15250,6 +15286,13 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
       decision_note: latestAmendment.decision_note,
       active_do_snapshot: latestAmendment.active_do_snapshot,
     } : null;
+    // Presentation-only: the active DO's date when exactly one exists (see
+    // lib/effective-delivery). data.delivery_date itself is left untouched —
+    // the edit form must keep editing the SO's own field.
+    try {
+      const eff = await effectiveDelivery.resolveEffectiveDeliveryForSalesOrders({ supabase, companyId: data.company_id, salesOrders: [data] });
+      data._effective_delivery = eff.get(data.id) || null;
+    } catch (e) { console.error("effective delivery error:", e.message); data._effective_delivery = null; }
     res.json({ order: data, legacy_order: legacyOrder, pending_amendment });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
