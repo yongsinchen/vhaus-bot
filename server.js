@@ -15600,10 +15600,36 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // initial_deposit that later understated paid once payments were reversed
     // and re-recorded (SO03306: -175). Only a genuinely changed paid amount is
     // backed out, against the SAME payments figure the ledger adds.
+    //
+    // Stale forms: the edit form also sends deposit_loaded — the Deposit value
+    // it LOADED. Deposit === deposit_loaded means the user never touched the
+    // field, so initial_deposit stays exactly as stored no matter what payments
+    // did since the form opened (another user recording / amending /
+    // withdrawing a payment must never rewrite the upfront deposit). A real
+    // Deposit change on a form whose loaded value no longer matches the stored
+    // paid amount is refused (409 stale_deposit) — never recomputed from a
+    // stale figure. Without the token (an old cached client) a Deposit that
+    // differs from the stored one is only applied when no payments exist (it
+    // then IS the upfront deposit); with payments it is refused, not guessed.
     let depositForUpdate = Number(deposit) || 0;
     let initialDepositForUpdate = depositForUpdate;
     const depositProvided = deposit !== undefined && deposit !== null && deposit !== "";
-    if (depositProvided) {
+    const sameMoney = (a, b) => Math.abs(a - b) < 0.005;
+    const existingDeposit = Number(existing.deposit) || 0;
+    const existingInitialDeposit = existing.initial_deposit != null ? Number(existing.initial_deposit) : existingDeposit;
+    const rawLoaded = req.body ? req.body.deposit_loaded : undefined;
+    const depositLoaded = rawLoaded !== undefined && rawLoaded !== null && rawLoaded !== "" && Number.isFinite(Number(rawLoaded)) ? Number(rawLoaded) : null;
+    const depositUntouched = depositProvided && depositLoaded != null && sameMoney(depositForUpdate, depositLoaded);
+    if (depositUntouched) {
+      depositForUpdate = existingDeposit;
+      initialDepositForUpdate = existingInitialDeposit;
+    } else if (depositProvided && depositLoaded != null && !sameMoney(depositLoaded, existingDeposit)) {
+      return res.status(409).json({
+        error: "This order's paid amount changed since you opened it (a payment was recorded, amended or withdrawn). Close and reopen the order, then enter the Deposit again.",
+        code: "stale_deposit", current_deposit: existingDeposit,
+      });
+    }
+    if (depositProvided && !depositUntouched) {
       const { data: legacyOrders } = await supabase.from("orders").select("id")
         .eq("company_id", company_id).eq("so_number", existing.order_number).or("type.is.null,type.neq.Service");
       const legIds = (legacyOrders || []).map(o => o.id);
@@ -15617,9 +15643,16 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
           + (gst_waived ? 0 : (Number(gst_amount) || 0))
           + (admin_charges != null && admin_charges !== "" ? Number(admin_charges) : 0) + adminPayments;
         const ledgerPaid = Math.max(0, Math.min(newTotalWithAdmin, existingInitial + paidFromPayments));
-        const same = (a, b) => Math.abs(a - b) < 0.005;
+        const same = sameMoney;
         if (same(depositForUpdate, Number(existing.deposit) || 0) || same(depositForUpdate, ledgerPaid)) {
           initialDepositForUpdate = existingInitial; // paid amount not changed — keep the baseline
+        } else if (depositLoaded == null) {
+          // Old client without the intent token: can't tell a real change from
+          // a stale pre-filled value, so never back payments out of it.
+          return res.status(409).json({
+            error: "Please refresh the page and reopen this order before changing its Deposit — payments have been recorded on it.",
+            code: "stale_deposit", current_deposit: existingDeposit,
+          });
         } else {
           const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
           if (!MANAGE_ROLES.includes(roleKey)) {

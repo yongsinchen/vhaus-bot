@@ -64,11 +64,12 @@ const pay = async (orderId, amount, extra = {}) => {
 };
 const soRow = async (id) => (await admin.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single()).data;
 const balance = async (orderId) => Number((await admin.from("orders").select("balance").eq("id", orderId).single()).data.balance);
-// Exactly what the Orders edit form sends back: the loaded row, deposit = row.deposit.
+// Exactly what the Orders edit form sends back: the loaded row, deposit = row.deposit,
+// plus deposit_loaded = the Deposit value the form loaded (intent token).
 const editBody = (so, overrides = {}) => ({
   customer_name: so.customer_name, customer_contact: so.customer_contact, status: so.status,
   items: so.sales_order_items.map(i => ({ id: i.id, product_code: i.product_code, product_name: i.product_name, quantity: i.quantity, unit_price: i.unit_price })),
-  discount: so.discount, deposit: so.deposit, admin_charges: so.admin_charges, gst_amount: so.gst_amount, gst_waived: so.gst_waived,
+  discount: so.discount, deposit: so.deposit, deposit_loaded: so.deposit, admin_charges: so.admin_charges, gst_amount: so.gst_amount, gst_waived: so.gst_waived,
   ...overrides,
 });
 
