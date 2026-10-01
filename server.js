@@ -5859,40 +5859,12 @@ app.get("/customers/lookup/:phone", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Recompute a sales order's paid/deposit total and its delivery order balance
-// from the authoritative ledger, given any one of its delivery orders' id.
-//
-// The Orders → Order (sales_orders) screen derives balance as
-// (subtotal − discount + gst) − deposit, so "deposit" means "amount paid to
-// date" = initial_deposit (the upfront deposit) + every recorded payment.
-// Recomputing from the ledger — instead of nudging deposit by a signed delta —
-// is exact and fully reversible: recording or deleting a payment always lands
-// on the correct total, so a capped over-/double-payment can never wipe the
-// original deposit. Clamped to [0, order total].
-async function recomputeOrderPaid(orderId) {
-  const { data: ord } = await supabase.from("orders")
-    .select("so_number, company_id, type").eq("id", orderId).single();
-  if (!ord?.so_number) return;
-  // Service orders are financially inert — never recompute paid/balance from them.
-  if (ord.type === "Service") return;
-  const { data: so } = await supabase.from("sales_orders")
-    .select("id, status, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges")
-    .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
-  if (!so) return;
-
-  const total = (Number(so.subtotal) || 0) - (Number(so.discount) || 0)
-    + (so.gst_waived ? 0 : (Number(so.gst_amount) || 0));
-  // Fall back to the legacy deposit if initial_deposit hasn't been backfilled.
-  const initial = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
-
-  // Sum every payment recorded against this SO (across its delivery orders).
-  // A single customer payment can be split across orders from DIFFERENT sales
-  // orders (payment_allocations). Credit this SO only the portion allocated to
-  // its own orders — summing the payment's whole amount by its single order_id
-  // would over-credit the first SO and leave the others' balance untouched.
-  const { data: dOrders } = await supabase.from("orders")
-    .select("id").eq("company_id", ord.company_id).eq("so_number", ord.so_number).or("type.is.null,type.neq.Service");
-  const ids = (dOrders || []).map(o => o.id);
+// The payments component of a sales order's ledger, given the ids of its
+// (non-Service) legacy orders: allocated portions pointing at those orders
+// plus unallocated payments attached directly to them, excluding REJECTED
+// payments. Shared by recomputeOrderPaid and the SO edit path so an edited
+// paid amount is always backed out against the SAME figure the ledger adds.
+async function ledgerPaymentsForOrderIds(ids) {
   let paidFromPayments = 0;
   let adminPayments = 0; // instalment admin charges recorded on this SO's payments
   // Payments count as soon as they're recorded (migration 065: "count now,
@@ -5937,6 +5909,44 @@ async function recomputeOrderPaid(orderId) {
     }
     paidFromPayments = allocatedSum + unallocatedSum;
   }
+  return { paidFromPayments, adminPayments };
+}
+
+// Recompute a sales order's paid/deposit total and its delivery order balance
+// from the authoritative ledger, given any one of its delivery orders' id.
+//
+// The Orders → Order (sales_orders) screen derives balance as
+// (subtotal − discount + gst) − deposit, so "deposit" means "amount paid to
+// date" = initial_deposit (the upfront deposit) + every recorded payment.
+// Recomputing from the ledger — instead of nudging deposit by a signed delta —
+// is exact and fully reversible: recording or deleting a payment always lands
+// on the correct total, so a capped over-/double-payment can never wipe the
+// original deposit. Clamped to [0, order total].
+async function recomputeOrderPaid(orderId) {
+  const { data: ord } = await supabase.from("orders")
+    .select("so_number, company_id, type").eq("id", orderId).single();
+  if (!ord?.so_number) return;
+  // Service orders are financially inert — never recompute paid/balance from them.
+  if (ord.type === "Service") return;
+  const { data: so } = await supabase.from("sales_orders")
+    .select("id, status, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges")
+    .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
+  if (!so) return;
+
+  const total = (Number(so.subtotal) || 0) - (Number(so.discount) || 0)
+    + (so.gst_waived ? 0 : (Number(so.gst_amount) || 0));
+  // Fall back to the legacy deposit if initial_deposit hasn't been backfilled.
+  const initial = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
+
+  // Sum every payment recorded against this SO (across its delivery orders).
+  // A single customer payment can be split across orders from DIFFERENT sales
+  // orders (payment_allocations). Credit this SO only the portion allocated to
+  // its own orders — summing the payment's whole amount by its single order_id
+  // would over-credit the first SO and leave the others' balance untouched.
+  const { data: dOrders } = await supabase.from("orders")
+    .select("id").eq("company_id", ord.company_id).eq("so_number", ord.so_number).or("type.is.null,type.neq.Service");
+  const ids = (dOrders || []).map(o => o.id);
+  const { paidFromPayments, adminPayments } = await ledgerPaymentsForOrderIds(ids);
 
   // Admin charges (instalment fee) add to what the customer owes — order-level
   // (sales_orders.admin_charges) plus any recorded on this SO's payments. They
@@ -15581,6 +15591,15 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // exist, treat the field as the AUTHORITATIVE total paid: back out the
     // payments into initial_deposit so recompute lands exactly on the entered
     // amount. Changing money after payments are recorded is manager/admin only.
+    //
+    // The edit form always re-sends the Deposit field (pre-filled with the
+    // ledger's paid figure, which is CAPPED at the order total), so a deposit
+    // that wasn't actually changed must leave initial_deposit alone. Re-deriving
+    // it on every edit baked payment-derived offsets into the baseline — e.g.
+    // an overpaid order (payments > total, paid capped) got a NEGATIVE
+    // initial_deposit that later understated paid once payments were reversed
+    // and re-recorded (SO03306: -175). Only a genuinely changed paid amount is
+    // backed out, against the SAME payments figure the ledger adds.
     let depositForUpdate = Number(deposit) || 0;
     let initialDepositForUpdate = depositForUpdate;
     const depositProvided = deposit !== undefined && deposit !== null && deposit !== "";
@@ -15588,18 +15607,33 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       const { data: legacyOrders } = await supabase.from("orders").select("id")
         .eq("company_id", company_id).eq("so_number", existing.order_number).or("type.is.null,type.neq.Service");
       const legIds = (legacyOrders || []).map(o => o.id);
-      let paymentsTotal = 0;
-      if (legIds.length) {
-        const { data: pays } = await supabase.from("payments").select("amount").in("order_id", legIds);
-        paymentsTotal = (pays || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
-      }
-      if (paymentsTotal > 0) {
-        const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
-        if (!MANAGE_ROLES.includes(roleKey)) {
-          return res.status(403).json({ error: "Only a manager can change the paid amount once payments have been recorded (e.g. collected on delivery)." });
+      const { paidFromPayments, adminPayments } = legIds.length
+        ? await ledgerPaymentsForOrderIds(legIds) : { paidFromPayments: 0, adminPayments: 0 };
+      if (paidFromPayments > 0) {
+        const existingInitial = existing.initial_deposit != null ? Number(existing.initial_deposit) : (Number(existing.deposit) || 0);
+        // What the ledger already pays this order with the existing baseline,
+        // under the totals being saved (same formula as recomputeOrderPaid).
+        const newTotalWithAdmin = (expandedItems ? subtotal : (Number(existing.subtotal) || 0)) - (Number(discount) || 0)
+          + (gst_waived ? 0 : (Number(gst_amount) || 0))
+          + (admin_charges != null && admin_charges !== "" ? Number(admin_charges) : 0) + adminPayments;
+        const ledgerPaid = Math.max(0, Math.min(newTotalWithAdmin, existingInitial + paidFromPayments));
+        const same = (a, b) => Math.abs(a - b) < 0.005;
+        if (same(depositForUpdate, Number(existing.deposit) || 0) || same(depositForUpdate, ledgerPaid)) {
+          initialDepositForUpdate = existingInitial; // paid amount not changed — keep the baseline
+        } else {
+          const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
+          if (!MANAGE_ROLES.includes(roleKey)) {
+            return res.status(403).json({ error: "Only a manager can change the paid amount once payments have been recorded (e.g. collected on delivery)." });
+          }
+          // recompute yields min(total, initial_deposit + paidFromPayments) → entered.
+          initialDepositForUpdate = Math.round((depositForUpdate - paidFromPayments) * 100) / 100;
+          if (initialDepositForUpdate < 0) {
+            return res.status(400).json({
+              error: `The paid amount can't be lower than the RM ${paidFromPayments.toFixed(2)} already recorded as payments. Reject or reverse a payment instead.`,
+              code: "paid_below_recorded_payments",
+            });
+          }
         }
-        // recompute yields min(total, initial_deposit + paymentsTotal) → entered.
-        initialDepositForUpdate = depositForUpdate - paymentsTotal;
       }
     }
 
