@@ -8286,7 +8286,7 @@ app.get("/service-cases", requireAuth, async (req, res) => {
     if (svcIds.length) {
       const [{ data: allLegs }, { data: allItems }] = await Promise.all([
         supabase.from("service_legs").select("id, service_id, leg_order, from_location, to_location, status, scheduled_at, scheduled_date").in("service_id", svcIds).order("leg_order"),
-        supabase.from("service_items").select("id, service_id, item_no, description, action_type, status, arrival_date").in("service_id", svcIds).order("item_no"),
+        supabase.from("service_items").select("id, service_id, item_no, description, action_type, quantity, status, arrival_date").in("service_id", svcIds).order("item_no"),
       ]);
       const legsBy = {}; for (const l of (allLegs || [])) (legsBy[l.service_id] ||= []).push(l);
       const itemsBy = {}; for (const it of (allItems || [])) (itemsBy[it.service_id] ||= []).push(it);
