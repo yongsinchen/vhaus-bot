@@ -37,6 +37,10 @@ const DRY_RUN = process.argv.includes("--dry-run");
 const { computeDeliveryReadiness } = createDeliveryReadinessService({ supabase, doLib });
 const { sendMessage } = createTelegramSender({});
 
+// Telegram chat ids are sensitive routing identifiers — never print them in full
+// (Railway logs are readable by more people than the chat itself).
+const maskChat = id => { const t = String(id ?? ""); return t.length <= 4 ? "****" : `…${t.slice(-4)}`; };
+
 function fmtDate(d) {
   if (!d) return "?";
   const [y, m, day] = String(d).split("-");
@@ -66,19 +70,24 @@ async function fetchAllRows(table, select, filterFn) {
 // both come exclusively from computeDeliveryReadiness.
 async function enrichNotReadyDo(entry) {
   const [{ data: items }, { data: scheds }] = await Promise.all([
-    supabase.from("delivery_order_items").select("product_name, product_code, size, color, quantity, delivered_qty, status").eq("delivery_order_id", entry.delivery_order_id),
+    supabase.from("delivery_order_items").select("id, product_name, product_code, size, color, quantity, delivered_qty, status").eq("delivery_order_id", entry.delivery_order_id),
     supabase.from("delivery_schedules").select("team_id, delivery_teams(driver:users!delivery_teams_driver_id_fkey(name))").eq("delivery_order_id", entry.delivery_order_id).limit(1),
   ]);
   const teamName = scheds?.[0]?.delivery_teams?.driver?.name || null;
-  const missingSet = new Set(entry.missing_items || []);
-  const conflictedSet = new Set(entry.conflicted_items || []);
+  // Lines are identified by delivery_order_items.id (from the readiness result),
+  // never by name — two CUSTOM lines can share a name/code, and a name match would
+  // name the wrong (or an arrived) line.
+  const missingSet = new Set(entry.missing_item_ids || []);
+  const conflictedSet = new Set(entry.conflicted_item_ids || []);
+  const partialByItem = new Map((entry.partial_details || []).map(p => [p.item_id, p]));
   const problemLines = (items || [])
-    .filter(i => i.status !== "cancelled" && (missingSet.has(i.product_name || i.product_code) || conflictedSet.has(i.product_name || i.product_code)))
+    .filter(i => i.status !== "cancelled" && (missingSet.has(i.id) || conflictedSet.has(i.id) || partialByItem.has(i.id)))
     .map(i => ({
       item: i.product_name || i.product_code || "item",
       option: [i.size, i.color].filter(Boolean).join(" / ") || null,
-      remaining_qty: Math.max(0, Number(i.quantity || 0) - Number(i.delivered_qty || 0)),
-      reason: conflictedSet.has(i.product_name || i.product_code) ? "arrival_allocation_conflict" : "missing_items",
+      // partial arrival: the useful number is the shortfall (needed − in stock)
+      remaining_qty: partialByItem.has(i.id) ? partialByItem.get(i.id).shortfall : Math.max(0, Number(i.quantity || 0) - Number(i.delivered_qty || 0)),
+      reason: conflictedSet.has(i.id) ? "arrival_allocation_conflict" : partialByItem.has(i.id) ? "partial_arrival" : "missing_items",
     }));
   return { ...entry, team_name: teamName, problem_lines: problemLines };
 }
@@ -88,7 +97,7 @@ function formatCompanyMessage(companyName, notReadyDos) {
   for (const d of notReadyDos) {
     lines.push(`📅 ${fmtDate(d.delivery_date)} | DO *${d.do_number}* | SO ${d.so_number || "?"}`);
     lines.push(`👤 ${d.customer_name || "?"} | 🚚 Team: ${d.team_name || "Unassigned"}`);
-    const otherReasons = (d.alerts || []).filter(a => !["missing_items", "arrival_allocation_conflict"].includes(a.type));
+    const otherReasons = (d.alerts || []).filter(a => !["missing_items", "arrival_allocation_conflict", "partial_arrival"].includes(a.type));
     for (const line of d.problem_lines) {
       lines.push(`   • ${line.item}${line.option ? ` (${line.option})` : ""} — remaining ${line.remaining_qty} — ${line.reason}`);
     }
@@ -130,7 +139,7 @@ async function run(deps = {}) {
     summary.companies_with_destination++;
 
     try {
-      const readiness = await computeReadiness({ companyId: company.id, startDate: today, endDate });
+      const readiness = await computeReadiness({ companyId: company.id, startDate: today, endDate, syncScheduleFlags: false });
       summary.candidate_do_count += readiness.orders.length;
       summary.ready_count += readiness.ready;
       const notReady = readiness.orders.filter(o => !o.is_ready && o.delivery_order_id);
@@ -149,12 +158,12 @@ async function run(deps = {}) {
       summary.grouped_message_count++;
 
       if (dryRun) {
-        console.log(`\n[${company.name}] would send to chat_id=${dest.chat_id}:\n${message}\n`);
+        console.log(`\n[${company.name}] would send to chat_id=${maskChat(dest.chat_id)}:\n${message}\n`);
         summary.results.push({ company: company.name, status: "dry_run_would_send", not_ready_count: notReady.length, sample: message.slice(0, 300) });
       } else {
         try {
           await send(dest.chat_id, message);
-          console.log(`[${company.name}] sent to chat_id=${dest.chat_id} (${notReady.length} NOT READY DOs)`);
+          console.log(`[${company.name}] sent to chat_id=${maskChat(dest.chat_id)} (${notReady.length} NOT READY DOs)`);
           summary.results.push({ company: company.name, status: "sent", not_ready_count: notReady.length });
         } catch (sendErr) {
           console.error(`[${company.name}] send failed (continuing to other companies):`, sendErr.message);

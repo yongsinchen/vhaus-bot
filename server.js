@@ -29,6 +29,7 @@ const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolve
 const effectiveDelivery = require("./lib/effective-delivery");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
+const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
@@ -1987,6 +1988,10 @@ Example: /${isApprove ? "approve" : "reject"} 11576`);
     } else {
       await supabase.from("orders").update({ delivery_date: newDate }).eq("id", orderId);
     }
+    try {
+      const { data: apprOrd } = await supabase.from("orders").select("company_id").eq("id", orderId).maybeSingle();
+      await syncServiceDateForLegacyOrder(apprOrd?.company_id || null, orderId, newDate);
+    } catch (e) { console.error("[approve] service sync failed (non-fatal):", e.message); }
     await sendMessage(chatId, `✅ *Approved*\n\nSO *${soNumber}*${isTrip ? ` Trip ${tripNo}` : ""} rescheduled to *${fmtDate(newDate)}*.`);
     // Notify salesman
     if (approval.salesmanChatId) {
@@ -2092,6 +2097,46 @@ const logDeliveryActivity = async ({
   } catch (e) { console.error("[delivery_activity] log failed (non-fatal):", e.message); }
 };
 
+// ── Keep a linked Service Case in step with its legacy order's date ──
+// A Service's operational date lives on services.due_date (+ lifecycle status);
+// the legacy orders row only mirrors it. The Telegram reschedule path used to
+// write orders.delivery_date alone, leaving the Service Case unscheduled/open.
+// Mirrors PATCH /service-cases/:id: due_date, schedule_tbc, and the centralized
+// open<->scheduled transition (lib/service-lifecycle). No-op for any order that
+// has no linked Service Case (company-scoped, so never touches another company).
+const syncServiceDateForLegacyOrder = async (companyId, orderId, newDate, { tbc = false } = {}) => {
+  if (!companyId || !orderId) return;
+  const { data: svc } = await supabase.from("services").select("id, status").eq("company_id", companyId).eq("legacy_order_id", orderId).maybeSingle();
+  if (!svc) return;
+  const patch = { due_date: newDate || null, schedule_tbc: !!tbc };
+  const next = serviceStatusAfterDateChange(svc.status, !!newDate && !tbc);
+  if (next !== svc.status) patch.status = next;
+  await supabase.from("services").update(patch).eq("id", svc.id).eq("company_id", companyId);
+};
+
+// ── Create a delivery_date_requests row (auto-approved or pending per the
+// 10-day rule) for a resolved target. ONE implementation shared by the web
+// assistant chat and the Telegram reschedule flow so the supersede-then-create
+// sequence cannot drift between channels. A DO-scoped request supersedes only
+// that DO's own open requests; a pre-DO request only the order's DO-less ones.
+async function submitDeliveryDateRequest({ companyId, branchId, orderId, salesOrderId, soNumber, customerName, deliveryOrderId, targetDo, requestedDate, remark, actorId, actorName, requestedVia }) {
+  let supersedeQ = supabase.from("delivery_date_requests")
+    .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
+    .in("status", ["pending", "needs_reschedule"]);
+  supersedeQ = deliveryOrderId ? supersedeQ.eq("delivery_order_id", deliveryOrderId) : supersedeQ.eq("order_id", orderId).is("delivery_order_id", null);
+  await supersedeQ;
+
+  const originalDate = await resolveOriginalDeliveryDate(companyId, { salesOrderId, orderId, deliveryOrderId });
+  return createDeliveryDateRequestAndMaybeAutoApprove({
+    company_id: companyId, branch_id: branchId, order_id: orderId,
+    sales_order_id: salesOrderId, so_number: soNumber, customer_name: customerName || null,
+    delivery_order_id: deliveryOrderId, requested_date: requestedDate, original_date: originalDate,
+    original_team_id: targetDo?.team_id || null, original_team_name: targetDo?.team_name || null,
+    schedule_id: targetDo?.schedule_id || null, remark: remark || null, status: "pending",
+    requested_by: actorId, requested_by_name: actorName || null, requested_via: requestedVia,
+  }, actorId);
+}
+
 // ── Apply a reschedule date ───────────────────────────────────────
 // Shared by the reschedule waiting_date step and the busy-date confirm step.
 //
@@ -2130,38 +2175,102 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
     if (orderCompanyId && !isTbc) isBlockedDate = !!(await getBlockedDateReason(orderCompanyId, newDate, null));
   }
 
-  // P1-6: reschedule must remain DO-scoped once a DO exists (never guess
-  // which DO to modify, never write the legacy whole-order date underneath
-  // an active DO). Telegram has no DO-selection UI, so the safe behavior
-  // when one or more active DOs exist is to refuse and defer to the web
-  // app/Delivery Schedule board rather than mutate orders/order_trips blind
-  // to the DO layer. TBC included: clearing only the legacy date under a
-  // dated active DO is exactly what made the SO read a false "TBC".
-  if (orderCompanyId && soNumber) {
-    const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", orderCompanyId).eq("order_number", soNumber).maybeSingle();
-    if (soRow?.id) {
-      const activeDOs = await resolveActiveDeliveryOrders({ supabase, companyId: orderCompanyId, salesOrderId: soRow.id });
-      if (activeDOs.length > 0) {
-        clearSession(key);
-        await sendMessage(chatId,
-          `⚠️ *Please use the web app for this reschedule*\n\n` +
-          `SO *${soNumber}* already has ${activeDOs.length > 1 ? "multiple active Delivery Orders" : `an active Delivery Order (${activeDOs[0].do_number})`}.\n\n` +
-          `Rescheduling here isn't supported once a Delivery Order exists — please use the Delivery Schedule board so you can pick the exact DO.`
-        );
-        return;
+  // P1-6: ONE canonical decision (lib/telegram-reschedule.js) built only from
+  // the rules every other channel already uses — active Delivery Order 0/1/2+
+  // (same selection rule as the web), the Service First-Scheduling rule, and
+  // the 10-calendar-day approval rule. Telegram never guesses which DO is
+  // meant and never writes the legacy whole-order date underneath an active DO.
+  let activeDOs = [];
+  let salesOrderIdTg = null;
+  let serviceCtx = null;
+  if (orderCompanyId) {
+    if (soNumber) {
+      const { data: soRow } = await supabase.from("sales_orders").select("id").eq("company_id", orderCompanyId).eq("order_number", soNumber).maybeSingle();
+      if (soRow?.id) {
+        salesOrderIdTg = soRow.id;
+        activeDOs = await resolveActiveDeliveryOrders({ supabase, companyId: orderCompanyId, salesOrderId: soRow.id });
       }
     }
+    if (orderId) {
+      const { data: svc } = await supabase.from("services").select("id, status, due_date").eq("company_id", orderCompanyId).eq("legacy_order_id", orderId).maybeSingle();
+      if (svc) serviceCtx = { id: svc.id, status: svc.status, dueDate: svc.due_date || null };
+    }
   }
+  // A multi-trip (order_trips) reschedule has no DO-scoped mechanism here — any
+  // active DO means defer to the web board rather than mutate trips blind to it.
+  const decision = (isTrip && activeDOs.length > 0)
+    ? { action: "refuse_ambiguous_do" }
+    : decideTelegramReschedule({ requestedDate: isTbc ? null : newDate, isTbc, currentDate: currentDate || null, isBlockedDate, activeDeliveryOrders: activeDOs, service: serviceCtx });
 
-  // ── Centralized 10-calendar-day approval decision (same rule every
-  // other delivery-date path uses) ──────────────────────────────
-  const dateDecision = isTbc ? null : evaluateDeliveryDateApproval({ requestedDate: newDate, currentDate: currentDate || null });
-  if (dateDecision && !dateDecision.valid) {
-    await sendMessage(chatId, dateDecision.reason === "past_date" ? "❌ That date is in the past — please pick a future date." : "❌ That date isn't valid — please try again.");
+  if (decision.action === "refuse_ambiguous_do") {
+    clearSession(key);
+    await sendMessage(chatId,
+      `⚠️ *Please use the web app for this reschedule*
+
+` +
+      `SO *${soNumber}* ${activeDOs.length > 1 ? "has multiple active Delivery Orders" : `has an active Delivery Order (${activeDOs[0]?.do_number || "?"})`} and this reschedule can't be done here — the bot can't pick the exact one.
+
+` +
+      `Please use the Delivery Schedule board so you can pick the exact DO.`
+    );
+    return;
+  }
+  if (decision.action === "refuse_do_tbc") {
+    clearSession(key);
+    await sendMessage(chatId,
+      `⚠️ *Nothing changed*
+
+SO *${soNumber}* is scheduled through Delivery Order *${decision.deliveryOrder.do_number}*. To set it to TBC, de-schedule that Delivery Order on the Delivery Schedule board.`
+    );
+    return;
+  }
+  if (decision.action === "invalid") {
+    await sendMessage(chatId, decision.reason === "past_date" ? "❌ That date is in the past — please pick a future date." : "❌ That date isn't valid — please try again.");
     return;
   }
 
-  if (!isTbc && ((dateDecision && dateDecision.requiresApproval) || isBlockedDate)) {
+  // Exactly one active DO: the DO is the target and its date is the current
+  // date — a DO-scoped delivery_date_requests row through the SAME shared
+  // creator the web chat uses (10-day rule decides auto-approve vs pending).
+  if (decision.action === "do_request") {
+    const tgActor = from?.id ? await getTelegramUser(from.id) : null;
+    // Fail closed: the actor must be a registered user and, when company-bound,
+    // bound to THIS order's company.
+    if (!tgActor || (tgActor.company_id && tgActor.company_id !== orderCompanyId)) {
+      clearSession(key);
+      await sendMessage(chatId, "❌ You are not authorized to reschedule this order.");
+      return;
+    }
+    const targetDo = decision.deliveryOrder;
+    const actorName = tgActor.salesman_name || tgActor.name || null;
+    const { request, error: reqErr } = await submitDeliveryDateRequest({
+      companyId: orderCompanyId, branchId: orderBranchId, orderId, salesOrderId: salesOrderIdTg, soNumber, customerName,
+      deliveryOrderId: targetDo.id, targetDo, requestedDate: newDate, remark: null,
+      actorId: tgActor.id, actorName, requestedVia: "telegram",
+    });
+    if (reqErr) { await sendMessage(chatId, `❌ Failed to send request: ${reqErr}`); return; }
+    clearSession(key);
+    if (request.status === "approved") {
+      await sendMessage(chatId,
+        `✅ *Delivery Date Updated*
+
+📋 SO: ${soNumber} (${targetDo.do_number})${customerName ? ` — ${customerName}` : ""}
+📅 Old date: ${fmtDate(targetDo.delivery_date)}
+📅 New date: *${displayDate}*
+${loadLine}
+_Auto-approved — 10+ days out._`
+      );
+    } else {
+      await sendMessage(chatId,
+        `⚠️ *Approval Required*
+
+SO *${soNumber}* (${targetDo.do_number}) → ${displayDate} needs approval under the 10-day rule. The request was sent — the delivery has NOT moved yet; it moves once approved in the *Delivery Dates* tab.`
+      );
+    }
+    return;
+  }
+
+  if (decision.action === "gated" || decision.action === "service_gated") {
     const salesmanName = from?.first_name
       ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
       : (from?.username || "Unknown");
@@ -2179,7 +2288,7 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
     clearSession(key);
 
     // Tell salesman request is pending
-    const windowReason = isBlockedDate && !(dateDecision && dateDecision.requiresApproval)
+    const windowReason = isBlockedDate && !(decision.decision && decision.decision.requiresApproval)
       ? "that date is blocked for scheduling"
       : "that date falls within the protected 10-day reschedule window";
     await sendMessage(chatId,
@@ -2248,6 +2357,12 @@ const applyRescheduleDate = async (chatId, key, from, data, newDate, load = null
 
   // Reaching here means the update succeeded — the error paths above
   // return early via `return;`.
+  // A Service's operational date/lifecycle lives on its Service Case — keep it
+  // in step with the legacy order write above (first scheduling → scheduled).
+  if (serviceCtx && orderCompanyId) {
+    try { await syncServiceDateForLegacyOrder(orderCompanyId, orderId, dbDate, { tbc: isTbc }); }
+    catch (e) { console.error("[applyRescheduleDate] service sync failed (non-fatal):", e.message); }
+  }
   const salesmanName = from?.first_name
     ? (from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name)
     : (from?.username || "Unknown");
@@ -2440,23 +2555,32 @@ Reply YES / CANCEL or correct again.`);
           ? await supabase.from("sales_orders").select("id").eq("company_id", order.company_id).eq("order_number", order.so_number).maybeSingle()
           : { data: null };
         const activeDOsTg = soRowTg?.id ? await resolveActiveDeliveryOrders({ supabase, companyId: order.company_id, salesOrderId: soRowTg.id }) : [];
-        if (activeDOsTg.length > 0) {
+        if (activeDOsTg.length > 1) {
           const eff = effectiveDelivery.effectiveDeliveryState({ soDeliveryDate: order.delivery_date, activeDeliveryOrders: activeDOsTg });
           clearSession(key);
           await sendMessage(chatId,
-            `📋 *SO ${soNumber}* — ${order.customer_name || ""} _(${label})_\n` +
-            (eff.source === "delivery_order"
-              ? `📅 Currently scheduled: *${fmtScheduleDate(eff.date)}* (${eff.do_number})\n\n`
-              : `📅 Currently scheduled: multiple — ${eff.deliveries.map(d => `${d.do_number}: ${fmtScheduleDate(d.date)}`).join(", ")}\n\n`) +
-            `⚠️ Rescheduling here isn't supported once a Delivery Order exists — please use the Delivery Schedule board so you can pick the exact DO.`
+            `📋 *SO ${soNumber}* — ${order.customer_name || ""} _(${label})_
+` +
+            `📅 Currently scheduled: multiple — ${eff.deliveries.map(d => `${d.do_number}: ${fmtScheduleDate(d.date)}`).join(", ")}
+
+` +
+            `⚠️ This order has more than one active Delivery Order and the bot can't pick the exact one — please use the Delivery Schedule board.`
           );
           return true;
         }
-        setSession(key, "reschedule", "waiting_date", { soNumber, orderId: order.id, currentDate: order.delivery_date, customerName: order.customer_name, isTrip: false });
+        // Exactly one active DO: its date is the current date (lib/effective-delivery)
+        // and it is the reschedule target (applyRescheduleDate → DO-scoped request).
+        const currentDateTg = activeDOsTg.length === 1 ? activeDOsTg[0].delivery_date : order.delivery_date;
+        const doTagTg = activeDOsTg.length === 1 ? ` (${activeDOsTg[0].do_number})` : "";
+        setSession(key, "reschedule", "waiting_date", { soNumber, orderId: order.id, currentDate: currentDateTg, customerName: order.customer_name, isTrip: false });
         await sendMessage(chatId,
-          `📋 *SO ${soNumber}* — ${order.customer_name || ""} _(${label})_\n` +
-          `📅 Currently scheduled: *${fmtScheduleDate(order.delivery_date)}*\n\n` +
-          `What is the new date?\n_e.g. 5/3, 5/3/2026, tmr, TBC_`
+          `📋 *SO ${soNumber}*${doTagTg} — ${order.customer_name || ""} _(${label})_
+` +
+          `📅 Currently scheduled: *${fmtScheduleDate(currentDateTg)}*
+
+` +
+          `What is the new date?
+_e.g. 5/3, 5/3/2026, tmr, TBC_`
         );
       }
       return true;
@@ -9528,21 +9652,10 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
     // rule), and reply. Used both directly by processDate (0/1 active DO)
     // and after the user resolves a select_do prompt (2+ active DOs).
     const finalizeDeliveryDateRequest = async ({ soNumber, orderId, customerName, salesOrderId, branchId, requestedDate, remark, deliveryOrderId, targetDo }) => {
-      let supersedeQ = supabase.from("delivery_date_requests")
-        .update({ status: "rejected", decision_note: "Superseded by a new request", updated_at: new Date().toISOString() })
-        .in("status", ["pending", "needs_reschedule"]);
-      supersedeQ = deliveryOrderId ? supersedeQ.eq("delivery_order_id", deliveryOrderId) : supersedeQ.eq("order_id", orderId).is("delivery_order_id", null);
-      await supersedeQ;
-
-      const originalDate = await resolveOriginalDeliveryDate(companyId, { salesOrderId, orderId, deliveryOrderId });
-      const { status, request, error } = await createDeliveryDateRequestAndMaybeAutoApprove({
-        company_id: companyId, branch_id: branchId, order_id: orderId,
-        sales_order_id: salesOrderId, so_number: soNumber, customer_name: customerName || null,
-        delivery_order_id: deliveryOrderId, requested_date: requestedDate, original_date: originalDate,
-        original_team_id: targetDo?.team_id || null, original_team_name: targetDo?.team_name || null,
-        schedule_id: targetDo?.schedule_id || null, remark: remark || null, status: "pending",
-        requested_by: req.user.id, requested_by_name: req.user.salesman_name || req.user.name || null, requested_via: "chat",
-      }, req.user.id);
+      const { status, request, error } = await submitDeliveryDateRequest({
+        companyId, branchId, orderId, salesOrderId, soNumber, customerName, deliveryOrderId, targetDo, requestedDate, remark,
+        actorId: req.user.id, actorName: req.user.salesman_name || req.user.name || null, requestedVia: "chat",
+      });
       if (error) return reply(`❌ Failed to send request: ${error}`);
       clearSession(key);
       const doLine = deliveryOrderId && targetDo ? ` (${targetDo.do_number})` : "";
