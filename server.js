@@ -1481,7 +1481,7 @@ const buildOrderPreview = (data) => {
     `Time Slot: ${fmt(data.timeSlot)}\n` +
     `Salesman: ${fmt(data.salesman)}\n` +
     `Amount: RM${fmt(data.orderAmount)}\n` +
-    `Balance: RM${fmt(data.balance)}\n` +
+    `Balance: RM${data.balance != null && data.balance !== "" ? Number(data.balance).toFixed(2) : "-"}\n` +
     `Type: ${fmt(data.type)}\n` +
     `Remark: ${fmt(data.remark)}\n` +
     (data.serviceNote ? `Service Note: ${fmt(data.serviceNote)}\n` : "") +
@@ -1715,7 +1715,7 @@ const handleScheduleCommand = async (chatId, text) => {
       reply += `  ${i + 1}. SO *${o.so_number}* — ${o.customer_name || "-"}\n`;
       reply += `     📦 ${itemNames || "No items"}\n`;
       if (o.time_slot) reply += `     ⏰ ${o.time_slot}\n`;
-      if (parseFloat(o.balance) > 0) reply += `     🔴 Balance: RM ${o.balance}\n`;
+      if (parseFloat(o.balance) > 0) reply += `     🔴 Balance: RM ${Number(o.balance).toFixed(2)}\n`;
     });
   });
   reply += `\n━━━━━━━━━━━━━━━━━━━━\n_Open delivery sheet to assign lorries._`;
@@ -1922,7 +1922,7 @@ const buildOrderStatusReply = async (soToken, companyId = null) => {
     deliveryLine,
     o.salesman ? `Salesman: ${o.salesman}` : null,
     items.length ? `Items arrived: ${arrived}/${items.length}${pending.length ? ` — pending: ${pending.slice(0, 3).join(", ")}${pending.length > 3 ? "…" : ""}` : ""}` : null,
-    parseFloat(o.balance) > 0 ? `🔴 Outstanding balance: RM ${o.balance}` : null,
+    parseFloat(o.balance) > 0 ? `🔴 Outstanding balance: RM ${Number(o.balance).toFixed(2)}` : null,
   ].filter(Boolean).join("\n");
 };
 
@@ -4149,7 +4149,7 @@ app.get("/branch-performance", requireAuth, async (req, res) => {
     const rows = list.map(o => {
       const legit = isLegit(o);
       const amt = Number(o.order_amount) || 0;
-      const bal = Number(o.balance) || 0;
+      const bal = round2(Number(o.balance) || 0);
       outstanding += bal;
       const soDep = o.so_number ? depBySo.get(o.so_number) : null;
       if (soDep && soDep.status === "pending_deposit") pendingDeposit++;
@@ -4398,7 +4398,7 @@ Order ${i+1}:
   Items: ${o.itemKeywords}
   Duration: ${o.estimatedDuration} minutes
   Time preference: ${o.time_slot || "No preference"}
-  Balance: ${parseFloat(o.balance) > 0 ? "RM " + o.balance + " outstanding" : "Settled"}
+  Balance: ${parseFloat(o.balance) > 0 ? "RM " + Number(o.balance).toFixed(2) + " outstanding" : "Settled"}
 `).join("")}
 
 VEHICLES:
@@ -5978,8 +5978,18 @@ async function recomputeOrderPaid(orderId) {
   // raise the outstanding balance without touching order_amount (which drives
   // commission / GST / e-invoice).
   const totalWithAdmin = total + (Number(so.admin_charges) || 0) + adminPayments;
-  const paid = Math.max(0, Math.min(totalWithAdmin, initial + paidFromPayments));
-  const balance = Math.max(0, totalWithAdmin - paid);
+  // Round to the cent before persisting — every input here (subtotal, gst,
+  // deposit, payment amounts) is itself a 2-decimal money value; summing and
+  // subtracting them in JS Number arithmetic can leave a binary-float tail
+  // (e.g. 5640 + 507.6 - 2500 === 3647.6000000000004) that is not a real
+  // discrepancy, just IEEE-754 representation noise around the correct cent
+  // value. Rounding once, here, at the final computed amounts — never
+  // repeated on intermediate sums — keeps the persisted sales_orders.deposit
+  // / orders.balance exact instead of leaking that noise into every reader
+  // (dashboard, Telegram, print) that doesn't defensively reformat it.
+  const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+  const paid = round2(Math.max(0, Math.min(totalWithAdmin, initial + paidFromPayments)));
+  const balance = round2(Math.max(0, totalWithAdmin - paid));
   await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
   for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
 
