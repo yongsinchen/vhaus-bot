@@ -5435,9 +5435,24 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
     // Legacy requests with no sales_order_id — read the date off the legacy order.
     const legacyOrderIds = [...new Set((data || []).filter(r => !r.sales_order_id && r.order_id).map(r => r.order_id))];
     const legacyDate = new Map();
+    const legacyType = new Map();
     if (legacyOrderIds.length) {
-      const { data: ords } = await supabase.from("orders").select("id, delivery_date").in("id", legacyOrderIds);
-      for (const o of (ords || [])) legacyDate.set(o.id, o.delivery_date || null);
+      const { data: ords } = await supabase.from("orders").select("id, delivery_date, type").in("id", legacyOrderIds);
+      for (const o of (ords || [])) { legacyDate.set(o.id, o.delivery_date || null); legacyType.set(o.id, o.type || null); }
+    }
+    // Service orders never go through the sales_order_id -> delivery_orders
+    // lifecycle at all — a Service is scheduled straight onto
+    // delivery_schedules (the same table backing the Delivery Schedule board),
+    // so "no delivery_orders row" is its NORMAL, permanent state, not a
+    // pending step. Surface its own canonical services.status instead of the
+    // SO-only "Awaiting DO" / "DO created" badge, which is category-wrong for
+    // this flow (see ServicePage.js's STATUS_STYLE for the same vocabulary —
+    // open / scheduled / in_progress / resolved / closed).
+    const serviceLegacyIds = legacyOrderIds.filter(id => legacyType.get(id) === "Service");
+    const serviceStatus = new Map();
+    if (serviceLegacyIds.length) {
+      const { data: svcs } = await supabase.from("services").select("legacy_order_id, status").in("legacy_order_id", serviceLegacyIds);
+      for (const s of (svcs || [])) serviceStatus.set(s.legacy_order_id, s.status || null);
     }
     // Availability of each requested date so the approver can judge it without
     // leaving the page: how many deliveries are already booked that day (load),
@@ -5462,6 +5477,8 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
       has_delivery_order: r.sales_order_id ? withDo.has(r.sales_order_id) : false,
       current_delivery_date: r.sales_order_id ? (soDate.get(r.sales_order_id) || null) : (legacyDate.get(r.order_id) || null),
       requested_date_load: r.requested_date ? (loadByDate.get(r.requested_date) || null) : null,
+      is_service: !r.sales_order_id && r.order_id ? legacyType.get(r.order_id) === "Service" : false,
+      service_status: !r.sales_order_id && r.order_id ? (serviceStatus.get(r.order_id) || null) : null,
     }));
     res.json({ requests, is_approver: isDateApprover(req) });
   } catch (err) { res.status(500).json({ error: err.message }); }
