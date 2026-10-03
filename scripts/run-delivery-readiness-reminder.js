@@ -92,19 +92,105 @@ async function enrichNotReadyDo(entry) {
   return { ...entry, team_name: teamName, problem_lines: problemLines };
 }
 
+// Telegram rejects a text message over 4,096 characters outright, which would lose
+// the WHOLE reminder on a busy window. Parts are kept under this conservative
+// limit, measured in UTF-16 code units (`.length`), which can only over-count
+// Telegram's own character count (an emoji = 2 here).
+const SAFE_MESSAGE_LIMIT = 3800;
+const MESSAGE_TITLE = "⚠️ *Delivery Readiness — Next 5 Days*";
+
+// One delivery's lines: `context` identifies it (date / DO / SO / customer / team),
+// `issues` are its NOT READY lines. Shared by the single-message and split formats.
+function deliveryBlock(d) {
+  const context = [
+    `📅 ${fmtDate(d.delivery_date)} | DO *${d.do_number}* | SO ${d.so_number || "?"}`,
+    `👤 ${d.customer_name || "?"} | 🚚 Team: ${d.team_name || "Unassigned"}`,
+  ];
+  const otherReasons = (d.alerts || []).filter(a => !["missing_items", "arrival_allocation_conflict", "partial_arrival"].includes(a.type));
+  const issues = [];
+  for (const line of d.problem_lines) {
+    issues.push(`   • ${line.item}${line.option ? ` (${line.option})` : ""} — remaining ${line.remaining_qty} — ${line.reason}`);
+  }
+  for (const a of otherReasons) issues.push(`   • ${a.message} — ${a.type}`);
+  return { context, issues };
+}
+
+// The whole reminder as ONE message (what staff get when it fits).
 function formatCompanyMessage(companyName, notReadyDos) {
-  const lines = [`⚠️ *Delivery Readiness — Next 5 Days* (${companyName})`, ""];
+  const lines = [`${MESSAGE_TITLE} (${companyName})`, ""];
   for (const d of notReadyDos) {
-    lines.push(`📅 ${fmtDate(d.delivery_date)} | DO *${d.do_number}* | SO ${d.so_number || "?"}`);
-    lines.push(`👤 ${d.customer_name || "?"} | 🚚 Team: ${d.team_name || "Unassigned"}`);
-    const otherReasons = (d.alerts || []).filter(a => !["missing_items", "arrival_allocation_conflict", "partial_arrival"].includes(a.type));
-    for (const line of d.problem_lines) {
-      lines.push(`   • ${line.item}${line.option ? ` (${line.option})` : ""} — remaining ${line.remaining_qty} — ${line.reason}`);
-    }
-    for (const a of otherReasons) lines.push(`   • ${a.message} — ${a.type}`);
-    lines.push("");
+    const b = deliveryBlock(d);
+    lines.push(...b.context, ...b.issues, "");
   }
   return lines.join("\n").trim();
+}
+
+// Split a string into pieces of at most `max` UTF-16 units without ever cutting a
+// surrogate pair (emoji / rare CJK) — splitting by code point, never by index.
+function wrapByCodePoint(text, max) {
+  const out = [];
+  let cur = "";
+  for (const ch of Array.from(text)) {
+    if (cur.length + ch.length > max) { out.push(cur); cur = ""; }
+    cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/**
+ * The reminder as one or more Telegram-safe messages.
+ *   - fits in `limit` → exactly the single message formatCompanyMessage() builds
+ *   - otherwise "Part i/n" messages, each with its own title + company header so
+ *     every part stands alone; deliveries are never split across parts when one
+ *     fits, and a delivery block (header + its issue lines) is never cut mid-line.
+ *   - a single delivery larger than a whole part is split BY ITEM LINES, each piece
+ *     repeating that delivery's date / DO / SO / customer / team (a line longer than
+ *     a part — practically impossible — is wrapped on code-point boundaries).
+ * Nothing is dropped or duplicated; the issue lines are never truncated.
+ */
+function splitCompanyMessages(companyName, notReadyDos, limit = SAFE_MESSAGE_LIMIT) {
+  const single = formatCompanyMessage(companyName, notReadyDos);
+  if (single.length <= limit) return [single];
+
+  const headerFor = (i, n) => `${MESSAGE_TITLE}\n(${companyName})\nPart ${i}/${n}`;
+  const budget = limit - headerFor(999, 999).length - 2; // 2 = the blank line after the header
+  const SEP = "\n\n";
+  const bodies = [];
+  let cur = [];
+  const curLen = () => cur.join(SEP).length;
+  const flush = () => { if (cur.length) { bodies.push(cur.join(SEP)); cur = []; } };
+  const pack = text => {
+    if (cur.length && curLen() + SEP.length + text.length > budget) flush();
+    cur.push(text);
+  };
+
+  for (const d of notReadyDos) {
+    const b = deliveryBlock(d);
+    const whole = [...b.context, ...b.issues].join("\n");
+    if (whole.length <= budget) { pack(whole); continue; }
+
+    // Oversized delivery: split by item lines, repeating the context on every piece.
+    flush();
+    const ctx = b.context.join("\n");
+    const contCtx = `${ctx}\n(continued)`;
+    const room = budget - contCtx.length - 1;
+    const lines = [];
+    for (const issue of b.issues) for (const seg of (issue.length > room ? wrapByCodePoint(issue, room) : [issue])) lines.push(seg);
+    let piece = [];
+    const pieces = [];
+    const pieceLen = () => piece.join("\n").length;
+    for (const ln of lines) {
+      if (piece.length && pieceLen() + 1 + ln.length > room) { pieces.push(piece); piece = []; }
+      piece.push(ln);
+    }
+    if (piece.length) pieces.push(piece);
+    pieces.forEach((pl, i) => pack(`${i === 0 ? ctx : contCtx}\n${pl.join("\n")}`));
+  }
+  flush();
+
+  const n = bodies.length;
+  return bodies.map((body, i) => `${headerFor(i + 1, n)}\n\n${body}`);
 }
 
 // deps override lets the dedicated test suite inject a fake sendMessage (to
@@ -126,7 +212,7 @@ async function run(deps = {}) {
 
   const companies = await fetchAllRows("companies", "id, name");
 
-  const summary = { companies_inspected: companies.length, companies_with_destination: 0, companies_without_destination: 0, candidate_do_count: 0, ready_count: 0, not_ready_count: 0, reason_breakdown: {}, grouped_message_count: 0, results: [] };
+  const summary = { companies_inspected: companies.length, companies_with_destination: 0, companies_without_destination: 0, candidate_do_count: 0, ready_count: 0, not_ready_count: 0, reason_breakdown: {}, grouped_message_count: 0, message_part_count: 0, results: [] };
 
   for (const company of companies) {
     const dest = destByCompany.get(company.id);
@@ -153,21 +239,29 @@ async function run(deps = {}) {
       }
 
       const enriched = [];
-      for (const o of notReady) enriched.push(await enrichNotReadyDo(o));
-      const message = formatCompanyMessage(company.name, enriched);
+      for (const o of notReady) enriched.push(await (deps.enrichNotReadyDo || enrichNotReadyDo)(o));
+      const messages = splitCompanyMessages(company.name, enriched);
       summary.grouped_message_count++;
+      summary.message_part_count += messages.length;
 
       if (dryRun) {
-        console.log(`\n[${company.name}] would send to chat_id=${maskChat(dest.chat_id)}:\n${message}\n`);
-        summary.results.push({ company: company.name, status: "dry_run_would_send", not_ready_count: notReady.length, sample: message.slice(0, 300) });
+        console.log(`\n[${company.name}] would send to chat_id=${maskChat(dest.chat_id)} (${messages.length} message${messages.length === 1 ? "" : "s"}):`);
+        messages.forEach((m, i) => console.log(`${messages.length > 1 ? `--- part ${i + 1}/${messages.length} (${m.length} chars) ---\n` : ""}${m}\n`));
+        summary.results.push({ company: company.name, status: "dry_run_would_send", not_ready_count: notReady.length, parts: messages.length, sample: messages[0].slice(0, 300) });
       } else {
+        // Parts go out sequentially. If part k fails we STOP: the parts already delivered are
+        // not resent (no retry infrastructure here), and the run reports exactly which part
+        // failed — a partial reminder is never reported as a success.
+        let sentParts = 0;
         try {
-          await send(dest.chat_id, message);
-          console.log(`[${company.name}] sent to chat_id=${maskChat(dest.chat_id)} (${notReady.length} NOT READY DOs)`);
-          summary.results.push({ company: company.name, status: "sent", not_ready_count: notReady.length });
+          for (const part of messages) { await send(dest.chat_id, part); sentParts++; }
+          console.log(`[${company.name}] sent to chat_id=${maskChat(dest.chat_id)} (${notReady.length} NOT READY DOs, ${messages.length} message${messages.length === 1 ? "" : "s"})`);
+          summary.results.push({ company: company.name, status: "sent", not_ready_count: notReady.length, parts: messages.length });
         } catch (sendErr) {
-          console.error(`[${company.name}] send failed (continuing to other companies):`, sendErr.message);
-          summary.results.push({ company: company.name, status: "send_failed", error: sendErr.message });
+          const failedPart = sentParts + 1;
+          const status = sentParts === 0 ? "send_failed" : "partial_send_failed";
+          console.error(`[${company.name}] ${status}: part ${failedPart}/${messages.length} FAILED (${sentParts} part${sentParts === 1 ? "" : "s"} already delivered, NOT resent; remaining parts not sent) — continuing to other companies:`, sendErr.message);
+          summary.results.push({ company: company.name, status, parts_total: messages.length, parts_sent: sentParts, failed_part: failedPart, error: sendErr.message });
         }
       }
     } catch (err) {
@@ -185,4 +279,4 @@ if (require.main === module) {
   run().then(() => process.exit(0)).catch(e => { console.error("FATAL:", e); process.exit(1); });
 }
 
-module.exports = { run, formatCompanyMessage, enrichNotReadyDo };
+module.exports = { run, formatCompanyMessage, splitCompanyMessages, SAFE_MESSAGE_LIMIT, enrichNotReadyDo };
