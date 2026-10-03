@@ -30,6 +30,7 @@ const effectiveDelivery = require("./lib/effective-delivery");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
+const { createAutoLinkService } = require("./lib/auto-link");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
@@ -5386,6 +5387,14 @@ async function supersedeOpenDeliveryDateRequest({ ord, target }) {
   await q;
 }
 
+// Auto-link (lib/auto-link.js): exact same company + customer_id + normalized
+// address + already on the requested date ⇒ linked as Deliver Together through
+// this same write path (inert approved membership rows; nothing is moved).
+const autoLinkService = createAutoLinkService({
+  supabase, prepareTarget: prepareDeliveryDateTarget, resolveCurrentDate: resolveOriginalDeliveryDate,
+  isVisible: soVisibleToRequester, excludedSoStatuses: LINK_EXCLUDED_SO_STATUSES,
+});
+
 // POST /delivery-date-requests — salesman requests a date for an existing
 // order, optionally linking other undelivered SOs of the same customer
 // (link_so_numbers) so they are delivered together.
@@ -5425,6 +5434,17 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
       }
     }
 
+    // Auto-link: other SOs that are provably the SAME delivery (exact customer_id +
+    // normalized address + already on this date). Best-effort — a failure here never
+    // blocks the request itself.
+    let autoLink = { members: [], joinGroupId: null, skipped: "not_run" };
+    try {
+      autoLink = await autoLinkService.findAutoLinkMembers({
+        cid, mainOrderId: main.ord.id, requestedDate: requested_date,
+        excludeOrderIds: members.map(m => m.ord.id), allowJoin: members.length === 1, req,
+      });
+    } catch (e) { console.error("[auto-link] lookup failed (non-fatal):", e.message); }
+
     const payloads = [];
     for (const m of members) payloads.push(await buildDeliveryDateRequestPayload(req, m, { requested_date, remark }));
     // The group moves as one: auto-approve only if EVERY member qualifies.
@@ -5435,7 +5455,8 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
     const forcePending = linked && !decisions.every(d => d.autoApproved);
     // link_group_id is only written for a real group, so unlinked requests
     // keep working even before migration 106 is applied.
-    const linkGroupId = linked ? crypto.randomUUID() : null;
+    const hasAutoLink = autoLink.members.length > 0 || !!autoLink.joinGroupId;
+    const linkGroupId = autoLink.joinGroupId || ((linked || hasAutoLink) ? crypto.randomUUID() : null);
 
     const created = [];
     for (let i = 0; i < members.length; i++) {
@@ -5451,7 +5472,16 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
       }
       created.push(out.request);
     }
-    res.status(201).json({ request: created[0], linked_requests: created.slice(1) });
+    let autoLinked = [];
+    if (autoLink.members.length > 0 && linkGroupId) {
+      try {
+        autoLinked = await autoLinkService.persistAutoLinkMembers({
+          members: autoLink.members, linkGroupId, requestedDate: requested_date,
+          buildPayload: (m, o) => buildDeliveryDateRequestPayload(req, m, o),
+        });
+      } catch (e) { console.error("[auto-link] recording members failed (non-fatal):", e.message); }
+    }
+    res.status(201).json({ request: created[0], linked_requests: created.slice(1), auto_linked_requests: autoLinked });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
