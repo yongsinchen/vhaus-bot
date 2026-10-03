@@ -31,6 +31,7 @@ const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
 const { createAutoLinkService, AUTO_LINK_VIA } = require("./lib/auto-link");
+const { createAssistantReadService } = require("./lib/assistant-read");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
@@ -9543,6 +9544,15 @@ app.get("/supplier-dos/:id", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Assistant READ service (lib/assistant-read.js): deterministic, company-scoped,
+// permission-aware lookups — no LLM, no writes. Built from the same canonical helpers
+// every other channel uses (effective delivery date, active DO, delivery readiness).
+const assistantRead = createAssistantReadService({
+  supabase, doLib, effective: effectiveDelivery, resolveActiveDeliveryOrders, computeDeliveryReadiness,
+  getMalaysiaToday: require("./lib/delivery-date-approval").getMalaysiaToday,
+  addCalendarDays: require("./lib/delivery-date-approval").addCalendarDays,
+});
+
 // ── Web Delivery Assistant (chat) ─────────────────────────────────
 // Web version of the Telegram scheduling flow for salesmen/managers:
 // reschedule an order with the same busy-day gate and day-load check,
@@ -9560,8 +9570,11 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
     const reply = (msg, suggestions = []) => res.json({ reply: msg, suggestions });
 
     const HELP = [
-      "I can help you schedule deliveries. Try:",
-      "• Type an SO number (e.g. 31006) to reschedule that order",
+      "I can look things up and help you schedule deliveries. Try:",
+      "• An SO number (e.g. SO31006) — customer, balance, delivery, readiness, items, Service",
+      "• \"balance SO31006\", \"when is SO31006 delivering\", \"is DO2610-0001 ready\", \"remaining items SO31006\", \"service note SO31006\"",
+      "• \"customer Tan\" or a phone number; \"deliveries tomorrow\", \"not ready tomorrow\", \"unassigned tomorrow\"",
+      "• \"reschedule 31006\" — move an order's delivery date",
       "• \"best date\" — emptiest delivery days in the next 7 days",
       "• \"load 15/7\" — how busy a specific day is",
       "• Or just ask naturally — \"move 31006 to next Friday\", \"where is 31006\", \"how busy is tomorrow\"",
@@ -9822,6 +9835,24 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       });
     }
 
+    // READ lookups (Phase 1): deterministic, company-scoped, no LLM. Active write sessions above
+    // keep priority; anything not recognised returns null and falls through unchanged.
+    {
+      const readOut = await assistantRead.handle({ text, cid: companyId, user: req.user, ctxKey: `${req.user.id}:${companyId || ""}` });
+      if (readOut) {
+        console.log(`[assistant-read] user=${req.user.id} company=${companyId || "-"} q="${text.slice(0, 40).replace(/\d{6,}/g, "#")}"`);
+        return reply(readOut.reply, readOut.suggestions || []);
+      }
+    }
+
+    // Explicit reschedule command (a bare SO number now LOOKS UP the order instead — see above).
+    const reschedMatch = text.match(/^(?:reschedule|resched|move|postpone|schedule)\s+(?:so[-\s]?)?([\w-]*\d[\w-]*)$/i);
+    if (reschedMatch) {
+      const data = await beginSchedule(reschedMatch[1]);
+      if (data) await askForDate(data);
+      return;
+    }
+
     // Day load: "load 15/7" or a bare date
     const loadMatch = lower.match(/^load\s+(.+)$/);
     if (loadMatch || (parseDateInput(text) && parseDateInput(text) !== "TBC")) {
@@ -9829,14 +9860,6 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       if (!ds || ds === "TBC") return reply('Which date? e.g. "load 15/7"');
       const l = await getDayLoad(ds, companyId);
       return reply(`${loadDot(l)} ${fmtDate(l.date)}\n${l.total} order${l.total === 1 ? "" : "s"} booked, ${l.unassigned} unassigned, ${l.teams} lorr${l.teams === 1 ? "y" : "ies"} assigned.`, ["best date"]);
-    }
-
-    // Bare SO number → start a scheduling session (must contain a digit so
-    // plain words fall through to the natural-language parser)
-    if (/^(?=.*\d)[\w-]+$/.test(text)) {
-      const data = await beginSchedule(text);
-      if (data) await askForDate(data);
-      return;
     }
 
     // ── Natural language fallback (shared intent parser with Telegram) ──
