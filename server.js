@@ -30,7 +30,7 @@ const effectiveDelivery = require("./lib/effective-delivery");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
-const { createAutoLinkService } = require("./lib/auto-link");
+const { createAutoLinkService, AUTO_LINK_VIA } = require("./lib/auto-link");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
@@ -5395,6 +5395,24 @@ const autoLinkService = createAutoLinkService({
   isVisible: soVisibleToRequester, excludedSoStatuses: LINK_EXCLUDED_SO_STATUSES,
 });
 
+// Auto-link trigger #2 — TEAM ASSIGNMENT (POST /delivery-schedules, DO and whole-
+// order paths): the one canonical event where a Delivery becomes actionable on a
+// date regardless of whether anyone edited a date. The assigned order's date is
+// the schedule's own date; candidates must already be on that same effective date
+// (active DO's date when exactly one, else the SO date; 2+ active DOs ⇒ skipped).
+// Best-effort and non-fatal — assignment never fails because of linking.
+async function autoLinkOnAssignment(req, cid, orderId, scheduledDate) {
+  try {
+    if (!cid || !orderId || !scheduledDate) return;
+    const found = await autoLinkService.findAutoLinkMembers({ cid, mainOrderId: orderId, requestedDate: scheduledDate, includeMain: true, allowJoin: true, req });
+    if (!found.members.length) return;
+    await autoLinkService.persistAutoLinkMembers({
+      members: found.members, linkGroupId: found.joinGroupId || crypto.randomUUID(), requestedDate: scheduledDate,
+      buildPayload: (m, o) => buildDeliveryDateRequestPayload(req, m, o),
+    });
+  } catch (e) { console.error("[auto-link] on assignment failed (non-fatal):", e.message); }
+}
+
 // POST /delivery-date-requests — salesman requests a date for an existing
 // order, optionally linking other undelivered SOs of the same customer
 // (link_so_numbers) so they are delivered together.
@@ -5565,8 +5583,11 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
     // P1-2: joined DO fields so the approval card/detail can show the exact
     // shipment (do_number/status/delivery_date/superseded_at) without a
     // second round-trip per row.
+    // Link-only Deliver Together membership rows (requested_via 'auto_link') are
+    // technical, not requests anyone made or approved — never listed as cards.
     let q = supabase.from("delivery_date_requests")
       .select("*, delivery_orders!delivery_order_id(do_number, status, delivery_date, superseded_at)")
+      .neq("requested_via", AUTO_LINK_VIA)
       .order("created_at", { ascending: false }).limit(500);
     if (cid) q = q.eq("company_id", cid);
     if (!isDateApprover(req)) q = q.eq("requested_by", req.user.id);
@@ -10880,6 +10901,7 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
         await logDoEvent(dord.id, "blocked_date_override",
           { scheduled_date, block_reason: blockReason, override_reason: override_reason.trim() }, req.user.id);
       }
+      await autoLinkOnAssignment(req, cid, dord.order_id, scheduled_date);
       return res.status(201).json({ schedule });
     }
 
@@ -10925,6 +10947,7 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
     // day / team rather than a stale original date. Best-effort.
     try { await supabase.from("orders").update({ delivery_date: scheduled_date }).eq("id", order_id); }
     catch (e) { console.error("[assign] order delivery_date sync (non-fatal):", e.message); }
+    await autoLinkOnAssignment(req, cid, order_id, scheduled_date);
     res.status(201).json({ schedule: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -15360,7 +15383,7 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
           soNumbers.length
             ? supabase.from("orders").select("so_number, items").eq("company_id", company_id).in("so_number", soNumbers).or("type.is.null,type.neq.Service")
             : Promise.resolve({ data: [] }),
-          supabase.from("delivery_date_requests").select("sales_order_id, status, created_at").in("sales_order_id", orderIds).neq("status", "rejected").order("created_at", { ascending: false }),
+          supabase.from("delivery_date_requests").select("sales_order_id, status, created_at").in("sales_order_id", orderIds).neq("status", "rejected").neq("requested_via", AUTO_LINK_VIA).order("created_at", { ascending: false }),
           supabase.from("delivery_orders").select("sales_order_id").in("sales_order_id", orderIds).neq("status", "cancelled").is("superseded_at", null),
         ]);
         const arrivedBySo = new Map();
