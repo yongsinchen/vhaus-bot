@@ -91,7 +91,9 @@ const s0 = L.findIndex(l => l.startsWith("let _commCache =")), p0 = L.findIndex(
 let e0 = p0; while (L[e0] !== "}") e0++;
 const code = L.slice(s0, e0 + 1).join("\n");
 function loadCalc(db) {
-  const ctx = vm.createContext({ supabase: db, commissionLib, commissionLifecycle: lifecycle, ...tokensLib, getCommissionableAmount: commissionLib.getCommissionableAmount,
+  // businessMonth: calculateCommission gained a dependency on lib/business-month (Malaysia business-month tiers) after this
+  // sandbox was written; the sliced function runs in a vm with only the globals listed here, so it must be supplied explicitly.
+  const ctx = vm.createContext({ supabase: db, commissionLib, commissionLifecycle: lifecycle, businessMonth: require("../lib/business-month"), ...tokensLib, getCommissionableAmount: commissionLib.getCommissionableAmount,
     SALES_COMMISSION_ROLES: ["salesman", "part_time", "short_term_part_time"], console: { log() {}, warn() {}, error() {} },
     Date, Math, JSON, Number, String, Array, Object, Set, Map, Promise, Boolean, isNaN, parseFloat, parseInt, Error, RegExp });
   vm.runInContext(code + "\n;globalThis.__calc = calculateCommission;", ctx);

@@ -12,6 +12,7 @@ const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry")
 const { OrganizationIdentityService } = require("./organization-identity-service");
 const { composeProductView, composeSupplierView } = require("./lib/product-view-composer");
 const doLib = require("./lib/delivery-orders");
+const malaysiaDate = require("./lib/malaysia-date");
 const { classifySalesOrderItemEdit, identityKey: soItemIdentityKey } = require("./lib/sales-order-item-diff");
 const { createSupplierDOService } = require("./lib/supplier-do");
 const SELECTS = require("./lib/selects");
@@ -1688,16 +1689,14 @@ const handlePendingDraftMessage = async (chatId, userId, text) => {
 // a username or a display name. A user with no company mapping is refused (fail closed).
 const handleScheduleCommand = async (chatId, text, companyId) => {
   if (!companyId) { await sendMessage(chatId, "❌ Your Telegram account isn't linked to a company, so I can't show a schedule. Please contact admin."); return; }
-  const dateMatch = text.match(/\/schedule\s+(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/i);
-  if (!dateMatch) { await sendMessage(chatId, "Usage: `/schedule 15/7` or `/schedule 2026-07-15`"); return; }
-  const day = parseInt(dateMatch[1]);
-  const month = parseInt(dateMatch[2]) - 1;
-  const year = dateMatch[3]
-    ? (dateMatch[3].length === 2 ? 2000 + parseInt(dateMatch[3]) : parseInt(dateMatch[3]))
-    : new Date().getFullYear();
-  const dateObj = new Date(year, month, day);
-  const dateStr = dateObj.toISOString().split("T")[0];
-  const dateLabel = dateObj.toLocaleDateString("en-MY", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  // Phase 2B: the date is a MALAYSIA business (calendar) date, parsed without any host-timezone conversion
+  // (lib/malaysia-date.js) — the old `new Date(y, m, d).toISOString()` gave the previous day on a UTC+8 host and a wrong
+  // default year just after Malaysian midnight on a UTC host.
+  const parsedCmd = malaysiaDate.parseScheduleCommand(text);
+  if (!parsedCmd.ok && parsedCmd.reason === "usage") { await sendMessage(chatId, "Usage: `/schedule 15/7` or `/schedule 2026-07-15`"); return; }
+  if (!parsedCmd.ok) { await sendMessage(chatId, "❌ That isn't a real calendar date. Usage: `/schedule 15/7` or `/schedule 15/7/2026`"); return; }
+  const dateStr = parsedCmd.date;
+  const dateLabel = malaysiaDate.malaysiaDateLabel(dateStr);
 
   const { data: orders, error } = await supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("company_id", companyId).eq("delivery_date", dateStr);
   if (error) { await sendMessage(chatId, `❌ Error: ${error.message}`); return; }
@@ -2042,24 +2041,10 @@ const showMenu = async (chatId, intro = "") => {
 };
 
 // ── Parse date helper ─────────────────────────────────────────────
-const parseDateInput = (text) => {
-  const t = text.trim();
-  // TBC / TBD → return special marker
-  if (/^(tbc|tbd|unknown|belum)$/i.test(t)) return "TBC";
-  const m = t.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
-  if (m) {
-    const day = parseInt(m[1]);
-    const month = parseInt(m[2]) - 1;
-    const year = m[3] ? (m[3].length === 2 ? 2000 + parseInt(m[3]) : parseInt(m[3])) : new Date().getFullYear();
-    const d = new Date(year, month, day);
-    if (!isNaN(d.getTime())) return d.toISOString().split("T")[0];
-  }
-  const lower = t.toLowerCase();
-  const today = new Date();
-  if (/^(today|hari ini)$/.test(lower)) return today.toISOString().split("T")[0];
-  if (/^(tmr|tomorrow|esok)$/.test(lower)) { today.setDate(today.getDate()+1); return today.toISOString().split("T")[0]; }
-  return null;
-};
+// Phase 2B: Malaysia business-date semantics (lib/malaysia-date.js) — "today"/"tomorrow" and a missing year are the
+// MALAYSIA calendar, an impossible date (31/2) is rejected instead of rolling into March, and no host-timezone
+// conversion is involved.
+const parseDateInput = (text) => malaysiaDate.parseScheduleDateInput(text);
 
 const fmtDate = (d) => d ? new Date(d + "T00:00:00").toLocaleDateString("en-MY", { weekday: "short", day: "numeric", month: "short", year: "numeric" }) : "-";
 // Some delivery_date writers (e.g. the SO edit/amendment path) store the
@@ -11623,8 +11608,12 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
 
     // DO-aware routing: fetch the schedule first to see if it carries a
     // Delivery Order. Legacy (NULL DO) schedules keep today's behavior exactly.
-    const { data: existing } = await supabase.from("delivery_schedules")
-      .select("id, delivery_order_id").eq("id", req.params.id).maybeSingle();
+    // Phase 2B: company-scoped. This lookup (and every write below, which keys on this row) was previously by
+    // id only, so a driver/manager of company A could move company B's schedule. Fail closed with the same 404.
+    const driverCid = getActiveCompanyId(req);
+    let existingQ = supabase.from("delivery_schedules").select("id, delivery_order_id").eq("id", req.params.id);
+    if (driverCid) existingQ = existingQ.eq("company_id", driverCid);
+    const { data: existing } = await existingQ.maybeSingle();
     if (!existing) return res.status(404).json({ error: "Schedule not found" });
 
     // P1-3: fetch the DO's live status/superseded_at ONCE, up front, so
@@ -11633,8 +11622,10 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
     // action, and no branch trusts a stale read.
     let dord = null;
     if (existing.delivery_order_id) {
-      const { data } = await supabase.from("delivery_orders")
-        .select("id, do_number, status, superseded_at").eq("id", existing.delivery_order_id).maybeSingle();
+      let dordQ = supabase.from("delivery_orders")
+        .select("id, do_number, status, superseded_at").eq("id", existing.delivery_order_id);
+      if (driverCid) dordQ = dordQ.eq("company_id", driverCid);
+      const { data } = await dordQ.maybeSingle();
       if (!data) return res.status(404).json({ error: "Delivery order not found" });
       dord = data;
       if (dord.superseded_at) {
@@ -11758,18 +11749,25 @@ app.post("/driver/schedule/:id/photo", requireRole(DRIVER_ROLES), upload.single(
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No photo" });
+    // Phase 2B: the schedule must belong to the caller's company BEFORE anything is uploaded or written
+    // (previously by id only: another company's schedule/order could be modified and a file stored for it).
+    const photoCid = getActiveCompanyId(req);
+    let photoSchedQ = supabase.from("delivery_schedules").select("order_id, notes").eq("id", req.params.id);
+    if (photoCid) photoSchedQ = photoSchedQ.eq("company_id", photoCid);
+    const { data: sched } = await photoSchedQ.maybeSingle();
+    if (!sched) return res.status(404).json({ error: "Schedule not found" });
     const ext = file.originalname.split(".").pop();
     const path = `delivery-photos/${getActiveCompanyId(req)}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
     const { error: upErr } = await supabase.storage.from("order-attachments").upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
     if (upErr) return res.status(500).json({ error: "Upload failed: " + upErr.message });
     const { data: urlData } = supabase.storage.from("order-attachments").getPublicUrl(path);
     const photoUrl = urlData?.publicUrl || null;
-    // Save on the schedule
-    const { data: sched } = await supabase.from("delivery_schedules").select("order_id, notes").eq("id", req.params.id).single();
-    await supabase.from("delivery_schedules").update({ notes: ((sched?.notes || "") + `\nPhoto: ${photoUrl}`).trim() }).eq("id", req.params.id);
+    const photoScope = photoCid ? { company_id: photoCid } : {};
+    // Save on the schedule (the row was already loaded company-scoped above)
+    await supabase.from("delivery_schedules").update({ notes: ((sched.notes || "") + `\nPhoto: ${photoUrl}`).trim() }).eq("id", req.params.id).match(photoScope);
     // Also save on the order
-    if (sched?.order_id) {
-      await supabase.from("orders").update({ photo_url: photoUrl }).eq("id", sched.order_id);
+    if (sched.order_id) {
+      await supabase.from("orders").update({ photo_url: photoUrl }).eq("id", sched.order_id).match(photoScope);
     }
     res.json({ url: photoUrl });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -11780,7 +11778,11 @@ app.post("/driver/schedule/:id/payment", requireRole(DRIVER_ROLES), async (req, 
   try {
     const { amount, method, reference_no } = req.body;
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "Amount required" });
-    const { data: sched } = await supabase.from("delivery_schedules").select("order_id").eq("id", req.params.id).single();
+    // Phase 2B: company-scoped (previously by id only: a payment could be recorded against another company's order).
+    const payCid = getActiveCompanyId(req);
+    let paySchedQ = supabase.from("delivery_schedules").select("order_id").eq("id", req.params.id);
+    if (payCid) paySchedQ = paySchedQ.eq("company_id", payCid);
+    const { data: sched } = await paySchedQ.maybeSingle();
     if (!sched?.order_id) return res.status(404).json({ error: "Schedule not found" });
     // Record payment
     await supabase.from("payments").insert({

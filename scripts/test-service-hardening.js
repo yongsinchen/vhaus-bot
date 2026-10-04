@@ -39,10 +39,16 @@ console.log("\n── 1. Manual create → inert legacy order (atomic RPC) ─�
 // Isolate just the POST /service-cases handler body.
 const manualStart = server.indexOf('app.post("/service-cases"');
 const manualHandler = server.slice(manualStart, server.indexOf('app.patch("/service-cases/:id"', manualStart));
-assert("POST /service-cases calls create_service_case RPC",
-  /rpc\("create_service_case"/.test(manualHandler));
-assert("Manual path no longer does a direct financial orders insert",
-  !/from\("orders"\)\.insert/.test(manualHandler));
+// Phase 2B: the route body now delegates to createServiceCaseFull() (shared with the service-request approval path), which
+// owns the RPC call. Behaviour is proven against the real route in test-service-case-routes.js; these pin the structure.
+const createFullStart = server.indexOf("async function createServiceCaseFull");
+const createFullBody = server.slice(createFullStart, server.indexOf('app.post("/service-cases"', createFullStart));
+assert("POST /service-cases delegates to createServiceCaseFull",
+  /createServiceCaseFull\(\{ companyId, actorUser: req\.user, body: req\.body \}\)/.test(manualHandler));
+assert("createServiceCaseFull calls the create_service_case RPC",
+  /rpc\("create_service_case"/.test(createFullBody));
+assert("Manual path no longer does a direct financial orders insert (route or createServiceCaseFull)",
+  !/from\("orders"\)\.insert/.test(manualHandler) && !/from\("orders"\)\.insert/.test(createFullBody));
 assert("RPC's legacy order is inert: salesman/order_amount NULL, balance 0",
   /NULL,\s*NULL,\s*0,\s*v_date/.test(rpcOrderInsert), "expected 'NULL, NULL, 0, v_date' in RPC order insert");
 assert("RPC's legacy order has empty items", /'\[\]'/.test(rpcOrderInsert));
@@ -87,8 +93,17 @@ assert("PATCH mirrors an APPLIED date directly onto the order (non-gated path)",
   /if \(orderDeliveryDate !== undefined\) orderPatch\.delivery_date = orderDeliveryDate;/.test(server));
 assert("PATCH writes services.due_date from the new date when the change is NOT gated",
   /updates\.due_date = cleanNewDate; orderDeliveryDate = cleanNewDate;/.test(server));
-assert("URGENT FIX: a real date change is evaluated against the 10-day rule using BOTH the current and requested date",
-  /evaluateDeliveryDateApproval\(\{ requestedDate: cleanNewDate, currentDate: currentDueDate \}\)/.test(server));
+// Phase 2B: the PATCH route now calls the centralized decideServiceDateChange() (lib/service-schedule-decision.js), which
+// wraps evaluateDeliveryDateApproval. Pin the call shape AND run the real helper, so the rule is proven rather than grepped.
+assert("URGENT FIX: PATCH decides a real date change with decideServiceDateChange using BOTH the current and requested date",
+  /decideServiceDateChange\(\{ currentDueDate, requestedDate: cleanNewDate, serviceStatus: cur\.status \}\)/.test(server));
+{
+  const { decideServiceDateChange } = require("../lib/service-schedule-decision");
+  const T = "2026-09-17"; // D+10 = 2026-09-27
+  const d = (cur, req) => decideServiceDateChange({ currentDueDate: cur, requestedDate: req, serviceStatus: "scheduled", today: T }).action;
+  assert("helper: current inside window -> gated; requested inside window -> gated; both outside -> direct; no current date -> direct (first scheduling)",
+    d("2026-09-20", "2026-10-20") === "gated" && d("2026-10-15", "2026-09-25") === "gated" && d("2026-10-15", "2026-10-20") === "direct" && d(null, "2026-09-20") === "direct");
+}
 assert("URGENT FIX: a gated date change is never applied directly — it funnels through delivery_date_requests (never a second bypass mutation path)",
   (() => {
     const patchHandler = server.slice(server.indexOf('app.patch("/service-cases/:id"'), server.indexOf('app.delete("/service-cases/:id"'));

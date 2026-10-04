@@ -67,7 +67,7 @@ async function run() {
   // ── 4. No business-logic refactor — each handler's core logic untouched ──
   console.log("\n── 4. No Business Logic Refactor ──");
   assert("POST /sales-orders still computes subtotal and order_number the same way",
-    postSO && postSO.includes("const subtotal = items.reduce(") && postSO.includes("order_number = await nextOrderNumber(company_id);"));
+    postSO && /subtotal = expandedItems\.reduce\(/.test(postSO) && /order_number = await nextOrderNumber\(company_id, branch_id\);/.test(postSO));   // Phase 2B: numbering became branch-aware after this was written
   assert("PUT /sales-orders/:id still detects amendments on confirmed/delivered orders (unchanged)",
     putSO && putSO.includes('const wasConfirmed = ["confirmed", "delivered"].includes(existing.status);'));
   assert("generate-do still generates DO number and inserts delivery_notes the same way",

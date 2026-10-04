@@ -16,7 +16,10 @@ function stub(request, exports) {
   require.cache[filename] = { id: filename, filename, loaded: true, exports, children: [], paths: [] };
 }
 
-async function bootServer({ seed = {}, users = {}, access = {}, rpcs = {}, env = {} } = {}) {
+async function bootServer({ seed = {}, users = {}, access = {}, rpcs = {}, env = {}, openaiCreate = null, axiosGet = null } = {}) {
+  // openaiCreate(args) -> completion  : lets a test supply the (stubbed) OCR/AI answer. Without it, constructing the client
+  //   without OPENAI_API_KEY fails exactly like the real SDK, and any call is refused. No real network call is ever possible.
+  // axiosGet(url, opts) -> {data}     : lets a test supply Telegram getFile / file download answers.
   // users:  { userId: { profile: {...users row}, authUser: {id,email} } }
   // access: { userId: { [companyId]: { roleKey: "MANAGER"|"MASTER"|..., keys: ["DELIVERY_EDIT", ...] | "ALL" } } }
   const db = new FakeDb(seed);
@@ -33,10 +36,10 @@ async function bootServer({ seed = {}, users = {}, access = {}, rpcs = {}, env =
 
   const sent = [];                                       // every Telegram message the server tried to send
   const openaiState = { constructed: 0 };
-  class StubOpenAI { constructor(opts = {}) { if (!opts.apiKey) throw new Error("The OPENAI_API_KEY environment variable is missing or empty (stub mirrors the SDK)"); openaiState.constructed++; this.chat = { completions: { create: async () => { throw new Error("stub OpenAI: no real call allowed in tests"); } } }; } }
+  class StubOpenAI { constructor(opts = {}) { if (!opts.apiKey && !openaiCreate) throw new Error("The OPENAI_API_KEY environment variable is missing or empty (stub mirrors the SDK)"); openaiState.constructed++; this.chat = { completions: { create: async (...a) => { if (!openaiCreate) throw new Error("stub OpenAI: no real call allowed in tests"); return openaiCreate(...a); } } }; } }
   const axiosStub = {
     post: async (url, body) => { const m = String(url).match(/\/sendMessage$/); if (m) sent.push({ chat_id: String(body.chat_id), text: body.text }); return { data: { ok: true } }; },
-    get: async () => ({ data: {} }),
+    get: async (url, o) => (axiosGet ? axiosGet(url, o) : { data: {} }),
   };
   axiosStub.default = axiosStub;
 

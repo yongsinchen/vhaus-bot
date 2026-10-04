@@ -115,11 +115,16 @@ async function run() {
   console.log("\n── 6. Catalogue Import Auto-Create / Supplier Matching ──");
   assert("Category auto-create's company-level insert line is unchanged (org-linking added on top, Phase E2)",
     commit && commit.includes('insert({ company_id, name: catName })'));
-  assert("Product insert's company-level fields are unchanged, organization_product_id now also set (Phase E3)",
-    commit && /insert\(\{ company_id, supplier_id: supplierId, category_id: categoryId, code: row\.product_code/.test(commit) &&
+  // Phase 2B: the insert gained organization_category_id (catalogue-group routing) after this assertion was written.
+  // Pin what D4 actually guards - the company-level identity fields - and that the category goes to exactly one of
+  // category_id / organization_category_id.
+  assert("Product insert's company-level fields are unchanged (company_id, supplier_id, code, name); category routed to category_id XOR organization_category_id; organization_product_id set (Phase E3)",
+    commit && /\.insert\(\{ company_id, supplier_id: supplierId, category_id: catalogueGroupId \? null : categoryId, organization_category_id: catalogueGroupId \? categoryId : null, code: row\.product_code, name: row\.product_name/.test(commit) &&
     /organization_product_id: orgProduct\.id/.test(commit));
-  assert("Supplier matching unchanged (still exact name lookup against existing company suppliers only, no auto-create)",
-    commit && commit.includes('supplierMap.get(row.supplier_name.toLowerCase())') && !commit.includes('suppliers").insert'));
+  // The old check searched for the substring 'suppliers").insert', which also matches the legitimate
+  // 'organization_product_suppliers").insert' LINK row. A real supplier auto-create is an insert on the suppliers table itself.
+  assert("Supplier matching unchanged (exact name lookup against existing company suppliers only; the suppliers table is never inserted into)",
+    commit && commit.includes('supplierMap.get(row.supplier_name.toLowerCase())') && !/from\("suppliers"\)\s*\.insert/.test(commit));
 
   // ── 7. PO grouping logic itself unchanged (only the company_id source changed) ──
   console.log("\n── 7. PO Grouping Logic Unchanged ──");

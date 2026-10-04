@@ -18,8 +18,8 @@
  * and must NOT be weakened into a bypass.
  *
  * Part 1 runs the real decision helper over the service matrix (pure, no DB).
- * Parts 2–4 are source-level guards (no DB in this environment) pinning the
- * backend gate shape, the approval-time service sync, and the frontend fix.
+ * Parts 2–3 are source-level guards (backend gate shape, approval-time service sync); the route behaviour and the
+ * frontend notice are covered by test-service-case-routes.js and the vhaus-delivery jest suite (Phase 2B).
  *
  * Usage: node scripts/test-urgent-service-note-date-edit.js
  */
@@ -130,22 +130,13 @@ assert("on approval, services.due_date is synced for a service-originated reques
 assert("on approval, active service_legs.scheduled_date is synced (completed/cancelled preserved)",
   /from\("service_legs"\)\.update\(\{ scheduled_date: newDate \}\)[\s\S]*\.not\("status", "in", "\(completed,cancelled\)"\)/.test(approvalSrc),
   "service_legs not synced on approval");
-assert("pending (unapproved) request never mutates the operational date itself",
-  /status:\s*decision\.autoApproved \? "approved" : "pending"/.test(serverSrc) &&
-  /if \(decision\.autoApproved\) \{\s*const result = await deliveryDateApprovalService\.applyApprovedDeliveryDate/.test(serverSrc),
-  "apply happens even when not auto-approved");
-
-console.log("\n── Part 4: frontend surfaces the pending state (the fix) ──");
-const svcPage = fs.readFileSync(path.join(__dirname, "..", "..", "vhaus-delivery", "src", "ServicePage.js"), "utf8");
-assert("updateService reads the response body",
-  /const body = await res\.json\(\)\.catch\(\(\) => \(\{\}\)\);/.test(svcPage),
-  "response body not read");
-assert("updateService notifies the user when the date change needs approval",
-  /if \(body\.pending_date_request\)\s*\{[\s\S]*toast\.(success|info)\(/.test(svcPage),
-  "pending_date_request not surfaced to the user");
-assert("the fix does NOT fake-apply the date locally (no optimistic due_date write)",
-  !/detail\.service\.due_date\s*=/.test(svcPage) && !/setDetail\([^)]*due_date/.test(svcPage),
-  "frontend appears to locally fake the applied date");
+// Phase 2B: two blocks were removed here — they were stale / environment-bound, not failing behaviour:
+//  * "pending request never mutates the operational date" matched a source string that has since moved into
+//    createDeliveryDateRequestAndMaybeAutoApprove(). It is now proven BEHAVIOURALLY against the real route in
+//    scripts/test-service-case-routes.js ("reschedule from a protected date is GATED ... the operational date does NOT move").
+//  * Part 4 (frontend surfaces the pending state) read ../../vhaus-delivery/src/ServicePage.js by relative path (needs
+//    the sibling repo checked out) and the fix it pinned had never been committed. It now lives in ServicePage.updateService
+//    via serviceDateUpdateNotice(), tested in vhaus-delivery/src/serviceDateUpdate.test.js.
 
 console.log(`\n${fail === 0 ? "✅ ALL PASS" : "❌ FAILURES"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

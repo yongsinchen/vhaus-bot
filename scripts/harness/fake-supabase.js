@@ -29,6 +29,7 @@ const RELATIONS = {
   "users.companies": { table: "companies", local: "company_id", foreign: "id" },
   "delivery_route_orders.delivery_routes": { table: "delivery_routes", local: "route_id", foreign: "id" },
   "orders.sales_orders": { table: "sales_orders", local: "so_number", foreign: "order_number" },
+  "commissions.orders": { table: "orders", local: "order_id", foreign: "id" },
 };
 const NUMERIC_ID_TABLES = new Set(["orders", "order_trips", "order_items", "delivery_routes"]);
 
@@ -86,6 +87,7 @@ class Query {
   update(p) { this.op = "update"; this.payload = p; return this; }
   delete() { this.op = "delete"; return this; }
   eq(c, v) { this.f.push(r => looseEq(this.val(r, c), v)); return this; }
+  match(o) { for (const [c, v] of Object.entries(o || {})) this.eq(c, v); return this; }
   neq(c, v) { this.f.push(r => { const x = this.val(r, c); return x != null && !looseEq(x, v); }); return this; }
   gt(c, v) { this.f.push(r => this.val(r, c) != null && cmp(this.val(r, c), v) > 0); return this; }
   gte(c, v) { this.f.push(r => this.val(r, c) != null && cmp(this.val(r, c), v) >= 0); return this; }
