@@ -11,7 +11,7 @@
  * The complete_delivery_order() SQL function (migration 016) is STUBBED with the same observable contract
  * (wrong_company / cancelled / superseded errors, already_completed on a repeat, DO -> completed). Its SQL cannot run
  * without PostgreSQL (classification B, docs/test-strategy.md); what is proven here is everything the ROUTE does with its
- * answer: stock deduction once and only once, commission once, error mapping, company scoping.
+ * answer: delivery completion succeeds with NO inventory mutation (automatic stock deduction is disabled — Phase 2D), commission once, error mapping, company scoping.
  *
  * Usage: node scripts/test-driver-completion-routes.js
  */
@@ -96,6 +96,7 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     access: { mgrA: { [A]: { roleKey: "MANAGER", keys: ["DELIVERY_EDIT", "DELIVERY_ORDER_VIEW"] } } },
   });
   h.quiet(true);
+  const INV0 = JSON.stringify(seed.inventory);
   const inv = (c, p) => h.db.table("inventory").find(r => r.company_id === c && r.product_id === p).on_hand;
   const moves = () => h.db.table("stock_movements");
   const DO = n => h.db.table("delivery_orders").find(d => d.id === id(n));
@@ -108,38 +109,38 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     r = await drive("sales", 1);
     assert("a salesman (not a DRIVER_ROLE) → 403; nothing deducted, DO untouched", r.status === 403 && DO(1).status === "scheduled" && moves().length === 0, JSON.stringify(r));
 
-    out("\n══ Normal completion: stock deducted, commission earned ══\n");
+    out("\n══ Normal completion: succeeds, commission earned, inventory NOT touched (automatic deduction disabled in Phase 2D) ══\n");
     r = await drive("drvA", 1);
     assert("driver completes DO1 → 200, DO completed", r.status === 200 && DO(1).status === "completed", JSON.stringify(r.body).slice(0, 200));
-    assert("qty > 1: Sofa on_hand 10 → 8 (the line quantity is deducted, not 1)", inv(A, P1) === 8, String(inv(A, P1)));
-    assert("a stock_movements 'out' row records it (type/quantity/reference/actor)", moves().length === 1 && moves()[0].type === "out" && moves()[0].quantity === -2 && moves()[0].reference_type === "delivery" && moves()[0].reference_id === id(1) && moves()[0].created_by === "drvA", JSON.stringify(moves()));
-    assert("CUSTOM / unlinked line (no product) is skipped — no movement, no inventory row invented", moves().every(m => m.product_id === P1) && h.db.table("inventory").length === 3);
+    assert("qty > 1 line completes and the Sofa balance is UNCHANGED (10) — the broken post-completion deduction is off", inv(A, P1) === 10, String(inv(A, P1)));
+    assert("NO stock movement was even attempted (stock_movements stays empty)", moves().length === 0, JSON.stringify(moves()));
+    assert("no inventory row was created or changed anywhere (custom / unlinked lines included)", h.db.table("inventory").length === 3 && JSON.stringify(h.db.table("inventory")) === INV0);
     assert("COMPANY ISOLATION: the same product's balance in Company B is untouched (99)", inv(B, P1) === 99);
 
     out("\n══ Idempotency: duplicate completion ══\n");
     r = await drive("drvA", 1);
-    assert("a second completion of the same DO (double tap) → 200 but NO second deduction", r.status === 200 && inv(A, P1) === 8 && moves().length === 1, `on_hand=${inv(A, P1)} moves=${moves().length}`);
+    assert("a second completion of the same DO (double tap) → 200 and still no inventory mutation", r.status === 200 && inv(A, P1) === 10 && moves().length === 0, `on_hand=${inv(A, P1)} moves=${moves().length}`);
     assert("…and no second commission row", comm().filter(c => c.delivery_order_id === id(1)).length >= 1 && comm().filter(c => c.sales_order_id === id(901) && c.driver_user_id === "drvA").length === 1);
     r = await drive("drvA", 6);
-    assert("completing an ALREADY-completed DO6 (stub says already_completed) deducts nothing", r.status === 200 && moves().length === 1);
+    assert("completing an ALREADY-completed DO6 (stub says already_completed) mutates nothing", r.status === 200 && moves().length === 0);
 
     out("\n══ Split DOs (one SO line shipped in two DOs) ══\n");
     await drive("drvA", 2); await drive("drvA2", 3);
-    assert("DO2 (qty 3) and DO3 (qty 2) each deduct their OWN quantity — Bed 10 → 5 total", inv(A, P2) === 5, String(inv(A, P2)));
-    assert("…as two separate movements, each referencing its own DO", moves().filter(m => m.product_id === P2).length === 2 && moves().filter(m => m.product_id === P2).map(m => m.reference_id).sort().join() === [id(2), id(3)].sort().join());
+    assert("split DOs (qty 3 + qty 2 of one SO line) complete without touching the Bed balance (10)", inv(A, P2) === 10 && DO(2).status === "completed" && DO(3).status === "completed", String(inv(A, P2)));
+    assert("…and no per-DO stock movement exists", moves().length === 0);
 
     out("\n══ Partial arrival ══\n");
     await drive("drvA", 4);
     // DO4 is superseded → not deducted (below). Use SO8 for a live partial case instead:
     r = await drive("drvA", 8);
-    assert("a DO carrying only part of the line (cancelled line ignored, 1 live unit) deducts exactly the live quantity", r.status === 200 && inv(A, P1) === 7, String(inv(A, P1)));
+    assert("a DO carrying only part of the line completes with no inventory change", r.status === 200 && inv(A, P1) === 10 && DO(8).status === "completed", String(inv(A, P1)));
 
     out("\n══ Superseded / cancelled DO ══\n");
     const movesBefore = moves().length;
     r = await drive("drvA", 4);
-    assert("superseded DO → 409 delivery_order_superseded, no deduction, DO status unchanged", r.status === 409 && r.body.code === "delivery_order_superseded" && inv(A, P1) === 7 && moves().length === movesBefore && DO(4).status === "scheduled", JSON.stringify(r));
+    assert("superseded DO → 409 delivery_order_superseded, DO status unchanged, no inventory change", r.status === 409 && r.body.code === "delivery_order_superseded" && inv(A, P1) === 10 && moves().length === movesBefore && DO(4).status === "scheduled", JSON.stringify(r));
     r = await drive("drvA", 5);
-    assert("cancelled DO → 400 'cancelled', no deduction", r.status === 400 && /cancelled/i.test(r.body.error) && moves().length === movesBefore && DO(5).status === "cancelled", JSON.stringify(r));
+    assert("cancelled DO → 400 'cancelled', DO unchanged, no inventory change", r.status === 400 && /cancelled/i.test(r.body.error) && moves().length === movesBefore && DO(5).status === "cancelled", JSON.stringify(r));
 
     out("\n══ Company isolation of the driver routes ══\n");
     r = await drive("drvA", 7);
@@ -156,9 +157,9 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     out("\n══ Admin 'Delivered' goes through the same pipeline ══\n");
     const before = inv(A, P1);
     r = await h.call("PATCH", `/delivery-schedules/${id(509)}`, { user: "mgrA", body: { status: "Delivered" } });
-    assert("manager marks DO9 'Delivered' → DO completed, stock deducted (Sofa −1)", r.status === 200 && DO(9).status === "completed" && inv(A, P1) === before - 1, JSON.stringify(r.body).slice(0, 160));
+    assert("manager marks DO9 'Delivered' → DO completed, inventory unchanged", r.status === 200 && DO(9).status === "completed" && inv(A, P1) === before, JSON.stringify(r.body).slice(0, 160));
     r = await h.call("PATCH", `/delivery-schedules/${id(509)}`, { user: "mgrA", body: { status: "Delivered" } });
-    assert("…repeating it never deducts twice", r.status === 200 && inv(A, P1) === before - 1);
+    assert("…repeating it changes nothing", r.status === 200 && inv(A, P1) === before);
 
     out("\n══ Driver commission ══\n");
     const c1 = comm().filter(c => c.sales_order_id === id(901));
@@ -180,6 +181,29 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     h.db.table("delivery_vehicle_leaders").length = 0;
     r = await drive("drvA", 11);
     assert("company rate 0 and no override → no commission row (a person with rate 0 earns nothing)", comm().filter(c => c.sales_order_id === id(911)).length === 0, JSON.stringify(comm().filter(c => c.sales_order_id === id(911))));
+
+    out("\n══ Inventory is NOT a canonical input to readiness / arrival / allocation (Phase 2D proof) ══\n");
+    {
+      const fs = require("fs"), path = require("path");
+      const rd = async () => JSON.stringify((await h.call("GET", `/delivery-readiness?date=${DAY}&days=3`, { user: "mgrA" })).body);
+      const r1 = await rd();
+      const savedInv = JSON.stringify(h.db.table("inventory"));
+      h.db.table("inventory").forEach(x => { x.on_hand = 9999; x.available = 9999; });     // wildly different balances …
+      const r2 = await rd();
+      h.db.t.inventory.length = 0;                                                          // … and no inventory at all
+      const r3 = await rd();
+      h.db.t.inventory = JSON.parse(savedInv);
+      assert("GET /delivery-readiness is byte-identical with inventory balances of 9999, or with no inventory table rows at all", r1 === r2 && r2 === r3 && r1.length > 20, r1.slice(0, 120));
+      const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+      const lines = server.split(/\r?\n/);
+      const holders = [];
+      lines.forEach((l, i) => { if (/from\("inventory"\)/.test(l)) { let k = i; while (k > 0 && !/^(app\.(get|post|patch|put|delete)\(|async function |function )/.test(lines[k])) k--; holders.push(lines[k].replace(/\s*\{.*$/, "").slice(0, 70)); } });
+      const allowed = ["async function adjustStock", 'app.get("/inventory"', 'app.get("/inventory/summary"', 'app.get("/inventory/projection"', 'app.post("/inventory/adjust"'];
+      assert("the inventory table is read/written ONLY by adjustStock and the four Inventory-page routes — no readiness, arrival, DO-allocation, delivery or Telegram code touches it", holders.length > 0 && holders.every(x => allowed.some(a => x.startsWith(a))), JSON.stringify(holders));
+      const libs = ["delivery-readiness.js", "delivery-orders.js", "item-arrival-events.js", "effective-delivery.js", "assistant-read.js", "p1-4d-legacy-arrived-qty-fallback.js"].map(f => fs.readFileSync(path.join(__dirname, "..", "lib", f), "utf8"));
+      assert("none of the readiness / allocation / arrival / assistant libraries mention the inventory table", libs.every(src => !/from\("inventory"\)|\.on_hand/.test(src)));
+      assert("the post-completion deduction is switched off by one explicit, greppable flag (TODO: Inventory Phase)", /const INVENTORY_AUTO_DEDUCT_ON_DELIVERY = false;/.test(server) && /TODO\(Inventory Phase\)/.test(server));
+    }
 
     out("\n══ GET /driver/my-route ══\n");
     h.db.table("delivery_teams").find(t => t.id === id(701)).driver_id = "drvA";

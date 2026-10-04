@@ -30,6 +30,11 @@ const RELATIONS = {
   "delivery_route_orders.delivery_routes": { table: "delivery_routes", local: "route_id", foreign: "id" },
   "orders.sales_orders": { table: "sales_orders", local: "so_number", foreign: "order_number" },
   "commissions.orders": { table: "orders", local: "order_id", foreign: "id" },
+  "user_company_access.roles": { table: "roles", local: "role_id", foreign: "id" },
+  "user_company_access.companies": { table: "companies", local: "company_id", foreign: "id" },
+  "order_item_packings.order_items": { table: "order_items", local: "order_item_id", foreign: "id" },
+  "order_items.orders": { table: "orders", local: "order_id", foreign: "id" },
+  "warehouse_racks.warehouse_zones": { table: "warehouse_zones", local: "zone_id", foreign: "id" },
 };
 const NUMERIC_ID_TABLES = new Set(["orders", "order_trips", "order_items", "delivery_routes"]);
 
@@ -184,7 +189,8 @@ function createFakeSupabase(db, { authUsers = {} } = {}) {
       if (!fn) throw new Error(`[fake-supabase] rpc ${name} is not stubbed`);
       return Promise.resolve().then(() => fn(args, db)).then(data => ({ data, error: null }), e => ({ data: null, error: { message: e.message } }));
     },
-    auth: { getUser: async token => (authUsers[token] ? { data: { user: authUsers[token] }, error: null } : { data: { user: null }, error: { message: "bad token" } }) },
+    // auth.admin: recorded, never executed — tests assert on db.authCalls (e.g. "no password was reset").
+    auth: { admin: { createUser: async a => { (db.authCalls ||= []).push({ op: "createUser", a }); return { data: { user: { id: "auth-" + (db.authCalls.length) } }, error: null }; }, updateUserById: async (id, a) => { (db.authCalls ||= []).push({ op: "updateUserById", id }); return { data: {}, error: null }; } }, getUser: async token => (authUsers[token] ? { data: { user: authUsers[token] }, error: null } : { data: { user: null }, error: { message: "bad token" } }) },
     storage: { from: () => ({ remove: async () => ({ error: null }), upload: async () => ({ error: null }), getPublicUrl: () => ({ data: { publicUrl: "" } }) }) },
   };
 }

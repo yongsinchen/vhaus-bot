@@ -125,7 +125,7 @@ const commissionCode = lines.slice(startIdx, endIdx + 1).join("\n");
 
 function loadCalc(db) {
   const ctx = vm.createContext({
-    supabase: db, commissionLib, commissionLifecycle: lifecycle, businessMonth: require("../lib/business-month"), ...require("../lib/salesperson-tokens"), getCommissionableAmount: commissionLib.getCommissionableAmount,
+    supabase: db, commissionLib, commissionLifecycle: lifecycle, businessMonth: require("../lib/business-month"), malaysiaDate: require("../lib/malaysia-date"), ...require("../lib/salesperson-tokens"), getCommissionableAmount: commissionLib.getCommissionableAmount,
     SALES_COMMISSION_ROLES: ["salesman", "part_time", "short_term_part_time"],
     console: { log() {}, warn() {}, error() {} }, Date, Math, JSON, Number, String, Array, Object, Set, Map, Promise, Boolean, isNaN, parseFloat, parseInt, Error,
   });

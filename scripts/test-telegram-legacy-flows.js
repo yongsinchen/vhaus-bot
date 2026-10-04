@@ -5,7 +5,7 @@
  * test supplies, no company_telegram_destinations row is read or written, production Supabase is NOT touched.
  *
  * Covers: immutable from.id authentication (unknown / inactive / spoofed username or display name), New Order
- * (photo → OCR → preview → confirm / cancel / duplicate / OCR failure / wardrobe trips), Flag Wrong Order, the
+ * (DISABLED in Phase 2D: every entry point answers "moved to PulseOS" and writes / OCRs nothing), Flag Wrong Order, the
  * delivery-group template gate, company isolation, session ownership (chat:user key).
  * (Reschedule + /schedule are covered by test-telegram-reschedule-routes.js and test-telegram-schedule-route.js.)
  *
@@ -78,56 +78,41 @@ const tg = (i, company, tgId, extra = {}) => ({ id: i, role: "salesman", company
     m = await send(999, "/start");
     assert("public commands (/start, help, 4) work without registration — they show the menu only", m.length >= 1 && !/Not Registered/.test(txt(m)));
 
-    out("\n══ New Order ══\n");
+    out("\n══ New Order — DISABLED (Phase 2D): every entry point answers 'moved to PulseOS' and does nothing else ══\n");
+    const dbBefore = () => JSON.stringify(h.db.t);
+    const MOVED = /New order creation has moved to PulseOS/;
+    let snapBefore = dbBefore(); let ocrBefore = ocrCalls; let sentBefore = h.sent.length;
     m = await send(111, "1");
-    assert("'1' → asks for the sales-order photo", /Send me the sales order photo/.test(txt(m)));
-    m = await send(111, "hello?");
-    assert("text while waiting for the photo → reminder, nothing saved", /send me the sales order photo/i.test(txt(m)));
-    m = await send(222, null, { photo: true, first_name: "Bob" });
-    assert("a photo sent WITHOUT choosing New Order first is refused (menu), no OCR", /select .*New Order/i.test(txt(m)) && ocrCalls === 0, txt(m).slice(0, 120));
-
-    ocrAnswer = new Error("model overloaded");
-    m = await send(111, null, { photo: true });
-    assert("OCR failure → friendly error, no order created, user may retry", /AI extraction failed/.test(txt(m)) && !O("83100"), txt(m).slice(0, 120));
-    ocrAnswer = ocr({ soNumber: "" });
-    m = await send(111, null, { photo: true });
-    assert("OCR without an SO number → asked to resend, nothing saved", /Could not find SO Number/.test(txt(m)) && !O("83100"));
-    ocrAnswer = "```json\n" + JSON.stringify(ocr()) + "\n```";
-    m = await send(111, null, { photo: true });
-    assert("OCR success (fenced JSON accepted) → preview shown, nothing saved yet", /83100/.test(txt(m)) && /New Cust/.test(txt(m)) && !O("83100"), txt(m).slice(0, 200));
-    m = await send(111, "YES");
-    const saved = O("83100");
-    assert("YES → ONE order saved, status Pending, in the SENDER's company (Company A), attributed to her user", !!saved && orders().filter(o => o.so_number === "83100").length === 1 && saved.company_id === A && saved.status === "Pending" && saved.created_by_user_id === "tina" && saved.main_salesman_user_id === "tina", JSON.stringify(saved));
-    assert("…customer / amount / delivery date copied from the confirmed draft", saved.customer_name === "New Cust" && Number(saved.order_amount) === 1000 && saved.delivery_date === "2026-11-20", JSON.stringify(saved));
-    assert("…and she is told it was saved", /Order Saved/.test(txt(m)));
-
+    assert("registered user: '1' → 'New order creation has moved to PulseOS' (and where to go)", MOVED.test(txt(m)) && /web app/.test(txt(m)), txt(m).slice(0, 160));
+    m = await send(111, "new order");
+    assert("registered user: 'new order' → the same message", MOVED.test(txt(m)));
+    m = await send(111, "NEW");
+    assert("registered user: 'NEW' → the same message", MOVED.test(txt(m)));
     ocrAnswer = ocr({ soNumber: "83100" });
-    await send(111, "1"); await send(111, null, { photo: true });
-    m = await send(111, "YES");
-    assert("the SAME SO number again in the SAME company → 'already exists', still exactly one row", /already exists/.test(txt(m)) && orders().filter(o => o.so_number === "83100" && o.company_id === A).length === 1);
-    await send(222, "1", { first_name: "Bob" }); await send(222, null, { photo: true, first_name: "Bob" });
-    m = await send(222, "YES", { first_name: "Bob" });
-    assert("the same number in ANOTHER company is legitimate (UNIQUE(company_id, so_number)) and lands in COMPANY B, never A", orders().filter(o => o.so_number === "83100").map(o => o.company_id).sort().join() === [A, B].sort().join(), JSON.stringify(orders().filter(o => o.so_number === "83100")));
-    ocrAnswer = ocr({ soNumber: "83999" });
-    await send(222, "1", { first_name: "Bob" }); await send(222, null, { photo: true, first_name: "Bob" });
-    await send(222, "YES", { first_name: "Bob" });
-    assert("a Company B user saving SO 83999 (which exists only in Company A) creates it in Company B and does NOT touch Company A's row", orders().filter(o => o.so_number === "83999").length === 2 && O("83999").customer_name === "Dup A" && orders().filter(o => o.so_number === "83999" && o.company_id === B).length === 1);
-
-    await send(111, "1");
-    ocrAnswer = ocr({ soNumber: "83200" });
-    await send(111, null, { photo: true });
-    m = await send(111, "cancel");
-    assert("CANCEL at the preview discards the draft; nothing saved", !O("83200") && /discarded/i.test(txt(m)));
-
-    await send(111, "1");
-    ocrAnswer = ocr({ soNumber: "83300", items: [{ itemName: "Wardrobe 3 door", itemCode: "W3" }] });
     m = await send(111, null, { photo: true });
-    assert("a wardrobe / fitting item triggers the how-many-trips question", /How many trips/i.test(txt(m)), txt(m).slice(0, 160));
-    m = await send(111, "99");
-    assert("an out-of-range trip count is refused (1–10), draft kept", /between 1 and 10/.test(txt(m)) && !O("83300"));
-    m = await send(111, "1");
-    assert("a valid count moves on to the preview", /83300/.test(txt(m)) && !O("83300"));
-    await send(111, "cancel");
+    assert("registered user: a PHOTO → the same message, refused before any download / OCR (OpenAI never called)", MOVED.test(txt(m)) && ocrCalls === ocrBefore && h.openaiState.constructed === 0, `ocrCalls=${ocrCalls}`);
+    await send(111, "1"); m = await send(111, null, { photo: true });
+    assert("'1' then a photo (the old two-step flow) → still the message; no session carries the photo anywhere", MOVED.test(txt(m)) && ocrCalls === ocrBefore);
+    m = await send(111, "YES");
+    assert("a stray 'YES' after that is NOT treated as an order confirmation (nothing to confirm)", !/Order Saved/.test(txt(m)));
+    ocrBefore = ocrCalls;   // free text goes to the assistant intent parser (an AI call by design) — that is not order OCR; photo checks below are measured from here
+    assert("NO database write of any kind (orders, sales_orders, order_trips, storage rows, SO number counters)", dbBefore() === snapBefore, "database changed");
+    assert("no SO number was allocated and no order exists for the OCR'd number", !O("83100") && orders().length === 4 && h.db.table("sales_orders").length === 0 && h.db.table("order_trips").length === 0);
+    m = await send(222, "1", { first_name: "Bob" });
+    assert("COMPANY ISOLATION: a Company B user gets the same message and creates nothing in either company", MOVED.test(txt(m)) && orders().length === 4 && dbBefore() === snapBefore);
+    m = await send(999, "1");
+    assert("UNKNOWN user: still 'Not Registered' (the auth gate runs first), not even the moved-message", /Not Registered/.test(txt(m)) && !MOVED.test(txt(m)));
+    m = await send(999, "1", { first_name: "Tina", username: "tina" });
+    assert("SPOOFED username / display name of a real user: 'Not Registered'", /Not Registered/.test(txt(m)) && dbBefore() === snapBefore);
+    m = await send(999, null, { photo: true, first_name: "Tina", username: "111" });
+    assert("SPOOFED sender sending a photo: Not Registered, no OCR", /Not Registered/.test(txt(m)) && ocrCalls === ocrBefore, JSON.stringify({ t: txt(m).slice(0, 80), ocrCalls, ocrBefore }));
+    m = await send(333, "1");
+    assert("a deactivated user: 'Not Registered'", /Not Registered/.test(txt(m)));
+    m = await send(111, "menu");
+    assert("the menu now says New Order is in the web app (no photo-flow instructions)", /web app/.test(txt(m)) && !/send .*photo/i.test(txt(m)), txt(m).slice(0, 200));
+    m = await send(999, "/start");
+    assert("/start (public) no longer advertises the photo flow either", !/Send a sales order photo/.test(txt(m)));
+    assert("only the sender's own chat was messaged during all of the above (no admin / group notification)", h.sent.slice(sentBefore).every(x => /^7\d{3}$/.test(x.chat_id)));
 
     out("\n══ Flag Wrong Order ══\n");
     m = await send(111, "3");

@@ -93,7 +93,7 @@ const code = L.slice(s0, e0 + 1).join("\n");
 function loadCalc(db) {
   // businessMonth: calculateCommission gained a dependency on lib/business-month (Malaysia business-month tiers) after this
   // sandbox was written; the sliced function runs in a vm with only the globals listed here, so it must be supplied explicitly.
-  const ctx = vm.createContext({ supabase: db, commissionLib, commissionLifecycle: lifecycle, businessMonth: require("../lib/business-month"), ...tokensLib, getCommissionableAmount: commissionLib.getCommissionableAmount,
+  const ctx = vm.createContext({ supabase: db, commissionLib, commissionLifecycle: lifecycle, businessMonth: require("../lib/business-month"), malaysiaDate: require("../lib/malaysia-date"), ...tokensLib, getCommissionableAmount: commissionLib.getCommissionableAmount,
     SALES_COMMISSION_ROLES: ["salesman", "part_time", "short_term_part_time"], console: { log() {}, warn() {}, error() {} },
     Date, Math, JSON, Number, String, Array, Object, Set, Map, Promise, Boolean, isNaN, parseFloat, parseInt, Error, RegExp });
   vm.runInContext(code + "\n;globalThis.__calc = calculateCommission;", ctx);

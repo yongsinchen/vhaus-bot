@@ -164,3 +164,15 @@ the one-time smoke tests already run when each migration shipped. That is a know
 | `step4b-crud-endpoints` | 7 | direct DB simulation of 7 endpoints; replaced by role-assignment-security once ported |
 | `step4c-profile-switch` | 0 | profile/switch-company by simulation; same gap as phase5-company-switching |
 | `urgent-service-item-quantity` | 12 | duplicate of service-item-quantity (same bug batch, same endpoints) |
+
+## 7. Phase 2D additions (security + Malaysia business date)
+
+| Suite | What it proves |
+|---|---|
+| `test-cross-company-writes.js` | 111 route-level assertions: a Company A caller addressing a Company B record is refused (404/403) **and the whole database is byte-identical afterwards**; the same call on the caller's own record succeeds (so the test is not vacuous). Covers every route reviewed in the Phase 2D security sweep, including `DELETE /delivery-teams/:id` (no cross-company cascade) and user / access administration. |
+| `test-write-route-scope-lint.js` | Static guard: every id-addressed write route must reference the caller's company/organization (or be allow-listed with a reason). Stops a new route reintroducing the hole. |
+| `test-malaysia-operational-dates.js` | Frozen clock at 07:30 Malaysia time (the UTC date is still yesterday), re-run under 5 host timezones: driver route, pick list, readiness, branch sales / performance, PO receive date, Telegram delivery-report date parsing. Also pins that the **excluded** semantics (SO/DO/PO number prefixes, ageing, bank-statement import) are unchanged. |
+| `test-telegram-legacy-flows.js` | Telegram **New Order is disabled**: every entry point answers "moved to PulseOS" with no DB write, no OCR, no SO number. Auth, spoofing, company isolation, flag and delivery-group gates unchanged. |
+| `test-driver-completion-routes.js` | Delivery completion still works with **automatic stock deduction disabled**; no inventory or stock-movement mutation; readiness is byte-identical regardless of inventory contents. |
+
+Frontend: `malaysiaDate.test.js` (run it under `TZ=UTC`, `Asia/Kuala_Lumpur`, `America/Los_Angeles`, `Pacific/Kiritimati` — set `$env:TZ` in PowerShell; Git Bash rewrites slash-containing `TZ` values and silently ignores them).
