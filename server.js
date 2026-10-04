@@ -78,7 +78,12 @@ const supabase = createClient(
 const permEngine = new PermissionEngine(supabase);
 const requirePerm = (key) => [requireAuth, permEngine.requirePermission(key)];
 const orgIdentity = new OrganizationIdentityService(supabase);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// OpenAI is constructed LAZILY, on the first AI call. The SDK itself still throws its normal
+// "OPENAI_API_KEY is missing" error at that moment, so AI requests keep full runtime validation,
+// while the server (and every non-AI route) can boot and be tested without the key.
+let _openai = null;
+const getOpenAI = () => (_openai ||= new OpenAI({ apiKey: process.env.OPENAI_API_KEY }));
+const openai = { chat: { completions: { create: (...args) => getOpenAI().chat.completions.create(...args) } } };
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
@@ -1677,7 +1682,12 @@ const handlePendingDraftMessage = async (chatId, userId, text) => {
 };
 
 // ── Bot: /schedule command ────────────────────────────────────────
-const handleScheduleCommand = async (chatId, text) => {
+// COMPANY-SCOPED (P1-6 follow-up): this used to list EVERY company's orders for the date to any
+// registered Telegram user. The company now comes only from the authenticated Telegram from.id →
+// user mapping (message._companyId, set by the webhook auth gate) — never from the message text,
+// a username or a display name. A user with no company mapping is refused (fail closed).
+const handleScheduleCommand = async (chatId, text, companyId) => {
+  if (!companyId) { await sendMessage(chatId, "❌ Your Telegram account isn't linked to a company, so I can't show a schedule. Please contact admin."); return; }
   const dateMatch = text.match(/\/schedule\s+(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/i);
   if (!dateMatch) { await sendMessage(chatId, "Usage: `/schedule 15/7` or `/schedule 2026-07-15`"); return; }
   const day = parseInt(dateMatch[1]);
@@ -1689,7 +1699,7 @@ const handleScheduleCommand = async (chatId, text) => {
   const dateStr = dateObj.toISOString().split("T")[0];
   const dateLabel = dateObj.toLocaleDateString("en-MY", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 
-  const { data: orders, error } = await supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("delivery_date", dateStr);
+  const { data: orders, error } = await supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT).eq("company_id", companyId).eq("delivery_date", dateStr);
   if (error) { await sendMessage(chatId, `❌ Error: ${error.message}`); return; }
   if (!orders || orders.length === 0) { await sendMessage(chatId, `📅 No orders found for *${dateLabel}*`); return; }
 
@@ -9953,9 +9963,9 @@ Please contact your manager to set up your account.`);
       const lower = text.toLowerCase();
       const session = getSession(draftKey);
 
-      // /schedule (admin command — always works)
+      // /schedule — scoped to the authenticated sender's company (webhook auth gate above)
       if (text.startsWith("/schedule")) {
-        await handleScheduleCommand(chatId, text);
+        await handleScheduleCommand(chatId, text, message._companyId || null);
         return;
       }
 
@@ -10932,7 +10942,13 @@ app.post("/delivery-schedules", ...requirePerm(PERMS.DELIVERY_CREATE), async (re
     if (!order_id || !scheduled_date) return res.status(400).json({ error: "order_id and scheduled_date required" });
 
     // Fix #7: SOFT block, same as the DO path above.
-    const { data: legacyOrderForBlock } = await supabase.from("orders").select("branch_id, so_number").eq("id", order_id).maybeSingle();
+    // COMPANY SCOPE: the order must belong to the caller's active company. Without this a user of company A
+    // could put company B's order (numeric ids are guessable) on A's team — and the date sync below would
+    // rewrite B's order — because only the schedule row carried company_id.
+    let legacyOrdQ = supabase.from("orders").select("branch_id, so_number").eq("id", order_id);
+    if (cid) legacyOrdQ = legacyOrdQ.eq("company_id", cid);
+    const { data: legacyOrderForBlock } = await legacyOrdQ.maybeSingle();
+    if (cid && !legacyOrderForBlock) return res.status(404).json({ error: "Order not found" });
     // Operations gate: an order still awaiting its deposit cannot be scheduled.
     if (legacyOrderForBlock?.so_number) {
       const { data: soChk } = await supabase.from("sales_orders").select("status")
@@ -12151,6 +12167,14 @@ app.patch("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_EDIT), asy
     if (Object.keys(patch).length === 0) return res.status(400).json({ error: "No updatable fields provided (Phase 1: delivery_date, remark, customer_confirmed)" });
 
     const dateChanged = patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date;
+    // LOCK RULE (same vocabulary as DELETE /delivery-schedules/:id and the approval path's
+    // DO_RESCHEDULE_BLOCKED_STATUSES): once a delivery is out for delivery / arrived / delivered, moving its
+    // date would delete its live schedule row mid-route. Remark / confirmation edits stay allowed.
+    if (dateChanged) {
+      const { data: liveScheds } = await supabase.from("delivery_schedules").select("status").eq("delivery_order_id", dord.id).eq("company_id", companyId);
+      const lockedBy = isLockedScheduleStatus(dord.status) ? dord.status : (liveScheds || []).map(x => x.status).find(st => isLockedScheduleStatus(st) && String(st).toLowerCase() !== "delivered");
+      if (lockedBy) return res.status(409).json({ error: `Cannot reschedule — the delivery is already ${lockedBy}`, code: "delivery_order_locked" });
+    }
     // Rescheduling the delivery date UNASSIGNS the DO. Teams are per-date, so a
     // stop can't stay on its old team when the date moves — the old team doesn't
     // exist on the new date and the stop would vanish from the board. Instead we
@@ -17664,4 +17688,7 @@ app.use((err, req, res, _next) => {
 
 // ── Start Server ──────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Listen only when run directly (`node server.js` / Railway). Tests `require("./server")` to get the
+// Express app and drive real routes over an ephemeral port without binding PORT.
+if (require.main === module) app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+module.exports = { app };
