@@ -46,6 +46,7 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     service_legs: [{ id: "lgA", service_id: "svcA", status: "pending" }, { id: "lgB", service_id: "svcB", status: "pending" }],
     service_part_claims: [{ id: "clA", service_id: "svcA", claim_status: "pending" }, { id: "clB", service_id: "svcB", claim_status: "pending" }],
     service_pending: [{ id: "spA", company_id: A, status: "Pending", so_number: "83001" }, { id: "spB", company_id: B, status: "Pending", so_number: "84002" }, { id: "spN", company_id: null, status: "Pending", so_number: "x" }],
+    warehouses: [{ id: "whA", company_id: A, name: "WA", is_active: true }, { id: "whB", company_id: B, name: "WB", is_active: true }],
     warehouse_zones: [{ id: "zA", company_id: A, name: "ZA" }, { id: "zA2", company_id: A, name: "ZA2" }, { id: "zB", company_id: B, name: "ZB" }],
     warehouse_racks: [{ id: "rkA", zone_id: "zA", rack_code: "A1", qr_code: "QR-A" }, { id: "rkA2", zone_id: "zA2", rack_code: "A2", qr_code: "QR-A2" }, { id: "rkB", zone_id: "zB", rack_code: "B1", qr_code: "QR-B" }],
     package_labels: [{ id: "plA", company_id: A, so_number: "83001", status: "pending", qr_code: "L-A" }, { id: "plB", company_id: B, so_number: "84002", status: "pending", qr_code: "L-B" }],
@@ -140,6 +141,8 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     await foreign("POST /service-pending/:id/convert (legacy row with NO company_id — fails closed)", "mgrA", "POST", "/service-pending/spN/convert", {});
 
     out("\n══ Warehouse (zones, racks, labels, packings) ══\n");
+    await foreign("POST /warehouses/:id/zones (another company's warehouse as the PARENT)", "mgrA", "POST", "/warehouses/whB/zones", { name: "HIJACK" });
+    await own("POST /warehouses/:id/zones", "mgrA", "POST", "/warehouses/whA/zones", { name: "NewZone" }, [201]);
     await foreign("PUT /warehouse-zones/:id", "mgrA", "PUT", "/warehouse-zones/zB", { name: "HIJACK" });
     await own("PUT /warehouse-zones/:id", "mgrA", "PUT", "/warehouse-zones/zA", { name: "ZA-renamed" });
     await foreign("POST /warehouse-zones/:id/racks", "mgrA", "POST", "/warehouse-zones/zB/racks", { code: "X1" });
