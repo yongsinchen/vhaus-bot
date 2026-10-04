@@ -4120,7 +4120,7 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
     // 2. Ops badge counts — same as GET /operations/pending-counts
     let spQ = supabase.from("service_pending").select("id", { count: "exact", head: true }).eq("status", "Pending");
     let drQ = supabase.from("do_review").select("id", { count: "exact", head: true }).eq("status", "Pending");
-    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.or(`company_id.eq.${cid},company_id.is.null`); }
+    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.eq("company_id", cid); }   // Phase 2E: NULL-company legacy rows are all closed (Dismissed/Resolved) and are no longer counted
 
     // 2b. Delivery-date approval queue count — only meaningful for approvers
     //     (the nav item is approver-gated). Same actionable statuses the
@@ -4363,7 +4363,7 @@ app.get("/operations/pending-counts", requireAuth, async (req, res) => {
     const cid = getActiveCompanyId(req);
     let spQ = supabase.from("service_pending").select("id", { count: "exact", head: true }).eq("status", "Pending");
     let drQ = supabase.from("do_review").select("id", { count: "exact", head: true }).eq("status", "Pending");
-    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.or(`company_id.eq.${cid},company_id.is.null`); }
+    if (cid) { spQ = spQ.eq("company_id", cid); drQ = drQ.eq("company_id", cid); }   // Phase 2E: NULL-company legacy rows are all closed (Dismissed/Resolved) and are no longer counted
     const [{ count: sp }, { count: dr }] = await Promise.all([spQ, drQ]);
     res.json({ service_pending: sp || 0, do_review: dr || 0 });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4390,7 +4390,8 @@ app.post("/service-pending/:id/convert", requireRole(MANAGE_ROLES), async (req, 
   // Phase 2D: a request that belongs to another company is "not found". (A legacy row with NO company_id stays reachable,
   // exactly as before — see the spCompanyId fallback below; production has one such row.)
   const convertCid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!convertCid) return;
-  if (sp.company_id && sp.company_id !== convertCid) return res.status(404).json({ error: "Service pending not found" });
+  // Phase 2E: ownerless (NULL-company) rows fail closed — production has one, already Converted.
+  if (sp.company_id !== convertCid) return res.status(404).json({ error: "Service pending not found" });
 
   // Prevent double conversion
   if (sp.status === "Converted") return res.status(400).json({ error: "Already converted" });
@@ -4452,7 +4453,7 @@ app.delete("/service-pending/:id", requireRole(MANAGE_ROLES), async (req, res) =
   const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
   // Phase 2D: company-scoped; a legacy row with NO company_id stays removable (null-safe, as before).
   const { data: spRow } = await supabase.from("service_pending").select("id, company_id").eq("id", id).maybeSingle();
-  if (!spRow || (spRow.company_id && spRow.company_id !== cid)) return res.status(404).json({ error: "Service pending not found" });
+  if (!spRow || spRow.company_id !== cid) return res.status(404).json({ error: "Service pending not found" });   // Phase 2E: ownerless rows fail closed
   const { error } = await supabase.from("service_pending").update({ status: "Removed" }).eq("id", id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
@@ -4463,14 +4464,18 @@ app.delete("/service-pending/:id", requireRole(MANAGE_ROLES), async (req, res) =
 
 // GET /auto-schedule/orders?date=&company_id= — get unassigned orders with AI duration suggestions
 app.get("/auto-schedule/orders", requireAuth, async (req, res) => {
-  const { date, company_id } = req.query;
+  const { date } = req.query;
   if (!date) return res.status(400).json({ error: "date required" });
+  // Phase 2E: ?company_id= may only target another company for a MASTER; everyone else is held to the active company (it used to
+  // list EVERY company's orders for the date when the parameter was omitted, and any company's when it was supplied).
+  const autoCid = companyScope.resolveTargetCompany({ requested: req.query.company_id, activeCid: getActiveCompanyId(req), isMaster: req.activeRoleKey === "MASTER" });
+  if (!autoCid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
 
   // Get unassigned orders for the date
   let query = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT)
     .eq("delivery_date", date)
     .in("status", ["Pending", "In Progress"]);
-  if (company_id) query = query.eq("company_id", company_id);
+  query = query.eq("company_id", autoCid);
   const { data: orders, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
 
@@ -4493,11 +4498,11 @@ app.get("/auto-schedule/orders", requireAuth, async (req, res) => {
 
     // Look up duration history for similar jobs
     let suggestedDuration = null;
-    if (company_id) {
+    if (autoCid) {
       const { data: history } = await supabase
         .from("duration_history")
         .select("duration_minutes")
-        .eq("company_id", company_id)
+        .eq("company_id", autoCid)
         .eq("item_type", itemType)
         .order("created_at", { ascending: false })
         .limit(10);
@@ -4523,13 +4528,11 @@ app.get("/auto-schedule/orders", requireAuth, async (req, res) => {
 
   // Get available vehicles
   let vQuery = supabase.from("delivery_vehicles").select("*").eq("status", "Active");
-  if (company_id) vQuery = vQuery.eq("company_id", company_id);
+  vQuery = vQuery.eq("company_id", autoCid);   // Phase 2E: the vehicles / settings of the SAME company the orders came from
   const { data: vehicles } = await vQuery;
 
   // Get company settings (base location, work hours)
-  const { data: settings } = company_id
-    ? await supabase.from("company_settings").select("*").eq("company_id", company_id).single()
-    : { data: null };
+  const { data: settings } = await supabase.from("company_settings").select("*").eq("company_id", autoCid).maybeSingle();
 
   res.json({
     orders: ordersWithSuggestions,
@@ -4851,10 +4854,18 @@ app.get("/do-review", requireAuth, async (req, res) => {
   // company_id land with company_id = NULL, and with matching disabled they
   // often can't be tied to an SO either — without this they'd be invisible in
   // every company's review queue and lost. Reviewers resolve them by hand.
+  // Phase 2E: a legacy row with NO company_id is shown ONLY when its owner can be derived from its parent supplier delivery (and that is
+  // this company); an ownerless row fails closed for company users. (Production: 9 such rows, all already Dismissed/Resolved.)
   if (cid) q = q.or(`company_id.eq.${cid},company_id.is.null`);
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  let reviewRows = data || [];
+  if (cid) {
+    const kept = [];
+    for (const r of reviewRows) { if ((await companyScope.doReviewOwnerCompany(supabase, r)) === cid) kept.push(r); }
+    reviewRows = kept;
+  }
+  res.json(reviewRows);
 });
 
 // PATCH /do-review/:id/resolve — reviewer manually links an unmatched supplier
@@ -4873,7 +4884,8 @@ app.patch("/do-review/:id/resolve", requireAuth, async (req, res) => {
   const { data: reviewOwner } = await supabase.from("do_review").select("id, company_id, supplier_delivery_id").eq("id", id).maybeSingle();
   if (!reviewOwner) return res.status(404).json({ error: "Review item not found" });
   const resolveCid = getActiveCompanyId(req);
-  if (resolveCid && reviewOwner.company_id && reviewOwner.company_id !== resolveCid) {
+  // Phase 2E: owner = the row's company, else its parent supplier delivery's; ownerless rows fail closed.
+  if (!resolveCid || (await companyScope.doReviewOwnerCompany(supabase, reviewOwner)) !== resolveCid) {
     return res.status(404).json({ error: "Review item not found" });
   }
 
@@ -4961,10 +4973,10 @@ app.patch("/do-review/:id/dismiss", requireAuth, async (req, res) => {
   const { id } = req.params;
   // P1-4B: same ownership check as /resolve — previously updated by id
   // alone with no company check.
-  const { data: reviewOwner } = await supabase.from("do_review").select("id, company_id").eq("id", id).maybeSingle();
+  const { data: reviewOwner } = await supabase.from("do_review").select("id, company_id, supplier_delivery_id").eq("id", id).maybeSingle();
   if (!reviewOwner) return res.status(404).json({ error: "Review item not found" });
   const dismissCid = getActiveCompanyId(req);
-  if (dismissCid && reviewOwner.company_id && reviewOwner.company_id !== dismissCid) {
+  if (!dismissCid || (await companyScope.doReviewOwnerCompany(supabase, reviewOwner)) !== dismissCid) {
     return res.status(404).json({ error: "Review item not found" });
   }
   const { error } = await supabase.from("do_review").update({ status: "Dismissed" }).eq("id", id);
@@ -4998,7 +5010,7 @@ app.patch("/do-review/:id/add-to-stock", requireRole(MANAGE_ROLES), async (req, 
     // company) — same class of misattribution fix as the supplier-deliveries
     // DELETE reversal above.
     const stockCid = getActiveCompanyId(req);
-    if (stockCid && review.company_id && review.company_id !== stockCid) {
+    if (!stockCid || (await companyScope.doReviewOwnerCompany(supabase, review)) !== stockCid) {
       return res.status(404).json({ error: "Review item not found" });
     }
     const qty = Number(quantity) || 1;
@@ -5167,13 +5179,16 @@ app.patch("/admin/users/:id/password", requireRole(["master", "manager"]), async
 
 // GET /services/unscheduled — service orders with no delivery_date
 app.get("/services/unscheduled", requireAuth, async (req, res) => {
-  const { company_id } = req.query;
+  // Phase 2E: ?company_id= may only target another company for a MASTER; everyone else is held to the active company, and with no
+  // company at all the route fails closed (it used to return EVERY company's unscheduled Service orders).
+  const unschedCid = companyScope.resolveTargetCompany({ requested: req.query.company_id, activeCid: getActiveCompanyId(req), isMaster: req.activeRoleKey === "MASTER" });
+  if (!unschedCid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
   let query = supabase.from("orders").select(SELECTS.ORDER_LIST_SELECT)
     .eq("type", "Service")
     .is("delivery_date", null)
     .not("status", "in", '("Delivered","Serviced","Cancelled")')
     .order("created_at", { ascending: false });
-  if (company_id) query = query.eq("company_id", company_id);
+  query = query.eq("company_id", unschedCid);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -6031,7 +6046,9 @@ app.get("/customers", requireAuth, async (req, res) => {
 
 app.get("/customers/:id", requireAuth, async (req, res) => {
   try {
-    const { data: customer } = await supabase.from("customers").select("*").eq("id", req.params.id).single();
+    // Phase 2E: company-scoped — a foreign customer id is "not found" (this route returns the customer's orders AND payments).
+    const custCid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!custCid) return;
+    const { data: customer } = await supabase.from("customers").select("*").eq("id", req.params.id).eq("company_id", custCid).maybeSingle();
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     // Load all orders for this customer
     const { data: orders } = await supabase.from("orders").select("id, so_number, customer_name, order_amount, balance, status, delivery_date, created_at, type")
@@ -8457,7 +8474,9 @@ app.get("/statements", requireAuth, async (req, res) => {
 
 app.get("/statements/:id", requireAuth, async (req, res) => {
   try {
-    const { data: upload } = await supabase.from("statement_uploads").select("*").eq("id", req.params.id).single();
+    // Phase 2E: company-scoped — a foreign statement id is "not found".
+    const stmtReadCid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!stmtReadCid) return;
+    const { data: upload } = await supabase.from("statement_uploads").select("*").eq("id", req.params.id).eq("company_id", stmtReadCid).maybeSingle();
     if (!upload) return res.status(404).json({ error: "Not found" });
     const { data: txns } = await supabase.from("statement_transactions").select("*").eq("upload_id", upload.id).order("transaction_date");
     // Enrich matched orders
@@ -9403,7 +9422,7 @@ app.get("/supplier-deliveries", requireAuth, async (req, res) => {
   let query = supabase.from("supplier_deliveries").select(SELECTS.SUPPLIER_DELIVERY_LIST_SELECT).order("created_at", { ascending: false }).limit(parseInt(limit));
   // Include unattributed Telegram uploads (company_id NULL) so a DO posted by a
   // user with no company still appears for review — mirrors GET /do-review.
-  if (cid) query = query.or(`company_id.eq.${cid},company_id.is.null`);
+  if (cid) query = query.eq("company_id", cid);   // Phase 2E: no NULL-company tolerance (production has none; uploads now always carry the sender's company)
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
   if (to_date) query = query.lte("do_date", to_date);
@@ -9422,7 +9441,7 @@ app.get("/supplier-deliveries/:id", requireAuth, async (req, res) => {
     // any authenticated user read another company's supplier delivery (and
     // its do_review lines) by id.
     const cid = getActiveCompanyId(req);
-    if (cid && delivery.company_id && delivery.company_id !== cid) return res.status(404).json({ error: "Not found" });
+    if (cid && delivery.company_id !== cid) return res.status(404).json({ error: "Not found" });   // Phase 2E: ownerless rows fail closed
     const { data: reviews } = await supabase.from("do_review").select(SELECTS.DO_REVIEW_SELECT).eq("supplier_delivery_id", delivery.id).order("created_at");
     res.json({ delivery, items: reviews || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -9436,7 +9455,7 @@ app.put("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, res) 
     const { data: existing } = await supabase.from("supplier_deliveries").select("id, company_id").eq("id", req.params.id).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Not found" });
     const cid = getActiveCompanyId(req);
-    if (cid && existing.company_id && existing.company_id !== cid) return res.status(404).json({ error: "Not found" });
+    if (cid && existing.company_id !== cid) return res.status(404).json({ error: "Not found" });   // Phase 2E: ownerless rows fail closed
     const { do_number, supplier, do_date, supplier_reference } = req.body;
     const { data, error } = await supabase.from("supplier_deliveries")
       .update({ do_number, supplier, do_date, supplier_reference })
@@ -9456,7 +9475,7 @@ app.delete("/supplier-deliveries/:id", requireRole(MANAGE_ROLES), async (req, re
     const { data: existing } = await supabase.from("supplier_deliveries").select("id, company_id").eq("id", req.params.id).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Not found" });
     const cid = getActiveCompanyId(req);
-    if (cid && existing.company_id && existing.company_id !== cid) return res.status(404).json({ error: "Not found" });
+    if (cid && existing.company_id !== cid) return res.status(404).json({ error: "Not found" });   // Phase 2E: ownerless rows fail closed
     // Reverse any stock movements from this DO
     const { data: movements } = await supabase.from("stock_movements")
       .select("id, warehouse_id, product_id, quantity")
@@ -9507,7 +9526,7 @@ app.get("/supplier-dos", requireAuth, async (req, res) => {
   let query = supabase.from("supplier_deliveries").select(SELECTS.SUPPLIER_DELIVERY_LIST_SELECT).order("created_at", { ascending: false }).limit(parseInt(limit));
   // Include unattributed Telegram uploads (company_id NULL) so a DO posted by a
   // user with no company still appears for review — mirrors GET /do-review.
-  if (cid) query = query.or(`company_id.eq.${cid},company_id.is.null`);
+  if (cid) query = query.eq("company_id", cid);   // Phase 2E: no NULL-company tolerance (production has none; uploads now always carry the sender's company)
   if (supplier) query = query.ilike("supplier", `%${supplier}%`);
   if (from_date) query = query.gte("do_date", from_date);
   if (to_date) query = query.lte("do_date", to_date);
@@ -9657,7 +9676,7 @@ app.get("/supplier-dos/:id", requireAuth, async (req, res) => {
     const { data: delivery, error } = await supabase.from("supplier_deliveries").select("*").eq("id", req.params.id).single();
     if (error || !delivery) return res.status(404).json({ error: "Not found" });
     const cid = getActiveCompanyId(req);
-    if (cid && delivery.company_id && delivery.company_id !== cid) return res.status(404).json({ error: "Not found" });
+    if (cid && delivery.company_id !== cid) return res.status(404).json({ error: "Not found" });   // Phase 2E: ownerless rows fail closed
     const { data: reviewItems } = await supabase.from("do_review").select(SELECTS.DO_REVIEW_SELECT).eq("supplier_delivery_id", delivery.id).order("created_at");
     res.json({ delivery, items: reviewItems || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -10343,7 +10362,10 @@ app.delete("/warehouses/:id", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (req, 
 // ── Warehouse Zones & Racks ──────────────────────────────────────
 app.get("/warehouses/:id/zones", requireAuth, async (req, res) => {
   try {
-    const { data: zoneData, error } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).order("name");
+    // Phase 2E: the warehouse must belong to the caller's active company (a foreign id is "not found").
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    if (!(await companyScope.ownedRow(supabase, "warehouses", req.params.id, cid))) return res.status(404).json({ error: "Warehouse not found" });
+    const { data: zoneData, error } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).eq("company_id", cid).order("name");
     if (error) throw error;
     const zones = zoneData || [];
     for (const z of zones) {
@@ -10359,6 +10381,10 @@ app.post("/warehouses/:id/zones", ...requirePerm(PERMS.WAREHOUSE_VIEW), async (r
     const cid = getActiveCompanyId(req);
     const { name, description } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
+    // Phase 2E: the PARENT warehouse must belong to the caller's active company — a zone can no longer be hung under another
+    // company's warehouse id (it was stamped with the caller's company but pointed at the foreign warehouse).
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    if (!(await companyScope.ownedRow(supabase, "warehouses", req.params.id, cid))) return res.status(404).json({ error: "Warehouse not found" });
     const { data, error } = await supabase.from("warehouse_zones").insert({ warehouse_id: req.params.id, company_id: cid, name: name.trim(), code: name.trim().substring(0, 10).toUpperCase().replace(/\s+/g, "-") }).select().single();
     if (error) throw error;
     res.status(201).json({ zone: data });
@@ -10478,7 +10504,9 @@ app.get("/package-labels", requireAuth, async (req, res) => {
 
 app.get("/package-labels/validate/:qr_code", requireAuth, async (req, res) => {
   try {
-    const { data, error } = await supabase.from("package_labels").select("*").eq("qr_code", req.params.qr_code).single();
+    // Phase 2E: company-scoped — another company's QR is "not found".
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const { data, error } = await supabase.from("package_labels").select("*").eq("qr_code", req.params.qr_code).eq("company_id", cid).maybeSingle();
     if (error || !data) return res.status(404).json({ error: "Package not found" });
     res.json({ label: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -10672,18 +10700,23 @@ app.post("/packings/generate", ...requirePerm(PERMS.WAREHOUSE_GENERATE_LABELS), 
 app.get("/packings", requireAuth, async (req, res) => {
   try {
     const { order_item_id, status, limit = 200 } = req.query;
+    // Phase 2E: order_item_packings has no company column — each row is kept only if its order (or DO) belongs to the caller's company.
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
     let q = supabase.from("order_item_packings").select("*").order("packed_at", { ascending: false }).limit(Number(limit));
     if (order_item_id) q = q.eq("order_item_id", order_item_id);
     if (status) q = q.eq("status", status);
     const { data, error } = await q;
     if (error) throw error;
-    res.json({ packings: data || [] });
+    res.json({ packings: await companyScope.filterPackingsByCompany(supabase, data || [], cid) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/packings/validate/:qr_code", requireAuth, async (req, res) => {
   try {
-    const { data: packing } = await supabase.from("order_item_packings").select("*").eq("qr_code", req.params.qr_code).maybeSingle();
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    let { data: packing } = await supabase.from("order_item_packings").select("*").eq("qr_code", req.params.qr_code).maybeSingle();
+    // Phase 2E: another company's packing is "not found" (ownership = its order's / DO's company).
+    if (packing && (await companyScope.packingCompanyId(supabase, packing.id)) !== cid) packing = null;
     if (packing) {
       // Enrich with order info
       if (packing.order_item_id) {
@@ -10693,7 +10726,7 @@ app.get("/packings/validate/:qr_code", requireAuth, async (req, res) => {
       return res.json({ packing, source: "order_item_packings" });
     }
     // Fallback to package_labels
-    const { data: label } = await supabase.from("package_labels").select("*").eq("qr_code", req.params.qr_code).maybeSingle();
+    const { data: label } = await supabase.from("package_labels").select("*").eq("qr_code", req.params.qr_code).eq("company_id", cid).maybeSingle();
     if (label) return res.json({ packing: { id: label.id, qr_code: label.qr_code, status: label.status, zone_id: label.zone_id, rack_id: label.rack_id, _product_name: label.product_name, _product_code: label.product_code, _so_number: label.so_number, _source: "package_labels" }, source: "package_labels" });
     res.status(404).json({ error: "Package not found" });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -11549,8 +11582,10 @@ app.get("/unified-loading-list", requireAuth, async (req, res) => {
 // ── Rack QR Validation ──────────────────────────────────────────
 app.get("/warehouse-racks/validate/:qr_code", requireAuth, async (req, res) => {
   try {
-    const { data, error } = await supabase.from("warehouse_racks").select("*, warehouse_zones(id, name, warehouse_id)").eq("qr_code", req.params.qr_code).single();
-    if (error || !data) return res.status(404).json({ error: "Rack not found" });
+    const { data, error } = await supabase.from("warehouse_racks").select("*, warehouse_zones(id, name, warehouse_id, company_id)").eq("qr_code", req.params.qr_code).maybeSingle();
+    // Phase 2E: ownership = the rack's zone's company; another company's rack QR is "not found".
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    if (error || !data || data.warehouse_zones?.company_id !== cid) return res.status(404).json({ error: "Rack not found" });
     res.json({ rack: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -11558,7 +11593,10 @@ app.get("/warehouse-racks/validate/:qr_code", requireAuth, async (req, res) => {
 // Print all rack QRs for a warehouse
 app.get("/warehouses/:id/rack-qrs", requireAuth, async (req, res) => {
   try {
-    const { data: zones } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).order("name");
+    // Phase 2E: the warehouse must belong to the caller's active company.
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    if (!(await companyScope.ownedRow(supabase, "warehouses", req.params.id, cid))) return res.status(404).json({ error: "Warehouse not found" });
+    const { data: zones } = await supabase.from("warehouse_zones").select("*").eq("warehouse_id", req.params.id).eq("company_id", cid).order("name");
     const racks = [];
     for (const z of (zones || [])) {
       const { data: rackData } = await supabase.from("warehouse_racks").select("*").eq("zone_id", z.id).order("rack_code");
@@ -17754,7 +17792,18 @@ app.get("/user-roles/:userId", requireRole(MANAGE_ROLES), async (req, res) => {
     const { data: branchAccess } = await supabase.from("user_branch_access")
       .select("id, company_id, branch_id, is_primary, is_active, branches(name, code)")
       .eq("user_id", req.params.userId).is("deleted_at", null);
-    res.json({ companyRoles: companyRoles || [], branchAccess: branchAccess || [] });
+    // Phase 2E: a non-master sees a user's access ONLY in companies the caller manages (the active company, or one where the caller
+    // holds a managing role) — never the user's access in other companies — and a user with no access in any such company is
+    // "not found" (no enumeration of arbitrary users). A MASTER keeps the full cross-company view (global role, intentional).
+    let visibleCompanyRoles = companyRoles || [], visibleBranchAccess = branchAccess || [];
+    if (req.activeRoleKey !== "MASTER") {
+      const managed = new Map();
+      for (const cidX of new Set([...visibleCompanyRoles.map(r => r.company_id), ...visibleBranchAccess.map(r => r.company_id)])) managed.set(cidX, await callerManagesCompany(req, cidX));
+      visibleCompanyRoles = visibleCompanyRoles.filter(r => managed.get(r.company_id));
+      visibleBranchAccess = visibleBranchAccess.filter(r => managed.get(r.company_id));
+      if (visibleCompanyRoles.length === 0 && visibleBranchAccess.length === 0) return res.status(404).json({ error: "User not found" });
+    }
+    res.json({ companyRoles: visibleCompanyRoles, branchAccess: visibleBranchAccess });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

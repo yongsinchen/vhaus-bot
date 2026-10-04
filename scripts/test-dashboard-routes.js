@@ -81,7 +81,7 @@ const M = MONTH.slice(0, 7);
     r = await h.call("GET", "/dashboard/bootstrap", { user: "master" });
     assert("services = this company's Service orders only (Company B's Service order never appears)", r.status === 200 && r.body.services.map(s => s.id).join() === "4", JSON.stringify(r.body.services.map(s => s.id)));
     assert("service_pending count: Pending, this company only (2)", r.body.pending_counts.service_pending === 2, JSON.stringify(r.body.pending_counts));
-    assert("do_review count: Pending rows of this company PLUS company-less legacy rows (2); not B's, not resolved", r.body.pending_counts.do_review === 2);
+    assert("do_review count: Pending rows of THIS company only (1) — company-less legacy rows are no longer counted (Phase 2E, fail closed); not B's, not resolved", r.body.pending_counts.do_review === 1);
     assert("delivery_requests count (approver): pending + needs_reschedule of THIS company only (2)", r.body.pending_counts.delivery_requests === 2);
     assert("order_amendments count (master): pending of THIS company only (1)", r.body.pending_counts.order_amendments === 1);
     assert("commission_summary is null for a non-salesman", r.body.commission_summary === null);

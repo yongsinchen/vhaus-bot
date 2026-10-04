@@ -82,11 +82,17 @@ async function bootServer({ seed = {}, users = {}, access = {}, rpcs = {}, env =
   await new Promise(r => server.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${server.address().port}`;
 
+  const unhandled = []; process.on("unhandledRejection", e => { unhandled.push(e); });
   const call = async (method, urlPath, { user, body, headers = {}, company } = {}) => {
     const h = { "Content-Type": "application/json", ...headers };
     if (user) h.Authorization = "Bearer tok-" + user;
     if (company) h["X-Company-ID"] = company;
-    const res = await fetch(base + urlPath, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body) });
+    // An async route handler that throws (Express 4 does not catch it) would otherwise kill the test process or hang the request.
+    // Report it as status 599 with the error text so a test can see exactly which route is not exercisable.
+    const before = unhandled.length;
+    let res;
+    try { res = await fetch(base + urlPath, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(4000) }); }
+    catch (e) { return { status: 599, body: { error: "route did not answer: " + (unhandled.length > before ? String(unhandled[unhandled.length - 1]?.message || unhandled[unhandled.length - 1]) : e.message) } }; }
     let json = null; try { json = await res.json(); } catch {}
     return { status: res.status, body: json };
   };

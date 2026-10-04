@@ -176,3 +176,10 @@ the one-time smoke tests already run when each migration shipped. That is a know
 | `test-driver-completion-routes.js` | Delivery completion still works with **automatic stock deduction disabled**; no inventory or stock-movement mutation; readiness is byte-identical regardless of inventory contents. |
 
 Frontend: `malaysiaDate.test.js` (run it under `TZ=UTC`, `Asia/Kuala_Lumpur`, `America/Los_Angeles`, `Pacific/Kiritimati` — set `$env:TZ` in PowerShell; Git Bash rewrites slash-containing `TZ` values and silently ignores them).
+
+## 8. Phase 2E additions (read isolation)
+
+| Suite | What it proves |
+|---|---|
+| `test-cross-company-reads.js` | 156 route-level assertions over a database holding BOTH companies' rows (Company B text carries the marker `ZZB`): ~70 collection GETs return no Company B value (with a Company A control so the route demonstrably ran); ~28 id-addressed GETs refuse a Company B id and still serve the caller's own; `?company_id=` pointing at another company is ignored for non-masters; the Assistant cannot retrieve another company's SO / customer / Service / DO / board; Finance reads (payments, allocations, statements, aging, commissions) are company-only; organization-level reads follow organization scope; legacy NULL-company rows fail closed unless their owner can be derived from the parent. |
+| `test-read-route-scope-lint.js` | Static guard: every authenticated GET route must visibly derive ownership (company / organization / self) or be an explicit, reasoned exception. Coarse by design — it catches a route with NO mechanism, not a mechanism applied to the wrong lookup; the behavioural suite above is the proof. |

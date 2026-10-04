@@ -136,7 +136,8 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     await foreign("POST /service-pending/:id/convert", "mgrA", "POST", "/service-pending/spB/convert", {});
     await foreign("DELETE /service-pending/:id", "mgrA", "DELETE", "/service-pending/spB");
     await own("DELETE /service-pending/:id", "mgrA", "DELETE", "/service-pending/spA");
-    await own("DELETE /service-pending/:id (legacy row with NO company stays reachable — unchanged, null-safe)", "mgrA", "DELETE", "/service-pending/spN");
+    await foreign("DELETE /service-pending/:id (legacy row with NO company_id — Phase 2E: fails closed for company users)", "mgrA", "DELETE", "/service-pending/spN");
+    await foreign("POST /service-pending/:id/convert (legacy row with NO company_id — fails closed)", "mgrA", "POST", "/service-pending/spN/convert", {});
 
     out("\n══ Warehouse (zones, racks, labels, packings) ══\n");
     await foreign("PUT /warehouse-zones/:id", "mgrA", "PUT", "/warehouse-zones/zB", { name: "HIJACK" });
