@@ -1,0 +1,6321 @@
+{
+ "note": "PostgREST-visible production schema (tables/columns/types/required) and RPC names. Acceptance target for a schema baseline. Regenerate with: node scripts/schema-drift-report.js --write",
+ "tables": {
+  "sales_order_notes": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "body": {
+    "type": "text",
+    "required": true
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "package_labels": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "supplier_delivery_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "do_review_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": false
+   },
+   "product_name": {
+    "type": "text",
+    "required": false
+   },
+   "so_number": {
+    "type": "text",
+    "required": false
+   },
+   "carton_number": {
+    "type": "integer",
+    "required": false,
+    "default": 1
+   },
+   "total_cartons": {
+    "type": "integer",
+    "required": false,
+    "default": 1
+   },
+   "qr_code": {
+    "type": "text",
+    "required": true
+   },
+   "warehouse_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "zone_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "rack_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "location_code": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "pending"
+   },
+   "picked_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "picked_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "loaded_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "loaded_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "delivery_order_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "order_trips": {
+   "id": {
+    "type": "integer",
+    "required": true
+   },
+   "so_number": {
+    "type": "text",
+    "required": true
+   },
+   "sv_number": {
+    "type": "text",
+    "required": false
+   },
+   "trip_no": {
+    "type": "integer",
+    "required": true
+   },
+   "total_trips": {
+    "type": "integer",
+    "required": true
+   },
+   "scheduled_date": {
+    "type": "date",
+    "required": false
+   },
+   "driver": {
+    "type": "text",
+    "required": false
+   },
+   "helper": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "Scheduled"
+   },
+   "note": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "user_permission_overrides": {
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "permission_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "granted": {
+    "type": "boolean",
+    "required": true
+   },
+   "updated_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "scope": {
+    "type": "text",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "deleted_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "delivery_order_events": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "delivery_order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "event_type": {
+    "type": "text",
+    "required": true
+   },
+   "payload": {
+    "type": "jsonb",
+    "required": false
+   },
+   "actor_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "wrong_item_holds": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "commission_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "hold_reason": {
+    "type": "text",
+    "required": true,
+    "default": "wrong_item"
+   },
+   "held_amt": {
+    "type": "numeric",
+    "required": true
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "held"
+   },
+   "auto_release": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "resale_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "override_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "released_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "product_incentives": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": false
+   },
+   "product_name": {
+    "type": "text",
+    "required": false
+   },
+   "incentive_amount": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "start_date": {
+    "type": "date",
+    "required": false
+   },
+   "end_date": {
+    "type": "date",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "commission_adjustments": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "commission_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "adjustment_type": {
+    "type": "text",
+    "required": true
+   },
+   "delta_amt": {
+    "type": "numeric",
+    "required": true
+   },
+   "reason": {
+    "type": "text",
+    "required": false
+   },
+   "applied_to_payout": {
+    "type": "date",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "payments": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": true
+   },
+   "amount": {
+    "type": "numeric",
+    "required": true
+   },
+   "payment_method": {
+    "type": "text",
+    "required": true,
+    "default": "cash"
+   },
+   "reference_no": {
+    "type": "text",
+    "required": false
+   },
+   "paid_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "recorded_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "customer_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "proof_url": {
+    "type": "text",
+    "required": false
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "admin_charges": {
+    "type": "numeric",
+    "required": false
+   },
+   "kind": {
+    "type": "text",
+    "required": false
+   },
+   "or_number": {
+    "type": "integer",
+    "required": false
+   },
+   "approval_status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "approved_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "approved_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "approval_note": {
+    "type": "text",
+    "required": false
+   },
+   "idempotency_key": {
+    "type": "text",
+    "required": false
+   },
+   "payment_date": {
+    "type": "date",
+    "required": false
+   }
+  },
+  "permission_modules": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "module_key": {
+    "type": "text",
+    "required": true
+   },
+   "module_name": {
+    "type": "text",
+    "required": true
+   },
+   "category": {
+    "type": "text",
+    "required": true,
+    "default": "BUSINESS"
+   },
+   "feature_key": {
+    "type": "text",
+    "required": false
+   },
+   "sort_order": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   }
+  },
+  "delivery_blocked_dates": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "blocked_date": {
+    "type": "date",
+    "required": true
+   },
+   "reason": {
+    "type": "text",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "delivery_teams": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "vehicle_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "driver_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "helper_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "team_date": {
+    "type": "date",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "purchase_order_items": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "po_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": true
+   },
+   "product_name": {
+    "type": "text",
+    "required": true
+   },
+   "qty_ordered": {
+    "type": "integer",
+    "required": true,
+    "default": 1
+   },
+   "qty_received": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   },
+   "unit_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "sales_order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "size": {
+    "type": "text",
+    "required": false
+   },
+   "color": {
+    "type": "text",
+    "required": false
+   },
+   "quantity": {
+    "type": "numeric",
+    "required": false,
+    "default": 1
+   },
+   "line_total": {
+    "type": "numeric",
+    "required": false
+   },
+   "received_qty": {
+    "type": "numeric",
+    "required": false,
+    "default": 0
+   },
+   "received_date": {
+    "type": "date",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "custom_dimensions": {
+    "type": "text",
+    "required": false
+   },
+   "attachment_url": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "sales_order_amendments": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_number": {
+    "type": "text",
+    "required": false
+   },
+   "customer_name": {
+    "type": "text",
+    "required": false
+   },
+   "category": {
+    "type": "text",
+    "required": true
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "changes": {
+    "type": "jsonb",
+    "required": true
+   },
+   "before_snapshot": {
+    "type": "jsonb",
+    "required": false
+   },
+   "proposed_snapshot": {
+    "type": "jsonb",
+    "required": false
+   },
+   "requested_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "requested_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "requested_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "reviewed_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "reviewed_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "reviewed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "decision_note": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "active_do_snapshot": {
+    "type": "jsonb",
+    "required": false
+   },
+   "expected_so_updated_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "conflict_detected_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "conflict_live_snapshot": {
+    "type": "jsonb",
+    "required": false
+   },
+   "rebase_base_fingerprint": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "rebased_proposed_snapshot": {
+    "type": "jsonb",
+    "required": false
+   },
+   "field_resolutions": {
+    "type": "jsonb",
+    "required": false
+   },
+   "rebased_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "rebased_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "rebased_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "final_applied_snapshot": {
+    "type": "jsonb",
+    "required": false
+   },
+   "superseded_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "superseded_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "superseded_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "rebase_base_snapshot": {
+    "type": "jsonb",
+    "required": false
+   }
+  },
+  "zz_deprecated_global_settings_20260902": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "key": {
+    "type": "text",
+    "required": true
+   },
+   "value": {
+    "type": "text",
+    "required": true
+   },
+   "updated_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "commission_rules": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "role_name": {
+    "type": "text",
+    "required": true
+   },
+   "tier_name": {
+    "type": "text",
+    "required": false
+   },
+   "min_net": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "max_net": {
+    "type": "numeric",
+    "required": false
+   },
+   "rate_pct": {
+    "type": "numeric",
+    "required": true
+   },
+   "incentive_pct": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "payout_day": {
+    "type": "integer",
+    "required": true,
+    "default": 25
+   },
+   "deposit_gate_pct": {
+    "type": "numeric",
+    "required": true,
+    "default": 30
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "updated_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "channel": {
+    "type": "text",
+    "required": false,
+    "default": "branch"
+   }
+  },
+  "commissions": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": true
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "role_name": {
+    "type": "text",
+    "required": true
+   },
+   "net_amount": {
+    "type": "numeric",
+    "required": true
+   },
+   "rate_pct": {
+    "type": "numeric",
+    "required": true
+   },
+   "incentive_pct": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "commission_amt": {
+    "type": "numeric",
+    "required": true
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "deposit_met": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "eligible_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "payout_month": {
+    "type": "date",
+    "required": false
+   },
+   "paid_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "tier_commission_amt": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "clearance_commission_amt": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "product_incentive_amt": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "package_incentive_amt": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "product_incentive_waived": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "product_incentive_waived_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_incentive_waived_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "clawback_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "clawback_reason": {
+    "type": "text",
+    "required": false
+   },
+   "clawback_snapshot": {
+    "type": "jsonb",
+    "required": false
+   }
+  },
+  "delivery_note_items": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "delivery_note_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "sales_order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": false
+   },
+   "product_name": {
+    "type": "text",
+    "required": false
+   },
+   "size": {
+    "type": "text",
+    "required": false
+   },
+   "color": {
+    "type": "text",
+    "required": false
+   },
+   "custom_dimensions": {
+    "type": "text",
+    "required": false
+   },
+   "quantity": {
+    "type": "numeric",
+    "required": false,
+    "default": 1
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "warehouse_zones": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "code": {
+    "type": "text",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": false
+   },
+   "warehouse_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "service_part_claims": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "service_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "supplier_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "part_code": {
+    "type": "text",
+    "required": false
+   },
+   "part_name": {
+    "type": "text",
+    "required": false
+   },
+   "claim_status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "claim_ref": {
+    "type": "text",
+    "required": false
+   },
+   "claimed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "received_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "sales_orders": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_number": {
+    "type": "text",
+    "required": false
+   },
+   "customer_name": {
+    "type": "text",
+    "required": true
+   },
+   "customer_contact": {
+    "type": "text",
+    "required": false
+   },
+   "customer_address": {
+    "type": "text",
+    "required": false
+   },
+   "salesman_name": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "draft"
+   },
+   "subtotal": {
+    "type": "numeric",
+    "required": false,
+    "default": 0
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "delivery_date": {
+    "type": "text",
+    "required": false
+   },
+   "delivery_time_slot": {
+    "type": "text",
+    "required": false
+   },
+   "delivery_type": {
+    "type": "text",
+    "required": false,
+    "default": "Delivery"
+   },
+   "remark": {
+    "type": "text",
+    "required": false
+   },
+   "discount": {
+    "type": "numeric",
+    "required": false,
+    "default": 0
+   },
+   "deposit": {
+    "type": "numeric",
+    "required": false,
+    "default": 0
+   },
+   "payment_method": {
+    "type": "text",
+    "required": false
+   },
+   "customer_signature": {
+    "type": "text",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "country": {
+    "type": "text",
+    "required": false
+   },
+   "gst_rate": {
+    "type": "numeric",
+    "required": false
+   },
+   "gst_amount": {
+    "type": "numeric",
+    "required": false
+   },
+   "gst_waived": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "payment_proofs": {
+    "type": "text",
+    "required": false
+   },
+   "sales_channel": {
+    "type": "text",
+    "required": false,
+    "default": "branch"
+   },
+   "legacy_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "legacy_so_number": {
+    "type": "text",
+    "required": false
+   },
+   "delivery_status": {
+    "type": "text",
+    "required": false
+   },
+   "photo_url": {
+    "type": "text",
+    "required": false
+   },
+   "first_delivery_date": {
+    "type": "date",
+    "required": false
+   },
+   "is_multi_trip": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "planned_trips": {
+    "type": "integer",
+    "required": false,
+    "default": 1
+   },
+   "main_salesman_user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "order_date": {
+    "type": "date",
+    "required": false
+   },
+   "initial_deposit": {
+    "type": "numeric",
+    "required": false
+   },
+   "customer_id_type": {
+    "type": "text",
+    "required": false
+   },
+   "customer_id_no": {
+    "type": "text",
+    "required": false
+   },
+   "customer_email": {
+    "type": "text",
+    "required": false
+   },
+   "delivery_address": {
+    "type": "text",
+    "required": false
+   },
+   "admin_charges": {
+    "type": "numeric",
+    "required": false
+   },
+   "einvoice_requested": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "deposit_or_number": {
+    "type": "integer",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "archived_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "archived_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "archived_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "archive_reason": {
+    "type": "text",
+    "required": false
+   },
+   "internal_remark": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "service_pending": {
+   "id": {
+    "type": "integer",
+    "required": true
+   },
+   "so_number": {
+    "type": "text",
+    "required": false
+   },
+   "driver": {
+    "type": "text",
+    "required": false
+   },
+   "helper": {
+    "type": "text",
+    "required": false
+   },
+   "date": {
+    "type": "date",
+    "required": false
+   },
+   "note": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "Pending"
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "converted_service_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "converted_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "converted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "orders": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "so_number": {
+    "type": "text",
+    "required": false
+   },
+   "customer_name": {
+    "type": "text",
+    "required": false
+   },
+   "address": {
+    "type": "text",
+    "required": false
+   },
+   "contact": {
+    "type": "text",
+    "required": false
+   },
+   "order_date": {
+    "type": "text",
+    "required": false
+   },
+   "salesman": {
+    "type": "text",
+    "required": false
+   },
+   "order_amount": {
+    "type": "numeric",
+    "required": false
+   },
+   "balance": {
+    "type": "numeric",
+    "required": false
+   },
+   "delivery_date": {
+    "type": "text",
+    "required": false
+   },
+   "time_slot": {
+    "type": "text",
+    "required": false
+   },
+   "plate_no": {
+    "type": "text",
+    "required": false
+   },
+   "type": {
+    "type": "text",
+    "required": false
+   },
+   "service_note": {
+    "type": "text",
+    "required": false
+   },
+   "remark": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false
+   },
+   "items": {
+    "type": "jsonb",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "sv_number": {
+    "type": "text",
+    "required": false
+   },
+   "planned_trips": {
+    "type": "integer",
+    "required": false,
+    "default": 1
+   },
+   "first_delivery_date": {
+    "type": "date",
+    "required": false
+   },
+   "is_multi_trip": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "estimated_duration": {
+    "type": "integer",
+    "required": false
+   },
+   "order_area": {
+    "type": "text",
+    "required": false
+   },
+   "photo_url": {
+    "type": "text",
+    "required": false
+   },
+   "linked_so": {
+    "type": "text",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_by_user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "main_salesman_user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "country": {
+    "type": "text",
+    "required": false
+   },
+   "gross_amount": {
+    "type": "numeric",
+    "required": false
+   },
+   "net_amount": {
+    "type": "numeric",
+    "required": false
+   },
+   "is_locked": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "locked_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "locked_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "source": {
+    "type": "text",
+    "required": true,
+    "default": "web"
+   },
+   "telegram_message_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "customer_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "sales_channel": {
+    "type": "text",
+    "required": false,
+    "default": "branch"
+   },
+   "incentive_excluded_ids": {
+    "type": "jsonb",
+    "required": true
+   }
+  },
+  "sales_order_photos": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "url": {
+    "type": "text",
+    "required": true
+   },
+   "storage_path": {
+    "type": "text",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "uploaded_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "uploaded_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "delivery_schedules": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": true
+   },
+   "team_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "scheduled_date": {
+    "type": "date",
+    "required": true
+   },
+   "area": {
+    "type": "text",
+    "required": false
+   },
+   "slot": {
+    "type": "text",
+    "required": false
+   },
+   "sort_order": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "scheduled"
+   },
+   "is_ready": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "delivered_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "source_type": {
+    "type": "text",
+    "required": false,
+    "default": "order"
+   },
+   "source_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "delivery_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "attempt_no": {
+    "type": "integer",
+    "required": false
+   },
+   "failed_reason": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "spec_options": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "label": {
+    "type": "text",
+    "required": true
+   },
+   "value": {
+    "type": "text",
+    "required": true
+   },
+   "is_approved": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "added_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "user_preferences": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "preference_key": {
+    "type": "text",
+    "required": true
+   },
+   "preference_value": {
+    "type": "jsonb",
+    "required": true
+   }
+  },
+  "product_bundles": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "package_price": {
+    "type": "numeric",
+    "required": true
+   },
+   "incentive_type": {
+    "type": "text",
+    "required": true,
+    "default": "fixed"
+   },
+   "incentive_value": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "is_clearance": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "start_date": {
+    "type": "date",
+    "required": false
+   },
+   "end_date": {
+    "type": "date",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "supplier_deliveries": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "do_number": {
+    "type": "text",
+    "required": false
+   },
+   "supplier": {
+    "type": "text",
+    "required": false
+   },
+   "do_date": {
+    "type": "date",
+    "required": false
+   },
+   "photo_url": {
+    "type": "text",
+    "required": false
+   },
+   "supplier_reference": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "Processed"
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "source": {
+    "type": "text",
+    "required": false
+   },
+   "uploaded_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "extracted_payload": {
+    "type": "jsonb",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "sales_order_items": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": false
+   },
+   "product_name": {
+    "type": "text",
+    "required": false
+   },
+   "size": {
+    "type": "text",
+    "required": false
+   },
+   "color": {
+    "type": "text",
+    "required": false
+   },
+   "is_custom": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "custom_dimensions": {
+    "type": "text",
+    "required": false
+   },
+   "quantity": {
+    "type": "numeric",
+    "required": false,
+    "default": 1
+   },
+   "unit_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "unit_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "line_total": {
+    "type": "numeric",
+    "required": false
+   },
+   "attachment_url": {
+    "type": "text",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "item_order_date": {
+    "type": "date",
+    "required": false
+   },
+   "supplier_sent_date": {
+    "type": "date",
+    "required": false
+   },
+   "arrival_date": {
+    "type": "date",
+    "required": false
+   },
+   "supplier_name": {
+    "type": "text",
+    "required": false
+   },
+   "legacy_item_json": {
+    "type": "jsonb",
+    "required": false
+   },
+   "requires_product_review": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "custom_specs": {
+    "type": "jsonb",
+    "required": false
+   },
+   "delivered_qty": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "arrived_at": {
+    "type": "date",
+    "required": false
+   },
+   "delivery_status": {
+    "type": "text",
+    "required": false
+   },
+   "linked_custom_item": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "is_clearance": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "bundle_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "bundle_instance_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "bundle_component_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "arrived_qty": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   }
+  },
+  "delivery_activity": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "so_number": {
+    "type": "text",
+    "required": false
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "trip_no": {
+    "type": "integer",
+    "required": false
+   },
+   "action": {
+    "type": "text",
+    "required": true
+   },
+   "from_date": {
+    "type": "date",
+    "required": false
+   },
+   "to_date": {
+    "type": "date",
+    "required": false
+   },
+   "source": {
+    "type": "text",
+    "required": true
+   },
+   "actor_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "actor_name": {
+    "type": "text",
+    "required": false
+   },
+   "note": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "supplier_lead_times": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "supplier_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "po_created_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "do_received_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "lead_days": {
+    "type": "integer",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "service_trips": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "service_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "trip_number": {
+    "type": "integer",
+    "required": true
+   },
+   "team_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "scheduled_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "completed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "delivery_notes": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "do_number": {
+    "type": "text",
+    "required": false
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "customer_name": {
+    "type": "text",
+    "required": false
+   },
+   "customer_address": {
+    "type": "text",
+    "required": false
+   },
+   "customer_contact": {
+    "type": "text",
+    "required": false
+   },
+   "delivery_date": {
+    "type": "date",
+    "required": false
+   },
+   "warehouse_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "pending"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "customers": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "phone": {
+    "type": "text",
+    "required": false
+   },
+   "email": {
+    "type": "text",
+    "required": false
+   },
+   "address": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "ic_number": {
+    "type": "text",
+    "required": false
+   },
+   "company_name": {
+    "type": "text",
+    "required": false
+   },
+   "credit_balance": {
+    "type": "numeric",
+    "required": false,
+    "default": 0
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "tags": {
+    "type": "text[]",
+    "required": false
+   },
+   "ic_number_normalized": {
+    "type": "text",
+    "required": false
+   },
+   "phone_normalized": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "duration_history": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "item_type": {
+    "type": "text",
+    "required": false
+   },
+   "item_keywords": {
+    "type": "text",
+    "required": false
+   },
+   "area": {
+    "type": "text",
+    "required": false
+   },
+   "duration_minutes": {
+    "type": "integer",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "delivery_route_orders": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "route_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "sequence_no": {
+    "type": "integer",
+    "required": false,
+    "default": 1
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "scheduled_time_range": {
+    "type": "text",
+    "required": false
+   },
+   "route_note": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "features": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "feature_key": {
+    "type": "text",
+    "required": true
+   },
+   "feature_name": {
+    "type": "text",
+    "required": true
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "is_premium": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "sort_order": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   }
+  },
+  "organization_suppliers": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "updated_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "share_enabled": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "contact": {
+    "type": "text",
+    "required": false
+   },
+   "phone": {
+    "type": "text",
+    "required": false
+   },
+   "email": {
+    "type": "text",
+    "required": false
+   },
+   "address": {
+    "type": "text",
+    "required": false
+   },
+   "version": {
+    "type": "integer",
+    "required": true,
+    "default": 1
+   }
+  },
+  "companies": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": true
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "country": {
+    "type": "text",
+    "required": true,
+    "default": "MY"
+   },
+   "gst_divisor": {
+    "type": "numeric",
+    "required": true,
+    "default": 1
+   },
+   "organization_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "logo_url": {
+    "type": "text",
+    "required": false
+   },
+   "brand_color": {
+    "type": "text",
+    "required": false
+   },
+   "gst_number": {
+    "type": "text",
+    "required": false
+   },
+   "invoice_template": {
+    "type": "text",
+    "required": false
+   },
+   "email_settings": {
+    "type": "jsonb",
+    "required": false
+   },
+   "whatsapp_sender": {
+    "type": "text",
+    "required": false
+   },
+   "telegram_bot_token": {
+    "type": "text",
+    "required": false
+   },
+   "version": {
+    "type": "integer",
+    "required": false,
+    "default": 1
+   },
+   "product_catalog_group_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "org_sharing_enabled": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "catalogue_group_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "custom_item_self_service_enabled": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "clearance_commission_enabled": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "driver_commission_rate": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "commission_director_user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "commission_director_rate": {
+    "type": "numeric",
+    "required": false
+   }
+  },
+  "packing_qr_scans": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "packing_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "scanned_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "scan_type": {
+    "type": "text",
+    "required": true
+   },
+   "is_valid": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "warning_code": {
+    "type": "text",
+    "required": false
+   },
+   "scanned_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "service_requests": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "service_type": {
+    "type": "integer",
+    "required": false
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "so_number": {
+    "type": "text",
+    "required": false
+   },
+   "customer_name": {
+    "type": "text",
+    "required": false
+   },
+   "customer_phone": {
+    "type": "text",
+    "required": false
+   },
+   "customer_address": {
+    "type": "text",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "service_date": {
+    "type": "date",
+    "required": false
+   },
+   "delivery_date": {
+    "type": "text",
+    "required": false
+   },
+   "schedule_tbc": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "items": {
+    "type": "jsonb",
+    "required": false
+   },
+   "requested_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "requested_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "decision_note": {
+    "type": "text",
+    "required": false
+   },
+   "decided_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "decided_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "created_service_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "amount": {
+    "type": "numeric",
+    "required": false
+   }
+  },
+  "delivery_date_requests": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "so_number": {
+    "type": "text",
+    "required": false
+   },
+   "customer_name": {
+    "type": "text",
+    "required": false
+   },
+   "requested_date": {
+    "type": "date",
+    "required": true
+   },
+   "remark": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "requested_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "requested_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "requested_via": {
+    "type": "text",
+    "required": true,
+    "default": "web"
+   },
+   "reviewed_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "reviewed_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "reviewed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "decision_note": {
+    "type": "text",
+    "required": false
+   },
+   "alternative_dates": {
+    "type": "jsonb",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "approval_required": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "original_date": {
+    "type": "date",
+    "required": false
+   },
+   "original_team_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "original_team_name": {
+    "type": "text",
+    "required": false
+   },
+   "original_trip_no": {
+    "type": "integer",
+    "required": false
+   },
+   "schedule_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "source_field": {
+    "type": "text",
+    "required": true,
+    "default": "delivery_date_widget"
+   },
+   "applied_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "auto_approved": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "delivery_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "link_group_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "payment_allocations": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "payment_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": true
+   },
+   "amount": {
+    "type": "numeric",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "services": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "service_type": {
+    "type": "integer",
+    "required": true
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "open"
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "assigned_to": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "closed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "source": {
+    "type": "text",
+    "required": false,
+    "default": "manual"
+   },
+   "source_pending_id": {
+    "type": "integer",
+    "required": false
+   },
+   "legacy_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "original_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "customer_name": {
+    "type": "text",
+    "required": false
+   },
+   "customer_phone": {
+    "type": "text",
+    "required": false
+   },
+   "customer_address": {
+    "type": "text",
+    "required": false
+   },
+   "issue_description": {
+    "type": "text",
+    "required": false
+   },
+   "priority": {
+    "type": "text",
+    "required": false,
+    "default": "normal"
+   },
+   "due_date": {
+    "type": "date",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "service_date": {
+    "type": "date",
+    "required": false
+   },
+   "schedule_tbc": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "amount": {
+    "type": "numeric",
+    "required": false
+   }
+  },
+  "do_counters": {
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "period": {
+    "type": "text",
+    "required": true
+   },
+   "seq": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   }
+  },
+  "organization_suppliers_history": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_supplier_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "changed_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "changed_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "old_name": {
+    "type": "text",
+    "required": false
+   },
+   "old_code": {
+    "type": "text",
+    "required": false
+   },
+   "old_notes": {
+    "type": "text",
+    "required": false
+   },
+   "old_contact": {
+    "type": "text",
+    "required": false
+   },
+   "old_phone": {
+    "type": "text",
+    "required": false
+   },
+   "old_email": {
+    "type": "text",
+    "required": false
+   },
+   "old_address": {
+    "type": "text",
+    "required": false
+   },
+   "old_is_active": {
+    "type": "boolean",
+    "required": false
+   },
+   "old_share_enabled": {
+    "type": "boolean",
+    "required": false
+   },
+   "old_version": {
+    "type": "integer",
+    "required": false
+   }
+  },
+  "order_item_packings": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "do_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "qty_packed": {
+    "type": "integer",
+    "required": true,
+    "default": 1
+   },
+   "qr_code": {
+    "type": "text",
+    "required": true
+   },
+   "qr_type": {
+    "type": "text",
+    "required": true,
+    "default": "order_unit"
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "packed"
+   },
+   "zone_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "rack_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "rack_level": {
+    "type": "integer",
+    "required": false
+   },
+   "packed_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "packed_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "put_away_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "picked_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "loaded_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "employees": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "employee_code": {
+    "type": "text",
+    "required": false
+   },
+   "job_title": {
+    "type": "text",
+    "required": false
+   },
+   "department_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "manager_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "hire_date": {
+    "type": "date",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "deleted_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "product_bundle_items": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "bundle_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "quantity": {
+    "type": "numeric",
+    "required": true,
+    "default": 1
+   },
+   "sort_order": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   }
+  },
+  "do_review": {
+   "id": {
+    "type": "integer",
+    "required": true
+   },
+   "do_number": {
+    "type": "text",
+    "required": false
+   },
+   "supplier": {
+    "type": "text",
+    "required": false
+   },
+   "do_date": {
+    "type": "date",
+    "required": false
+   },
+   "so_number": {
+    "type": "text",
+    "required": false
+   },
+   "item_code": {
+    "type": "text",
+    "required": false
+   },
+   "item_name": {
+    "type": "text",
+    "required": false
+   },
+   "quantity": {
+    "type": "text",
+    "required": false
+   },
+   "reason": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "Pending"
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "supplier_delivery_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "matched_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "sales_order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "arrival_date": {
+    "type": "date",
+    "required": false
+   },
+   "resolved_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "resolved_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "delivery_vehicle_leaders": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "plate_pattern": {
+    "type": "text",
+    "required": true
+   },
+   "leader_user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "system_events": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "event_type": {
+    "type": "text",
+    "required": true
+   },
+   "entity": {
+    "type": "text",
+    "required": false
+   },
+   "entity_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "payload": {
+    "type": "jsonb",
+    "required": false
+   },
+   "ip": {
+    "type": "text",
+    "required": false
+   },
+   "device": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "branches": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": true
+   },
+   "address": {
+    "type": "text",
+    "required": false
+   },
+   "phone": {
+    "type": "text",
+    "required": false
+   },
+   "active": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "commission_override_user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "order_number_prefix": {
+    "type": "text",
+    "required": false
+   },
+   "order_number_start": {
+    "type": "integer",
+    "required": false
+   },
+   "commission_override_rate": {
+    "type": "numeric",
+    "required": false
+   },
+   "order_number_next": {
+    "type": "bigint",
+    "required": false
+   }
+  },
+  "products": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "supplier_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "category_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "code": {
+    "type": "text",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "unit_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "unit_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "is_standard": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "reorder_point": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "color": {
+    "type": "text",
+    "required": false
+   },
+   "size": {
+    "type": "text",
+    "required": false
+   },
+   "is_customizable": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "organization_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "organization_product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "organization_category_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "price_override": {
+    "type": "numeric",
+    "required": false
+   },
+   "cost_override": {
+    "type": "numeric",
+    "required": false
+   },
+   "review_status": {
+    "type": "text",
+    "required": true,
+    "default": "approved"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "is_clearance": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "packages_per_unit": {
+    "type": "integer",
+    "required": true,
+    "default": 1
+   }
+  },
+  "company_setting_extras": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "setting_key": {
+    "type": "text",
+    "required": true
+   },
+   "setting_value": {
+    "type": "jsonb",
+    "required": true
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "suppliers": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": false
+   },
+   "contact": {
+    "type": "text",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "cost_divisor": {
+    "type": "numeric",
+    "required": false
+   },
+   "color_mode": {
+    "type": "text",
+    "required": true,
+    "default": "combined"
+   },
+   "organization_supplier_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "organization_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "legacy_order_migration_log": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "legacy_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "legacy_so_number": {
+    "type": "text",
+    "required": false
+   },
+   "new_sales_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true
+   },
+   "message": {
+    "type": "text",
+    "required": false
+   },
+   "migrated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "permissions": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "code": {
+    "type": "text",
+    "required": true
+   },
+   "label": {
+    "type": "text",
+    "required": true
+   },
+   "is_critical": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   }
+  },
+  "warehouse_racks": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "zone_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "rack_code": {
+    "type": "text",
+    "required": true
+   },
+   "levels": {
+    "type": "integer",
+    "required": true,
+    "default": 1
+   },
+   "qr_code": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "delivery_orders": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "do_number": {
+    "type": "text",
+    "required": true
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "customer_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "delivery_address": {
+    "type": "text",
+    "required": false
+   },
+   "contact": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "draft"
+   },
+   "pick_status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "delivery_date": {
+    "type": "date",
+    "required": false
+   },
+   "customer_confirmed": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "payment_collected": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "collected_amount": {
+    "type": "numeric",
+    "required": false
+   },
+   "signature_url": {
+    "type": "text",
+    "required": false
+   },
+   "remark": {
+    "type": "text",
+    "required": false
+   },
+   "pod": {
+    "type": "jsonb",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "completed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "superseded_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "superseded_by_do_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "supersedes_do_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "notification_preferences": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "notification_key": {
+    "type": "text",
+    "required": true
+   },
+   "channel": {
+    "type": "text",
+    "required": false,
+    "default": "in_app"
+   },
+   "is_enabled": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   }
+  },
+  "warehouses": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "type": {
+    "type": "text",
+    "required": false,
+    "default": "warehouse"
+   },
+   "address": {
+    "type": "text",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "pic": {
+    "type": "text",
+    "required": false
+   },
+   "contact": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "approval_rules": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "action_key": {
+    "type": "text",
+    "required": true
+   },
+   "condition_label": {
+    "type": "text",
+    "required": true
+   },
+   "required_role_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "required_user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "min_amount": {
+    "type": "numeric",
+    "required": false
+   },
+   "max_amount": {
+    "type": "numeric",
+    "required": false
+   },
+   "sort_order": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "statement_uploads": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "type": {
+    "type": "text",
+    "required": true,
+    "default": "bank"
+   },
+   "filename": {
+    "type": "text",
+    "required": false
+   },
+   "file_url": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "processing"
+   },
+   "total_transactions": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "matched_count": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "unmatched_count": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "uploaded_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "service_legs": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "service_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "leg_order": {
+    "type": "integer",
+    "required": true
+   },
+   "from_location": {
+    "type": "text",
+    "required": true
+   },
+   "to_location": {
+    "type": "text",
+    "required": true
+   },
+   "team_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "scheduled_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "completed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "leg_type": {
+    "type": "text",
+    "required": false,
+    "default": "pickup"
+   },
+   "scheduled_date": {
+    "type": "date",
+    "required": false
+   },
+   "legacy_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "delivery_schedule_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "statement_transactions": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "upload_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "transaction_date": {
+    "type": "date",
+    "required": false
+   },
+   "amount": {
+    "type": "numeric",
+    "required": true
+   },
+   "reference": {
+    "type": "text",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "match_status": {
+    "type": "text",
+    "required": false,
+    "default": "unmatched"
+   },
+   "matched_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "matched_payment_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "order_amendments": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "order_number": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "before_data": {
+    "type": "jsonb",
+    "required": false
+   },
+   "after_data": {
+    "type": "jsonb",
+    "required": false
+   },
+   "changes": {
+    "type": "jsonb",
+    "required": false
+   },
+   "requested_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "requested_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "decided_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "decided_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "decided_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "decision_note": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "departments": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "deleted_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "order_items": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": true
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": true
+   },
+   "product_name": {
+    "type": "text",
+    "required": true
+   },
+   "qty": {
+    "type": "integer",
+    "required": true,
+    "default": 1
+   },
+   "unit_price": {
+    "type": "numeric",
+    "required": true
+   },
+   "unit_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "subtotal": {
+    "type": "numeric",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "company_telegram_destinations": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "notification_type": {
+    "type": "text",
+    "required": true
+   },
+   "chat_id": {
+    "type": "text",
+    "required": true
+   },
+   "enabled": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "zz_deprecated_role_permissions_20260902": {
+   "role_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "permission_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "granted": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   }
+  },
+  "zz_deprecated_invoices_20260902": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "do_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "invoice_number": {
+    "type": "text",
+    "required": true
+   },
+   "total_cost": {
+    "type": "numeric",
+    "required": true
+   },
+   "invoice_date": {
+    "type": "date",
+    "required": true
+   },
+   "image_url": {
+    "type": "text",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "zz_deprecated_activity_log_20260902": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "action": {
+    "type": "text",
+    "required": true
+   },
+   "source": {
+    "type": "text",
+    "required": true
+   },
+   "table_name": {
+    "type": "text",
+    "required": false
+   },
+   "record_id": {
+    "type": "text",
+    "required": false
+   },
+   "old_value": {
+    "type": "jsonb",
+    "required": false
+   },
+   "new_value": {
+    "type": "jsonb",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "impersonation_sessions": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "master_user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "target_user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "started_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "ended_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "reason": {
+    "type": "text",
+    "required": false
+   },
+   "ip_address": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "permission_audit_log": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "target_user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "action_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "changed_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "change_type": {
+    "type": "text",
+    "required": true
+   },
+   "old_value": {
+    "type": "jsonb",
+    "required": false
+   },
+   "new_value": {
+    "type": "jsonb",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "organization_products_history": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_product_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "changed_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "changed_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "old_code": {
+    "type": "text",
+    "required": false
+   },
+   "old_name": {
+    "type": "text",
+    "required": false
+   },
+   "old_size": {
+    "type": "text",
+    "required": false
+   },
+   "old_color": {
+    "type": "text",
+    "required": false
+   },
+   "old_brand": {
+    "type": "text",
+    "required": false
+   },
+   "old_description": {
+    "type": "text",
+    "required": false
+   },
+   "old_unit_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "old_unit_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "old_base_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "old_base_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "old_is_active": {
+    "type": "boolean",
+    "required": false
+   },
+   "old_share_enabled": {
+    "type": "boolean",
+    "required": false
+   },
+   "old_is_customizable": {
+    "type": "boolean",
+    "required": false
+   },
+   "old_version": {
+    "type": "integer",
+    "required": false
+   }
+  },
+  "organizations": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": false
+   },
+   "logo_url": {
+    "type": "text",
+    "required": false
+   },
+   "settings": {
+    "type": "jsonb",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "deleted_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "slug": {
+    "type": "text",
+    "required": false
+   },
+   "billing_plan": {
+    "type": "text",
+    "required": false,
+    "default": "free"
+   },
+   "max_companies": {
+    "type": "integer",
+    "required": false,
+    "default": 10
+   },
+   "max_users": {
+    "type": "integer",
+    "required": false,
+    "default": 50
+   }
+  },
+  "commission_line_breakdown": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "commission_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "sales_order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": false
+   },
+   "product_name": {
+    "type": "text",
+    "required": false
+   },
+   "bundle_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "is_clearance": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "line_sell": {
+    "type": "numeric",
+    "required": false
+   },
+   "line_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "margin_pct": {
+    "type": "numeric",
+    "required": false
+   },
+   "clearance_level": {
+    "type": "text",
+    "required": false
+   },
+   "tier_commission_amt": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "clearance_share_commission_amt": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "delivery_routes": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "delivery_date": {
+    "type": "date",
+    "required": true
+   },
+   "lorry_plate": {
+    "type": "text",
+    "required": false
+   },
+   "driver_name": {
+    "type": "text",
+    "required": false
+   },
+   "area": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "Pending"
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "vehicle_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "stock_movements": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "warehouse_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "type": {
+    "type": "text",
+    "required": true
+   },
+   "quantity": {
+    "type": "numeric",
+    "required": true
+   },
+   "reference_type": {
+    "type": "text",
+    "required": false
+   },
+   "reference_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "catalogue_import_rows": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "job_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "raw_data": {
+    "type": "jsonb",
+    "required": true
+   },
+   "product_code": {
+    "type": "text",
+    "required": false
+   },
+   "product_name": {
+    "type": "text",
+    "required": false
+   },
+   "unit_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "unit_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "action": {
+    "type": "text",
+    "required": true,
+    "default": "import"
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "color": {
+    "type": "text",
+    "required": false
+   },
+   "supplier_name": {
+    "type": "text",
+    "required": false
+   },
+   "size": {
+    "type": "text",
+    "required": false
+   },
+   "category_name": {
+    "type": "text",
+    "required": false
+   },
+   "is_customizable": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   }
+  },
+  "zz_deprecated_supplier_company_access_20260902": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_supplier_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "supplier_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "company_features": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "feature_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "enabled": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "enabled_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "expires_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "organization_product_suppliers": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_product_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "organization_supplier_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "priority": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "is_preferred": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "is_default": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "lead_time_days": {
+    "type": "integer",
+    "required": false
+   },
+   "moq": {
+    "type": "integer",
+    "required": false
+   },
+   "last_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "last_cost_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "zz_deprecated_inventory_movements_20260902": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "movement_type": {
+    "type": "text",
+    "required": true
+   },
+   "qty": {
+    "type": "integer",
+    "required": true
+   },
+   "reference_type": {
+    "type": "text",
+    "required": false
+   },
+   "reference_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "zone_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "rack_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "rack_level": {
+    "type": "integer",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "zz_deprecated_product_company_access_20260902": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_product_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "local_code": {
+    "type": "text",
+    "required": false
+   },
+   "cost_override": {
+    "type": "numeric",
+    "required": false
+   },
+   "price_override": {
+    "type": "numeric",
+    "required": false
+   },
+   "category_override": {
+    "type": "uuid",
+    "required": false
+   },
+   "supplier_override": {
+    "type": "uuid",
+    "required": false
+   },
+   "local_notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "catalogue_groups": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "inventory": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "on_hand": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   },
+   "allocated": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   },
+   "available": {
+    "type": "integer",
+    "required": false
+   },
+   "zone_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "rack_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "rack_level": {
+    "type": "integer",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "reserved_qty": {
+    "type": "numeric",
+    "required": false,
+    "default": 0
+   }
+  },
+  "organization_products": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "code": {
+    "type": "text",
+    "required": false
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "category_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "organization_supplier_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "brand": {
+    "type": "text",
+    "required": false
+   },
+   "base_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "base_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "size": {
+    "type": "text",
+    "required": false
+   },
+   "color": {
+    "type": "text",
+    "required": false
+   },
+   "dimensions": {
+    "type": "text",
+    "required": false
+   },
+   "specification": {
+    "type": "text",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "image_url": {
+    "type": "text",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "barcode": {
+    "type": "text",
+    "required": false
+   },
+   "share_enabled": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "unit_cost": {
+    "type": "numeric",
+    "required": false
+   },
+   "unit_price": {
+    "type": "numeric",
+    "required": false
+   },
+   "is_customizable": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "version": {
+    "type": "integer",
+    "required": true,
+    "default": 1
+   }
+  },
+  "user_branch_access": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "is_primary": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "service_request_photos": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "request_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "url": {
+    "type": "text",
+    "required": true
+   },
+   "storage_path": {
+    "type": "text",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "uploaded_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "uploaded_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "delivery_commissions": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "delivery_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "driver_user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "base_amount": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "rate_pct": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "commission_amt": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "eligible"
+   },
+   "payout_month": {
+    "type": "date",
+    "required": false
+   },
+   "reversed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "reversal_reason": {
+    "type": "text",
+    "required": false
+   },
+   "paid_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "earner_type": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "company_settings": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "base_address": {
+    "type": "text",
+    "required": false
+   },
+   "base_lat": {
+    "type": "numeric",
+    "required": false
+   },
+   "base_lng": {
+    "type": "numeric",
+    "required": false
+   },
+   "work_start": {
+    "type": "time without time zone",
+    "required": false,
+    "default": "09:00:00"
+   },
+   "work_end": {
+    "type": "time without time zone",
+    "required": false,
+    "default": "20:00:00"
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "company_name": {
+    "type": "text",
+    "required": false
+   },
+   "registration_no": {
+    "type": "text",
+    "required": false
+   },
+   "address": {
+    "type": "text",
+    "required": false
+   },
+   "hotline": {
+    "type": "text",
+    "required": false
+   },
+   "bank_account": {
+    "type": "text",
+    "required": false
+   },
+   "branches_display": {
+    "type": "text",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "countries": {
+    "type": "jsonb",
+    "required": false
+   },
+   "sales_channels": {
+    "type": "text",
+    "required": false
+   },
+   "logo_url": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "user_company_access": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "role_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "department_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "is_default": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "deleted_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "users": {
+   "id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "email": {
+    "type": "text",
+    "required": true
+   },
+   "role": {
+    "type": "text",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "telegram_id": {
+    "type": "text",
+    "required": false
+   },
+   "salesman_name": {
+    "type": "text",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "driver_commission_rate": {
+    "type": "numeric",
+    "required": false
+   },
+   "override_commission_rate": {
+    "type": "numeric",
+    "required": false
+   }
+  },
+  "delivery_vehicles": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "driver_name": {
+    "type": "text",
+    "required": false
+   },
+   "vehicle_plate": {
+    "type": "text",
+    "required": true
+   },
+   "vehicle_type": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": false,
+    "default": "Active"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   }
+  },
+  "item_arrival_events": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "sales_order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "legacy_order_id": {
+    "type": "bigint",
+    "required": false
+   },
+   "legacy_so_number": {
+    "type": "text",
+    "required": false
+   },
+   "event_type": {
+    "type": "text",
+    "required": true
+   },
+   "source": {
+    "type": "text",
+    "required": true
+   },
+   "previous_arrived_at": {
+    "type": "date",
+    "required": false
+   },
+   "new_arrived_at": {
+    "type": "date",
+    "required": false
+   },
+   "previous_arrived_qty": {
+    "type": "numeric",
+    "required": false
+   },
+   "new_arrived_qty": {
+    "type": "numeric",
+    "required": false
+   },
+   "qty_delta": {
+    "type": "numeric",
+    "required": false
+   },
+   "supplier_delivery_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "do_review_id": {
+    "type": "integer",
+    "required": false
+   },
+   "actor_user_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "actor_name": {
+    "type": "text",
+    "required": false
+   },
+   "reason": {
+    "type": "text",
+    "required": false
+   },
+   "metadata": {
+    "type": "jsonb",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "delivery_order_items": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "delivery_order_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "sales_order_item_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "product_code": {
+    "type": "text",
+    "required": false
+   },
+   "product_name": {
+    "type": "text",
+    "required": false
+   },
+   "size": {
+    "type": "text",
+    "required": false
+   },
+   "color": {
+    "type": "text",
+    "required": false
+   },
+   "quantity": {
+    "type": "numeric",
+    "required": true
+   },
+   "delivered_qty": {
+    "type": "numeric",
+    "required": true,
+    "default": 0
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "supplier_name": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "roles": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "label": {
+    "type": "text",
+    "required": true
+   },
+   "is_system": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "role_key": {
+    "type": "text",
+    "required": false
+   },
+   "role_name": {
+    "type": "text",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "level": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "deleted_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "deleted_by": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "role_permission_templates": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "role_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "action_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "allowed": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "scope": {
+    "type": "text",
+    "required": false
+   }
+  },
+  "zz_deprecated_notifications_20260902": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "recipient_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "event_type": {
+    "type": "text",
+    "required": true
+   },
+   "title": {
+    "type": "text",
+    "required": true
+   },
+   "body": {
+    "type": "text",
+    "required": true
+   },
+   "reference_type": {
+    "type": "text",
+    "required": false
+   },
+   "reference_id": {
+    "type": "text",
+    "required": false
+   },
+   "is_read": {
+    "type": "boolean",
+    "required": true,
+    "default": false
+   },
+   "read_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "service_photos": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "service_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "url": {
+    "type": "text",
+    "required": true
+   },
+   "storage_path": {
+    "type": "text",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "uploaded_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "uploaded_by_name": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "user_company_roles": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "user_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "branch_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "role": {
+    "type": "text",
+    "required": true
+   },
+   "active": {
+    "type": "boolean",
+    "required": true,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   }
+  },
+  "organization_categories": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "organization_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "parent_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "spec_labels": {
+    "type": "jsonb",
+    "required": false
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "catalogue_group_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "product_categories": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "name": {
+    "type": "text",
+    "required": true
+   },
+   "parent_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "spec_labels": {
+    "type": "jsonb",
+    "required": false
+   },
+   "organization_category_id": {
+    "type": "uuid",
+    "required": false
+   }
+  },
+  "purchase_orders": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "supplier_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "po_number": {
+    "type": "text",
+    "required": true
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "draft"
+   },
+   "ordered_at": {
+    "type": "date",
+    "required": true,
+    "default": "CURRENT_DATE"
+   },
+   "expected_at": {
+    "type": "date",
+    "required": false
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "sales_order_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "expected_date": {
+    "type": "date",
+    "required": false
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   }
+  },
+  "permission_actions": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "module_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "action_key": {
+    "type": "text",
+    "required": true
+   },
+   "action_name": {
+    "type": "text",
+    "required": true
+   },
+   "description": {
+    "type": "text",
+    "required": false
+   },
+   "supports_scope": {
+    "type": "boolean",
+    "required": false,
+    "default": false
+   },
+   "sort_order": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "is_active": {
+    "type": "boolean",
+    "required": false,
+    "default": true
+   }
+  },
+  "service_items": {
+   "id": {
+    "type": "bigint",
+    "required": true
+   },
+   "service_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "item_no": {
+    "type": "integer",
+    "required": false
+   },
+   "description": {
+    "type": "text",
+    "required": true
+   },
+   "action_type": {
+    "type": "smallint",
+    "required": true,
+    "default": 2
+   },
+   "quantity": {
+    "type": "numeric",
+    "required": false,
+    "default": 1
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "notes": {
+    "type": "text",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "updated_at": {
+    "type": "timestamp with time zone",
+    "required": false,
+    "default": "now()"
+   },
+   "arrival_date": {
+    "type": "date",
+    "required": false
+   }
+  },
+  "catalogue_import_jobs": {
+   "id": {
+    "type": "uuid",
+    "required": true,
+    "default": "gen_random_uuid()"
+   },
+   "company_id": {
+    "type": "uuid",
+    "required": true
+   },
+   "supplier_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "category_id": {
+    "type": "uuid",
+    "required": false
+   },
+   "source_type": {
+    "type": "text",
+    "required": true
+   },
+   "source_url": {
+    "type": "text",
+    "required": false
+   },
+   "status": {
+    "type": "text",
+    "required": true,
+    "default": "pending"
+   },
+   "ai_raw_output": {
+    "type": "jsonb",
+    "required": false
+   },
+   "rows_imported": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   },
+   "rows_skipped": {
+    "type": "integer",
+    "required": true,
+    "default": 0
+   },
+   "created_by": {
+    "type": "uuid",
+    "required": true
+   },
+   "reviewed_by": {
+    "type": "uuid",
+    "required": false
+   },
+   "created_at": {
+    "type": "timestamp with time zone",
+    "required": true,
+    "default": "now()"
+   },
+   "reviewed_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "pages_total": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "pages_processed": {
+    "type": "integer",
+    "required": false,
+    "default": 0
+   },
+   "parse_method": {
+    "type": "text",
+    "required": false
+   },
+   "error_message": {
+    "type": "text",
+    "required": false
+   },
+   "started_at": {
+    "type": "timestamp with time zone",
+    "required": false
+   },
+   "storage_path": {
+    "type": "text",
+    "required": false
+   },
+   "cost_divisor": {
+    "type": "numeric",
+    "required": false
+   },
+   "color_mode": {
+    "type": "text",
+    "required": false
+   },
+   "organization_category_id": {
+    "type": "uuid",
+    "required": false
+   }
+  }
+ },
+ "rpcs": [
+  "_amendment_canonical_fields_changed",
+  "_finance_apply_ledger",
+  "_finance_lock_sales_orders",
+  "_finance_resolve_sales_order",
+  "amend_pending_payment",
+  "apply_active_do_amendment",
+  "apply_canonical_delivery_date",
+  "apply_sales_order_amendment",
+  "approve_allocated_payment",
+  "complete_delivery_order",
+  "create_canonical_sales_order",
+  "create_service_case",
+  "fn_compute_net",
+  "get_my_company_id",
+  "next_do_number",
+  "record_allocated_payment",
+  "reject_allocated_payment",
+  "reverse_allocated_payment",
+  "show_limit",
+  "show_trgm",
+  "update_org_product_master",
+  "update_org_supplier_master",
+  "withdraw_pending_payment"
+ ]
+}

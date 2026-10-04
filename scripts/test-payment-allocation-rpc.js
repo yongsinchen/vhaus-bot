@@ -106,7 +106,18 @@ async function cleanup() {
   for (const id of created.customers) await admin.from("customers").delete().eq("id", id);
   for (const uid of created.authUsers) { await admin.from("users").delete().eq("id", uid); await admin.auth.admin.deleteUser(uid); }
   for (const id of created.companies) await admin.from("branches").delete().eq("company_id", id); // auto-created default branch
-  for (const id of created.companies) await admin.from("companies").delete().eq("id", id);
+  // A default branch can be created by an async trigger fractionally after
+  // company creation — retry once before giving up, so a slow trigger can't
+  // leave an orphaned branch FK blocking company deletion.
+  for (const id of created.companies) {
+    let { error } = await admin.from("companies").delete().eq("id", id);
+    if (error) {
+      await new Promise(r => setTimeout(r, 500));
+      await admin.from("branches").delete().eq("company_id", id);
+      ({ error } = await admin.from("companies").delete().eq("id", id));
+      if (error) console.error(`cleanup: company ${id} still could not be deleted: ${error.message}`);
+    }
+  }
 }
 
 (async () => {

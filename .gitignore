@@ -4,3 +4,14 @@ scripts/link-*-report-*.json
 scripts/link-organization-product-suppliers-report-*.json
 scripts/link-organization-categories-report-*.json
 scripts/backfill-*.json
+# generated one-off reports (contain production ids / data — never commit; evidence is kept locally)
+scripts/audit-data-consistency-*.json
+scripts/audit-org-product-conflicts-*.json
+scripts/*-dry-[0-9]*.json
+scripts/*-live-[0-9]*.json
+scripts/inspect-*-[0-9]*.json
+scripts/orphaned-org-products-*.csv
+scripts/orphaned-org-products-*.json
+scripts/recompute-order-balances-*.json
+# local editor / dev-server workspace config
+.claude/
