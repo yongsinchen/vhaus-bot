@@ -12278,6 +12278,17 @@ app.get("/delivery-workbench/services", ...requirePerm(PERMS.SERVICE_VIEW), asyn
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /delivery-workbench/tbc — every live order / active DO whose effective
+// delivery date is TBC (lib/delivery-workbench listTbcWork). `count` is the
+// length of the same list — one rule for both.
+app.get("/delivery-workbench/tbc", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const entries = await workbench.listTbcWork({ supabase, companyId: cid });
+    res.json({ entries, count: entries.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /delivery-workbench/search?q= — DO / SO / Service / customer / phone /
 // address / item, across ALL dates (active and historical). Each record type
 // is returned only if the caller may read it (DELIVERY_ORDER_VIEW / SERVICE_VIEW);
@@ -12479,70 +12490,86 @@ app.get("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async
 });
 
 // PATCH /delivery-orders/:id — Phase 1 safe fields only
+// The ONE path that sets a Delivery Order's own date (PATCH /delivery-orders/:id,
+// and Edit Order → TBC / TBC → date for an SO with exactly one active DO —
+// PUT /sales-orders/:id). Two halves so a caller can validate before it writes
+// anything else:
+//   deliveryOrderDateBlock() → { status, body } when the DO's date may not change, else null
+//   applyDeliveryOrderPatch() → the write (+ unassign / back to draft on a date change)
+async function deliveryOrderDateBlock(dord, companyId, { dateChanging = true } = {}) {
+  if (["completed", "cancelled"].includes(dord.status)) {
+    return { status: 400, body: { error: `Cannot edit a ${dord.status} delivery order` } };
+  }
+  // P1-1 stabilization: a superseded DO is retired regardless of its status
+  // column — reschedule (which also re-homes its schedule/team, see below)
+  // must never operate on it. See POST /delivery-schedules's identical guard.
+  if (dord.superseded_at) {
+    return { status: 409, body: {
+      error: "This delivery order was superseded and cannot be rescheduled — see the replacement Delivery Order.",
+      code: "delivery_order_superseded",
+      superseded_by_do_id: dord.superseded_by_do_id || null,
+    } };
+  }
+  // LOCK RULE (same vocabulary as DELETE /delivery-schedules/:id and the approval path's
+  // DO_RESCHEDULE_BLOCKED_STATUSES): once a delivery is out for delivery / arrived / delivered, moving its
+  // date would delete its live schedule row mid-route. Remark / confirmation edits stay allowed.
+  if (dateChanging) {
+    const { data: liveScheds } = await supabase.from("delivery_schedules").select("status").eq("delivery_order_id", dord.id).eq("company_id", companyId);
+    const lockedBy = isLockedScheduleStatus(dord.status) ? dord.status : (liveScheds || []).map(x => x.status).find(st => isLockedScheduleStatus(st) && String(st).toLowerCase() !== "delivered");
+    if (lockedBy) return { status: 409, body: { error: `Cannot reschedule — the delivery is already ${lockedBy}`, code: "delivery_order_locked" } };
+  }
+  return null;
+}
+async function applyDeliveryOrderPatch(dord, patch, actorId) {
+  const dateChanged = patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date;
+  // Rescheduling the delivery date UNASSIGNS the DO. Teams are per-date, so a
+  // stop can't stay on its old team when the date moves — the old team doesn't
+  // exist on the new date and the stop would vanish from the board. Instead we
+  // detach it from the team and return it to the unassigned pool for the new
+  // date (or TBC when the date is cleared): set it back to draft so it shows
+  // in that date's pool, ready to be assigned to a team running that day.
+  if (dateChanged && dord.status !== "draft") patch.status = "draft";
+
+  const { data, error } = await supabase.from("delivery_orders")
+    .update(patch).eq("id", dord.id).select("*, delivery_order_items(*)").single();
+  if (error) throw error;
+
+  if (dateChanged) {
+    await logDoEvent(dord.id, "rescheduled", { from: dord.delivery_date, to: patch.delivery_date }, actorId);
+
+    // Remove the team assignment: delete every non-terminal schedule attempt
+    // for this DO (the rows that pin it to a team on the old date). Terminal
+    // attempts (delivered/failed) are history and must not be touched. With no
+    // schedule row and status back to draft, the DO reappears in the pool for
+    // its new date — team unknown — instead of being stranded on a team that
+    // only exists on the old date.
+    const { error: unassignErr } = await supabase.from("delivery_schedules")
+      .delete()
+      .eq("delivery_order_id", dord.id)
+      .not("status", "in", "(delivered,failed)");
+    if (unassignErr) console.error("[PATCH delivery-orders reschedule unassign]", unassignErr.message);
+  }
+  return data;
+}
+
 app.patch("/delivery-orders/:id", ...requirePerm(PERMS.DELIVERY_ORDER_EDIT), async (req, res) => {
   try {
     const companyId = getActiveCompanyId(req);
     const { data: dord } = await supabase.from("delivery_orders")
       .select("id, status, delivery_date, superseded_at, superseded_by_do_id").eq("id", req.params.id).eq("company_id", companyId).maybeSingle();
     if (!dord) return res.status(404).json({ error: "Delivery order not found" });
-    if (["completed", "cancelled"].includes(dord.status)) {
-      return res.status(400).json({ error: `Cannot edit a ${dord.status} delivery order` });
-    }
-    // P1-1 stabilization: a superseded DO is retired regardless of its status
-    // column — reschedule (which also re-homes its schedule/team, see below)
-    // must never operate on it. See POST /delivery-schedules's identical guard.
-    if (dord.superseded_at) {
-      return res.status(409).json({
-        error: "This delivery order was superseded and cannot be rescheduled — see the replacement Delivery Order.",
-        code: "delivery_order_superseded",
-        superseded_by_do_id: dord.superseded_by_do_id || null,
-      });
-    }
 
     const { delivery_date, remark, customer_confirmed } = req.body;
     const patch = {};
     if (delivery_date !== undefined) patch.delivery_date = delivery_date || null;
     if (remark !== undefined) patch.remark = remark || null;
     if (customer_confirmed !== undefined) patch.customer_confirmed = customer_confirmed === true;
+    const dateChanging = patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date;
+    const block = await deliveryOrderDateBlock(dord, companyId, { dateChanging });
+    if (block) return res.status(block.status).json(block.body);
     if (Object.keys(patch).length === 0) return res.status(400).json({ error: "No updatable fields provided (Phase 1: delivery_date, remark, customer_confirmed)" });
 
-    const dateChanged = patch.delivery_date !== undefined && patch.delivery_date !== dord.delivery_date;
-    // LOCK RULE (same vocabulary as DELETE /delivery-schedules/:id and the approval path's
-    // DO_RESCHEDULE_BLOCKED_STATUSES): once a delivery is out for delivery / arrived / delivered, moving its
-    // date would delete its live schedule row mid-route. Remark / confirmation edits stay allowed.
-    if (dateChanged) {
-      const { data: liveScheds } = await supabase.from("delivery_schedules").select("status").eq("delivery_order_id", dord.id).eq("company_id", companyId);
-      const lockedBy = isLockedScheduleStatus(dord.status) ? dord.status : (liveScheds || []).map(x => x.status).find(st => isLockedScheduleStatus(st) && String(st).toLowerCase() !== "delivered");
-      if (lockedBy) return res.status(409).json({ error: `Cannot reschedule — the delivery is already ${lockedBy}`, code: "delivery_order_locked" });
-    }
-    // Rescheduling the delivery date UNASSIGNS the DO. Teams are per-date, so a
-    // stop can't stay on its old team when the date moves — the old team doesn't
-    // exist on the new date and the stop would vanish from the board. Instead we
-    // detach it from the team and return it to the unassigned pool for the new
-    // date (or TBC when the date is cleared): set it back to draft so it shows
-    // in that date's pool, ready to be assigned to a team running that day.
-    if (dateChanged && dord.status !== "draft") patch.status = "draft";
-
-    const { data, error } = await supabase.from("delivery_orders")
-      .update(patch).eq("id", dord.id).select("*, delivery_order_items(*)").single();
-    if (error) throw error;
-
-    if (dateChanged) {
-      await logDoEvent(dord.id, "rescheduled", { from: dord.delivery_date, to: patch.delivery_date }, req.user.id);
-
-      // Remove the team assignment: delete every non-terminal schedule attempt
-      // for this DO (the rows that pin it to a team on the old date). Terminal
-      // attempts (delivered/failed) are history and must not be touched. With no
-      // schedule row and status back to draft, the DO reappears in the pool for
-      // its new date — team unknown — instead of being stranded on a team that
-      // only exists on the old date.
-      const { error: unassignErr } = await supabase.from("delivery_schedules")
-        .delete()
-        .eq("delivery_order_id", dord.id)
-        .not("status", "in", "(delivered,failed)");
-      if (unassignErr) console.error("[PATCH delivery-orders reschedule unassign]", unassignErr.message);
-    }
-    res.json({ delivery_order: data });
+    res.json({ delivery_order: await applyDeliveryOrderPatch(dord, patch, req.user.id) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -16085,6 +16112,47 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const anyDoRows = soDeliveryOrdersRaw || [];
     const anyDoExists = anyDoRows.length > 0;
 
+    // ── Delivery date ↔ TBC while an active DO exists ─────────────────
+    // Once a Delivery Order is active, ITS date is the delivery date (lib/
+    // effective-delivery; the edit form shows that effective date). Writing
+    // only sales_orders.delivery_date = "TBC" left the DO dated — the order
+    // kept showing the DO's date and the edit "did nothing" (production:
+    // SO03275 "26/09 → TBC" approved while DO2609-0422 stayed 03/10). So:
+    //   1 active DO, TBC ↔ date → the DO's own date changes through the ONE
+    //     DO-date path (deliveryOrderDateBlock / applyDeliveryOrderPatch:
+    //     lock rule, superseded guard, unassign + back to draft), with the
+    //     DO-edit permission that path requires; SO field kept in step.
+    //   2+ active DOs, TBC ↔ date → refused, never guessed: set it per DO.
+    //   no active DO → unchanged (the SO's own date is the planning date).
+    // TBC is a de-schedule, not a booking: like every other TBC path
+    // (Service, assistant, Delivery Orders tab) it is not 10-day gated —
+    // delivery_date_requests cannot hold a TBC target (requested_date DATE NOT NULL).
+    // Date → different date is unchanged here.
+    const isIsoDate = v => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+    let doDateChange = null; // { dord, newDate } — applied only once the SO edit itself is saved directly
+    if (delivery_date !== undefined) {
+      const activeDos = anyDoRows.filter(doLib.isOperationallyActive);
+      const eff = effectiveDelivery.effectiveDeliveryState({ soDeliveryDate: existing.delivery_date, activeDeliveryOrders: activeDos });
+      const submittedTbc = !isIsoDate(delivery_date);
+      if (eff.source === "delivery_order" && submittedTbc !== eff.tbc) {
+        const dord = activeDos[0];
+        if (!(await canDo(req, PERMS.DELIVERY_ORDER_EDIT))) {
+          return res.status(403).json({
+            error: `Delivery for this order runs on ${dord.do_number}. Changing it ${submittedTbc ? "to TBC" : "from TBC to a date"} needs Delivery Order edit permission — ask Operations, or use Request Delivery Date.`,
+            code: "delivery_order_edit_required", delivery_order_id: dord.id,
+          });
+        }
+        const block = await deliveryOrderDateBlock(dord, company_id, { dateChanging: true });
+        if (block) return res.status(block.status).json(block.body);
+        doDateChange = { dord, newDate: submittedTbc ? null : delivery_date };
+      } else if (eff.source === "multiple_delivery_orders" && submittedTbc !== !isIsoDate(existing.delivery_date)) {
+        return res.status(409).json({
+          error: `This order is delivered through ${eff.deliveries.length} Delivery Orders (${eff.deliveries.map(d => d.do_number).join(", ")}). Set TBC or a date on the specific Delivery Order in Deliveries → Delivery Orders.`,
+          code: "multiple_active_delivery_orders",
+        });
+      }
+    }
+
     // P1-1 guard: a legacy edit form with no per-line ids at all (a
     // different item shape from the standard order screen — see
     // vhaus-delivery/src/App.js) submitting here while a DO exists would
@@ -16757,10 +16825,17 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         if (nonCriticalAmendErr) throw nonCriticalAmendErr;
       } catch (e) { console.error("sales_order_amendments insert (non-fatal):", e.message); }
     }
+    // The active DO's date follows (TBC ↔ date) — see the block near the top.
+    let deliveryOrderUpdated = null;
+    if (doDateChange) {
+      const updated = await applyDeliveryOrderPatch(doDateChange.dord, { delivery_date: doDateChange.newDate }, req.user.id);
+      deliveryOrderUpdated = { id: updated.id, do_number: updated.do_number, delivery_date: updated.delivery_date, status: updated.status };
+    }
     // P0-16: don't report unconditional success when the operational
     // projection failed to sync — see POST /sales-orders for the same pattern.
     res.json({
       order: full,
+      ...(deliveryOrderUpdated ? { delivery_order_updated: deliveryOrderUpdated } : {}),
       ...(projectionSyncError ? { projection_sync_warning: "Sales order saved, but it may not yet be visible in Delivery/Telegram/Driver. An admin has been notified — retry or check scripts/audit-data-consistency.js." } : {}),
       ...(clawbackWarning ? { commission_clawback_warning: clawbackWarning } : {}),
     });

@@ -136,7 +136,9 @@ class Query {
     return this;
   }
   or(str) {
-    const preds = splitTop(str).map(s => { const m = s.match(/^([\w.]+)\.(not\.)?(\w+)\.(.*)$/); if (!m) throw new Error("[fake-supabase] unsupported or() term: " + s); const p = this.pred(m[1], m[3], m[4]); return m[2] ? (r => !p(r)) : p; });
+    // column (optionally relation.column) . [not.] operator . value — lazy column + explicit operator list, so
+    // "col.not.like.____-__-__" parses like PostgREST (a greedy [\w.]+ swallowed ".not" into the column name).
+    const preds = splitTop(str).map(s => { const m = s.match(/^([\w]+(?:\.[\w]+)??)\.(not\.)?(eq|neq|gt|gte|lt|lte|like|ilike|is|in)\.(.*)$/); if (!m) throw new Error("[fake-supabase] unsupported or() term: " + s); const p = this.pred(m[1], m[3], m[4]); return m[2] ? (r => !p(r)) : p; });
     this.f.push(r => preds.some(p => p(r)));
     return this;
   }
