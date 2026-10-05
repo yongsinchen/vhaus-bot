@@ -29,6 +29,7 @@ const productSearch = require("./lib/product-search");
 const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliveryStatusFromSO, buildLegacyItemsProjection } = require("./lib/sync-sales-order");
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const effectiveDelivery = require("./lib/effective-delivery");
+const workbench = require("./lib/delivery-workbench");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
@@ -12239,6 +12240,48 @@ app.get("/sales-orders/:id/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER
       delivery_orders: deliveryOrders.map(d => ({ ...d, events: eventsByDo[d.id] || [] })),
       items: buildAllocationSummary(so, deliveryOrders, legacyOrder),
       can_override_arrival: canOverrideArrival,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Delivery Operations workbench (Phase 3A) — reads only ─────────
+// Service Cases next to Delivery Orders, and one cross-date search over both.
+// See lib/delivery-workbench.js. Assigning a Service to a team is NOT here:
+// the workbench calls the existing POST/PATCH/DELETE /delivery-schedules
+// (order_id = the Service's inert legacy order), exactly like the board.
+const canDo = async (req, key) => req.activeRoleKey === "MASTER" || (await permEngine.can(req.user.id, req.activeCompanyId, key)).allowed;
+
+// GET /delivery-workbench/services?date=YYYY-MM-DD&include_done=1
+app.get("/delivery-workbench/services", ...requirePerm(PERMS.SERVICE_VIEW), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const date = typeof req.query.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date) ? req.query.date : null;
+    const includeDone = req.query.include_done === "1" || req.query.include_done === "true";
+    const services = await workbench.listWorkbenchServices({ supabase, companyId: cid, user: req.user, date, includeDone });
+    res.json({ services });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /delivery-workbench/search?q= — DO / SO / Service / customer / phone /
+// address / item, across ALL dates (active and historical). Each record type
+// is returned only if the caller may read it (DELIVERY_ORDER_VIEW / SERVICE_VIEW);
+// a caller with neither gets 403. Display only — never a mutation target.
+app.get("/delivery-workbench/search", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const q = workbench.normalizeQuery(req.query.q);
+    if (q.text.length < 2) return res.status(400).json({ error: "Type at least 2 characters to search" });
+    const [canDos, canSvc] = await Promise.all([canDo(req, PERMS.DELIVERY_ORDER_VIEW), canDo(req, PERMS.SERVICE_VIEW)]);
+    if (!canDos && !canSvc) return res.status(403).json({ error: "Permission denied: DELIVERY_ORDER_VIEW / SERVICE_VIEW" });
+    const [dos, svcs] = await Promise.all([
+      canDos ? workbench.searchDeliveryOrders({ supabase, companyId: cid, q, select: SELECTS.DELIVERY_ORDER_LIST_SELECT }) : { rows: [], truncated: false },
+      canSvc ? workbench.searchServices({ supabase, companyId: cid, user: req.user, q }) : { rows: [], truncated: false },
+    ]);
+    res.json({
+      query: q.text,
+      delivery_orders: dos.rows, services: svcs.rows,
+      truncated: { delivery_orders: dos.truncated, services: svcs.truncated },
+      searched: { delivery_orders: canDos, services: canSvc },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

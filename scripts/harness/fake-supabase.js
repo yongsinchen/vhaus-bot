@@ -24,6 +24,7 @@ const RELATIONS = {
   "delivery_orders.delivery_orders!supersedes_do_id": { table: "delivery_orders", local: "supersedes_do_id", foreign: "id" },
   "delivery_orders.delivery_orders!delivery_order_id": { table: "delivery_orders", local: "delivery_order_id", foreign: "id" },
   "delivery_order_items.sales_order_items": { table: "sales_order_items", local: "sales_order_item_id", foreign: "id" },
+  "delivery_order_items.delivery_orders": { table: "delivery_orders", local: "delivery_order_id", foreign: "id" },
   "sales_orders.sales_order_items": { table: "sales_order_items", local: "id", foreign: "order_id", many: true },
   "delivery_date_requests.delivery_orders!delivery_order_id": { table: "delivery_orders", local: "delivery_order_id", foreign: "id" },
   "users.companies": { table: "companies", local: "company_id", foreign: "id" },
