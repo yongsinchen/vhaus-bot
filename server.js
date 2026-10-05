@@ -31,6 +31,7 @@ const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolve
 const effectiveDelivery = require("./lib/effective-delivery");
 const workbench = require("./lib/delivery-workbench");
 const customer360 = require("./lib/customer-360");
+const dateRequestStaleness = require("./lib/date-request-staleness");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
@@ -4127,12 +4128,15 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
     // 2b. Delivery-date approval queue count — only meaningful for approvers
     //     (the nav item is approver-gated). Same actionable statuses the
     //     Delivery Dates page treats as pending: pending + needs_reschedule.
+    // Only requests that still need a decision: an open request whose own
+    // DO / Service can no longer change date is not counted (lib/date-request-staleness.js).
     const deliveryReqPromise = isDateApprover(req) ? (async () => {
-      let q = supabase.from("delivery_date_requests").select("id", { count: "exact", head: true })
-        .in("status", ["pending", "needs_reschedule"]);
+      let q = supabase.from("delivery_date_requests").select("id, company_id, status, delivery_order_id, order_id")
+        .in("status", ["pending", "needs_reschedule"]).limit(2000);
       if (cid) q = q.eq("company_id", cid);
-      const { count } = await q;
-      return count || 0;
+      const { data: open } = await q;
+      const stale = await dateRequestStaleness.staleReasons({ supabase, requests: open || [] });
+      return (open || []).filter(r => !stale.has(r.id)).length;
     })() : Promise.resolve(0);
 
     // Order amendment approvals — master/manager only.
@@ -5287,6 +5291,7 @@ function deliveryDateConflictMessage(code) {
     delivery_order_not_found: "The selected Delivery Order could not be found for this request.",
     delivery_order_superseded: "The selected Delivery Order was superseded — submit a new request against the current replacement Delivery Order.",
     delivery_date_change_conflict: "The selected Delivery Order is already out for delivery, arrived, delivered, completed, or cancelled — its date can no longer be changed.",
+    service_closed: "This Service case is already resolved, completed, closed or cancelled — its date can no longer be changed.",
   }[code] || "This request can no longer be applied.";
 }
 
@@ -5744,8 +5749,14 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
         busy_threshold: BUSY_DAY_THRESHOLD, blocked_reason: blocked || null,
       });
     }));
-    const requests = (data || []).map(r => ({
+    // An open request whose own DO / Service can no longer change date is
+    // shown as "no_longer_applicable" (with the reason) instead of an
+    // actionable pending one — derived, the stored row is untouched
+    // (stored_status keeps the persisted value). See lib/date-request-staleness.js.
+    const stale = await dateRequestStaleness.staleReasons({ supabase, requests: data || [] });
+    const requests = (data || []).filter(r => !(status && stale.has(r.id))).map(r => ({
       ...r,
+      ...(stale.has(r.id) ? { status: "no_longer_applicable", stored_status: r.status, stale_reason: stale.get(r.id) } : {}),
       has_delivery_order: r.sales_order_id ? withDo.has(r.sales_order_id) : false,
       current_delivery_date: r.sales_order_id ? (soDate.get(r.sales_order_id) || null) : (legacyDate.get(r.order_id) || null),
       requested_date_load: r.requested_date ? (loadByDate.get(r.requested_date) || null) : null,
@@ -5845,6 +5856,10 @@ app.patch("/delivery-date-requests/:id/propose", requireAuth, async (req, res) =
     if (alts.length === 0) return res.status(400).json({ error: "Provide at least one alternative date" });
     const { data: r } = await supabase.from("delivery_date_requests").select("*").eq("id", req.params.id).maybeSingle();
     if (!r || (cid && r.company_id !== cid)) return res.status(404).json({ error: "Request not found" });
+    // Its own DO / Service can no longer change date — proposing dates would
+    // only send the salesman options that can never be applied.
+    const staleReason = (await dateRequestStaleness.staleReasons({ supabase, requests: [r] })).get(r.id);
+    if (staleReason) return res.status(409).json({ error: staleReason, code: "request_no_longer_applicable" });
     const ids = r.link_group_id ? (await openDeliveryDateGroup(r)).map(m => m.id) : [r.id];
     const { data, error } = await supabase.from("delivery_date_requests").update({
       status: "needs_reschedule", alternative_dates: alts, decision_note: req.body?.note || null,
