@@ -5518,18 +5518,23 @@ async function autoLinkOnAssignment(req, cid, orderId, scheduledDate) {
 // POST /delivery-date-requests — salesman requests a date for an existing
 // order, optionally linking other undelivered SOs of the same customer
 // (link_so_numbers) so they are delivered together.
-app.post("/delivery-date-requests", requireAuth, async (req, res) => {
-  try {
-    const cid = getActiveCompanyId(req);
-    const { order_id, so_number, requested_date, remark, delivery_order_id, link_so_numbers } = req.body || {};
-    if (!requested_date) return res.status(400).json({ error: "requested_date is required" });
+// The ONE Delivery Date Request flow: resolve the target (and validate a
+// client DO id), snapshot the original date, decide with the 10-day rule,
+// supersede the target's open request, create (auto-approve + apply when the
+// rule allows), link / auto-link. Used by POST /delivery-date-requests and by
+// Edit Order when a date change must go through the active DO
+// (PUT /sales-orders/:id). Returns { status, body } — the HTTP response.
+const httpOut = (status, body) => ({ status, body });
+async function runDeliveryDateRequestFlow(req, cid, input) {
+    const { order_id, so_number, requested_date, remark, delivery_order_id, link_so_numbers } = input || {};
+    if (!requested_date) return httpOut(400, { error: "requested_date is required" });
     // P1-4B: fail closed rather than resolving `order_id`/`so_number`
     // unscoped — `ord.company_id` becomes authoritative for everything this
     // request does downstream (target DO resolution, the actual delivery-
     // date write), so an unscoped match here would let a caller with no
     // resolvable company reschedule ANY company's order by guessing/
     // enumerating a raw order_id.
-    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    if (!cid) return httpOut(400, { error: "Active company could not be resolved for this request" });
     const main = await prepareDeliveryDateTarget(cid, { order_id, so_number, delivery_order_id });
     if (main.error) return res.status(main.status).json({ error: main.error, code: main.code, active_delivery_orders: main.active_delivery_orders });
 
@@ -5539,7 +5544,7 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
       .map(s => String(s || "").trim()).filter(s => s && s !== main.ord.so_number))];
     if (linkNos.length) {
       const mainPhone = canonicalPhone(main.so?.customer_contact || main.ord.contact);
-      if (!mainPhone) return res.status(400).json({ error: "This order has no phone number to match linked orders by" });
+      if (!mainPhone) return httpOut(400, { error: "This order has no phone number to match linked orders by" });
       for (const no of linkNos) {
         const m = await prepareDeliveryDateTarget(cid, { so_number: no });
         if (m.error) {
@@ -5547,9 +5552,9 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
             ? `SO ${no} has several active deliveries — request its date separately.`
             : `SO ${no}: ${m.error}` });
         }
-        if (!m.so || LINK_EXCLUDED_SO_STATUSES.includes(m.so.status)) return res.status(400).json({ error: `SO ${no} can't be linked (${m.so?.status || "no sales order"})` });
-        if (canonicalPhone(m.so.customer_contact || m.ord.contact) !== mainPhone) return res.status(400).json({ error: `SO ${no} is not for the same customer phone` });
-        if (!soVisibleToRequester(req, m.so)) return res.status(403).json({ error: `You can't request a delivery date for SO ${no}` });
+        if (!m.so || LINK_EXCLUDED_SO_STATUSES.includes(m.so.status)) return httpOut(400, { error: `SO ${no} can't be linked (${m.so?.status || "no sales order"})` });
+        if (canonicalPhone(m.so.customer_contact || m.ord.contact) !== mainPhone) return httpOut(400, { error: `SO ${no} is not for the same customer phone` });
+        if (!soVisibleToRequester(req, m.so)) return httpOut(403, { error: `You can't request a delivery date for SO ${no}` });
         members.push(m);
       }
     }
@@ -5570,7 +5575,7 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
     // The group moves as one: auto-approve only if EVERY member qualifies.
     const decisions = payloads.map(p => evaluateDeliveryDateApproval({ requestedDate: p.requested_date, currentDate: p.original_date || null }));
     const invalid = decisions.find(d => !d.valid);
-    if (invalid) return res.status(400).json({ error: invalid.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
+    if (invalid) return httpOut(400, { error: invalid.reason === "past_date" ? "Requested date must not be in the past" : "Requested date is invalid" });
     const linked = members.length > 1;
     const forcePending = linked && !decisions.every(d => d.autoApproved);
     // link_group_id is only written for a real group, so unlinked requests
@@ -5601,7 +5606,28 @@ app.post("/delivery-date-requests", requireAuth, async (req, res) => {
         });
       } catch (e) { console.error("[auto-link] recording members failed (non-fatal):", e.message); }
     }
-    res.status(201).json({ request: created[0], linked_requests: created.slice(1), auto_linked_requests: autoLinked });
+    return httpOut(201, { request: created[0], linked_requests: created.slice(1), auto_linked_requests: autoLinked });
+}
+
+// A DO-scoped request raised on the user's behalf (Edit Order, or an approved
+// order amendment that changed the date). Pending: nothing moves — the DO and
+// the SO field keep the current date. Auto-approved: the flow already applied
+// it to the DO; the SO / legacy fields are kept in step with it.
+async function submitDoDateRequestKeepingSoInStep(req, companyId, { so, dord, requestedDate, remark }) {
+  const out = await runDeliveryDateRequestFlow(req, companyId, { so_number: so.order_number, delivery_order_id: dord.id, requested_date: requestedDate, remark });
+  if (out.status >= 300) return { error: out.body?.error || "Delivery date request failed", do_number: dord.do_number };
+  const r = out.body.request;
+  if (r.status === "approved") {
+    await supabase.from("sales_orders").update({ delivery_date: requestedDate }).eq("id", so.id).eq("company_id", companyId);
+    await supabase.from("orders").update({ delivery_date: requestedDate }).eq("company_id", companyId).eq("so_number", so.order_number).or("type.is.null,type.neq.Service");
+  }
+  return { id: r.id, status: r.status, requested_date: r.requested_date, original_date: r.original_date, do_number: dord.do_number };
+}
+
+app.post("/delivery-date-requests", requireAuth, async (req, res) => {
+  try {
+    const out = await runDeliveryDateRequestFlow(req, getActiveCompanyId(req), req.body || {});
+    res.status(out.status).json(out.body);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -16112,43 +16138,58 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const anyDoRows = soDeliveryOrdersRaw || [];
     const anyDoExists = anyDoRows.length > 0;
 
-    // ── Delivery date ↔ TBC while an active DO exists ─────────────────
+    // ── Delivery date while an active DO exists (Edit Order) ──────────
     // Once a Delivery Order is active, ITS date is the delivery date (lib/
     // effective-delivery; the edit form shows that effective date). Writing
-    // only sales_orders.delivery_date = "TBC" left the DO dated — the order
-    // kept showing the DO's date and the edit "did nothing" (production:
-    // SO03275 "26/09 → TBC" approved while DO2609-0422 stayed 03/10). So:
-    //   1 active DO, TBC ↔ date → the DO's own date changes through the ONE
-    //     DO-date path (deliveryOrderDateBlock / applyDeliveryOrderPatch:
-    //     lock rule, superseded guard, unassign + back to draft), with the
-    //     DO-edit permission that path requires; SO field kept in step.
-    //   2+ active DOs, TBC ↔ date → refused, never guessed: set it per DO.
-    //   no active DO → unchanged (the SO's own date is the planning date).
-    // TBC is a de-schedule, not a booking: like every other TBC path
-    // (Service, assistant, Delivery Orders tab) it is not 10-day gated —
-    // delivery_date_requests cannot hold a TBC target (requested_date DATE NOT NULL).
-    // Date → different date is unchanged here.
+    // only sales_orders.delivery_date left the DO on its old date — the order
+    // kept showing the DO's date (production: SO03275 "26/09 → TBC" approved
+    // while DO2609-0422 stayed 03/10). One rule for every change of the
+    // effective date (compared with what the user saw, not the SO field):
+    //   1 active DO, date → TBC: the DO's own date is cleared through the ONE
+    //     DO-date path (deliveryOrderDateBlock / applyDeliveryOrderPatch: lock
+    //     rule, superseded guard, unassign + back to draft), with the DO-edit
+    //     permission that path requires. TBC is a de-schedule, not a booking —
+    //     ungated like every other TBC path (a request cannot hold TBC).
+    //   1 active DO, → a (different) date, from a date or from TBC: a normal
+    //     DO-scoped Delivery Date Request (runDeliveryDateRequestFlow — the
+    //     10-day rule decides pending vs auto-approve-and-apply). The SO field
+    //     is written only once the DO actually has that date.
+    //   2+ active DOs: refused, never guessed — change it per DO.
+    //   no active DO: unchanged (the SO's own date is the planning date).
+    // A change that ends up in a PENDING order amendment touches no DO and
+    // creates no request now — it follows when the amendment is approved
+    // (routeDeliveryDateAfterAmendment).
     const isIsoDate = v => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
-    let doDateChange = null; // { dord, newDate } — applied only once the SO edit itself is saved directly
+    let doDateChange = null;  // { dord, newDate } — TBC, applied once the SO edit itself is saved directly
+    let doDateRequest = null; // { dord, requested_date } — request, submitted once the SO edit itself is saved directly
     if (delivery_date !== undefined) {
       const activeDos = anyDoRows.filter(doLib.isOperationallyActive);
       const eff = effectiveDelivery.effectiveDeliveryState({ soDeliveryDate: existing.delivery_date, activeDeliveryOrders: activeDos });
       const submittedTbc = !isIsoDate(delivery_date);
-      if (eff.source === "delivery_order" && submittedTbc !== eff.tbc) {
+      if (eff.source === "delivery_order") {
         const dord = activeDos[0];
-        if (!(await canDo(req, PERMS.DELIVERY_ORDER_EDIT))) {
-          return res.status(403).json({
-            error: `Delivery for this order runs on ${dord.do_number}. Changing it ${submittedTbc ? "to TBC" : "from TBC to a date"} needs Delivery Order edit permission — ask Operations, or use Request Delivery Date.`,
-            code: "delivery_order_edit_required", delivery_order_id: dord.id,
-          });
+        if (submittedTbc && !eff.tbc) {
+          if (!(await canDo(req, PERMS.DELIVERY_ORDER_EDIT))) {
+            return res.status(403).json({
+              error: `Delivery for this order runs on ${dord.do_number}. Setting it to TBC needs Delivery Order edit permission — ask Operations.`,
+              code: "delivery_order_edit_required", delivery_order_id: dord.id,
+            });
+          }
+          const block = await deliveryOrderDateBlock(dord, company_id, { dateChanging: true });
+          if (block) return res.status(block.status).json(block.body);
+          doDateChange = { dord, newDate: null };
+        } else if (!submittedTbc && delivery_date !== eff.date) {
+          const block = await deliveryOrderDateBlock(dord, company_id, { dateChanging: true });
+          if (block) return res.status(block.status).json(block.body);
+          const decision = evaluateDeliveryDateApproval({ requestedDate: delivery_date, currentDate: eff.date || null });
+          if (!decision.valid) return res.status(400).json({ error: decision.reason === "past_date" ? "Delivery date must not be in the past" : "Delivery date is invalid" });
+          doDateRequest = { dord, requested_date: delivery_date };
         }
-        const block = await deliveryOrderDateBlock(dord, company_id, { dateChanging: true });
-        if (block) return res.status(block.status).json(block.body);
-        doDateChange = { dord, newDate: submittedTbc ? null : delivery_date };
-      } else if (eff.source === "multiple_delivery_orders" && submittedTbc !== !isIsoDate(existing.delivery_date)) {
+      } else if (eff.source === "multiple_delivery_orders"
+        && (submittedTbc ? isIsoDate(existing.delivery_date) : delivery_date !== existing.delivery_date)) {
         return res.status(409).json({
-          error: `This order is delivered through ${eff.deliveries.length} Delivery Orders (${eff.deliveries.map(d => d.do_number).join(", ")}). Set TBC or a date on the specific Delivery Order in Deliveries → Delivery Orders.`,
-          code: "multiple_active_delivery_orders",
+          error: `This order has multiple active Delivery Orders (${eff.deliveries.map(d => d.do_number).join(", ")}). Change the delivery date from Deliveries → Delivery Orders so the correct Delivery Order is selected.`,
+          code: "multiple_active_delivery_orders", delivery_orders: eff.deliveries,
         });
       }
     }
@@ -16251,7 +16292,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       // Date changes are material too (order date drives the commission month;
       // delivery date drives scheduling) — flag them for manager re-approval.
       if (orderDateChanged) changes.push(`Order date: ${existing.order_date || "-"} → ${newOrderDate || "-"}`);
-      if ((delivery_date || null) !== (existing.delivery_date || null)) changes.push(`Delivery date: ${existing.delivery_date || "-"} → ${delivery_date || "-"}`);
+      // A date that goes to the DO's Delivery Date Request is not an SO edit — the request is its record.
+      if ((delivery_date || null) !== (existing.delivery_date || null) && !(doDateRequest && !criticalChanged)) changes.push(`Delivery date: ${existing.delivery_date || "-"} → ${delivery_date || "-"}`);
       // Non-material fields too — "record whatever was amended". Compared against
       // the values being written (the edit form sends the full order).
       const nrm = v => (v === undefined || v === null) ? "" : String(v).trim();
@@ -16591,6 +16633,9 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       });
     }
 
+    // A date going through the DO's Delivery Date Request is not written to
+    // the SO here — the SO field follows only once the DO has it (below).
+    if (doDateRequest) updateData.delivery_date = existing.delivery_date || null;
     const { error: updErr } = await supabase.from("sales_orders").update(updateData).eq("id", id).eq("company_id", company_id);
     if (updErr) throw updErr;
 
@@ -16825,17 +16870,22 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         if (nonCriticalAmendErr) throw nonCriticalAmendErr;
       } catch (e) { console.error("sales_order_amendments insert (non-fatal):", e.message); }
     }
-    // The active DO's date follows (TBC ↔ date) — see the block near the top.
-    let deliveryOrderUpdated = null;
+    // The active DO's date follows — see the block near the top.
+    let deliveryOrderUpdated = null, deliveryDateRequest = null;
     if (doDateChange) {
       const updated = await applyDeliveryOrderPatch(doDateChange.dord, { delivery_date: doDateChange.newDate }, req.user.id);
       deliveryOrderUpdated = { id: updated.id, do_number: updated.do_number, delivery_date: updated.delivery_date, status: updated.status };
+    }
+    if (doDateRequest) {
+      deliveryDateRequest = await submitDoDateRequestKeepingSoInStep(req, company_id, { so: existing, dord: doDateRequest.dord, requestedDate: doDateRequest.requested_date, remark: "Delivery date changed from Edit Order" });
+      if (deliveryDateRequest.status === "approved" && full) full.delivery_date = doDateRequest.requested_date;
     }
     // P0-16: don't report unconditional success when the operational
     // projection failed to sync — see POST /sales-orders for the same pattern.
     res.json({
       order: full,
       ...(deliveryOrderUpdated ? { delivery_order_updated: deliveryOrderUpdated } : {}),
+      ...(deliveryDateRequest ? { delivery_date_request: deliveryDateRequest } : {}),
       ...(projectionSyncError ? { projection_sync_warning: "Sales order saved, but it may not yet be visible in Delivery/Telegram/Driver. An admin has been notified — retry or check scripts/audit-data-consistency.js." } : {}),
       ...(clawbackWarning ? { commission_clawback_warning: clawbackWarning } : {}),
     });
@@ -16952,6 +17002,53 @@ app.get("/order-amendments", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// After an approved amendment changed the delivery date on an order that has
+// Delivery Orders: the same rule Edit Order follows (PUT /sales-orders/:id).
+//   exactly 1 active DO, → a different date: DO-scoped Delivery Date Request
+//     (10-day rule: pending, or auto-approve + apply). While pending, the SO /
+//     legacy field is put back on the DO's current date — never left showing
+//     a date the DO does not have.
+//   exactly 1 active DO, → TBC: the DO's date is cleared through the DO-date
+//     path when the approver holds DO-edit permission; otherwise it is put
+//     back and reported.
+//   2+ active DOs: the SO field is put back; reported — set it per DO.
+// Returns null when the amendment did not change the delivery date.
+async function routeDeliveryDateAfterAmendment(req, a, companyId) {
+  const isIso = v => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const beforeDate = a.before_snapshot?.delivery_date ?? null;
+  const { data: so } = await supabase.from("sales_orders").select("id, order_number, delivery_date").eq("id", a.sales_order_id).eq("company_id", companyId).maybeSingle();
+  if (!so || (so.delivery_date || null) === (beforeDate || null)) return null;
+  const { data: dos } = await supabase.from("delivery_orders").select("id, do_number, status, delivery_date, superseded_at, superseded_by_do_id")
+    .eq("company_id", companyId).eq("sales_order_id", so.id);
+  const active = (dos || []).filter(doLib.isOperationallyActive);
+  if (active.length === 0) return null; // no active DO: the SO's own date is the planning date
+  const putBack = async (date) => {
+    await supabase.from("sales_orders").update({ delivery_date: date }).eq("id", so.id).eq("company_id", companyId);
+    await supabase.from("orders").update({ delivery_date: date }).eq("company_id", companyId).eq("so_number", so.order_number).or("type.is.null,type.neq.Service");
+  };
+  if (active.length > 1) {
+    await putBack(beforeDate);
+    return { result: "multiple_active_delivery_orders", message: `The delivery date was not changed — this order has ${active.length} active Delivery Orders (${active.map(d => d.do_number).join(", ")}). Change it per Delivery Order.` };
+  }
+  const dord = active[0];
+  const doDate = isIso(dord.delivery_date) ? dord.delivery_date : null;
+  const newDate = isIso(so.delivery_date) ? so.delivery_date : null;
+  if (newDate === doDate) return null; // already what the DO has
+  const block = await deliveryOrderDateBlock(dord, companyId, { dateChanging: true });
+  if (block) { await putBack(doDate || "TBC"); return { result: "delivery_order_locked", message: block.body.error }; }
+  if (!newDate) {
+    if (!(await canDo(req, PERMS.DELIVERY_ORDER_EDIT))) {
+      await putBack(doDate);
+      return { result: "needs_delivery_order_edit", message: `${dord.do_number} keeps ${doDate} — setting it to TBC needs Delivery Order edit permission.` };
+    }
+    const updated = await applyDeliveryOrderPatch(dord, { delivery_date: null }, req.user.id);
+    return { result: "delivery_order_tbc", do_number: updated.do_number };
+  }
+  const r = await submitDoDateRequestKeepingSoInStep(req, companyId, { so, dord, requestedDate: newDate, remark: "Delivery date from an approved order amendment" });
+  if (r.status !== "approved") await putBack(doDate || "TBC"); // pending / failed: nothing moved yet
+  return { result: r.error ? "request_failed" : `request_${r.status}`, request: r };
+}
+
 app.patch("/order-amendments/:id/approve", requireAuth, async (req, res) => {
   try {
     if (!isAmendApprover(req)) return res.status(403).json({ error: "Only a manager can approve amendments" });
@@ -16999,8 +17096,12 @@ app.patch("/order-amendments/:id/approve", requireAuth, async (req, res) => {
       reviewed_by_name: req.user.name || null, decision_note: req.body?.note || null, updated_at: new Date().toISOString(),
     }).eq("id", a.id).select().single();
     if (nameErr) throw nameErr;
+    // The RPC writes the proposed delivery date onto the SO / legacy order but
+    // carries each (regenerated) DO's own date unchanged — route a changed date
+    // to the active DO now that the amendment is approved.
+    const dateRouting = await routeDeliveryDateAfterAmendment(req, a, a.company_id);
     const { data: updatedOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", a.sales_order_id).maybeSingle();
-    res.json({ amendment: updatedAmendment, order: updatedOrder, new_delivery_orders: result.new_delivery_orders });
+    res.json({ amendment: updatedAmendment, order: updatedOrder, new_delivery_orders: result.new_delivery_orders, ...(dateRouting ? { delivery_date_routing: dateRouting } : {}) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
