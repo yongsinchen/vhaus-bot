@@ -11686,7 +11686,8 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
   try {
     const companyId = getActiveCompanyId(req);
     if (!companyId) return res.json({ delivery_orders: [] });
-    const { status, so_number } = req.query;
+    const { status, so_number, active } = req.query;
+    const activeOnly = active === "1" || active === "true";
     let { sales_order_id } = req.query;
     // P1-2: DO picker for a Delivery Date Request — accept either id directly,
     // or a so_number (what the request-creation UI already has from its order
@@ -11697,11 +11698,18 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
       sales_order_id = soRow?.id || null;
       if (!sales_order_id) return res.json({ delivery_orders: [] });
     }
+    // active=1: every NON-terminal DO (draft/scheduled/out_for_delivery/arrived/
+    // failed/TBC), so the Delivery Orders tab never drops an active DO that
+    // falls outside the newest-500-by-created_at window — the confirmed cause
+    // of a future-scheduled but older-created DO (e.g. DO2608-0016) showing on
+    // the schedule board yet missing from the flat list. The non-terminal set
+    // is small, so a higher cap stays well within row limits.
     let q = supabase.from("delivery_orders")
       .select(SELECTS.DELIVERY_ORDER_LIST_SELECT)
       .eq("company_id", companyId)
       .order("created_at", { ascending: false })
-      .limit(500);
+      .limit(activeOnly ? 1000 : 500);
+    if (activeOnly) q = q.not("status", "in", "(completed,cancelled)");
     if (status) {
       const list = String(status).split(",").map(s => s.trim()).filter(Boolean);
       q = list.length > 1 ? q.in("status", list) : q.eq("status", list[0]);
@@ -11718,7 +11726,8 @@ app.get("/delivery-orders", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), async (re
         .select("*, delivery_order_items(*), sales_orders(id, order_number, customer_name, customer_contact, customer_address, delivery_date, delivery_time_slot), delivery_schedules(id, status, team_id, scheduled_date, delivery_teams(vehicle_id, driver_id, delivery_vehicles(vehicle_plate), driver:users!delivery_teams_driver_id_fkey(name)))")
         .eq("company_id", companyId)
         .order("created_at", { ascending: false })
-        .limit(500);
+        .limit(activeOnly ? 1000 : 500);
+      if (activeOnly) q2 = q2.not("status", "in", "(completed,cancelled)");
       if (status) {
         const list = String(status).split(",").map(s => s.trim()).filter(Boolean);
         q2 = list.length > 1 ? q2.in("status", list) : q2.eq("status", list[0]);
