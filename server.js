@@ -30,6 +30,7 @@ const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliver
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const effectiveDelivery = require("./lib/effective-delivery");
 const workbench = require("./lib/delivery-workbench");
+const customer360 = require("./lib/customer-360");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
@@ -12283,6 +12284,63 @@ app.get("/delivery-workbench/search", requireAuth, async (req, res) => {
       truncated: { delivery_orders: dos.truncated, services: svcs.truncated },
       searched: { delivery_orders: canDos, services: canSvc },
     });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Global Search + Customer / Order 360 (Phase 3B) — reads only ──
+// See lib/customer-360.js. Each section is returned only if the caller may
+// read it (backend-enforced); "other orders" are by customer_id only.
+const story360Perms = async (req) => {
+  const [orders, finance, deliveries, service, customers] = await Promise.all(
+    [PERMS.ORDERS_VIEW, PERMS.FINANCE_VIEW, PERMS.DELIVERY_ORDER_VIEW, PERMS.SERVICE_VIEW, PERMS.CUSTOMERS_VIEW].map(k => canDo(req, k)));
+  return { orders, finance, deliveries, service, customers };
+};
+
+// GET /global-search?q= — SO / DO / SV number, customer, phone, address, item.
+app.get("/global-search", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const text = String(req.query.q || "").trim();
+    if (text.length < 2) return res.status(400).json({ error: "Type at least 2 characters to search" });
+    const perms = await story360Perms(req);
+    if (!perms.orders && !perms.deliveries && !perms.service && !perms.customers) return res.status(403).json({ error: "Permission denied" });
+    res.json(await customer360.globalSearch({ supabase, companyId: cid, user: req.user, rawQuery: text, perms }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /customer-360/orders/:id — one Sales Order's complete story.
+app.get("/customer-360/orders/:id", ...requirePerm(PERMS.ORDERS_VIEW), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const story = await customer360.orderStory({ supabase, companyId: cid, user: req.user, soId: req.params.id, perms: await story360Perms(req) });
+    if (!story) return res.status(404).json({ error: "Order not found" });
+    res.json(story);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /customer-360/services/:id — the Service's Sales Order story (or the
+// Service alone). Without ORDERS_VIEW only the Service part is returned.
+app.get("/customer-360/services/:id", ...requirePerm(PERMS.SERVICE_VIEW), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const perms = await story360Perms(req);
+    const story = await customer360.serviceStory({ supabase, companyId: cid, user: req.user, serviceId: req.params.id, perms });
+    if (!story) return res.status(404).json({ error: "Service not found" });
+    if (story.order && !perms.orders) {
+      return res.json({ ...story, order: null, payments: null, deliveries: null, amendments: [], other_orders: [],
+        sections: { payments: false, deliveries: false, services: true }, timeline: story.timeline.filter(e => e.kind === "service") });
+    }
+    res.json(story);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /customer-360/customers/:id — the customer and their orders (customer_id only).
+app.get("/customer-360/customers/:id", ...requirePerm(PERMS.CUSTOMERS_VIEW), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const story = await customer360.customerStory({ supabase, companyId: cid, user: req.user, customerId: req.params.id });
+    if (!story) return res.status(404).json({ error: "Customer not found" });
+    res.json(story);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
