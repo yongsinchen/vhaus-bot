@@ -30,6 +30,7 @@ const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliver
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const effectiveDelivery = require("./lib/effective-delivery");
 const workbench = require("./lib/delivery-workbench");
+const actionRequired = require("./lib/action-required");
 const customer360 = require("./lib/customer-360");
 const dateRequestStaleness = require("./lib/date-request-staleness");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
@@ -12312,6 +12313,46 @@ app.get("/delivery-workbench/tbc", ...requirePerm(PERMS.DELIVERY_ORDER_VIEW), as
     const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
     const entries = await workbench.listTbcWork({ supabase, companyId: cid });
     res.json({ entries, count: entries.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Phase 4A — Operations "Action Required" (lib/action-required.js). Read-only.
+// GET /operations/action-required          → { counts: { category: n }, labels, today }
+// GET /operations/action-required/:category → { entries, count, today }
+// A card's count IS its list's length (same listCategory call). Each category
+// is returned only to a caller who may already open the page it drills into:
+// DELIVERY_ORDER_VIEW (TBC / delivery), SERVICE_VIEW (service), date approver
+// (Delivery Date Approvals), amendment approver (Order Amendments). Company
+// scope = the active company only. Nothing here grants any edit/approve right.
+async function actionCategoryAllowed(req, category) {
+  const perm = actionRequired.CATEGORIES[category]?.perm;
+  if (!perm) return false;
+  if (perm === "date_approver") return isDateApprover(req);
+  if (perm === "amend_approver") return isAmendApprover(req);
+  return canDo(req, PERMS[perm]);
+}
+app.get("/operations/action-required", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const today = malaysiaDate.malaysiaDateOf();
+    const keys = Object.keys(actionRequired.CATEGORIES);
+    const allowed = (await Promise.all(keys.map(k => actionCategoryAllowed(req, k)))).map((ok, i) => ok && keys[i]).filter(Boolean);
+    if (!allowed.length) return res.status(403).json({ error: "No access to any Action Required category" });
+    const lists = await Promise.all(allowed.map(k => actionRequired.listCategory(k, { supabase, companyId: cid, user: req.user, today })));
+    const counts = {}, labels = {};
+    allowed.forEach((k, i) => { counts[k] = lists[i].length; labels[k] = actionRequired.CATEGORIES[k].label; });
+    res.json({ counts, labels, today });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get("/operations/action-required/:category", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const category = req.params.category;
+    if (!actionRequired.CATEGORIES[category]) return res.status(404).json({ error: "Unknown category" });
+    if (!(await actionCategoryAllowed(req, category))) return res.status(403).json({ error: "Not allowed" });
+    const today = malaysiaDate.malaysiaDateOf();
+    const entries = await actionRequired.listCategory(category, { supabase, companyId: cid, user: req.user, today });
+    res.json({ entries, count: entries.length, today, label: actionRequired.CATEGORIES[category].label });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
