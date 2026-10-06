@@ -17,6 +17,7 @@
  *
  * Usage: node scripts/test-commission-business-month.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const path = require("path");
 const { spawnSync } = require("child_process");

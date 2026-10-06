@@ -5,6 +5,7 @@
  * Verifies 51 endpoints migrated from requireRole to requirePermission.
  * Tests: code analysis, permission coverage, role-based access, regression.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const { PermissionEngine } = require("../permission-engine");

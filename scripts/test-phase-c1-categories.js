@@ -6,6 +6,7 @@
  * GET /organization-categories + drill-down endpoints mirror the
  * Phase 2 supplier pattern (org-scoped, cross-org isolation enforced).
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");

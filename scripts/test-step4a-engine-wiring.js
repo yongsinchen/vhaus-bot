@@ -5,6 +5,7 @@
  * Verifies that the engine is wired into requireAuth and
  * resolves company context correctly without changing behavior.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const { PermissionEngine } = require("../permission-engine");

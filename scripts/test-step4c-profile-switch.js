@@ -13,6 +13,7 @@
  * 9. Backward compatibility: old fields still exist
  * 10. Backend syntax/build
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const { PermissionEngine } = require("../permission-engine");

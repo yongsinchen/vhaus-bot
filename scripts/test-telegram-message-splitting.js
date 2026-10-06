@@ -11,6 +11,7 @@
  *
  * Usage: node scripts/test-telegram-message-splitting.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const fs = require("fs");
 const path = require("path");

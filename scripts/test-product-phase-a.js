@@ -6,6 +6,7 @@
  * layer is correctly built without touching any existing product row,
  * FK reference, or business data.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 

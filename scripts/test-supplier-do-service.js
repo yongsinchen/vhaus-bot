@@ -10,6 +10,7 @@
  *
  * Usage: node scripts/test-supplier-do-service.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const { createSupplierDOService, extractKeywords, itemMatchesOrderItem } = require("../lib/supplier-do");

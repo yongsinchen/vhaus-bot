@@ -19,6 +19,7 @@
  *
  * Usage: node scripts/test-p1-4d-partial-arrival-quantity.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const crypto = require("crypto");

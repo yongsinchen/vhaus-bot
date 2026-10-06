@@ -14,6 +14,7 @@
  * Part B — live integration tests (self-cleaning TEST-ARR- fixtures) covering
  *          case 6 (projection refresh) and case 7 (supplier DO exact stamp).
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const doLib = require("../lib/delivery-orders");
 

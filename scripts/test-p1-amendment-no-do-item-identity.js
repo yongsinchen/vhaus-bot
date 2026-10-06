@@ -29,6 +29,7 @@
  * Usage: PORT=3199 OPENAI_API_KEY=sk-dummy node server.js   (separately, first)
  *        node scripts/test-p1-amendment-no-do-item-identity.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const axios = require("axios");

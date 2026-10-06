@@ -17,6 +17,7 @@
  * 5. Telegram and the normal POST /suppliers, POST /products endpoints are
  *    unaffected (dryRun is optional and additive).
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");

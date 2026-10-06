@@ -40,6 +40,7 @@
  *
  * Self-cleaning: synthetic fixtures only (TAG-prefixed), deleted in finally.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const axios = require("axios");

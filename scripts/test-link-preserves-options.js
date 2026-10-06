@@ -5,6 +5,7 @@
 // Requires migration 025 (linked_custom_item). Creates a clearly-marked TEST
 // sales order, runs the link update, asserts, then deletes everything.
 // Run: node scripts/test-link-preserves-options.js
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);

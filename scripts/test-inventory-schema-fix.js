@@ -8,6 +8,7 @@
  * no warehouse_id, quantity, or created_at), and that organization_products
  * enrichment (Phase C-3) and low-stock logic both still work on the corrected schema.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");

@@ -23,6 +23,7 @@
  *
  * Self-cleaning: synthetic fixtures only; the two real SOs are read-only.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const axios = require("axios");

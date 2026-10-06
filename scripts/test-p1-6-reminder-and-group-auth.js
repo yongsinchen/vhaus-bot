@@ -18,6 +18,7 @@
  *
  * Usage: node scripts/test-p1-6-reminder-and-group-auth.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const fs = require("fs");
 const path = require("path");

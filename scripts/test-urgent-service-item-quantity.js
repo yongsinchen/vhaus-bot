@@ -12,6 +12,7 @@
  * Self-cleaning live fixture against production Supabase via a locally
  * spawned server.js (PORT 3199).
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const axios = require("axios");

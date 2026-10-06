@@ -17,6 +17,7 @@
  *
  * Usage: PORT=3199 node server.js (separately), then node scripts/test-payment-confirm-retier.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const axios = require("axios");

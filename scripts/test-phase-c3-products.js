@@ -7,6 +7,7 @@
  * search behavior, same existing field values. PO line items must remain
  * untouched (historical snapshots, never live-joined to organization_products).
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");

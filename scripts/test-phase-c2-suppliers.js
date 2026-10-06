@@ -6,6 +6,7 @@
  * is purely additive: same row scope, same existing field values, no
  * change to write logic, catalogue import, products, or Telegram.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");

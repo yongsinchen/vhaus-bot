@@ -16,6 +16,7 @@
  *
  * Usage: node scripts/test-delivery-orders-phase1.js
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const doLib = require("../lib/delivery-orders");

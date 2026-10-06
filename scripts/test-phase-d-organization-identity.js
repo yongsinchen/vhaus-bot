@@ -13,6 +13,7 @@
  * find-or-create is exercised live against a known-existing, already-linked
  * supplier/product instead, which is read-only and safe to run repeatedly.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");

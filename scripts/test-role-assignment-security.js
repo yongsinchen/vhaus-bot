@@ -11,6 +11,7 @@
  * 6. user cannot switch to revoked/deactivated company
  * 7. backend blocks invalid role escalation regardless of UI
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const { PermissionEngine } = require("../permission-engine");

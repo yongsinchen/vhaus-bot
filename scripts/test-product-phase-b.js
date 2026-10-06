@@ -8,6 +8,7 @@
  * NOT created (explicitly deferred) and organization_categories was
  * NOT implemented (design only).
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");

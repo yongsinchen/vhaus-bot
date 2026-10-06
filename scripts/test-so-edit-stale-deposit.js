@@ -20,6 +20,7 @@
  * Usage: node scripts/test-so-edit-stale-deposit.js   (STALE_API overrides the target;
  *        default http://localhost:3199 — PORT=3199 node server.js first)
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const axios = require("axios");

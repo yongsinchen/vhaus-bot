@@ -25,6 +25,7 @@
  * by design (confirmed back in the Phase D audit), so a fresh fabricated name
  * on every run would permanently pollute real org master data over time.
  */
+require("./harness/live-db-guard").assertSafeTestDatabase(__filename); // fail closed: never against production
 try { require("dotenv").config(); } catch {}
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");
