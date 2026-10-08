@@ -6600,6 +6600,90 @@ app.patch("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) =
   } catch (err) { console.error("PATCH /payments/:id error:", err); res.status(500).json({ error: "Failed to amend payment" }); }
 });
 
+// ── Payment PROOF edit (proof-only) ─────────────────────────────────────────────────────────────────────
+// PATCH /payments/:id/proof — change ONLY the evidence attached to a payment. It never touches amount, method, reference, date, allocation,
+// the order's paid / balance, commission or the approval status (no recompute, no RPC): the full Amend flow re-records the whole payment, which
+// is far more than "this screenshot is wrong", and it deletes removed proof files from storage.
+//   pending   — replace / add / remove (the list sent is the new list). Whoever may amend a pending payment may do this: managers and
+//               Finance for any pending payment, others only for one they recorded. The payment stays pending; Finance reviews the latest proof.
+//   approved  — APPEND-ONLY, managers / Finance only: every existing proof must still be present, new ones are added after them. Approved
+//               evidence is never replaced or removed.
+//   rejected  — not editable (a rejected payment is void; record a new payment with the corrected proof).
+// Nothing is deleted from storage: a proof taken off a pending payment is recorded as SUPERSEDED in the audit event (system_events,
+// event_type 'payment.proof_updated') with its URL, who/when/status, so the original evidence stays recoverable. Compare-and-set on
+// (approval_status, proof_url) closes the race with Finance approving, or another edit, at the same moment.
+const PROOF_MAX = 10;
+const parseProofList = (v) => (Array.isArray(v) ? v : String(v || "").split(",")).map(s => String(s).trim()).filter(Boolean);
+function isUploadedProofUrl(url, cid) {
+  // only files this system uploaded for THIS company (…/storage/v1/object/public/<bucket>/order-attachments/<companyId>/<file>)
+  try {
+    const u = new URL(url); const base = new URL(process.env.SUPABASE_URL);
+    if (u.host !== base.host || !/^https?:$/.test(u.protocol)) return false;
+    return new RegExp(`^/storage/v1/object/public/(order-attachments|catalogue-imports)/(order-attachments/)?${cid}/[^/]+$`).test(u.pathname);
+  } catch { return false; }
+}
+app.patch("/payments/:id/proof", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    const wanted = [...new Set(parseProofList(req.body?.proof_url))];
+    if (wanted.length === 0) return res.status(400).json({ error: "At least one payment proof is required", code: "proof_required" });
+    if (wanted.length > PROOF_MAX) return res.status(400).json({ error: `At most ${PROOF_MAX} proofs per payment`, code: "too_many_proofs" });
+
+    const { data: pay } = await supabase.from("payments").select("id, company_id, approval_status, proof_url, recorded_by, or_number, amount").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
+    if (!pay) return res.status(404).json({ error: "Payment not found" });
+    const status = pay.approval_status || "approved";   // legacy rows with no status are approved
+    const privileged = MANAGE_ROLES.includes(req.user.role) || req.user.role === "finance";
+
+    if (status === "rejected") return res.status(409).json({ error: "This payment was rejected and is void — record a new payment with the corrected proof.", code: "payment_rejected" });
+    if (status === "pending") {
+      if (!privileged && pay.recorded_by !== req.user.id) return res.status(403).json({ error: "You can only change the proof of a payment you recorded", code: "not_owner" });
+    } else if (!privileged) {
+      return res.status(403).json({ error: "This payment is already approved — only a manager or Finance can add a supplementary proof", code: "approved_requires_manager" });
+    }
+
+    const current = parseProofList(pay.proof_url);
+    const added = wanted.filter(u => !current.includes(u));
+    const superseded = current.filter(u => !wanted.includes(u));
+    if (status !== "pending" && superseded.length > 0) {
+      return res.status(409).json({ error: "Approved payment evidence cannot be replaced or removed — you can only add a supplementary proof.", code: "approved_evidence_locked" });
+    }
+    if (added.length === 0 && superseded.length === 0 && wanted.join() === current.join()) return res.json({ payment: { id: pay.id, proof_url: pay.proof_url, approval_status: status }, unchanged: true });
+    for (const u of added) if (!isUploadedProofUrl(u, cid)) return res.status(400).json({ error: "A proof must be a file uploaded through the system for this company", code: "invalid_proof_url" });
+
+    // approved: keep the original order, new proofs after them (so "latest" is always the last one)
+    const finalList = status === "pending" ? wanted : [...current, ...added];
+    let upd = supabase.from("payments").update({ proof_url: finalList.join(", ") }).eq("id", pay.id).eq("company_id", cid);
+    upd = pay.approval_status == null ? upd.is("approval_status", null) : upd.eq("approval_status", pay.approval_status);
+    upd = pay.proof_url == null ? upd.is("proof_url", null) : upd.eq("proof_url", pay.proof_url);
+    const { data: written, error: wErr } = await upd.select("id, proof_url, approval_status");
+    if (wErr) throw wErr;
+    if (!written || written.length === 0) return res.status(409).json({ error: "This payment changed while you were editing it (it may have just been approved). Reload and try again.", code: "payment_changed" });
+
+    let auditWarning = null;
+    const { error: aErr } = await supabase.from("system_events").insert({
+      company_id: cid, user_id: req.user.id, event_type: "payment.proof_updated", entity: "payments", entity_id: pay.id,
+      payload: { or_number: pay.or_number, amount: pay.amount, status_at_time: status, by_name: req.user.name || null, by_role: req.user.role, before: current, after: finalList, added, superseded },
+      ip: req.ip || null, device: (req.headers["user-agent"] || "").substring(0, 255) || null,
+    });
+    if (aErr) { console.error("[payment.proof_updated] audit insert failed:", aErr.message); auditWarning = "The proof was saved, but the audit entry could not be written."; }
+    res.json({ payment: written[0], added, superseded, ...(auditWarning ? { audit_warning: auditWarning } : {}) });
+  } catch (err) { console.error("PATCH /payments/:id/proof error:", err); res.status(500).json({ error: "Failed to update payment proof" }); }
+});
+
+// GET /payments/:id/proof-history — who changed the evidence, when, and which proofs were superseded (kept in storage).
+app.get("/payments/:id/proof-history", requireAuth, async (req, res) => {
+  try {
+    const cid = getActiveCompanyId(req);
+    if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
+    const { data: pay } = await supabase.from("payments").select("id").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
+    if (!pay) return res.status(404).json({ error: "Payment not found" });
+    const { data } = await supabase.from("system_events").select("id, created_at, user_id, payload")
+      .eq("company_id", cid).eq("entity", "payments").eq("entity_id", pay.id).eq("event_type", "payment.proof_updated").order("created_at", { ascending: true });
+    res.json({ history: (data || []).map(e => ({ id: e.id, at: e.created_at, by_name: e.payload?.by_name || null, by_role: e.payload?.by_role || null, status_at_time: e.payload?.status_at_time || null, added: e.payload?.added || [], superseded: e.payload?.superseded || [] })) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.delete("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) => {
   try {
     const cid = getActiveCompanyId(req);
