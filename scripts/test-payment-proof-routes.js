@@ -126,7 +126,7 @@ const pay = (id, status, over = {}) => ({ id, company_id: A, order_id: 1, custom
     out("\n══ Existing workflows untouched ══\n");
     const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
     const amendRoute = src.slice(src.indexOf('app.patch("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES)'), src.indexOf("// ── Payment PROOF edit"));
-    assert("the existing Amend route (PATCH /payments/:id) is unchanged: still the atomic amend RPC with its own proof cleanup", /paymentAllocationService\.amendPendingPayment/.test(amendRoute) && /cleanupRemovedProofs\(result\.oldProofUrl/.test(amendRoute) && /allocations\) \|\| allocations\.length === 0/.test(amendRoute));
+    assert("the existing Amend route (PATCH /payments/:id) is still the atomic amend RPC, and no longer deletes any stored proof (superseded ones are audited)", /paymentAllocationService\.amendPendingPayment/.test(amendRoute) && !/deleteStorageObjectsByPublicUrl|cleanupRemovedProofs/.test(amendRoute) && /allocations\) \|\| allocations\.length === 0/.test(amendRoute));
     const proofRoute = src.slice(src.indexOf('app.patch("/payments/:id/proof"'), src.indexOf('app.get("/payments/:id/proof-history"'));
     assert("the proof route deletes NO stored file and calls no recompute / commission / RPC", !/deleteStorageObjectsByPublicUrl|cleanupRemovedProofs|\.rpc\(|recompute|calculateCommission|recalcCommission|payment_allocations/.test(proofRoute));
   } catch (e) { h.quiet(false); out("❌ FATAL:", e.stack || e.message); fail++; }

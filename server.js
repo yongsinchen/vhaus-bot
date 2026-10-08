@@ -6562,16 +6562,6 @@ app.get("/payments", requireAuth, async (req, res) => {
 const PAYMENT_CHANGE_ROLES = [...new Set([...ORDER_ROLES, ...MANAGE_ROLES, "finance"])];
 const pendingPaymentOwnerScope = (req) => (MANAGE_ROLES.includes(req.user.role) || req.user.role === "finance") ? null : req.user.id;
 
-// Best-effort proof-image cleanup AFTER a committed reversal/amend; never
-// undoes the financial write. Returns a warning string or null.
-async function cleanupRemovedProofs(oldProofUrl, keepProofUrl) {
-  const keep = new Set(String(keepProofUrl || "").split(",").map(s => s.trim()).filter(Boolean));
-  const removed = String(oldProofUrl || "").split(",").map(s => s.trim()).filter(u => u && !keep.has(u));
-  if (removed.length === 0) return null;
-  try { await deleteStorageObjectsByPublicUrl(removed.join(", ")); return null; }
-  catch (e) { console.error("proof cleanup error:", e.message); return "The payment was updated, but cleaning up a removed proof image failed — it may need manual removal from storage."; }
-}
-
 // PATCH /payments/:id — amend a PENDING payment (amount, method, reference,
 // proof, admin charges, kind, allocations) atomically via
 // amend_pending_payment: reversed and re-recorded in one savepoint, keeping
@@ -6587,16 +6577,33 @@ app.patch("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) =
     const pdProvided = req.body && Object.prototype.hasOwnProperty.call(req.body, "payment_date");
     const pd = validatePaymentDate(req.body?.payment_date);
     if (!pd.ok) return res.status(pd.status).json({ error: pd.error, code: pd.code });
-    const { data: before } = await supabase.from("payments").select("payment_date").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
+    const { data: before } = await supabase.from("payments").select("or_number, amount, payment_method, reference_no, paid_at, payment_date, proof_url, approval_status, kind, admin_charges, payment_allocations(order_id, amount)").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
     const result = await paymentAllocationService.amendPendingPayment({
       cid, actorUserId: req.user.id, paymentId: req.params.id, requireRecordedBy: pendingPaymentOwnerScope(req),
       amount, payment_method, reference_no, proof_url, allocations, admin_charges, kind,
     });
     if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code });
     await recalcCommissionForAffectedOrders(result.affectedOrderIds, cid, result.autoConfirmedOrderIds);
-    const proofCleanupWarning = await cleanupRemovedProofs(result.oldProofUrl, result.payment?.proof_url);
-    const dateWarning = await stampPaymentDate(result.payment, cid, pdProvided && pd.value ? pd.value : (before?.payment_date || null));
-    res.json({ payment: result.payment, replaced_payment_id: result.replacedPaymentId, ...(proofCleanupWarning ? { proof_cleanup_warning: proofCleanupWarning } : {}), ...(dateWarning ? { payment_date_warning: dateWarning } : {}) });
+    const finalPaymentDate = pdProvided && pd.value ? pd.value : (before?.payment_date || null);
+    const dateWarning = await stampPaymentDate(result.payment, cid, finalPaymentDate);
+    // A proof taken off the payment is NOT deleted from storage: it is recorded as superseded so the original evidence stays recoverable.
+    const oldProofs = parseProofList(result.oldProofUrl || before?.proof_url);
+    const newProofs = parseProofList(result.payment?.proof_url);
+    const supersededProofs = oldProofs.filter(u => !newProofs.includes(u));
+    const { error: aErr } = await supabase.from("system_events").insert({
+      company_id: cid, user_id: req.user.id, event_type: "payment.amended", entity: "payments", entity_id: result.payment?.id || req.params.id,
+      payload: {
+        or_number: before?.or_number ?? result.payment?.or_number ?? null, replaced_payment_id: result.replacedPaymentId || req.params.id, status_at_time: before?.approval_status || "pending",
+        by_name: req.user.name || null, by_role: req.user.role,
+        before: before ? { amount: before.amount, payment_method: before.payment_method, reference_no: before.reference_no, payment_date: before.payment_date || before.paid_at || null, proof_url: oldProofs, kind: before.kind, admin_charges: before.admin_charges, allocations: (before.payment_allocations || []).map(a => ({ order_id: a.order_id, amount: a.amount })) } : null,
+        after: { amount: result.payment?.amount, payment_method: result.payment?.payment_method, reference_no: result.payment?.reference_no, payment_date: finalPaymentDate, proof_url: newProofs, kind: result.payment?.kind, admin_charges: result.payment?.admin_charges, allocations: (Array.isArray(allocations) ? allocations : []).map(a => ({ order_id: a.order_id, amount: a.amount })) },
+        superseded_proofs: supersededProofs,
+      },
+      ip: req.ip || null, device: (req.headers["user-agent"] || "").substring(0, 255) || null,
+    });
+    let auditWarning = null;
+    if (aErr) { console.error("[payment.amended] audit insert failed:", aErr.message); auditWarning = "The payment was updated, but the audit entry could not be written."; }
+    res.json({ payment: result.payment, replaced_payment_id: result.replacedPaymentId, ...(supersededProofs.length ? { superseded_proofs: supersededProofs } : {}), ...(auditWarning ? { audit_warning: auditWarning } : {}), ...(dateWarning ? { payment_date_warning: dateWarning } : {}) });
   } catch (err) { console.error("PATCH /payments/:id error:", err); res.status(500).json({ error: "Failed to amend payment" }); }
 });
 
