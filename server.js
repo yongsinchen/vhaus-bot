@@ -17200,7 +17200,8 @@ async function _hasActiveDo(salesOrderId) {
   const { data: doRows } = await supabase.from("delivery_orders").select("id").eq("sales_order_id", salesOrderId).limit(1);
   return (doRows || []).length > 0;
 }
-const ACTIVE_DO_REBASE_UNSUPPORTED = "This order has an active Delivery Order — conflict resolution for Active-DO amendments isn't supported yet. Reject this amendment and ask the salesperson to resubmit, or resolve the Delivery Order state first.";
+const ALREADY_APPLIED_MESSAGE = "This amendment has already been applied.";
+const ACTIVE_DO_REBASE_UNSUPPORTED ="This order has an active Delivery Order — conflict resolution for Active-DO amendments isn't supported yet. Reject this amendment and ask the salesperson to resubmit, or resolve the Delivery Order state first.";
 
 app.post("/order-amendments/:id/rebase-preview", requireAuth, async (req, res) => {
   try {
@@ -17273,11 +17274,16 @@ app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) =
     const cid = getActiveCompanyId(req);
     const { data: a } = await supabase.from("sales_order_amendments").select("*").eq("id", req.params.id).maybeSingle();
     if (!a || (cid && a.company_id !== cid)) return res.status(404).json({ error: "Amendment not found" });
+    // A repeated click / retry after a successful apply: say so plainly (409 already_applied) instead of a generic status error —
+    // the UI treats it as "done", never as a failure, and nothing is written.
+    if (a.status === "approved") return res.status(409).json({ error: ALREADY_APPLIED_MESSAGE, reason: "already_applied", amendment_status: "approved" });
     if (a.status !== "conflict") return res.status(400).json({ error: `Amendment is '${a.status}', not 'conflict' — nothing to rebase` });
     if (await _hasActiveDo(a.sales_order_id)) return res.status(400).json({ error: ACTIVE_DO_REBASE_UNSUPPORTED, code: "active_do_rebase_unsupported" });
 
-    const fieldResolutions = req.body?.field_resolutions;
-    if (!fieldResolutions || typeof fieldResolutions !== "object") return res.status(400).json({ error: "field_resolutions is required" });
+    // With ZERO conflicting fields there is nothing for the manager to decide, so no resolutions are needed (an empty map, or none at all,
+    // is valid). With real conflicts every one still needs an explicit proposed|live choice — applyResolutions() below enforces that.
+    const fieldResolutions = req.body?.field_resolutions ?? {};
+    if (typeof fieldResolutions !== "object" || Array.isArray(fieldResolutions)) return res.status(400).json({ error: "field_resolutions must be an object" });
 
     const { data: liveSo } = await supabase.from("sales_orders").select("*, sales_order_items(*)")
       .eq("id", a.sales_order_id).eq("company_id", a.company_id).maybeSingle();
@@ -17300,7 +17306,9 @@ app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) =
     }
 
     const nowIso = new Date().toISOString();
-    const { error: rebaseWriteErr } = await supabase.from("sales_order_amendments").update({
+    // Compare-and-set on status: the audit record is written ONLY while the amendment is still 'conflict'. A second (double-click / concurrent)
+    // request that arrives after the first one applied must never overwrite the applied amendment's audit trail.
+    const { data: rebaseWritten, error: rebaseWriteErr } = await supabase.from("sales_order_amendments").update({
       rebase_base_snapshot: liveSo,
       rebase_base_fingerprint: liveSo.updated_at,
       rebased_proposed_snapshot: rebasedSnapshot,
@@ -17309,8 +17317,13 @@ app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) =
       rebased_by_name: req.user.name || null,
       rebased_at: nowIso,
       updated_at: nowIso,
-    }).eq("id", a.id);
+    }).eq("id", a.id).eq("status", "conflict").select("id");
     if (rebaseWriteErr) throw rebaseWriteErr;
+    if (!rebaseWritten || rebaseWritten.length === 0) {
+      const { data: nowRow } = await supabase.from("sales_order_amendments").select("status").eq("id", a.id).maybeSingle();
+      if (nowRow?.status === "approved") return res.status(409).json({ error: ALREADY_APPLIED_MESSAGE, reason: "already_applied", amendment_status: "approved" });
+      return res.status(409).json({ error: `This amendment changed while you were reviewing it (it is now '${nowRow?.status || "unknown"}'). Reload and review again.`, reason: "amendment_changed" });
+    }
 
     // Shared apply mechanics — the exact same function normal /approve
     // calls for a NO-DO amendment. Re-fetch first: it needs the
@@ -17319,6 +17332,8 @@ app.post("/order-amendments/:id/rebase-resolve", requireAuth, async (req, res) =
     const applyResult = await applySalesOrderAmendmentTransactional(freshAmendment, req.user.id);
     if (applyResult.error) return res.status(500).json({ error: applyResult.error });
     if (applyResult.conflict) {
+      // 'already_decided' = another request (a double click) won the row lock and applied it first: report that, not a failure.
+      if (applyResult.reason === "already_decided") return res.status(409).json({ error: ALREADY_APPLIED_MESSAGE, reason: "already_applied", amendment_status: "approved" });
       const message = applyResult.reason === "rebase_stale"
         ? "The sales order changed again since this amendment was rebased — the prepared rebase is no longer valid. Run Rebase & Review again."
         : "This amendment could not be applied — it is in conflict and needs manual review.";
