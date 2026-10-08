@@ -22,6 +22,7 @@ const scheduleTeamDate = require("./lib/schedule-team-date");
 const commissionLifecycle = require("./lib/commission-lifecycle");
 const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { validatePaymentDate } = require("./lib/payment-date");
+const ledgerView = require("./lib/payment-ledger-view");
 const businessMonth = require("./lib/business-month");
 const { parseServiceItemQuantity, validateServiceItemQuantities, displayServiceItemQuantity } = require("./lib/service-item-quantity");
 const { salespersonTokens, orderHasSalesperson, escapeLike } = require("./lib/salesperson-tokens");
@@ -6088,6 +6089,16 @@ app.get("/customers", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// id → display name for a set of user ids (Recorded-by on the payment ledger). Failure degrades to "no name", never to an error.
+async function userNamesById(ids) {
+  const uniq = [...new Set((ids || []).filter(Boolean))];
+  if (!uniq.length) return {};
+  try {
+    const { data } = await supabase.from("users").select("id, name, salesman_name").in("id", uniq);
+    return Object.fromEntries((data || []).map(u => [u.id, u.name || u.salesman_name || null]));
+  } catch { return {}; }
+}
+
 app.get("/customers/:id", requireAuth, async (req, res) => {
   try {
     // Phase 2E: company-scoped — a foreign customer id is "not found" (this route returns the customer's orders AND payments).
@@ -6113,31 +6124,18 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
     // (they're edited on the order, not deletable here).
     const soNumbers = [...new Set(allOrders.map(o => o.so_number).filter(Boolean))];
     const depositLines = [];
+    const names = await userNamesById((payments || []).map(p => p.recorded_by));   // "Recorded by" for payment rows (and, below, deposits)
     if (soNumbers.length) {
       const { data: sos } = await supabase.from("sales_orders")
-        .select("order_number, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
+        .select("id, order_number, customer_name, status, created_by, salesman_name, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
         .eq("company_id", customer.company_id).in("order_number", soNumbers);
+      Object.assign(names, await userNamesById((sos || []).map(s => s.created_by)));
+      // Normalized read model (lib/payment-ledger-view.js): each line is tagged SO_DEPOSIT / PAYMENT_TRANSACTION.
       for (const so of (sos || [])) {
-        const dep = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
-        if (dep > 0) {
-          const ord = allOrders.find(o => o.so_number === so.order_number);
-          // Surface HOW the deposit was paid + its receipt(s) from the order:
-          // payment_proofs is a JSON array of URL strings, and the finance UI
-          // splits proof_url on commas into individual proof links.
-          let proofs = so.payment_proofs;
-          if (typeof proofs === "string") { try { proofs = JSON.parse(proofs || "[]"); } catch { proofs = []; } }
-          const proofUrl = Array.isArray(proofs) ? proofs.filter(Boolean).join(",") : null;
-          depositLines.push({
-            id: null, _deposit: true, amount: dep,
-            payment_method: so.payment_method || "Deposit",
-            reference_no: null, proof_url: proofUrl || null, order_id: ord?.id || null,
-            so_number: so.order_number, paid_at: so.created_at || ord?.created_at || null,
-            or_number: so.deposit_or_number || null, approval_status: "approved",
-          });
-        }
+        if (ledgerView.depositAmountOf(so) > 0) depositLines.push(ledgerView.depositLine(so, allOrders.find(o => o.so_number === so.order_number), names));
       }
     }
-    const allPayments = [...depositLines, ...(payments || [])]
+    const allPayments = [...depositLines, ...(payments || []).map(p => ledgerView.paymentLine(p, names))]
       .sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
 
     // Totals. total_paid is derived from balances (the source of truth kept by
@@ -6502,6 +6500,8 @@ app.get("/payments", requireAuth, async (req, res) => {
     } else {
       payments = normalize(data);
     }
+    const payNames = await userNamesById(payments.map(p => p.recorded_by));
+    payments = payments.map(p => ledgerView.paymentLine(p, payNames));   // source_type PAYMENT_TRANSACTION + Recorded by
 
     // Fold in each order's upfront deposit as a synthetic line so the Finance
     // page captures deposits, not just ledger collections. These live on the
@@ -6510,8 +6510,9 @@ app.get("/payments", requireAuth, async (req, res) => {
     // filter on), so skip when a specific order/customer is requested.
     if (include_deposits && cid && !order_id && !customer_id) {
       const { data: sos } = await supabase.from("sales_orders")
-        .select("order_number, customer_name, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
+        .select("id, order_number, customer_name, status, created_by, salesman_name, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
         .eq("company_id", cid).order("created_at", { ascending: false }).limit(2000);
+      const depNames = await userNamesById((sos || []).map(s => s.created_by));
       // Map each SO number → its legacy order's customer_id, so a deposit can
       // link to the customer (sales_orders has no customer_id of its own).
       const custBySo = {};
@@ -6523,21 +6524,9 @@ app.get("/payments", requireAuth, async (req, res) => {
       }
       const depositLines = [];
       for (const so of (sos || [])) {
-        const dep = so.initial_deposit != null ? Number(so.initial_deposit) : (Number(so.deposit) || 0);
-        if (!(dep > 0)) continue;
-        let proofs = so.payment_proofs;
-        if (typeof proofs === "string") { try { proofs = JSON.parse(proofs || "[]"); } catch { proofs = []; } }
-        depositLines.push({
-          id: null, _deposit: true, amount: dep,
-          payment_method: so.payment_method || "Deposit",
-          reference_no: null, proof_url: Array.isArray(proofs) ? proofs.filter(Boolean).join(",") : null,
-          so_number: so.order_number, customer_name: so.customer_name,
-          customer_id: custBySo[so.order_number] || null,
-          order_id: null, paid_at: so.created_at, or_number: so.deposit_or_number || null,
-          // Upfront order deposits live on the order, not the ledger — outside
-          // the payment-approval flow, so treat them as already approved.
-          approval_status: "approved",
-        });
+        if (!(ledgerView.depositAmountOf(so) > 0)) continue;
+        // Upfront order deposits live on the order, not the ledger — outside the payment-approval flow (approval_basis "none").
+        depositLines.push({ ...ledgerView.depositLine(so, { customer_id: custBySo[so.order_number] || null }, depNames), order_id: null });
       }
       payments = [...depositLines, ...payments].sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
     }
