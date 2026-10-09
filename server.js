@@ -23,6 +23,7 @@ const commissionLifecycle = require("./lib/commission-lifecycle");
 const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { validatePaymentDate } = require("./lib/payment-date");
 const ledgerView = require("./lib/payment-ledger-view");
+const depositAmendmentsLib = require("./lib/deposit-amendments");
 const businessMonth = require("./lib/business-month");
 const { parseServiceItemQuantity, validateServiceItemQuantities, displayServiceItemQuantity } = require("./lib/service-item-quantity");
 const { salespersonTokens, orderHasSalesperson, escapeLike } = require("./lib/salesperson-tokens");
@@ -6139,7 +6140,7 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
         if (ledgerView.depositAmountOf(so) > 0) depositLines.push(ledgerView.depositLine(so, allOrders.find(o => o.so_number === so.order_number), names));
       }
     }
-    const allPayments = [...depositLines, ...(payments || []).map(p => ledgerView.paymentLine(p, names))]
+    const allPayments = (await attachAmendmentRequests([...depositLines, ...(payments || []).map(p => ledgerView.paymentLine(p, names))], customer.company_id))
       .sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
 
     // Totals. total_paid is derived from balances (the source of truth kept by
@@ -6285,6 +6286,30 @@ async function ledgerPaymentsForOrderIds(ids) {
 // is exact and fully reversible: recording or deleting a payment always lands
 // on the correct total, so a capped over-/double-payment can never wipe the
 // original deposit. Clamped to [0, order total].
+// Migration 117: each ledger row carries its latest deposit-change /
+// payment-amendment request (pending, or the most recent decision) so
+// Customer Profile → Payment History and Finance can show the approval status.
+async function attachAmendmentRequests(lines, companyId) {
+  const rows = lines || [];
+  if (!companyId || !rows.length) return rows;
+  const soIds = [...new Set(rows.filter(l => l.source_type === ledgerView.SOURCE_DEPOSIT && l.sales_order_id).map(l => l.sales_order_id))];
+  const payIds = [...new Set(rows.filter(l => l.source_type !== ledgerView.SOURCE_DEPOSIT && l.id).map(l => l.id))];
+  const pick = list => { const by = new Map(); for (const r of list || []) { const k = r.sales_order_id || r.payment_id; const cur = by.get(k); if (!cur || (r.status === "pending" && cur.status !== "pending") || (cur.status !== "pending" && r.requested_at > cur.requested_at)) by.set(k, r); } return by; };
+  const view = r => r && ({ id: r.id, request_type: r.request_type, status: r.status, proposed_snapshot: r.proposed_snapshot, before_snapshot: r.before_snapshot,
+    reason: r.reason, requested_by: r.requested_by, requested_by_name: r.requested_by_name, requested_at: r.requested_at,
+    reviewed_by_name: r.reviewed_by_name, reviewed_at: r.reviewed_at, decision_note: r.decision_note, recalc_status: r.recalc_status });
+  try {
+    const chunk = (ids, n = 200) => { const out = []; for (let i = 0; i < ids.length; i += n) out.push(ids.slice(i, i + n)); return out; };
+    const dep = [], pay = [];
+    for (const part of chunk(soIds)) { const { data, error } = await supabase.from("sales_order_deposit_requests").select("*").eq("company_id", companyId).in("sales_order_id", part); if (error) throw error; dep.push(...(data || [])); }
+    for (const part of chunk(payIds)) { const { data, error } = await supabase.from("payment_amendment_requests").select("*").eq("company_id", companyId).in("payment_id", part); if (error) throw error; pay.push(...(data || [])); }
+    const depBy = pick(dep), payBy = pick(pay);
+    return rows.map(l => l.source_type === ledgerView.SOURCE_DEPOSIT
+      ? { ...l, deposit_request: view(depBy.get(l.sales_order_id)) || null }
+      : { ...l, amendment_request: view(payBy.get(l.id)) || null });
+  } catch (e) { console.error("attachAmendmentRequests:", e.message); return rows; }
+}
+
 async function recomputeOrderPaid(orderId) {
   const { data: ord } = await supabase.from("orders")
     .select("so_number, company_id, type").eq("id", orderId).single();
@@ -6549,6 +6574,7 @@ app.get("/payments", requireAuth, async (req, res) => {
       payments = [...depositLines, ...payments].sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
     }
     // Each row's Sales Order(s) + effective delivery date (display only; amounts untouched).
+    if (cid) payments = await attachAmendmentRequests(payments, cid);
     if (cid) {
       try { payments = await paymentSoLinks.attachLinkedOrders({ supabase, companyId: cid, rows: payments }); }
       catch (e) { console.error("attachLinkedOrders:", e.message); }
@@ -6707,7 +6733,14 @@ app.delete("/payments/:id", requireRole(PAYMENT_CHANGE_ROLES), async (req, res) 
   try {
     const cid = getActiveCompanyId(req);
     if (!cid) return res.status(400).json({ error: "Active company could not be resolved for this request" });
-    // Managers keep the existing any-status reversal; everyone else may only
+    // 117: an APPROVED payment is never removed directly — that is a reversal
+    // request (POST /payments/:id/amendment-requests, request_type "reverse")
+    // that another Manager / Finance / Master approves; its proof is kept.
+    const { data: target } = await supabase.from("payments").select("approval_status").eq("id", req.params.id).eq("company_id", cid).maybeSingle();
+    if (target?.approval_status === "approved") {
+      return res.status(409).json({ error: "This payment is already approved — submit a reversal request for Manager / Finance approval instead of deleting it.", code: "approved_payment_requires_request" });
+    }
+    // Managers keep the existing reversal of pending / rejected payments; everyone else may only
     // withdraw a still-pending payment (their own, unless Finance).
     const result = MANAGE_ROLES.includes(req.user.role)
       ? await paymentAllocationService.reversePayment({ cid, actorUserId: req.user.id, paymentId: req.params.id })
@@ -16089,7 +16122,15 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
       const eff = await effectiveDelivery.resolveEffectiveDeliveryForSalesOrders({ supabase, companyId: data.company_id, salesOrders: [data] });
       data._effective_delivery = eff.get(data.id) || null;
     } catch (e) { console.error("effective delivery error:", e.message); data._effective_delivery = null; }
-    res.json({ order: data, legacy_order: legacyOrder, pending_amendment });
+    // Migration 117: a deposit change waiting for approval (Edit Order shows it; the order keeps the approved deposit).
+    let pending_deposit_request = null;
+    try {
+      const { data: dr } = await supabase.from("sales_order_deposit_requests").select("*")
+        .eq("company_id", data.company_id).eq("sales_order_id", data.id).eq("status", "pending").maybeSingle();
+      if (dr) pending_deposit_request = { id: dr.id, request_type: dr.request_type, before_snapshot: dr.before_snapshot, proposed_snapshot: dr.proposed_snapshot,
+        reason: dr.reason, requested_by: dr.requested_by, requested_by_name: dr.requested_by_name, requested_at: dr.requested_at, source: dr.source };
+    } catch (e) { console.error("pending deposit request lookup:", e.message); }
+    res.json({ order: data, legacy_order: legacyOrder, pending_amendment, pending_deposit_request });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -16570,7 +16611,9 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
           });
         } else {
           const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
-          if (!MANAGE_ROLES.includes(roleKey)) {
+          // 117: when the order already HAS a recorded deposit, this becomes an
+          // approval request (below) — the requester need not be a manager.
+          if (!MANAGE_ROLES.includes(roleKey) && depositAmendmentsLib.recordedDepositOf(existing) <= 0) {
             return res.status(403).json({ error: "Only a manager can change the paid amount once payments have been recorded (e.g. collected on delivery)." });
           }
           // recompute yields min(total, initial_deposit + paidFromPayments) → entered.
@@ -16582,6 +16625,45 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
             });
           }
         }
+      }
+    }
+
+    // ── 117: an order that ALREADY has a recorded deposit never has it changed
+    // here. Any change to its amount, method or proof becomes a deposit-change
+    // request (Manager / Finance / Master approval — migration 117); the live
+    // deposit fields are kept exactly as they are and the rest of this edit
+    // follows its own rules. The request is created only once the rest of the
+    // edit has been saved (or submitted as an order amendment). Recording the
+    // FIRST deposit on an order without one is unchanged (immediate).
+    let depositChange = null;
+    {
+      const recordedDeposit = depositAmendmentsLib.recordedDepositOf(existing);
+      const amountChanged = depositProvided && !depositUntouched && !sameMoney(initialDepositForUpdate, existingInitialDeposit);
+      const methodChanged = payment_method !== undefined && (payment_method || null) !== (existing.payment_method || null);
+      const proofsChanged = payment_proofs !== undefined && depositAmendmentsLib.normalizeProofs(payment_proofs) !== depositAmendmentsLib.normalizeProofs(existing.payment_proofs);
+      if (recordedDeposit > 0 && (amountChanged || methodChanged || proofsChanged)) {
+        const reason = String(req.body?.deposit_change_reason || "").trim();
+        if (!reason) {
+          return res.status(400).json({ error: "Changing the deposit needs Manager / Finance approval — enter a reason for the deposit change.", code: "deposit_reason_required" });
+        }
+        const { data: pendingDep } = await supabase.from("sales_order_deposit_requests").select("id")
+          .eq("company_id", company_id).eq("sales_order_id", id).eq("status", "pending").maybeSingle();
+        if (pendingDep) {
+          return res.status(409).json({ error: "A deposit change for this order is already waiting for approval. Wait for it to be decided (or withdraw it) before changing the deposit again.", code: "deposit_change_pending", request_id: pendingDep.id });
+        }
+        const proposedAmount = amountChanged ? initialDepositForUpdate : existingInitialDeposit;
+        depositChange = {
+          request_type: proposedAmount === 0 ? "reverse" : "edit",
+          proposed: {
+            initial_deposit: proposedAmount,
+            payment_method: methodChanged ? (payment_method || null) : (existing.payment_method || null),
+            payment_proofs: proofsChanged ? (depositAmendmentsLib.normalizeProofs(payment_proofs)) : (existing.payment_proofs || null),
+            ...(amountChanged ? { entered_paid_total: depositForUpdate } : {}),
+          },
+          reason,
+        };
+        depositForUpdate = existingDeposit;               // the approved deposit stays live until approval
+        initialDepositForUpdate = existingInitialDeposit;
       }
     }
 
@@ -16619,6 +16701,17 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (amendmentNote) {
       updateData.notes = [amendmentNote, notes || ""].filter(Boolean).join("\n");
     }
+    // 117: a deposit change goes to approval — every deposit column keeps its live value (incl. a legacy NULL initial_deposit).
+    if (depositChange) {
+      Object.assign(updateData, { deposit: existing.deposit, initial_deposit: existing.initial_deposit, deposit_or_number: existing.deposit_or_number,
+        payment_method: existing.payment_method, payment_proofs: existing.payment_proofs });
+    }
+    const submitDepositChange = async () => {
+      if (!depositChange) return {};
+      const r = await depositAmendments.requestDeposit({ cid: company_id, user: req.user, salesOrderId: id, requestType: depositChange.request_type,
+        proposed: depositChange.proposed, reason: depositChange.reason, source: "edit_order" });
+      return r.ok ? { deposit_change_request: r.request } : { deposit_change_error: { code: r.code, error: r.error } };
+    };
 
     // ── P0-18/P1-1: critical amendment on a confirmed/delivered/amended
     // order, OR an order with ANY Delivery Order at all ─────────────────
@@ -16785,6 +16878,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       const { data: unchangedOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).maybeSingle();
       await attachLinkedProducts(unchangedOrder?.sales_order_items);
       return res.json({
+        ...(await submitDepositChange()),
         order: unchangedOrder,
         pending_amendment: true,
         message: "This is a critical change (items, price, discount, or amount). It has been submitted for manager approval — the order's live data has NOT been changed yet.",
@@ -17041,6 +17135,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // P0-16: don't report unconditional success when the operational
     // projection failed to sync — see POST /sales-orders for the same pattern.
     res.json({
+      ...(await submitDepositChange()),
       order: full,
       ...(deliveryOrderUpdated ? { delivery_order_updated: deliveryOrderUpdated } : {}),
       ...(deliveryDateRequest ? { delivery_date_request: deliveryDateRequest } : {}),
@@ -17049,6 +17144,136 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// ── Deposit-change + approved-payment amendment requests (migration 117) ──
+// Every change to an EXISTING SO deposit and to an APPROVED payment is a
+// request that a Manager / Finance / Master of the company approves (never the
+// requester). The SQL functions own the money (lock, verify, apply, ledger,
+// audit — one transaction); lib/deposit-amendments.js runs the canonical
+// commission recalculation afterwards and records its outcome (retryable).
+const depositAmendments = depositAmendmentsLib.createDepositAmendments({ supabase, calculateCommission });
+const AMENDMENT_TABLE = { deposit: "sales_order_deposit_requests", payment: "payment_amendment_requests" };
+
+// Who may ASK for a change: the roles that record payments; a salesman only on their own orders / payments.
+function mayRequestForSo(req, so) {
+  const role = String(req.user.role || "").toLowerCase();
+  if (!PAYMENT_CHANGE_ROLES.includes(role)) return false;
+  if (role !== "salesman") return true;
+  const me = String(req.user.salesman_name || "").toLowerCase().trim();
+  return !!me && String(so?.salesman_name || "").toLowerCase().split("/").map(x => x.trim()).includes(me);
+}
+
+app.get("/amendment-requests", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const { status, kind, sales_order_id, payment_id } = req.query;
+    const approver = depositAmendments.isApproverRole(req);
+    const kinds = kind ? [kind].filter(k => AMENDMENT_TABLE[k]) : ["deposit", "payment"];
+    const out = [];
+    for (const k of kinds) {
+      let q = supabase.from(AMENDMENT_TABLE[k]).select("*").eq("company_id", cid).order("requested_at", { ascending: false }).limit(300);
+      if (status) q = q.eq("status", status);
+      if (k === "deposit" && sales_order_id) q = q.eq("sales_order_id", sales_order_id);
+      if (k === "payment" && payment_id) q = q.eq("payment_id", payment_id);
+      if (k === "deposit" && payment_id) continue;
+      if (k === "payment" && sales_order_id) continue;
+      // Approvers see the company's queue; everyone else their own requests (or the history of a record they can open).
+      if (!approver && !sales_order_id && !payment_id) q = q.eq("requested_by", req.user.id);
+      const { data, error } = await q;
+      if (error) throw error;
+      out.push(...(data || []).map(r => ({ kind: k, ...r })));
+    }
+    // Context for the review screen: SO number / customer (deposit) — the payment's own before snapshot carries its details.
+    const soIds = [...new Set(out.filter(r => r.kind === "deposit").map(r => r.sales_order_id))];
+    if (soIds.length) {
+      const { data: sos } = await supabase.from("sales_orders").select("id, order_number, customer_name, salesman_name, status").eq("company_id", cid).in("id", soIds);
+      const by = new Map((sos || []).map(s => [s.id, s]));
+      for (const r of out) if (r.kind === "deposit") r.sales_order = by.get(r.sales_order_id) || null;
+    }
+    if (!approver && (sales_order_id || payment_id)) {
+      // History of one record: only if the caller may work on it.
+      if (sales_order_id) {
+        const { data: so } = await supabase.from("sales_orders").select("salesman_name").eq("company_id", cid).eq("id", sales_order_id).maybeSingle();
+        if (!so || !mayRequestForSo(req, so)) return res.status(403).json({ error: "Not allowed" });
+      }
+    }
+    out.sort((a, b) => String(b.requested_at).localeCompare(String(a.requested_at)));
+    res.json({ requests: out, is_approver: approver, me: req.user.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /sales-orders/:id/deposit-requests — Customer Profile → Payment History → Edit / Reverse deposit.
+app.post("/sales-orders/:id/deposit-requests", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const { data: so } = await supabase.from("sales_orders").select("id, salesman_name").eq("company_id", cid).eq("id", req.params.id).maybeSingle();
+    if (!so) return res.status(404).json({ error: "Sales order not found" });
+    if (!mayRequestForSo(req, so)) return res.status(403).json({ error: "You can only request deposit changes on orders you manage" });
+    const b = req.body || {};
+    const proposed = {};
+    if (b.initial_deposit !== undefined && b.initial_deposit !== null && b.initial_deposit !== "") {
+      const n = Number(b.initial_deposit);
+      if (!Number.isFinite(n)) return res.status(400).json({ error: "Deposit amount must be a number", code: "invalid_amount" });
+      proposed.initial_deposit = n;
+    }
+    if (b.payment_method !== undefined) proposed.payment_method = b.payment_method || null;
+    if (b.payment_proofs !== undefined) proposed.payment_proofs = depositAmendmentsLib.normalizeProofs(b.payment_proofs);
+    const r = await depositAmendments.requestDeposit({ cid, user: req.user, salesOrderId: so.id, requestType: b.request_type === "reverse" ? "reverse" : "edit",
+      proposed, reason: b.reason, source: "customer_profile", fingerprint: b.fingerprint || null });
+    if (!r.ok) return res.status(r.status).json({ error: r.error, code: r.code, request_id: r.request_id });
+    res.status(201).json({ request: r.request });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /payments/:id/amendment-requests — change or reverse an APPROVED payment (pending ones keep PATCH / DELETE).
+app.post("/payments/:id/amendment-requests", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const role = String(req.user.role || "").toLowerCase();
+    if (!PAYMENT_CHANGE_ROLES.includes(role)) return res.status(403).json({ error: "Not allowed" });
+    const { data: pay } = await supabase.from("payments").select("id, recorded_by").eq("company_id", cid).eq("id", req.params.id).maybeSingle();
+    if (!pay) return res.status(404).json({ error: "Payment not found" });
+    if (role === "salesman" && pay.recorded_by !== req.user.id) return res.status(403).json({ error: "You can only request changes to payments you recorded" });
+    const b = req.body || {};
+    const proposed = {};
+    for (const k of ["payment_method", "reference_no", "proof_url", "kind"]) if (b[k] !== undefined) proposed[k] = b[k];
+    for (const k of ["amount", "admin_charges"]) if (b[k] !== undefined && b[k] !== null && b[k] !== "") proposed[k] = Number(b[k]);
+    if (b.payment_date !== undefined) {
+      const v = validatePaymentDate(b.payment_date);
+      if (!v.ok) return res.status(400).json({ error: v.error, code: v.code || "invalid_payment_date" });
+      proposed.payment_date = v.value || null;
+    }
+    if (Array.isArray(b.allocations)) proposed.allocations = b.allocations.map(a => ({ order_id: Number(a.order_id), amount: Number(a.amount) }));
+    const r = await depositAmendments.requestPayment({ cid, user: req.user, paymentId: pay.id, requestType: b.request_type === "reverse" ? "reverse" : "edit", proposed, reason: b.reason });
+    if (!r.ok) return res.status(r.status).json({ error: r.error, code: r.code, request_id: r.request_id });
+    res.status(201).json({ request: r.request });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+const amendmentAction = action => async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const kind = req.params.kind;
+    if (!AMENDMENT_TABLE[kind]) return res.status(404).json({ error: "Unknown request type" });
+    if ((action === "approve" || action === "reject" || action === "retry") && !depositAmendments.isApproverRole(req)) {
+      return res.status(403).json({ error: "Only a Manager, Finance or Master can decide amendment requests" });
+    }
+    const args = { cid, user: req.user, requestId: req.params.id, note: req.body?.note };
+    const fnName = { approve: kind === "deposit" ? "approveDeposit" : "approvePayment", reject: kind === "deposit" ? "rejectDeposit" : "rejectPayment",
+      withdraw: kind === "deposit" ? "withdrawDeposit" : "withdrawPayment" }[action];
+    const r = action === "retry" ? await depositAmendments.retryRecalc({ cid, kind, requestId: req.params.id }) : await depositAmendments[fnName](args);
+    if (!r.ok) return res.status(r.status).json({ error: r.error, code: r.code });
+    const { ok, status, ...body } = r;
+    if (body.commission && body.commission.status === "failed") {
+      body.warning = "The change was applied and the balance is correct, but the commission recalculation did not finish. It is recorded on the request — use Retry commission.";
+    }
+    res.json(body);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+};
+app.post("/amendment-requests/:kind/:id/approve", requireAuth, amendmentAction("approve"));
+app.post("/amendment-requests/:kind/:id/reject", requireAuth, amendmentAction("reject"));
+app.post("/amendment-requests/:kind/:id/withdraw", requireAuth, amendmentAction("withdraw"));
+app.post("/amendment-requests/:kind/:id/retry-recalc", requireAuth, amendmentAction("retry"));
 
 // ── URGENT production fix — SO number identity/reference correction ────
 // Deliberately its own endpoint rather than folded into PUT /sales-orders/:id
