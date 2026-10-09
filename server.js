@@ -32,6 +32,7 @@ const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolve
 const effectiveDelivery = require("./lib/effective-delivery");
 const workbench = require("./lib/delivery-workbench");
 const serviceNumber = require("./lib/service-number");
+const paymentSoLinks = require("./lib/payment-so-links");
 const actionRequired = require("./lib/action-required");
 const customer360 = require("./lib/customer-360");
 const dateRequestStaleness = require("./lib/date-request-staleness");
@@ -6477,6 +6478,16 @@ app.get("/payments", requireAuth, async (req, res) => {
   try {
     const { customer_id, order_id, limit = 100, include_deposits, approval_status } = req.query;
     const cid = getActiveCompanyId(req);
+    // Finance → Payments "SO #" search: every payment ALLOCATED to that Sales
+    // Order (split / 2C2P included) plus its deposit — exact SO number, active
+    // company only (lib/payment-so-links.js). Same access as this list.
+    const soQuery = String(req.query.so || "").trim();
+    let soSearch = null;
+    if (soQuery) {
+      if (!companyScope.requireActiveCompany(cid, res)) return;
+      soSearch = await paymentSoLinks.findPaymentIdsForSo({ supabase, companyId: cid, query: soQuery });
+      if (!soSearch.paymentIds.length && !soSearch.salesOrders.length) return res.json({ payments: [], so_search: { query: soQuery, sales_orders: [] } });
+    }
     let payments = [];
     // Join the customer (direct FK, else via the linked order) so each
     // collected payment carries who paid + which SO — the Finance detail view
@@ -6486,6 +6497,7 @@ app.get("/payments", requireAuth, async (req, res) => {
     if (customer_id) q = q.eq("customer_id", customer_id);
     if (order_id) q = q.eq("order_id", order_id);
     if (approval_status) q = q.eq("approval_status", approval_status);
+    if (soSearch) q = soSearch.paymentIds.length ? q.in("id", soSearch.paymentIds.slice(0, 500)) : q.eq("id", "00000000-0000-0000-0000-000000000000");
     const { data, error } = await q;
     const normalize = (rows) => (rows || []).map(p => ({
       ...p,
@@ -6498,6 +6510,7 @@ app.get("/payments", requireAuth, async (req, res) => {
       if (cid) q2 = q2.eq("company_id", cid);
       if (customer_id) q2 = q2.eq("customer_id", customer_id);
       if (order_id) q2 = q2.eq("order_id", order_id);
+      if (soSearch) q2 = soSearch.paymentIds.length ? q2.in("id", soSearch.paymentIds.slice(0, 500)) : q2.eq("id", "00000000-0000-0000-0000-000000000000");
       const { data: d2 } = await q2;
       payments = d2 || [];
     } else {
@@ -6512,9 +6525,11 @@ app.get("/payments", requireAuth, async (req, res) => {
     // deletable here. Company-wide only (deposits have no customer/order FK to
     // filter on), so skip when a specific order/customer is requested.
     if (include_deposits && cid && !order_id && !customer_id) {
-      const { data: sos } = await supabase.from("sales_orders")
+      let soQ = supabase.from("sales_orders")
         .select("id, order_number, customer_name, status, created_by, salesman_name, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
         .eq("company_id", cid).order("created_at", { ascending: false }).limit(2000);
+      if (soSearch) soQ = soSearch.salesOrders.length ? soQ.in("id", soSearch.salesOrders.map(o => o.id)) : soQ.eq("id", "00000000-0000-0000-0000-000000000000");
+      const { data: sos } = await soQ;
       const depNames = await userNamesById((sos || []).map(s => s.created_by));
       // Map each SO number → its legacy order's customer_id, so a deposit can
       // link to the customer (sales_orders has no customer_id of its own).
@@ -6533,7 +6548,12 @@ app.get("/payments", requireAuth, async (req, res) => {
       }
       payments = [...depositLines, ...payments].sort((a, b) => new Date(b.paid_at || 0) - new Date(a.paid_at || 0));
     }
-    res.json({ payments });
+    // Each row's Sales Order(s) + effective delivery date (display only; amounts untouched).
+    if (cid) {
+      try { payments = await paymentSoLinks.attachLinkedOrders({ supabase, companyId: cid, rows: payments }); }
+      catch (e) { console.error("attachLinkedOrders:", e.message); }
+    }
+    res.json(soSearch ? { payments, so_search: { query: soQuery, sales_orders: soSearch.salesOrders.map(o => ({ id: o.id, order_number: o.order_number, customer_name: o.customer_name })) } } : { payments });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
