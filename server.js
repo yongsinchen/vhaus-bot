@@ -16130,7 +16130,22 @@ app.get("/sales-orders/:id", requireAuth, async (req, res) => {
       if (dr) pending_deposit_request = { id: dr.id, request_type: dr.request_type, before_snapshot: dr.before_snapshot, proposed_snapshot: dr.proposed_snapshot,
         reason: dr.reason, requested_by: dr.requested_by, requested_by_name: dr.requested_by_name, requested_at: dr.requested_at, source: dr.source };
     } catch (e) { console.error("pending deposit request lookup:", e.message); }
-    res.json({ order: data, legacy_order: legacyOrder, pending_amendment, pending_deposit_request });
+    // 118: read-only payment summary for Edit Order — original deposit (as the
+    // ledger counts it), additional payments, total paid, balance.
+    let payment_summary = null;
+    try {
+      const { data: legs } = await supabase.from("orders").select("id, balance").eq("company_id", data.company_id).eq("so_number", data.order_number).or("type.is.null,type.neq.Service");
+      const legIds = (legs || []).map(o => o.id);
+      const { paidFromPayments, adminPayments } = legIds.length ? await ledgerPaymentsForOrderIds(legIds) : { paidFromPayments: 0, adminPayments: 0 };
+      const total = (Number(data.subtotal) || 0) - (Number(data.discount) || 0) + (data.gst_waived ? 0 : (Number(data.gst_amount) || 0)) + (Number(data.admin_charges) || 0) + adminPayments;
+      const original = data.initial_deposit != null ? Number(data.initial_deposit) : (paidFromPayments > 0 ? 0 : (Number(data.deposit) || 0));
+      payment_summary = {
+        order_total: Math.round(total * 100) / 100, original_deposit: original, additional_payments: Math.round(paidFromPayments * 100) / 100,
+        total_paid: Number(data.deposit) || 0, balance: legs?.[0]?.balance != null ? Number(legs[0].balance) : Math.max(0, Math.round((total - (Number(data.deposit) || 0)) * 100) / 100),
+        legacy_baseline: data.initial_deposit == null,
+      };
+    } catch (e) { console.error("payment summary:", e.message); }
+    res.json({ order: data, legacy_order: legacyOrder, pending_amendment, pending_deposit_request, payment_summary });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -16309,6 +16324,43 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
 });
 
 // PUT /sales-orders/:id — update order + replace items
+// Ordinary order details saved directly even while a critical amendment waits
+// (2026-10-09). sameDetail: null / "" / undefined are the same "empty".
+const DIRECT_DETAIL_FIELDS = ["customer_name", "customer_contact", "customer_address", "customer_id_type", "customer_id_no", "customer_email",
+  "delivery_address", "notes", "remark", "internal_remark", "delivery_time_slot"];
+const sameDetail = v => (v === undefined || v === null || v === "" ? "" : String(v).trim());
+// Header fields an amendment's staleness check / apply covers that an ordinary save may change directly.
+const AMENDMENT_CARRY_FIELDS = ["customer_name", "customer_contact", "customer_address", "customer_id_type", "customer_id_no", "customer_email",
+  "delivery_address", "delivery_date", "delivery_time_slot", "delivery_type", "salesman_name", "branch_id", "country", "sales_channel", "order_date",
+  "remark", "einvoice_requested", "internal_remark", "notes"];
+
+// After an ordinary save on an order with a PENDING critical amendment: carry
+// each field this save changed into the amendment's before / proposed
+// snapshots — but only where the amendment itself does not propose a value of
+// its own (those stay a visible conflict for the manager, never a silent
+// overwrite either way) — and move the active-DO freshness stamp along when
+// nothing conflicts. Approving the amendment then applies only its own
+// change and keeps these details.
+async function keepPendingAmendmentInStep(companyId, soId, before, saved) {
+  const { data: am, error } = await supabase.from("sales_order_amendments").select("id, before_snapshot, proposed_snapshot, expected_so_updated_at")
+    .eq("company_id", companyId).eq("sales_order_id", soId).eq("status", "pending").maybeSingle();
+  if (error) throw error;
+  if (!am || !saved) return null;
+  const b = { ...(am.before_snapshot || {}) }, p = { ...(am.proposed_snapshot || {}) };
+  const carried = [], conflicts = [];
+  for (const k of AMENDMENT_CARRY_FIELDS) {
+    if (sameDetail(saved[k]) === sameDetail(before[k])) continue;
+    if (sameDetail(b[k]) !== sameDetail(p[k])) { conflicts.push(k); continue; }
+    b[k] = saved[k]; p[k] = saved[k]; carried.push(k);
+  }
+  if (!carried.length && !conflicts.length) return null;
+  const patch = { before_snapshot: b, proposed_snapshot: p, updated_at: new Date().toISOString() };
+  if (!conflicts.length && String(am.expected_so_updated_at || "") === String(before.updated_at || "")) patch.expected_so_updated_at = saved.updated_at;
+  const { error: uErr } = await supabase.from("sales_order_amendments").update(patch).eq("id", am.id).eq("status", "pending");
+  if (uErr) throw uErr;
+  return { amendment_id: am.id, carried, conflicts };
+}
+
 app.put("/sales-orders/:id", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
@@ -16540,147 +16592,33 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "E-invoice details (I/C number and email) are required." });
     }
 
-    // Deposit handling. Normally the Deposit field is the upfront deposit and
-    // recomputeOrderPaid derives the shown amount as initial_deposit + recorded
-    // payments. But once payments exist (e.g. balance collected on delivery),
-    // that override means a plain deposit edit "does nothing". So when payments
-    // exist, treat the field as the AUTHORITATIVE total paid: back out the
-    // payments into initial_deposit so recompute lands exactly on the entered
-    // amount. Changing money after payments are recorded is manager/admin only.
-    //
-    // The edit form always re-sends the Deposit field (pre-filled with the
-    // ledger's paid figure, which is CAPPED at the order total), so a deposit
-    // that wasn't actually changed must leave initial_deposit alone. Re-deriving
-    // it on every edit baked payment-derived offsets into the baseline — e.g.
-    // an overpaid order (payments > total, paid capped) got a NEGATIVE
-    // initial_deposit that later understated paid once payments were reversed
-    // and re-recorded (SO03306: -175). Only a genuinely changed paid amount is
-    // backed out, against the SAME payments figure the ledger adds.
-    //
-    // Stale forms: the edit form also sends deposit_loaded — the Deposit value
-    // it LOADED. Deposit === deposit_loaded means the user never touched the
-    // field, so initial_deposit stays exactly as stored no matter what payments
-    // did since the form opened (another user recording / amending /
-    // withdrawing a payment must never rewrite the upfront deposit). A real
-    // Deposit change on a form whose loaded value no longer matches the stored
-    // paid amount is refused (409 stale_deposit) — never recomputed from a
-    // stale figure. Without the token (an old cached client) a Deposit that
-    // differs from the stored one is only applied when no payments exist (it
-    // then IS the upfront deposit); with payments it is refused, not guessed.
-    let depositForUpdate = Number(deposit) || 0;
-    let initialDepositForUpdate = depositForUpdate;
-    const depositProvided = deposit !== undefined && deposit !== null && deposit !== "";
-    const sameMoney = (a, b) => Math.abs(a - b) < 0.005;
+    // ── Deposit (migration 118, owner decision 2026-10-09) ────────────────
+    // Edit Order no longer edits money. The ORIGINAL deposit has its own
+    // direct, audited editor — PATCH /sales-orders/:id/deposit (no approval;
+    // reason + before/after audit; ledger recomputed atomically) — and any
+    // additional money is a payment (Collect Payment). Every deposit column is
+    // kept exactly as it is here. An older client that still sends a CHANGED
+    // deposit / method / proof is refused BEFORE anything is written — never
+    // half-saved and never guessed.
+    const sameMoney = (x, y) => Math.abs(x - y) < 0.005;
     const existingDeposit = Number(existing.deposit) || 0;
-    const existingInitialDeposit = existing.initial_deposit != null ? Number(existing.initial_deposit) : existingDeposit;
     const rawLoaded = req.body ? req.body.deposit_loaded : undefined;
     const depositLoaded = rawLoaded !== undefined && rawLoaded !== null && rawLoaded !== "" && Number.isFinite(Number(rawLoaded)) ? Number(rawLoaded) : null;
-    const depositUntouched = depositProvided && depositLoaded != null && sameMoney(depositForUpdate, depositLoaded);
-    if (depositUntouched) {
-      depositForUpdate = existingDeposit;
-      initialDepositForUpdate = existingInitialDeposit;
-    } else if (depositProvided && depositLoaded != null && !sameMoney(depositLoaded, existingDeposit)) {
+    const depositSent = deposit !== undefined && deposit !== null && deposit !== "";
+    const depositAttempt = (depositSent && !sameMoney(Number(deposit) || 0, depositLoaded != null ? depositLoaded : existingDeposit))
+      || (payment_method !== undefined && (payment_method || null) !== (existing.payment_method || null))
+      || (payment_proofs !== undefined && depositAmendmentsLib.normalizeProofs(payment_proofs) !== depositAmendmentsLib.normalizeProofs(existing.payment_proofs));
+    if (depositAttempt) {
       return res.status(409).json({
-        error: "This order's paid amount changed since you opened it (a payment was recorded, amended or withdrawn). Close and reopen the order, then enter the Deposit again.",
-        code: "stale_deposit", current_deposit: existingDeposit,
+        error: "The deposit is now changed with “Edit Original Deposit”, and new money with “Collect Payment”. Nothing was saved — refresh the page and use those buttons.",
+        code: "deposit_edit_separately",
       });
-    }
-    if (depositProvided && !depositUntouched) {
-      const { data: legacyOrders } = await supabase.from("orders").select("id")
-        .eq("company_id", company_id).eq("so_number", existing.order_number).or("type.is.null,type.neq.Service");
-      const legIds = (legacyOrders || []).map(o => o.id);
-      const { paidFromPayments, adminPayments } = legIds.length
-        ? await ledgerPaymentsForOrderIds(legIds) : { paidFromPayments: 0, adminPayments: 0 };
-      if (paidFromPayments > 0) {
-        const existingInitial = existing.initial_deposit != null ? Number(existing.initial_deposit) : (Number(existing.deposit) || 0);
-        // What the ledger already pays this order with the existing baseline,
-        // under the totals being saved (same formula as recomputeOrderPaid).
-        const newTotalWithAdmin = (expandedItems ? subtotal : (Number(existing.subtotal) || 0)) - (Number(discount) || 0)
-          + (gst_waived ? 0 : (Number(gst_amount) || 0))
-          + (admin_charges != null && admin_charges !== "" ? Number(admin_charges) : 0) + adminPayments;
-        const ledgerPaid = Math.max(0, Math.min(newTotalWithAdmin, existingInitial + paidFromPayments));
-        const same = sameMoney;
-        if (same(depositForUpdate, Number(existing.deposit) || 0) || same(depositForUpdate, ledgerPaid)) {
-          initialDepositForUpdate = existingInitial; // paid amount not changed — keep the baseline
-        } else if (depositLoaded == null) {
-          // Old client without the intent token: can't tell a real change from
-          // a stale pre-filled value, so never back payments out of it.
-          return res.status(409).json({
-            error: "Please refresh the page and reopen this order before changing its Deposit — payments have been recorded on it.",
-            code: "stale_deposit", current_deposit: existingDeposit,
-          });
-        } else {
-          const roleKey = (req.activeRoleKey || req.user.role || "").toLowerCase();
-          // 117: when the order already HAS a recorded deposit, this becomes an
-          // approval request (below) — the requester need not be a manager.
-          if (!MANAGE_ROLES.includes(roleKey) && depositAmendmentsLib.recordedDepositOf(existing) <= 0) {
-            return res.status(403).json({ error: "Only a manager can change the paid amount once payments have been recorded (e.g. collected on delivery)." });
-          }
-          // recompute yields min(total, initial_deposit + paidFromPayments) → entered.
-          initialDepositForUpdate = Math.round((depositForUpdate - paidFromPayments) * 100) / 100;
-          if (initialDepositForUpdate < 0) {
-            return res.status(400).json({
-              error: `The paid amount can't be lower than the RM ${paidFromPayments.toFixed(2)} already recorded as payments. Reject or reverse a payment instead.`,
-              code: "paid_below_recorded_payments",
-            });
-          }
-        }
-      }
-    }
-
-    // ── 117: an order that ALREADY has a recorded deposit never has it changed
-    // here. Any change to its amount, method or proof becomes a deposit-change
-    // request (Manager / Finance / Master approval — migration 117); the live
-    // deposit fields are kept exactly as they are and the rest of this edit
-    // follows its own rules. The request is created only once the rest of the
-    // edit has been saved (or submitted as an order amendment). Recording the
-    // FIRST deposit on an order without one is unchanged (immediate).
-    let depositChange = null;
-    {
-      const recordedDeposit = depositAmendmentsLib.recordedDepositOf(existing);
-      const amountChanged = depositProvided && !depositUntouched && !sameMoney(initialDepositForUpdate, existingInitialDeposit);
-      const methodChanged = payment_method !== undefined && (payment_method || null) !== (existing.payment_method || null);
-      const proofsChanged = payment_proofs !== undefined && depositAmendmentsLib.normalizeProofs(payment_proofs) !== depositAmendmentsLib.normalizeProofs(existing.payment_proofs);
-      if (recordedDeposit > 0 && (amountChanged || methodChanged || proofsChanged)) {
-        const reason = String(req.body?.deposit_change_reason || "").trim();
-        if (!reason) {
-          return res.status(400).json({ error: "Changing the deposit needs Manager / Finance approval — enter a reason for the deposit change.", code: "deposit_reason_required" });
-        }
-        const { data: pendingDep } = await supabase.from("sales_order_deposit_requests").select("id")
-          .eq("company_id", company_id).eq("sales_order_id", id).eq("status", "pending").maybeSingle();
-        if (pendingDep) {
-          return res.status(409).json({ error: "A deposit change for this order is already waiting for approval. Wait for it to be decided (or withdraw it) before changing the deposit again.", code: "deposit_change_pending", request_id: pendingDep.id });
-        }
-        const proposedAmount = amountChanged ? initialDepositForUpdate : existingInitialDeposit;
-        depositChange = {
-          request_type: proposedAmount === 0 ? "reverse" : "edit",
-          proposed: {
-            initial_deposit: proposedAmount,
-            payment_method: methodChanged ? (payment_method || null) : (existing.payment_method || null),
-            payment_proofs: proofsChanged ? (depositAmendmentsLib.normalizeProofs(payment_proofs)) : (existing.payment_proofs || null),
-            ...(amountChanged ? { entered_paid_total: depositForUpdate } : {}),
-          },
-          reason,
-        };
-        depositForUpdate = existingDeposit;               // the approved deposit stays live until approval
-        initialDepositForUpdate = existingInitialDeposit;
-      }
     }
 
     // Confirming requires a deposit (same rule as POST). Effective paid = the
     // deposit field when provided, else what's already on the order.
-    const effectiveDeposit = depositProvided ? depositForUpdate : (Number(existing.deposit) || 0);
-    if (finalStatus === "confirmed" && effectiveDeposit <= 0) {
-      return res.status(400).json({ error: "A deposit is required to confirm an order. Record the deposit to confirm it." });
-    }
-
-    // If this edit gives the order an upfront deposit and it never received an
-    // Official Receipt number (legacy row, or created before this deposit
-    // existed), assign one now from the per-company sequence. Never renumber an
-    // order that already has one.
-    let depositOrNumberUpd = existing.deposit_or_number || null;
-    if (!depositOrNumberUpd && initialDepositForUpdate > 0) {
-      depositOrNumberUpd = await nextOrNumber(company_id);
+    if (finalStatus === "confirmed" && existingDeposit <= 0) {
+      return res.status(400).json({ error: "A deposit is required to confirm an order. Record it with “Edit Original Deposit” or “Collect Payment” — the order confirms itself once paid." });
     }
 
     const updateData = {
@@ -16693,7 +16631,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       order_date: order_date !== undefined ? (order_date || null) : (existing.order_date || null),
       delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,
       delivery_type: delivery_type || "Delivery", remark: remark || null, internal_remark: internal_remark || null,
-      discount: Number(discount) || 0, deposit: depositForUpdate, initial_deposit: initialDepositForUpdate, deposit_or_number: depositOrNumberUpd, payment_method: payment_method || null, payment_proofs: payment_proofs || null,
+      discount: Number(discount) || 0, deposit: existing.deposit, initial_deposit: existing.initial_deposit, deposit_or_number: existing.deposit_or_number, payment_method: existing.payment_method, payment_proofs: existing.payment_proofs, // 118: live values
       admin_charges: admin_charges != null && admin_charges !== "" ? Number(admin_charges) : null,
       einvoice_requested: einvoice_requested !== undefined ? einvoice_requested === true : existing.einvoice_requested,
       country: country || null, gst_rate: gst_rate != null ? Number(gst_rate) : null, gst_amount: gst_amount != null ? Number(gst_amount) : null, gst_waived: gst_waived || false, sales_channel: sales_channel || "branch",
@@ -16701,17 +16639,6 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (amendmentNote) {
       updateData.notes = [amendmentNote, notes || ""].filter(Boolean).join("\n");
     }
-    // 117: a deposit change goes to approval — every deposit column keeps its live value (incl. a legacy NULL initial_deposit).
-    if (depositChange) {
-      Object.assign(updateData, { deposit: existing.deposit, initial_deposit: existing.initial_deposit, deposit_or_number: existing.deposit_or_number,
-        payment_method: existing.payment_method, payment_proofs: existing.payment_proofs });
-    }
-    const submitDepositChange = async () => {
-      if (!depositChange) return {};
-      const r = await depositAmendments.requestDeposit({ cid: company_id, user: req.user, salesOrderId: id, requestType: depositChange.request_type,
-        proposed: depositChange.proposed, reason: depositChange.reason, source: "edit_order" });
-      return r.ok ? { deposit_change_request: r.request } : { deposit_change_error: { code: r.code, error: r.error } };
-    };
 
     // ── P0-18/P1-1: critical amendment on a confirmed/delivered/amended
     // order, OR an order with ANY Delivery Order at all ─────────────────
@@ -16857,6 +16784,25 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       // freshness fingerprint apply_active_do_amendment() (migration 089)
       // compares against at approval time. Every other field on the live
       // order is left untouched by this write.
+      // Processed independently (2026-10-09): the ordinary details in this same
+      // edit (customer, contact, addresses, remarks, time slot) are saved NOW;
+      // only the critical part waits for approval. The amendment is recorded
+      // against the order as saved, so approving it can never revert them.
+      const directFields = {};
+      for (const k of DIRECT_DETAIL_FIELDS) {
+        const v = k === "notes" ? (notes || null) : updateData[k];
+        if (v !== undefined && sameDetail(v) !== sameDetail(existing[k])) directFields[k] = v;
+      }
+      let detailsSaved = [], detailsSyncWarning = null, amendmentBase = existing;
+      if (Object.keys(directFields).length) {
+        const { error: dErr } = await supabase.from("sales_orders").update(directFields).eq("id", id).eq("company_id", company_id);
+        if (dErr) throw dErr;
+        detailsSaved = Object.keys(directFields);
+        const { data: saved } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
+        amendmentBase = saved || existing;
+        const { syncError } = await syncSalesOrderToDelivery(saved, saved?.sales_order_items);
+        if (syncError) detailsSyncWarning = "Details saved, but Delivery / Telegram may not show them yet.";
+      }
       const { data: flippedOrder, error: flipErr } = await supabase.from("sales_orders")
         .update({ status: "amended", updated_at: new Date().toISOString() })
         .eq("id", id).eq("company_id", company_id)
@@ -16867,7 +16813,7 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
         company_id, branch_id: existing.branch_id || null, sales_order_id: id,
         order_number: existing.order_number, customer_name: existing.customer_name,
         category: "critical", status: "pending",
-        before_snapshot: existing, proposed_snapshot: proposedSnapshot,
+        before_snapshot: amendmentBase, proposed_snapshot: proposedSnapshot,
         changes: amendmentChanges,
         requested_by: req.user.id, requested_by_name: req.user.name || req.user.salesman_name || null,
         active_do_snapshot: activeDoSnapshot,
@@ -16878,10 +16824,13 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
       const { data: unchangedOrder } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).maybeSingle();
       await attachLinkedProducts(unchangedOrder?.sales_order_items);
       return res.json({
-        ...(await submitDepositChange()),
         order: unchangedOrder,
         pending_amendment: true,
-        message: "This is a critical change (items, price, discount, or amount). It has been submitted for manager approval — the order's live data has NOT been changed yet.",
+        details_saved: detailsSaved,
+        ...(detailsSyncWarning ? { projection_sync_warning: detailsSyncWarning } : {}),
+        message: detailsSaved.length
+          ? "Order details saved. The critical change (items, price, discount or amount) was submitted for manager approval — it is NOT applied yet."
+          : "This is a critical change (items, price, discount, or amount). It has been submitted for manager approval — the order's live data has NOT been changed yet.",
       });
     }
 
@@ -17047,6 +16996,10 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     const { data: full } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).single();
     await attachLinkedProducts(full?.sales_order_items);
     const { orderId: deliveryOrderId, syncError: projectionSyncError } = await syncSalesOrderToDelivery(full, full.sales_order_items);
+    // A pending critical amendment stays valid after an ordinary-details save (2026-10-09).
+    let amendmentInStep = null;
+    try { amendmentInStep = await keepPendingAmendmentInStep(company_id, id, existing, full); }
+    catch (e) { console.error("keepPendingAmendmentInStep:", e.message); amendmentInStep = { error: e.message }; }
     // Fold any recorded payments back into the paid/deposit + balance now that
     // the edited deposit/total has been written (sync set balance = total −
     // deposit; recompute adds initial_deposit + payments so payments aren't lost).
@@ -17135,8 +17088,8 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     // P0-16: don't report unconditional success when the operational
     // projection failed to sync — see POST /sales-orders for the same pattern.
     res.json({
-      ...(await submitDepositChange()),
       order: full,
+      ...(amendmentInStep ? { pending_amendment_kept: amendmentInStep } : {}),
       ...(deliveryOrderUpdated ? { delivery_order_updated: deliveryOrderUpdated } : {}),
       ...(deliveryDateRequest ? { delivery_date_request: deliveryDateRequest } : {}),
       ...(projectionSyncError ? { projection_sync_warning: "Sales order saved, but it may not yet be visible in Delivery/Telegram/Driver. An admin has been notified — retry or check scripts/audit-data-consistency.js." } : {}),
@@ -17202,26 +17155,76 @@ app.get("/amendment-requests", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /sales-orders/:id/deposit-requests — Customer Profile → Payment History → Edit / Reverse deposit.
-app.post("/sales-orders/:id/deposit-requests", requireAuth, async (req, res) => {
+// Deposit changes are no longer approval requests (migration 118) — see PATCH /sales-orders/:id/deposit.
+app.post("/sales-orders/:id/deposit-requests", requireAuth, (req, res) => res.status(410).json({
+  error: "Deposit changes no longer need approval — use “Edit Original Deposit” (refresh the page).", code: "deposit_edit_direct" }));
+
+// PATCH /sales-orders/:id/deposit — edit the ORIGINAL deposit directly (amount,
+// method, proof; RM0 = reversal). No approval (owner decision 2026-10-09);
+// reason required; the database function locks the order, refuses a stale
+// form, recomputes paid / balance atomically and writes the before/after
+// audit. Commission then follows through the canonical engine (outcome
+// returned and, on failure, recorded durably — POST …/recalc-commission retries).
+app.patch("/sales-orders/:id/deposit", requireAuth, async (req, res) => {
   try {
     const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
-    const { data: so } = await supabase.from("sales_orders").select("id, salesman_name").eq("company_id", cid).eq("id", req.params.id).maybeSingle();
+    const { data: so } = await supabase.from("sales_orders").select("id, salesman_name, deposit_or_number").eq("company_id", cid).eq("id", req.params.id).maybeSingle();
     if (!so) return res.status(404).json({ error: "Sales order not found" });
-    if (!mayRequestForSo(req, so)) return res.status(403).json({ error: "You can only request deposit changes on orders you manage" });
+    if (!mayRequestForSo(req, so)) return res.status(403).json({ error: "You can only edit the deposit of orders you manage" });
     const b = req.body || {};
-    const proposed = {};
-    if (b.initial_deposit !== undefined && b.initial_deposit !== null && b.initial_deposit !== "") {
-      const n = Number(b.initial_deposit);
-      if (!Number.isFinite(n)) return res.status(400).json({ error: "Deposit amount must be a number", code: "invalid_amount" });
-      proposed.initial_deposit = n;
+    const amount = Number(b.initial_deposit);
+    if (b.initial_deposit === undefined || b.initial_deposit === null || b.initial_deposit === "" || !Number.isFinite(amount)) {
+      return res.status(400).json({ error: "Enter the deposit amount", code: "invalid_amount" });
     }
-    if (b.payment_method !== undefined) proposed.payment_method = b.payment_method || null;
-    if (b.payment_proofs !== undefined) proposed.payment_proofs = depositAmendmentsLib.normalizeProofs(b.payment_proofs);
-    const r = await depositAmendments.requestDeposit({ cid, user: req.user, salesOrderId: so.id, requestType: b.request_type === "reverse" ? "reverse" : "edit",
-      proposed, reason: b.reason, source: "customer_profile", fingerprint: b.fingerprint || null });
-    if (!r.ok) return res.status(r.status).json({ error: r.error, code: r.code, request_id: r.request_id });
-    res.status(201).json({ request: r.request });
+    const proofs = b.payment_proofs === undefined ? undefined : JSON.parse(depositAmendmentsLib.normalizeProofs(b.payment_proofs) || "[]");
+    // A receipt number is only drawn when this is the order's first deposit.
+    const orNumber = !so.deposit_or_number && amount > 0 ? await nextOrNumber(cid) : null;
+    const r = await depositAmendments.editDeposit({ cid, user: req.user, salesOrderId: so.id, amount, paymentMethod: b.payment_method,
+      paymentProofs: proofs, reason: b.reason, expected: b.expected || null, orNumber });
+    if (!r.ok) return res.status(r.status).json({ error: r.error, code: r.code, ...(r.current ? { current: r.current } : {}) });
+    const { ok, status, ...body } = r;
+    if (body.commission?.status === "failed") body.warning = "Deposit saved and balance updated, but the commission recalculation did not finish — it was recorded; use Retry commission.";
+    if ((body.paid_commissions || []).length) body.finance_note = "Commission on this order was already PAID — it was not changed. Finance has been flagged to review it.";
+    res.json(body);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /sales-orders/:id/payment-history — the order's original deposit, every
+// payment allocated to it (split / 2C2P included) and the deposit audit trail.
+app.get("/sales-orders/:id/payment-history", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const { data: so } = await supabase.from("sales_orders").select("id, order_number, customer_name, status, created_by, salesman_name, initial_deposit, deposit, payment_method, payment_proofs, created_at, deposit_or_number")
+      .eq("company_id", cid).eq("id", req.params.id).maybeSingle();
+    if (!so) return res.status(404).json({ error: "Sales order not found" });
+    if (String(req.user.role || "").toLowerCase() === "salesman" && !mayRequestForSo(req, so)) return res.status(403).json({ error: "Not allowed" });
+    const found = await paymentSoLinks.findPaymentIdsForSo({ supabase, companyId: cid, query: so.order_number });
+    let pays = [];
+    if (found.paymentIds.length) {
+      const { data, error } = await supabase.from("payments").select("*, payment_allocations(order_id, amount)").eq("company_id", cid).in("id", found.paymentIds.slice(0, 500));
+      if (error) throw error;
+      pays = data || [];
+    }
+    const names = await userNamesById([...pays.map(p => p.recorded_by), so.created_by]);
+    let lines = [...(ledgerView.depositAmountOf(so) > 0 ? [ledgerView.depositLine(so, null, names)] : []), ...pays.map(p => ledgerView.paymentLine(p, names))]
+      .sort((x, y) => new Date(y.paid_at || 0) - new Date(x.paid_at || 0));
+    lines = await attachAmendmentRequests(lines, cid);
+    const { data: events } = await supabase.from("system_events").select("id, created_at, user_id, event_type, payload")
+      .eq("company_id", cid).eq("entity", "sales_order").eq("entity_id", so.id).like("event_type", "deposit%").order("created_at", { ascending: false }).limit(100);
+    res.json({ order: { id: so.id, order_number: so.order_number }, lines, deposit_history: events || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /sales-orders/:id/recalc-commission — re-run the canonical commission
+// calculation for this order (e.g. after a deposit edit reported 'failed').
+app.post("/sales-orders/:id/recalc-commission", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const { data: so } = await supabase.from("sales_orders").select("id, order_number, salesman_name").eq("company_id", cid).eq("id", req.params.id).maybeSingle();
+    if (!so) return res.status(404).json({ error: "Sales order not found" });
+    if (!mayRequestForSo(req, so)) return res.status(403).json({ error: "Not allowed" });
+    const r = await depositAmendments.recalcForSalesOrder({ cid, user: req.user, salesOrder: so });
+    res.json(r);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
