@@ -168,14 +168,14 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     const dos = s.deliveries.delivery_orders;
     assert("multiple / partial DOs: both listed, delivered + TBC unassigned", dos.length === 2 && dos[0].status === "completed" && dos[0].schedules[0].team === "VAA1 · Ali" && dos[1].status === "draft" && dos[1].delivery_date === null && dos[1].schedules.length === 0, JSON.stringify(dos));
     const svcs = s.services;
-    assert("multiple Service cases of the SO (scheduled with team, TBC), note + items", svcs.length === 2 && svcs[0].sv_number === "SV-226" && svcs[0].description === "Table surface scratch" && svcs[0].stops[0].team === "VAA1 · Bala" && svcs[0].items[0].description === "Table top" && svcs[1].operational_date === null, JSON.stringify(svcs.map(x => [x.sv_number, x.stops])));
+    assert("multiple Service cases of the SO (scheduled with team, TBC), note + items", svcs.length === 2 && svcs[0].sv_number === "SV-226" && svcs[0].display_number === "SV-30665" && svcs[1].display_number === "SV-30665-2" && svcs[0].description === "Table surface scratch" && svcs[0].stops[0].team === "VAA1 · Bala" && svcs[0].items[0].description === "Table top" && svcs[1].operational_date === null, JSON.stringify(svcs.map(x => [x.sv_number, x.stops])));
     assert("standalone Service (no SO) is NOT in this SO's story", !svcs.some(x => x.sv_number === "SV-300"));
     assert("amendment: status + Before → After line, no internal snapshot", s.amendments.length === 1 && s.amendments[0].status === "approved" && s.amendments[0].changes[0] === "Time slot: - → After 2pm" && !JSON.stringify(s.amendments).includes("internal"), JSON.stringify(s.amendments));
     const titles = s.timeline.map(e => `${e.date} ${e.title}`);
-    const expectOrder = ["Order 30665 created", "Deposit", "Amendment requested", "Amendment approved", "DO2609-0188 created", "DO2609-0188 scheduled", "DO2609-0199 created", "Payment received", "DO2609-0188 delivered", "Payment received", "SV-226 opened", "SV-227 opened", "SV-226 scheduled"];
+    const expectOrder = ["Order 30665 created", "Deposit", "Amendment requested", "Amendment approved", "DO2609-0188 created", "DO2609-0188 scheduled", "DO2609-0199 created", "Payment received", "DO2609-0188 delivered", "Payment received", "SV-30665 opened", "SV-30665-2 opened", "SV-30665 scheduled"];
     assert("timeline: real events in chronological order", JSON.stringify(s.timeline.map(e => e.title)) === JSON.stringify(expectOrder), JSON.stringify(titles));
     assert("timeline detail: delivery date + team, service note, payment amount", s.timeline.find(e => e.title === "DO2609-0188 scheduled").detail === "for 2026-09-10 · VAA1 · Ali"
-      && s.timeline.find(e => e.title === "SV-226 opened").detail === "Table surface scratch" && /RM 1400\.00 · Cash/.test(s.timeline.find(e => e.title === "Payment received").detail), JSON.stringify(s.timeline));
+      && s.timeline.find(e => e.title === "SV-30665 opened").detail === "Table surface scratch" && /RM 1400\.00 · Cash/.test(s.timeline.find(e => e.title === "Payment received").detail), JSON.stringify(s.timeline));
     assert("payment timeline uses the payment's business date (payment_date over paid_at)", s.timeline.find(e => e.title === "Payment received").date === "2026-09-09");
     const others = s.other_orders.map(o => o.order_number);
     assert("other orders = same customer_id only (29881 archived, 31000) — same-name customer's 27118 and nameless 306650 excluded",
@@ -204,7 +204,7 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
     r = await get("mgr", `/customer-360/services/${id(1)}`);
     assert("Service → its parent SO story, Service highlighted", r.status === 200 && r.body.order.order_number === "30665" && r.body.highlight.service_id === id(1), JSON.stringify(r.body.order));
     r = await get("mgr", `/customer-360/services/${id(3)}`);
-    assert("standalone Service → Service-only story (no order)", r.status === 200 && r.body.order === null && r.body.services.length === 1 && r.body.services[0].sv_number === "SV-300", JSON.stringify(r.body).slice(0, 300));
+    assert("standalone Service → Service-only story (no order)", r.status === 200 && r.body.order === null && r.body.services.length === 1 && r.body.services[0].sv_number === "SV-300" && r.body.services[0].display_number === "SV-300", JSON.stringify(r.body).slice(0, 300));
     r = await get("svcOnly", `/customer-360/services/${id(1)}`);
     assert("Service viewer without ORDERS_VIEW → Service part only, no order / payments", r.status === 200 && r.body.order === null && r.body.payments === null && r.body.services.length === 2, JSON.stringify(r.body).slice(0, 300));
     r = await get("ordersOnly", `/customer-360/services/${id(1)}`);

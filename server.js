@@ -31,6 +31,7 @@ const { createSyncService, normalizeIc, isPlaceholderIc, normalizePhone, deliver
 const { evaluateDeliveryDateApproval, createDeliveryDateApprovalService, resolveActiveDeliveryOrders } = require("./lib/delivery-date-approval");
 const effectiveDelivery = require("./lib/effective-delivery");
 const workbench = require("./lib/delivery-workbench");
+const serviceNumber = require("./lib/service-number");
 const actionRequired = require("./lib/action-required");
 const customer360 = require("./lib/customer-360");
 const dateRequestStaleness = require("./lib/date-request-staleness");
@@ -3373,7 +3374,9 @@ app.get("/delivery/unassigned", requireAuth, async (req, res) => {
       .select("id, order_number").eq("company_id", cid).in("order_number", nums);
     soMap = new Map((sos || []).map(s => [s.order_number, s.id]));
   }
-  res.json(filtered.map(o => ({ ...o, sales_order_id: soMap.get(o.so_number) || null })));
+  // Service display number (SV-<SO>) + canonical salesperson for each pool card.
+  const info = cid ? await serviceNumber.scheduleOrderInfo({ supabase, companyId: cid, orders: filtered }).catch(e => { console.error("scheduleOrderInfo:", e.message); return new Map(); }) : new Map();
+  res.json(filtered.map(o => ({ ...o, ...(info.get(o.id) || {}), sales_order_id: soMap.get(o.so_number) || null })));
 }); 
 
 // POST /delivery/routes — with duplicate vehicle validation
@@ -8776,6 +8779,11 @@ app.get("/service-cases", requireAuth, async (req, res) => {
       const svBy = {}; for (const r of (svRows || [])) svBy[r.id] = r.sv_number;
       for (const svc of (data || [])) svc._sv_number = svc.legacy_order_id ? (svBy[svc.legacy_order_id] || null) : null;
     }
+    // Display number: "SV-<SO>" for a case linked to a Sales Order (lib/service-number.js; presentation only).
+    if (cid && (data || []).length) {
+      const nums = await serviceNumber.serviceDisplayNumbers({ supabase, companyId: cid, services: data });
+      for (const svc of data) { const n = nums.get(svc.id); svc._display_number = n?.display_number || svc._sv_number || null; svc._linked_so_label = svc.order_id ? n?.linked_so_label || null : null; }
+    }
     // Salesman role: only show services linked to their orders
     let result = data || [];
     if (req.user.role === "salesman" && req.user.salesman_name) {
@@ -8811,7 +8819,9 @@ app.get("/service-cases/:id", requireAuth, async (req, res) => {
     const orderData = orderRes.data
       ? (svc.order_id ? orderRes.data : { ...orderRes.data, so_number: null })
       : null;
-    res.json({ service: svc, legs: legsRes.data || [], trips: tripsRes.data || [], claims: claimsRes.data || [], items: itemsRes.data || [], order: orderData });
+    const num = (await serviceNumber.serviceDisplayNumbers({ supabase, companyId: svc.company_id, services: [svc] })).get(svc.id) || {};
+    res.json({ service: { ...svc, display_number: num.display_number || num.sv_number || null, sv_number: num.sv_number || null, linked_so_label: svc.order_id ? num.linked_so_label || null : null },
+      legs: legsRes.data || [], trips: tripsRes.data || [], claims: claimsRes.data || [], items: itemsRes.data || [], order: orderData });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -11167,6 +11177,13 @@ app.get("/delivery-schedules", requireAuth, async (req, res) => {
       if (cid) q2 = q2.eq("company_id", cid);
       const { data: d2 } = await q2;
       return res.json({ schedules: d2 || [] });
+    }
+    // Service display number (SV-<SO>), linked SO and canonical salesperson on each stop's order.
+    if (cid && (data || []).length) {
+      const stops = data.filter(sc => sc.orders && sc.order_id != null);
+      const info = await serviceNumber.scheduleOrderInfo({ supabase, companyId: cid, orders: stops.map(sc => ({ id: sc.order_id, ...sc.orders })) })
+        .catch(e => { console.error("scheduleOrderInfo:", e.message); return new Map(); });
+      for (const sc of stops) sc.orders = { ...sc.orders, ...(info.get(sc.order_id) || {}) };
     }
     res.json({ schedules: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
