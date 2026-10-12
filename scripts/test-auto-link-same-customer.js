@@ -36,6 +36,12 @@ const ord = (n, company, over = {}) => ({ id: n, company_id: company, so_number:
   assert("different record AND different phone → different customer", !al.isExactIdentityMatch(base, { ...base, customer_id: C2, contact: "019-999 0000" }).match);
   assert("same customer, genuinely different address → never linked (SELVI case)", !al.isExactIdentityMatch(base, { ...base, address: "12 Lorong Paya Lebar" }).match);
   assert("no customer record on one side but same phone → still the same customer", al.isExactIdentityMatch(base, { ...base, customer_id: null }).match);
+  assert("a contact holding TWO numbers matches an order with one of them (Goh Xin Yi, SO 55574 / 56143)",
+    al.isExactIdentityMatch({ ...base, customer_id: C2, contact: "+65 88923692 / +65 91907690" }, { ...base, customer_id: C3, contact: "+65 88923692" }).match);
+  assert("phone splitting: / , 'or' and a second +country prefix; one number with spaces stays one number",
+    JSON.stringify(al.phoneKeys("+60 12-345 6789 +60 19-888 7777")) === JSON.stringify(["0123456789", "0198887777"])
+    && al.phoneKeys("012 345 6789 or 019 888 7777").length === 2 && JSON.stringify(al.phoneKeys("012-345 6789")) === JSON.stringify(["0123456789"]));
+  assert("no shared number → different customer", !al.sharePhone("+65 88923692 / +65 91907690", "+65 81112222"));
 
   const seed = {
     companies: [{ id: A, name: "A" }, { id: B, name: "B" }],
@@ -46,8 +52,11 @@ const ord = (n, company, over = {}) => ({ id: n, company_id: company, so_number:
       ord(5, B), ord(6, B, { customer_id: C2, contact: "+6012 345 0000" }),                                               // company B pair
       ord(11, A, { customer_id: C3, contact: "0177000000", address: "2B2-16-5 IDEAL VENICE" }), ord(12, A, { customer_id: C3, contact: "0177000000", address: "2B2-16-5, IDEAL VERNICE" }),
       ord(21, A, { customer_id: C3, contact: "0166000000", address: "8 Jalan Sweep" }), ord(22, A, { customer_id: null, contact: "016-600 0000", address: "8 JALAN SWEEP" }),
+      // Goh Xin Yi shape: two customer records; one contact holds two numbers, sharing one with the other order
+      ord(31, A, { customer_id: C2, contact: "+65 88923692 / +65 91907690", address: "314 JURONG EAST ST 32 #11-229 S(600314)" }),
+      ord(32, A, { customer_id: C3, contact: "+65 88923692", address: "314 JURONG EAST ST 32 #11-229 S(600314)" }),
     ],
-    sales_orders: [1, 2, 3, 4, 11, 12, 21, 22].map(n => so(n, A)).concat([so(5, B), so(6, B)]),
+    sales_orders: [1, 2, 3, 4, 11, 12, 21, 22, 31, 32].map(n => so(n, A)).concat([so(5, B), so(6, B)]),
     delivery_teams: [{ id: id(701), company_id: A, team_date: DATE, vehicle_id: null }, { id: id(702), company_id: B, team_date: DATE, vehicle_id: null }],
     delivery_schedules: [], delivery_orders: [], delivery_order_items: [], delivery_date_requests: [], delivery_blocked_dates: [], delivery_order_events: [], services: [], delivery_vehicles: [],
   };
@@ -66,6 +75,9 @@ const ord = (n, company, over = {}) => ({ id: n, company_id: company, so_number:
     assert("same customer, different address (80003) and another person at the same address (80004) are NOT linked", !groupOf(3) && !groupOf(4));
     r = await h.call("GET", "/delivery-links", { user: "mgr" });
     assert("the board receives one group (one customer stop) with both orders", (r.body.groups || []).some(g => g.members.length === 2 && g.members.every(m => ["80001", "80002"].includes(m.so_number))), JSON.stringify(r.body).slice(0, 200));
+    r = await h.call("POST", "/delivery-schedules", { user: "mgr", body: { order_id: 32, team_id: id(701), scheduled_date: DATE } });
+    assert("assigning SO 80032 links it with SO 80031 — two customer records, one contact with two numbers sharing one", r.status === 201 && groupOf(31) && groupOf(31) === groupOf(32),
+      JSON.stringify(h.db.table("delivery_date_requests").filter(x => [31, 32].includes(Number(x.order_id)))));
 
     out("\n══ Linking the CURRENT schedule (sweep) ══\n");
     // already on the board before the new rule: stops for 11/12 (VENICE/VERNICE) and 21/22 (no record on one side, same phone)

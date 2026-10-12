@@ -40,7 +40,7 @@ const dateRequestStaleness = require("./lib/date-request-staleness");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
-const { createAutoLinkService, AUTO_LINK_VIA, canonicalPhone: autoLinkCanonicalPhone } = require("./lib/auto-link");
+const { createAutoLinkService, AUTO_LINK_VIA, canonicalPhone: autoLinkCanonicalPhone, phoneKeys, sharePhone } = require("./lib/auto-link");
 const { createAssistantReadService } = require("./lib/assistant-read");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
@@ -5584,8 +5584,8 @@ async function runDeliveryDateRequestFlow(req, cid, input) {
     const linkNos = [...new Set((Array.isArray(link_so_numbers) ? link_so_numbers : [])
       .map(s => String(s || "").trim()).filter(s => s && s !== main.ord.so_number))];
     if (linkNos.length) {
-      const mainPhone = canonicalPhone(main.so?.customer_contact || main.ord.contact);
-      if (!mainPhone) return httpOut(400, { error: "This order has no phone number to match linked orders by" });
+      const mainContact = main.so?.customer_contact || main.ord.contact;
+      if (!phoneKeys(mainContact).length) return httpOut(400, { error: "This order has no phone number to match linked orders by" });
       for (const no of linkNos) {
         const m = await prepareDeliveryDateTarget(cid, { so_number: no });
         if (m.error) {
@@ -5594,7 +5594,8 @@ async function runDeliveryDateRequestFlow(req, cid, input) {
             : `SO ${no}: ${m.error}` });
         }
         if (!m.so || LINK_EXCLUDED_SO_STATUSES.includes(m.so.status)) return httpOut(400, { error: `SO ${no} can't be linked (${m.so?.status || "no sales order"})` });
-        if (canonicalPhone(m.so.customer_contact || m.ord.contact) !== mainPhone) return httpOut(400, { error: `SO ${no} is not for the same customer phone` });
+        // Same customer = shares a phone number (a contact may hold several, e.g. "+65 8892 3692 / +65 9190 7690").
+        if (!sharePhone(m.so.customer_contact || m.ord.contact, mainContact)) return httpOut(400, { error: `SO ${no} is not for the same customer phone` });
         if (!soVisibleToRequester(req, m.so)) return httpOut(403, { error: `You can't request a delivery date for SO ${no}` });
         members.push(m);
       }
@@ -5682,11 +5683,12 @@ app.get("/delivery-date-requests/linkable", requireAuth, async (req, res) => {
     if (!cid || !soNumber) return res.json({ phone: null, orders: [] });
     const { data: mainSo } = await supabase.from("sales_orders").select("id, order_number, customer_contact")
       .eq("company_id", cid).eq("order_number", soNumber).maybeSingle();
-    let phone = canonicalPhone(mainSo?.customer_contact);
-    if (!phone) {
+    let mainContact = mainSo?.customer_contact || "";
+    if (!phoneKeys(mainContact).length) {
       const { data: leg } = await supabase.from("orders").select("contact").eq("company_id", cid).eq("so_number", soNumber).limit(1);
-      phone = canonicalPhone(leg?.[0]?.contact);
+      mainContact = leg?.[0]?.contact || "";
     }
+    const phone = phoneKeys(mainContact)[0] || null;
     if (!phone) return res.json({ phone: null, orders: [] });
     // Phones are stored formatted, so match in JS on the canonical form over
     // the company's open SOs (bounded, light columns).
@@ -5694,7 +5696,7 @@ app.get("/delivery-date-requests/linkable", requireAuth, async (req, res) => {
       .select("id, order_number, customer_name, customer_contact, salesman_name, status, delivery_date")
       .eq("company_id", cid).not("status", "in", `(${LINK_EXCLUDED_SO_STATUSES.join(",")})`)
       .neq("order_number", soNumber).order("created_at", { ascending: false }).limit(3000);
-    const matches = (open || []).filter(o => canonicalPhone(o.customer_contact) === phone && soVisibleToRequester(req, o));
+    const matches = (open || []).filter(o => sharePhone(o.customer_contact, mainContact) && soVisibleToRequester(req, o));
     if (matches.length === 0) return res.json({ phone, orders: [] });
     const ids = matches.map(o => o.id);
     const [{ data: items }, { data: dos }, { data: openReqs }] = await Promise.all([
