@@ -32,7 +32,7 @@ const ordRow = (n, company, over = {}) => ({ id: n, company_id: company, so_numb
     orders: [
       ordRow(1, A), ordRow(2, A, { address: "55 JALAN TRIGGER GEORGETOWN" }),                 // same customer / address / date → link
       ordRow(3, A, { address: "56 Jalan Trigger Georgetown" }),                               // different address
-      ordRow(4, A, { customer_id: CUST2 }),                                                    // different customer
+      ordRow(4, A, { customer_id: CUST2, contact: "0199990000" }),                            // different customer (different record AND phone)
       ordRow(5, A, { delivery_date: OTHER }),                                                  // different date
       ordRow(6, A, { status: "Cancelled" }),                                                   // cancelled
       ordRow(7, B, { customer_id: CUST1 }),                                                    // other company, same ids/address

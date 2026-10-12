@@ -40,7 +40,7 @@ const dateRequestStaleness = require("./lib/date-request-staleness");
 const { decideServiceDateChange } = require("./lib/service-schedule-decision");
 const { serviceStatusAfterDateChange } = require("./lib/service-lifecycle");
 const { decideTelegramReschedule } = require("./lib/telegram-reschedule");
-const { createAutoLinkService, AUTO_LINK_VIA } = require("./lib/auto-link");
+const { createAutoLinkService, AUTO_LINK_VIA, canonicalPhone: autoLinkCanonicalPhone } = require("./lib/auto-link");
 const { createAssistantReadService } = require("./lib/assistant-read");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
@@ -5430,10 +5430,7 @@ async function createDeliveryDateRequestAndMaybeAutoApprove(insertPayload, actor
 // Same-customer phone match: digits only, with a leading MY (60 → 0) or SG
 // (65) country code folded so "+60 12-345 6789" matches "012-3456789".
 function canonicalPhone(v) {
-  let d = normalizePhone(v);
-  if (d.startsWith("60") && d.length >= 11) d = "0" + d.slice(2);
-  else if (d.startsWith("65") && d.length === 10) d = d.slice(2);
-  return d.length >= 7 ? d : "";
+  return autoLinkCanonicalPhone(v); // one rule for manual and automatic Deliver Together (lib/auto-link.js)
 }
 // SO statuses that can't take part in a linked delivery.
 const LINK_EXCLUDED_SO_STATUSES = ["draft", "cancelled", "delivered"];
@@ -5510,6 +5507,43 @@ const autoLinkService = createAutoLinkService({
 // the schedule's own date; candidates must already be on that same effective date
 // (active DO's date when exactly one, else the SO date; 2+ active DOs ⇒ skipped).
 // Best-effort and non-fatal — assignment never fails because of linking.
+// Owner decision 2026-10-12: the CURRENT schedule is linked too — POST
+// /delivery-links/auto-link-sweep runs the SAME assignment trigger for every
+// live team stop from a date onward (default: Malaysia today). dry_run lists
+// what would be linked without writing anything. Manager / Master only.
+app.post("/delivery-links/auto-link-sweep", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    if (!["MASTER", "MANAGER"].includes(String(req.activeRoleKey || req.user.role || "").toUpperCase())) {
+      return res.status(403).json({ error: "Only a Manager or Master can link the schedule" });
+    }
+    const dryRun = req.body?.dry_run !== false;
+    const fromDate = /^\d{4}-\d{2}-\d{2}$/.test(req.body?.from_date || "") ? req.body.from_date : malaysiaDate.malaysiaDateOf();
+    const { data: stops, error } = await supabase.from("delivery_schedules").select("order_id, scheduled_date, status")
+      .eq("company_id", cid).gte("scheduled_date", fromDate).not("status", "in", "(delivered,failed,cancelled)").not("order_id", "is", null)
+      .order("scheduled_date").limit(2000);
+    if (error) throw error;
+    const seen = new Set(), groups = [];
+    for (const st of stops || []) {
+      const key = `${st.order_id}|${st.scheduled_date}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const found = await autoLinkService.findAutoLinkMembers({ cid, mainOrderId: st.order_id, requestedDate: st.scheduled_date, includeMain: true, allowJoin: true, req });
+      if (!found.members.length) continue;
+      const ids = found.members.map(m => m.ord.id);
+      for (const i of ids) seen.add(`${i}|${st.scheduled_date}`);
+      const g = { date: st.scheduled_date, joins_existing_group: !!found.joinGroupId,
+        orders: found.members.map(m => ({ order_id: m.ord.id, so_number: m.ord.so_number, customer_name: m.ord.customer_name })) };
+      if (!dryRun) {
+        await autoLinkService.persistAutoLinkMembers({ members: found.members, linkGroupId: found.joinGroupId || crypto.randomUUID(), requestedDate: st.scheduled_date,
+          buildPayload: (m, o) => buildDeliveryDateRequestPayload(req, m, o) });
+      }
+      groups.push(g);
+    }
+    res.json({ dry_run: dryRun, from_date: fromDate, groups, linked: dryRun ? 0 : groups.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 async function autoLinkOnAssignment(req, cid, orderId, scheduledDate) {
   try {
     if (!cid || !orderId || !scheduledDate) return;
