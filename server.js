@@ -16012,6 +16012,18 @@ app.get("/sales-orders", requireAuth, async (req, res) => {
         finalData = finalData.map(o => ({ ...o, _item_count: countMap[o.id] || 0 }));
       } catch (e) { console.error("item count error:", e.message); }
 
+      // Shared "ordered" ticks per order (migrations 119 + 120), for the list's
+      // order-placement reminder. Unset on failure (e.g. migration not yet
+      // applied) — the frontend then falls back to its local cache.
+      try {
+        const { data: marks, error: mErr } = await supabase.from("sales_order_item_marks").select("sales_order_id")
+          .eq("company_id", company_id).in("sales_order_id", orderIds);
+        if (mErr) throw mErr;
+        const markMap = {};
+        (marks || []).forEach(m => { markMap[m.sales_order_id] = (markMap[m.sales_order_id] || 0) + 1; });
+        finalData = finalData.map(o => ({ ...o, _ordered_mark_count: markMap[o.id] || 0 }));
+      } catch (e) { console.error("ordered mark count error:", e.message); }
+
       // Delivery-readiness hints for the Orders list illustration, batched per
       // page (never per order). Presentation-only; failures leave them unset.
       //   _all_arrived      every legacy item line has an arrivalDate (null = no lines)
@@ -18139,6 +18151,79 @@ app.delete("/sales-orders/:id/notes/:noteId", requireAuth, async (req, res) => {
     const { error: delErr } = await supabase.from("sales_order_notes").delete().eq("id", note.id).eq("company_id", company_id);
     if (delErr) throw delErr;
     res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// Sales order item "ordered" marks (migrations 119 + 120) — a SHARED checklist
+// on an SO's items ("has this line been placed with the supplier?"). One tick
+// per (order, item_key); user_id / created_by_name record who ticked it.
+// Never touches sales_orders / sales_order_items, so no amendment and no
+// order-edit permission. Visibility follows the Orders list: managerial and
+// other non-salesman roles see every SO in the active company; a salesman
+// sees an SO only when they are on it (incl. shared "A / B" SOs).
+// item_key = item id as text, or "idx:N" for an unsaved line.
+// The Orders list gets the tick count as _ordered_mark_count (GET /sales-orders).
+// ══════════════════════════════════════════════════════════════════
+const SO_MARK_KEY_RE = /^[A-Za-z0-9:_-]{1,64}$/;
+const SO_MARK_MAX = 500;
+// Sends the 404 / 403 itself and returns false when the caller may not see the SO.
+const soMarksAccess = async (req, res) => {
+  const { data, error } = await supabase.from("sales_orders").select("id, salesman_name")
+    .eq("id", req.params.id).eq("company_id", getActiveCompanyId(req)).maybeSingle();
+  if (error) throw error;
+  if (!data) { res.status(404).json({ error: "Order not found" }); return false; }
+  if (req.user.role === "salesman" && !salesmanOwnsOrder(req.user, data)) {
+    res.status(403).json({ error: "Not your order" }); return false;
+  }
+  return true;
+};
+// { marks: [item_key], ticked_by: { item_key: { name, at } } }
+const listSoItemMarks = async (req) => {
+  const { data, error } = await supabase.from("sales_order_item_marks").select("item_key, created_by_name, created_at")
+    .eq("sales_order_id", req.params.id).eq("company_id", getActiveCompanyId(req));
+  if (error) throw error;
+  const ticked_by = {};
+  (data || []).forEach(r => { ticked_by[r.item_key] = { name: r.created_by_name || null, at: r.created_at }; });
+  return { marks: (data || []).map(r => r.item_key), ticked_by };
+};
+
+app.get("/sales-orders/:id/item-marks", requireAuth, async (req, res) => {
+  try {
+    if (!(await soMarksAccess(req, res))) return;
+    res.json(await listSoItemMarks(req));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Body: { add?: string[], remove?: string[] } — covers a single toggle,
+// pruning keys for items no longer on the order, and one-off upload of
+// marks a browser still holds in localStorage. Idempotent; adding an item
+// someone already ticked keeps the original ticker. Returns the order's
+// resulting marks.
+app.post("/sales-orders/:id/item-marks", requireAuth, async (req, res) => {
+  try {
+    const norm = (v) => (Array.isArray(v) ? [...new Set(v.map(String))] : []);
+    const add = norm(req.body?.add), remove = norm(req.body?.remove);
+    if (add.length + remove.length === 0) return res.status(400).json({ error: "Nothing to change" });
+    if (add.length + remove.length > SO_MARK_MAX) return res.status(400).json({ error: `Too many marks (max ${SO_MARK_MAX})` });
+    if ([...add, ...remove].some(k => !SO_MARK_KEY_RE.test(k))) return res.status(400).json({ error: "Invalid item key" });
+    if (!(await soMarksAccess(req, res))) return;
+    const company_id = getActiveCompanyId(req);
+    const removeSet = new Set(remove);
+    const toAdd = add.filter(k => !removeSet.has(k));
+    if (toAdd.length) {
+      const created_by_name = req.user.name || req.user.salesman_name || null;
+      const { error } = await supabase.from("sales_order_item_marks").upsert(
+        toAdd.map(item_key => ({ sales_order_id: req.params.id, company_id, user_id: req.user.id, created_by_name, item_key })),
+        { onConflict: "sales_order_id,item_key", ignoreDuplicates: true });
+      if (error) throw error;
+    }
+    if (remove.length) {
+      const { error } = await supabase.from("sales_order_item_marks").delete()
+        .eq("sales_order_id", req.params.id).eq("company_id", company_id).in("item_key", remove);
+      if (error) throw error;
+    }
+    res.json(await listSoItemMarks(req));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
