@@ -964,6 +964,20 @@ async function syncLegacyDeliveredToSalesOrder(companyId, soNumber) {
   }
 }
 
+// What follows EVERY Delivery Order completion, whichever screen it came from
+// (driver app, schedule board, Orders page / driver / board item confirmation,
+// Telegram settle, route status) — so the same DO always has the same outcome.
+// calculateDeliveryCommission() is the canonical driver-commission rule: it
+// pays only for a COMPLETED DO, only the DO schedule team's driver / vehicle
+// leaders, once per sales order per person (code guard + the partial unique
+// index of migration 053) — calling it again is a no-op. No new rule here.
+// deductStockOnDeliveredDO() is unchanged (switched off: INVENTORY_AUTO_DEDUCT_ON_DELIVERY).
+async function afterDeliveryOrderCompleted(deliveryOrderId, cid, actorId) {
+  try { await calculateDeliveryCommission(deliveryOrderId, cid); }
+  catch (e) { console.error("delivery commission calc:", e.message); }
+  await deductStockOnDeliveredDO(deliveryOrderId, cid, actorId);
+}
+
 // An un-itemised "Delivered" (Telegram settle, route status Delivered) for a
 // legacy order (owner decision 2026-10-20): never marks the order Delivered
 // directly. Only when its sales order has EXACTLY ONE open Delivery Order is
@@ -996,6 +1010,7 @@ async function completeSingleOpenDoForLegacyOrder(legacyOrder, actorId) {
     return { completed: false, reason: "completion_failed", so_number: soNumber, sales_order_id: so.id,
       text: `NOT marked Delivered — Delivery Order ${pick.deliveryOrder.do_number} could not be completed (${String(error.message).replace(/[_*`[\]]/g, " ")}). Please confirm in PulseOS.` };
   }
+  if (!data?.already_completed) await afterDeliveryOrderCompleted(pick.deliveryOrder.id, cid, actorId);
   const label = data?.sales_order_status === "delivered" ? "Delivered" : "Partially Delivered";
   return { completed: true, do_number: pick.deliveryOrder.do_number, sales_order_status: data?.sales_order_status || null,
     already_completed: !!data?.already_completed, so_number: soNumber, sales_order_id: so.id,
@@ -11572,11 +11587,7 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
         // Driver commission: earned once, on the FIRST trip of the order to
         // complete. No-op on a double-tap (already_completed) or when the
         // company hasn't opted in. Non-fatal — never block completion.
-        if (!result?.already_completed) {
-          try { await calculateDeliveryCommission(schedRow.delivery_order_id, cid); }
-          catch (e) { console.error("delivery commission calc:", e.message); }
-          await deductStockOnDeliveredDO(schedRow.delivery_order_id, cid, req.user.id);
-        }
+        if (!result?.already_completed) await afterDeliveryOrderCompleted(schedRow.delivery_order_id, cid, req.user.id);
         const { data: fresh } = await supabase.from("delivery_schedules").select("*").eq("id", req.params.id).single();
         return res.json({ schedule: fresh, delivery_order: result });
       }
@@ -12223,11 +12234,7 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       // Driver commission: earned once, on the FIRST trip of the order to
       // complete. No-op on a double-tap (already_completed) or when the
       // company hasn't opted in. Non-fatal — never block completion.
-      if (!result?.already_completed) {
-        try { await calculateDeliveryCommission(existing.delivery_order_id, cid); }
-        catch (e) { console.error("delivery commission calc:", e.message); }
-        await deductStockOnDeliveredDO(existing.delivery_order_id, cid, req.user.id);
-      }
+      if (!result?.already_completed) await afterDeliveryOrderCompleted(existing.delivery_order_id, cid, req.user.id);
       const { data: fresh } = await supabase.from("delivery_schedules")
         .select("*, orders(id, so_number, status)").eq("id", existing.id).single();
       return res.json({ schedule: fresh, delivery_order: result });
@@ -17927,6 +17934,13 @@ const sendConfirmContext = async (res, cid, soId, extra) => {
 const runConfirm = async (req, res, { cid, soId, source, scheduleId = null }) => {
   const out = await deliveryConfirmation.confirmDeliveredItems({ supabase, companyId: cid, salesOrderId: soId, actorId: req.user.id,
     lines: req.body?.lines, idempotencyKey: req.body?.idempotency_key, source, legacyScheduleId: scheduleId });
+  // Every DO this confirmation completed gets the same follow-up as any other
+  // DO completion (driver commission, once per order per person). A replayed
+  // key (already_confirmed) completed nothing new and triggers nothing.
+  const conf = out.body?.confirmation;
+  if (out.status === 201 && conf && !conf.already_confirmed) {
+    for (const d of conf.delivery_orders || []) if (d?.delivery_order_id) await afterDeliveryOrderCompleted(d.delivery_order_id, cid, req.user.id);
+  }
   res.status(out.status).json(out.body);
 };
 
