@@ -20,7 +20,7 @@
 const fs = require("fs");
 const path = require("path");
 const { createServerDb, serverConfigured } = require("./pg/server-db");
-const { functionBlocks, REPO } = require("./pg/pglite-db");
+const { functionBlocks, REPO, prodBaselineCompleteDoSql } = require("./pg/pglite-db");
 const out = s => process.stdout.write(s + "\n");
 let pass = 0, fail = 0;
 const assert = (n, c, d) => { if (c) { out(`  ✅ ${n}`); pass++; } else { out(`  ❌ ${n}${d ? " — " + d : ""}`); fail++; } };
@@ -38,7 +38,7 @@ if (!serverConfigured()) {
   const q = t.query, one = async (s, p) => (await q(s, p))[0];
   try {
     for (const b of functionBlocks("015_delivery_orders.sql")) if (/FUNCTION next_do_number/.test(b)) await q(b);
-    for (const b of functionBlocks("016_complete_delivery_order_rpc.sql")) await q(b);
+    await q(prodBaselineCompleteDoSql());   // complete_delivery_order as production runs it before 123 (090)
     await q(fs.readFileSync(path.join(REPO, "migrations", "123_confirm_delivered_items.sql"), "utf8"));
     await q(`INSERT INTO companies (id, name) VALUES ('${A}', 'A')`);
 

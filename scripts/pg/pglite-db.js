@@ -76,4 +76,12 @@ async function runMigrationFile(db, file) {
   await db.exec(fs.readFileSync(path.join(REPO, "migrations", file), "utf8"));
 }
 
-module.exports = { createTestDb, loadFunctions, runMigrationFile, functionBlocks, schemaSql, REPO };
+// complete_delivery_order() exactly as production runs it before migration 123 (migration 090's body — 084–092 were
+// applied by hand and are not on main; verified against production 2026-10-20, md5 2f3c975a…).
+const PROD_BASELINE_COMPLETE_DO = path.join(REPO, "scripts", "fixtures", "prod-baseline-complete_delivery_order.sql");
+const prodBaselineCompleteDoSql = () => fs.readFileSync(PROD_BASELINE_COMPLETE_DO, "utf8");
+async function loadProductionBaseline(db) {
+  await db.exec(prodBaselineCompleteDoSql());
+}
+
+module.exports = { createTestDb, loadFunctions, runMigrationFile, functionBlocks, schemaSql, REPO, loadProductionBaseline, prodBaselineCompleteDoSql };

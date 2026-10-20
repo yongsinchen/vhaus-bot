@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * complete_delivery_order() REGRESSION — the original migration 016 body vs the body re-stated in migration 123
- * (non-goods change only). REAL PostgreSQL (PGlite; production never touched).
+ * complete_delivery_order() REGRESSION — production's current body (migration 090 = 016 + superseded guard, search_path
+ * pinned; scripts/fixtures/prod-baseline-complete_delivery_order.sql) vs the body re-stated in migration 123 (non-goods
+ * change only); the original 016 body is run too, for reference. REAL PostgreSQL (PGlite; production never touched).
  *
  * Ports every scenario of the live-DB scripts/test-delivery-orders-phase2a.js (which must not run against production):
  * partial completion → partially_delivered / Partially Delivered · remaining DOs → delivered / Delivered · DO + items
@@ -12,7 +13,7 @@
  *
  * Usage: node scripts/test-016-complete-delivery-order-regression-pg.js
  */
-const { createTestDb, loadFunctions, functionBlocks } = require("./pg/pglite-db");
+const { createTestDb, loadFunctions, functionBlocks, loadProductionBaseline } = require("./pg/pglite-db");
 const out = s => process.stdout.write(s + "\n");
 let pass = 0, fail = 0;
 const assert = (n, c, d) => { if (c) { out(`  ✅ ${n}`); pass++; } else { out(`  ❌ ${n}${d ? " — " + d : ""}`); fail++; } };
@@ -22,7 +23,8 @@ const A = u(1), B = u(2), ACT = u(9);
 async function scenario(label, which) {
   const db = await createTestDb();
   await loadFunctions(db, "015_delivery_orders.sql");
-  await loadFunctions(db, "016_complete_delivery_order_rpc.sql");
+  if (which === "016") await loadFunctions(db, "016_complete_delivery_order_rpc.sql");
+  else await loadProductionBaseline(db);   // 090 — production today
   if (which === "123") for (const b of functionBlocks("123_confirm_delivered_items.sql")) if (/FUNCTION (delivery_line_is_non_goods|complete_delivery_order)/.test(b)) await db.exec(b);
   const q = async (s, p = []) => (await db.query(s, p)).rows, one = async (s, p) => (await q(s, p))[0];
   const complete = async (doId, company = A) => (await one("SELECT complete_delivery_order($1,$2,$3) r", [doId, company, ACT])).r;
@@ -39,6 +41,10 @@ async function scenario(label, which) {
       ('${u(401)}', '${u(301)}', '${u(201)}', 'Item A', 2, 0, 'pending'), ('${u(402)}', '${u(302)}', '${u(201)}', 'Item A', 4, 0, 'pending'),
       ('${u(403)}', '${u(303)}', '${u(202)}', 'Item B', 1, 0, 'pending'), ('${u(404)}', '${u(304)}', '${u(202)}', 'Item B', 1, 0, 'cancelled'), ('${u(405)}', '${u(305)}', '${u(203)}', 'Item D', 1, 0, 'pending');
     INSERT INTO delivery_schedules (id, order_id, delivery_order_id, company_id, status) VALUES ('${u(501)}', 1, '${u(301)}', '${A}', 'scheduled');
+    INSERT INTO sales_orders (id, company_id, order_number, status) VALUES ('${u(103)}', '${A}', 'R3', 'confirmed');
+    INSERT INTO sales_order_items (id, order_id, product_code, product_name, quantity, delivered_qty) VALUES ('${u(204)}', '${u(103)}', 'E1', 'Item E', 1, 0);
+    INSERT INTO delivery_orders (id, company_id, do_number, sales_order_id, status, superseded_at) VALUES ('${u(306)}', '${A}', 'DO6', '${u(103)}', 'scheduled', now());
+    INSERT INTO delivery_order_items (id, delivery_order_id, sales_order_item_id, product_name, quantity, delivered_qty, status) VALUES ('${u(406)}', '${u(306)}', '${u(204)}', 'Item E', 1, 0, 'pending');
     INSERT INTO payments (id, company_id, order_id, amount, approval_status) VALUES ('${u(601)}', '${A}', 1, 100, 'approved');
     INSERT INTO commissions (id, company_id, order_id, commission_amt, status) VALUES ('${u(701)}', '${A}', 1, 10, 'eligible');
   `);
@@ -68,14 +74,22 @@ async function scenario(label, which) {
   const r6 = await complete(u(305)); trace.push(r6);
   assert(`${label}: completing a previously-failed DO (retry) works and delivers the item`, r6.already_completed === false && Number((await soi(u(203))).delivered_qty) === 1);
   assert(`${label}: no payments / commissions / balances changed`, JSON.stringify([await q("SELECT * FROM payments"), await q("SELECT * FROM commissions"), await q("SELECT id, balance FROM orders ORDER BY id")]) === money0);
+  if (which !== "016") {
+    e = null; try { await complete(u(306)); } catch (x) { e = x; }
+    assert(`${label}: completing a SUPERSEDED DO is blocked (090's guard kept) and writes nothing`, e && /delivery_order_superseded/.test(e.message) && Number((await soi(u(204))).delivered_qty) === 0 && (await one("SELECT status FROM delivery_orders WHERE id = $1", [u(306)])).status === "scheduled", e?.message);
+    const cfg = (await one("SELECT proconfig FROM pg_proc WHERE proname = 'complete_delivery_order'")).proconfig;
+    assert(`${label}: search_path stays pinned (public, pg_temp)`, JSON.stringify(cfg) === JSON.stringify(["search_path=public, pg_temp"]), JSON.stringify(cfg));
+  }
   return trace.map(t => ({ a: t.already_completed, s: t.sales_order_status ?? null, all: t.all_items_delivered ?? null }));
 }
 
 (async () => {
-  const t016 = await scenario("016 (original body)", "016");
+  const t016 = await scenario("016 (original body, reference)", "016");
+  const t090 = await scenario("090 (production today)", "090");
   const t123 = await scenario("123 (re-stated body)", "123");
   out("\n══ Equivalence ══\n");
-  assert("for orders without billing lines, the 123 body returns exactly what 016 returned at every step", JSON.stringify(t016) === JSON.stringify(t123), `${JSON.stringify(t016)} vs ${JSON.stringify(t123)}`);
+  assert("for orders without billing lines, the 123 body returns exactly what production's 090 body returns at every step", JSON.stringify(t090) === JSON.stringify(t123), `${JSON.stringify(t090)} vs ${JSON.stringify(t123)}`);
+  assert("…and 090 itself matches 016 on these scenarios (the guard only adds a refusal)", JSON.stringify(t016) === JSON.stringify(t090));
   out(`\n${fail === 0 ? "✅ ALL PASS" : "❌ FAILURES"} — ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch(e => { console.error(e); process.exit(1); });

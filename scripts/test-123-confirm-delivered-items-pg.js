@@ -12,7 +12,7 @@
  *
  * Usage: node scripts/test-123-confirm-delivered-items-pg.js
  */
-const { createTestDb, loadFunctions, runMigrationFile } = require("./pg/pglite-db");
+const { createTestDb, loadFunctions, runMigrationFile, loadProductionBaseline } = require("./pg/pglite-db");
 const out = s => process.stdout.write(s + "\n");
 let pass = 0, fail = 0;
 const assert = (n, c, d) => { if (c) { out(`  ✅ ${n}`); pass++; } else { out(`  ❌ ${n}${d ? " — " + d : ""}`); fail++; } };
@@ -23,7 +23,7 @@ let keySeq = 0; const key = () => `test-key-${++keySeq}-${Date.now()}`;
 (async () => {
   const db = await createTestDb();
   await loadFunctions(db, "015_delivery_orders.sql");
-  await loadFunctions(db, "016_complete_delivery_order_rpc.sql");
+  await loadProductionBaseline(db);   // complete_delivery_order as production runs it before 123 (090)
   await runMigrationFile(db, "123_confirm_delivered_items.sql");
   const q = async (sql, p = []) => (await db.query(sql, p)).rows;
   const one = async (sql, p = []) => (await q(sql, p))[0];

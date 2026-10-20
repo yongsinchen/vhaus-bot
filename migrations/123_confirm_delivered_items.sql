@@ -42,16 +42,17 @@
 -- completed DO become 'not_applicable' with delivered_qty 0, and they never
 -- hold an order back from Delivered. An order with only such lines is refused
 -- (nothing to deliver) and keeps its status. Ambiguous lines are goods.
--- complete_delivery_order() (migration 016) is re-stated at the end of this file
--- with ONLY that change (non-goods lines + physical-only roll-up); it stays the
--- path for "the whole DO was delivered" (driver / schedule board).
+-- complete_delivery_order() — as production runs it (016 + 090's superseded
+-- guard, search_path pinned) — is re-stated at the end of this file with ONLY
+-- that change (non-goods lines + physical-only roll-up); it stays the path for
+-- "the whole DO was delivered" (driver / schedule board).
 --
 -- NOT touched: payments, balances, commissions, prices, the DO's planned item
 -- quantities, any quantity already recorded (no back-fill, no rewrite).
 --
 -- Rollback (in this order):
---   1. re-run the CREATE OR REPLACE FUNCTION block of
---      migrations/016_complete_delivery_order_rpc.sql (restores the 016 body);
+--   1. restore complete_delivery_order() to production's pre-123 body
+--      (docs/runbooks/migration-123-rollback.sql — migration 090's block, md5 2f3c975a…);
 --   2. DROP FUNCTION IF EXISTS confirm_delivered_items(UUID, UUID, UUID, JSONB, TEXT, TEXT, UUID);
 --      DROP FUNCTION IF EXISTS delivery_line_is_non_goods(TEXT, TEXT);
 --   3. export, then DROP TABLE IF EXISTS delivery_confirmations;
@@ -428,20 +429,27 @@ REVOKE ALL ON FUNCTION delivery_line_is_non_goods(TEXT, TEXT) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION delivery_line_is_non_goods(TEXT, TEXT) TO authenticated, service_role;
 
 -- ══════════════════════════════════════════════════════════════════
--- complete_delivery_order() — migration 016's canonical DO completion,
--- re-stated with the MINIMUM change for non-goods lines (owner decision
--- 2026-10-20). Everything else is byte-for-byte 016: the DO → SO locks,
--- idempotent early return, cancelled guard, ledger increment, schedule close,
--- legacy-order roll-up and the event. The two changes:
+-- complete_delivery_order() — the canonical DO completion AS PRODUCTION RUNS
+-- IT TODAY: migration 016 + migration 090's superseded-DO guard, with
+-- search_path pinned (migration 084), EXECUTE for service_role only (084).
+-- (084–092 were applied to production by hand; their source is on branch
+-- claude/payment-allocation-103. Production's body was verified on
+-- 2026-10-20: md5 2f3c975a… = migration 090.) Re-stated with the MINIMUM
+-- change for non-goods lines (owner decision 2026-10-20). Everything else is
+-- 090 verbatim: the DO → SO locks, idempotent early return, cancelled and
+-- superseded guards, ledger increment, schedule close, legacy-order roll-up
+-- and the event. The two changes:
 --   (a) step 3: a DO line whose sales-order item is a billing / service line
 --       becomes 'not_applicable' with delivered_qty 0 (never "delivered"), so
 --       step 4 never adds it to the delivered ledger;
 --   (b) step 7: the order's status is rolled up from its PHYSICAL lines only —
 --       every physical line delivered → delivered; some → partially_delivered;
 --       an order with no physical line delivered keeps its current status.
--- Grants are kept as they are (CREATE OR REPLACE does not change them).
--- Rollback: re-run the CREATE OR REPLACE FUNCTION block of
--- migrations/016_complete_delivery_order_rpc.sql (restores the 016 body).
+-- Grants are kept as they are (CREATE OR REPLACE does not change them) — no
+-- GRANT here, so migration 084's service_role-only hardening stays. The
+-- search_path pin is NOT kept by CREATE OR REPLACE, so it is re-declared.
+-- Rollback: docs/runbooks/migration-123-rollback.sql restores the production
+-- (090) body — scripts/fixtures/prod-baseline-complete_delivery_order.sql.
 -- ══════════════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION complete_delivery_order(
   p_delivery_order_id UUID,
@@ -451,6 +459,7 @@ CREATE OR REPLACE FUNCTION complete_delivery_order(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_do            delivery_orders%ROWTYPE;
@@ -481,6 +490,12 @@ BEGIN
   END IF;
   IF v_do.status = 'cancelled' THEN
     RAISE EXCEPTION 'delivery_order_cancelled: cannot complete a cancelled delivery order';
+  END IF;
+  -- P1-1 (migration 085/089, guard added by 090): a superseded DO keeps the
+  -- status it had at supersession, so without this guard it would pass every
+  -- check above although its replacement DO owns its items.
+  IF v_do.superseded_at IS NOT NULL THEN
+    RAISE EXCEPTION 'delivery_order_superseded: cannot complete a superseded delivery order';
   END IF;
 
   -- 2. Serialize concurrent completions on the same sales order.
