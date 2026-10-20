@@ -33,17 +33,24 @@ function columnSql(name, def) {
   return sql;
 }
 
-async function createTestDb() {
-  const { PGlite } = await import("@electric-sql/pglite");
-  const db = new PGlite();
-  await db.exec(`CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;`);
+/** The production-shaped schema as one SQL script (shared by PGlite and the real-server kit, scripts/pg/server-db.js). */
+function schemaSql() {
   const stmts = [];
   for (const [table, cols] of Object.entries(INVENTORY.tables)) {
     const parts = Object.entries(cols).map(([c, d]) => columnSql(c, d) + (c === "id" ? " PRIMARY KEY" : ""));
     stmts.push(`CREATE TABLE IF NOT EXISTS "${table}" (${parts.join(", ")});`);
   }
   stmts.push(`CREATE UNIQUE INDEX IF NOT EXISTS payments_company_idempotency_key_uniq ON payments (company_id, idempotency_key) WHERE idempotency_key IS NOT NULL;`);
-  await db.exec(stmts.join("\n"));
+  // next_do_number() (migration 015) upserts on do_counters' primary key.
+  stmts.push(`CREATE UNIQUE INDEX IF NOT EXISTS do_counters_company_period_uniq ON do_counters (company_id, period);`);
+  return stmts.join("\n");
+}
+
+async function createTestDb() {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const db = new PGlite();
+  await db.exec(`CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;`);
+  await db.exec(schemaSql());
   return db;
 }
 
@@ -69,4 +76,4 @@ async function runMigrationFile(db, file) {
   await db.exec(fs.readFileSync(path.join(REPO, "migrations", file), "utf8"));
 }
 
-module.exports = { createTestDb, loadFunctions, runMigrationFile, functionBlocks };
+module.exports = { createTestDb, loadFunctions, runMigrationFile, functionBlocks, schemaSql, REPO };
