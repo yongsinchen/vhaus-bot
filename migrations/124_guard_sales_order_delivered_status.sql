@@ -8,9 +8,13 @@
 -- dropdown, legacy schedule stop, Telegram settle) would start failing.
 --
 -- Rule (only on a CHANGE of status, so existing rows and unrelated edits of an
--- already-delivered order are untouched — no historical row is modified):
---   → 'delivered'            every item's delivered_qty >= quantity
---   → 'partially_delivered'  at least one item has delivered_qty > 0
+-- already-delivered order are untouched — no historical row is modified).
+-- PHYSICAL lines only — billing / service lines (delivery_line_is_non_goods(),
+-- migration 123) are never delivered and never required (owner decision 2026-10-20):
+--   → 'delivered'            the order has a physical line and every physical
+--                            line's delivered_qty >= quantity
+--   → 'partially_delivered'  at least one physical line has delivered_qty > 0
+-- An order with only billing / service lines can never be set to either.
 -- An INSERT straight into either status is refused the same way (its items do
 -- not exist yet). complete_delivery_order() (016) and confirm_delivered_items()
 -- (123) update the item ledger BEFORE the status, so they always pass.
@@ -18,7 +22,8 @@
 -- (reconcile-order-sync.js, migrate-legacy-orders-to-sales-orders.js) are
 -- refused too — by design.
 --
--- Rollback:
+-- Requires migration 123 (delivery_line_is_non_goods).
+-- Rollback (BEFORE rolling back 123):
 --   DROP TRIGGER IF EXISTS trg_guard_sales_order_delivered_status ON sales_orders;
 --   DROP FUNCTION IF EXISTS guard_sales_order_delivered_status();
 -- ══════════════════════════════════════════════════════════════════
@@ -38,10 +43,11 @@ BEGIN
 
   SELECT count(*), COALESCE(bool_and(COALESCE(delivered_qty, 0) >= quantity), false), COALESCE(bool_or(COALESCE(delivered_qty, 0) > 0), false)
   INTO v_items, v_all, v_any
-  FROM sales_order_items WHERE order_id = NEW.id;
+  FROM sales_order_items WHERE order_id = NEW.id
+    AND NOT delivery_line_is_non_goods(product_code, product_name);
 
   IF NEW.status = 'delivered' AND (v_items = 0 OR NOT v_all) THEN
-    RAISE EXCEPTION 'delivery_quantities_not_recorded: sales order % cannot be marked delivered until every item''s delivered quantity is confirmed', NEW.order_number
+    RAISE EXCEPTION 'delivery_quantities_not_recorded: sales order % cannot be marked delivered until every physical item''s delivered quantity is confirmed', NEW.order_number
       USING ERRCODE = 'P0001', HINT = 'Use Confirm Delivered Items (or complete the Delivery Order).';
   END IF;
   IF NEW.status = 'partially_delivered' AND NOT v_any THEN

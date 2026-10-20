@@ -17900,7 +17900,9 @@ function confirmationContextBody(ctx, extra = {}) {
   return {
     sales_order: { id: ctx.so.id, order_number: ctx.so.order_number, status: ctx.so.status, customer_name: ctx.so.customer_name,
       delivery_date: ctx.so.delivery_date, salesman_name: ctx.so.salesman_name },
-    items: ctx.items, open_delivery_orders: ctx.openDos, failed_delivery_orders: ctx.failedDos, ...extra,
+    items: ctx.items, open_delivery_orders: ctx.openDos, failed_delivery_orders: ctx.failedDos,
+    // Billing / service lines are shown read-only; an order with only those has nothing to deliver.
+    goods_count: ctx.goods_count, only_non_goods: ctx.only_non_goods, ...extra,
   };
 }
 async function salesOrderForConfirmation(req, res, cid) {

@@ -268,6 +268,99 @@ let keySeq = 0; const key = () => `test-key-${++keySeq}-${Date.now()}`;
   await db.exec(`UPDATE sales_orders SET status = 'cancelled' WHERE id = '${S(16)}'`);
   assert("J9. other status changes (e.g. cancel) are not affected", (await so(S(16))).status === "cancelled");
 
+  out("\n══ K. Physical goods + billing / service lines (owner decision 2026-10-20; 124 active) ══\n");
+  // seedMix(n, lines, dos): lines = [[code, name, qty]], dos = [[status, [[lineIdx, qty]]]] → { so, it: [...], d: [...] }
+  const seedMix = async (n, lines, dos = [], soStatus = "confirmed") => {
+    const so = S(n), it = lines.map((_, i) => I(n * 10 + i)), d = dos.map((_, k) => D(n * 10 + k));
+    await db.exec(`INSERT INTO sales_orders (id, company_id, order_number, status) VALUES ('${so}', '${A}', '${5000 + n}', '${soStatus}');
+      INSERT INTO orders (id, company_id, so_number, type, status) VALUES (${100 + n}, '${A}', '${5000 + n}', 'Delivery', 'Pending');`);
+    for (let i = 0; i < lines.length; i++) await db.query("INSERT INTO sales_order_items (id, order_id, product_code, product_name, quantity, delivered_qty) VALUES ($1,$2,$3,$4,$5,0)", [it[i], so, lines[i][0], lines[i][1], lines[i][2]]);
+    for (let k = 0; k < dos.length; k++) {
+      await db.query("INSERT INTO delivery_orders (id, company_id, do_number, sales_order_id, order_id, status) VALUES ($1,$2,$3,$4,$5,$6)", [d[k], A, `DO-K${n}${k}`, so, 100 + n, dos[k][0]]);
+      for (const [ix, q] of dos[k][1]) await db.query("INSERT INTO delivery_order_items (delivery_order_id, sales_order_item_id, product_name, quantity, delivered_qty, status) VALUES ($1,$2,$3,$4,0,'pending')", [d[k], it[ix], lines[ix][1], q]);
+    }
+    return { so, it, d, leg: 100 + n };
+  };
+  const doiOf = async (doId, itemId) => one("SELECT status, delivered_qty FROM delivery_order_items WHERE delivery_order_id = $1 AND sales_order_item_id = $2", [doId, itemId]);
+  const SOFA = ["2202", "Sofa", 1], BILL = ["BILL", "Full Bill Amount", 1];
+  const k0 = await moneyState();
+
+  let m = await seedMix(20, [SOFA, BILL], [["scheduled", [[0, 1]]]]);
+  r = await confirm({ so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }] });
+  assert("K1. Sofa + BILL (BILL not on the DO): confirming the sofa → SO Delivered; BILL ledger stays 0", r.sales_order_status === "delivered" && (await so(m.so)).status === "delivered" && Number((await soi(m.it[1])).delivered_qty) === 0 && (await leg(m.leg)).status === "Delivered");
+
+  m = await seedMix(21, [SOFA, BILL], [["scheduled", [[0, 1], [1, 1]]]]);
+  r = await confirm({ so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }] });
+  const billLine = await doiOf(m.d[0], m.it[1]);
+  assert("K2. BILL on the DO: the DO's BILL line → not_applicable, delivered 0; SO Delivered", r.sales_order_status === "delivered" && billLine.status === "not_applicable" && Number(billLine.delivered_qty) === 0 && Number((await soi(m.it[1])).delivered_qty) === 0);
+
+  m = await seedMix(22, [SOFA, BILL], [["scheduled", [[0, 1]]]]);
+  await refuse("K3. confirming the BILL line (no DO) is refused", { so: m.so, lines: [{ sales_order_item_id: m.it[1], delivery_order_id: null, quantity: 1 }] }, /Full Bill Amount is a billing \/ charge line/);
+  await refuse("K3b. …also when sent together with the sofa (whole call refused)", { so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }, { sales_order_item_id: m.it[1], delivery_order_id: null, quantity: 1 }] }, /billing \/ charge line/);
+
+  m = await seedMix(23, [SOFA, BILL], [["scheduled", [[0, 1], [1, 1]]]]);
+  let c = (await one(`SELECT complete_delivery_order('${m.d[0]}', '${A}', '${ACT}') r`)).r;
+  const ev23 = await one(`SELECT payload FROM delivery_order_events WHERE delivery_order_id = '${m.d[0]}' AND event_type = 'completed'`);
+  assert("K4. driver completes a DO carrying Sofa + BILL (016 re-stated): SO Delivered; BILL line not_applicable / 0; ledger sofa 1, BILL 0",
+    c.sales_order_status === "delivered" && c.all_items_delivered === true && (await doiOf(m.d[0], m.it[1])).status === "not_applicable" && Number((await soi(m.it[0])).delivered_qty) === 1 && Number((await soi(m.it[1])).delivered_qty) === 0);
+  assert("K4b. the completion event lists the BILL line as not_applicable (audit)", ev23.payload.not_applicable?.length === 1 && ev23.payload.items.length === 1);
+  c = (await one(`SELECT complete_delivery_order('${m.d[0]}', '${A}', '${ACT}') r`)).r;
+  assert("K4c. repeat → already_completed, nothing changes", c.already_completed === true && Number((await soi(m.it[1])).delivered_qty) === 0);
+
+  m = await seedMix(24, [SOFA, BILL], [["scheduled", [[0, 1]]]]);
+  c = (await one(`SELECT complete_delivery_order('${m.d[0]}', '${A}', '${ACT}') r`)).r;
+  assert("K5. 016 on a DO WITHOUT the BILL line → SO Delivered (BILL never required)", c.sales_order_status === "delivered" && (await so(m.so)).status === "delivered");
+
+  m = await seedMix(25, [["2202", "Sofa", 2], BILL], [["scheduled", [[0, 2]]]]);
+  r = await confirm({ so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }] });
+  assert("K6. partial (1 of 2 sofas) → partially_delivered; BILL ignored", r.sales_order_status === "partially_delivered");
+
+  m = await seedMix(26, [SOFA, ["T1", "Table", 1], BILL], [["scheduled", [[0, 1]]], ["draft", [[1, 1]]]]);
+  r = await confirm({ so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }] });
+  const afterA = r.sales_order_status;
+  c = (await one(`SELECT complete_delivery_order('${m.d[1]}', '${A}', '${ACT}') r`)).r;
+  assert("K7. multi-DO: DO-A (confirm) → partially_delivered; DO-B (driver) → Delivered; BILL on no DO never needed", afterA === "partially_delivered" && c.sales_order_status === "delivered");
+
+  m = await seedMix(27, [SOFA, ["CUSTOM", "TOP UP SOFA", 1], ["CUSTOM", "SERVICE", 1], ["BILL", "2202 A+C+B+D SOFA", 1], ["", "Pillow (FOC)", 2]], [["scheduled", [[0, 1]]]]);
+  r = await confirm({ so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }] });
+  assert("K8. ambiguous lines (TOP UP, SERVICE, BILL-coded sofa) and FOC goods are goods: still required → partially_delivered", r.sales_order_status === "partially_delivered");
+  r = await confirm({ so: m.so, lines: [1, 2, 3].map(i => ({ sales_order_item_id: m.it[i], delivery_order_id: null, quantity: 1 })).concat([{ sales_order_item_id: m.it[4], delivery_order_id: null, quantity: 2 }]) });
+  assert("K8b. …once they are confirmed like goods, the order is Delivered", r.sales_order_status === "delivered");
+
+  m = await seedMix(28, [BILL, ["CUSTOM", "Delivery Fee", 1]], [["scheduled", [[0, 1]]]], "confirmed");
+  await refuse("K9. an order with ONLY billing / charge lines cannot be confirmed (nothing to deliver, flagged for review)", { so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }] }, /only billing \/ charge lines/);
+  c = (await one(`SELECT complete_delivery_order('${m.d[0]}', '${A}', '${ACT}') r`)).r;
+  assert("K9b. …and completing its DO keeps the SO status (confirmed) — never auto-Delivered", c.sales_order_status === "confirmed" && (await so(m.so)).status === "confirmed" && (await leg(m.leg)).status === "Pending");
+  await expectErr("K9c. 124 refuses typing 'delivered' on an only-non-goods order", () => db.exec(`UPDATE sales_orders SET status = 'delivered' WHERE id = '${m.so}'`), /delivery_quantities_not_recorded/);
+
+  m = await seedMix(29, [SOFA, BILL], []);
+  await db.exec(`UPDATE sales_order_items SET delivered_qty = 1 WHERE id = '${m.it[0]}'`);
+  await db.exec(`UPDATE sales_orders SET status = 'delivered' WHERE id = '${m.so}'`);
+  assert("K10. 124: 'delivered' allowed when every physical line is recorded and BILL is not", (await so(m.so)).status === "delivered");
+  m = await seedMix(30, [SOFA, BILL], []);
+  await db.exec(`UPDATE sales_order_items SET delivered_qty = 1 WHERE id = '${m.it[1]}'`);   // a historical BILL record (not rewritten)
+  await expectErr("K10b. 124: a recorded BILL line alone never makes an order 'partially_delivered'", () => db.exec(`UPDATE sales_orders SET status = 'partially_delivered' WHERE id = '${m.so}'`), /delivery_quantities_not_recorded/);
+  await expectErr("K10c. 124: …nor 'delivered' while the sofa is unrecorded", () => db.exec(`UPDATE sales_orders SET status = 'delivered' WHERE id = '${m.so}'`), /delivery_quantities_not_recorded/);
+  assert("K10d. the historical BILL quantity (1) is left exactly as recorded", Number((await soi(m.it[1])).delivered_qty) === 1);
+
+  m = await seedMix(31, [SOFA, ["M2222A", "M2222A HEIGHT ADJUSTMENT FEE", 1], ["CUSTOM", "500MM LED 3C (WALNUT) WITH INSTALLATION FEE", 1]], [["scheduled", [[0, 1], [2, 1]]]]);
+  r = await confirm({ so: m.so, lines: [{ sales_order_item_id: m.it[0], delivery_order_id: m.d[0], quantity: 1 }, { sales_order_item_id: m.it[2], delivery_order_id: m.d[0], quantity: 1 }] });
+  assert("K11. a fee line is non-goods but a product sold 'WITH INSTALLATION FEE' is goods (required, confirmed) → Delivered", r.sales_order_status === "delivered");
+
+  assert("K12. money unchanged by every K case (payments, commissions, order amounts, balances)", (await moneyState()) === k0);
+
+  out("\n══ L. SQL classifier = forecast classifier (parity on production code / name pairs) ══\n");
+  const { classifyLine } = require("../lib/item-classification");
+  const PAIRS = require("./fixtures/non-goods-classifier-pairs.json");
+  const mism = [];
+  for (const [code, name] of PAIRS) {
+    const sqlNg = (await one("SELECT delivery_line_is_non_goods($1, $2) r", [code, name])).r;
+    const jsNg = classifyLine({ product_code: code, product_name: name }).cls === "non_goods";
+    if (sqlNg !== jsNg) mism.push(`${code} | ${name}: sql ${sqlNg} js ${jsNg}`);
+  }
+  assert(`L1. ${PAIRS.length} production pairs: identical answers`, mism.length === 0, mism.join("; "));
+  assert("L2. null code / name never errors and is goods", (await one("SELECT delivery_line_is_non_goods(NULL, NULL) r")).r === false);
+
   out(`\n${fail === 0 ? "✅ ALL PASS" : "❌ FAILURES"} — ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch(e => { console.error(e); process.exit(1); });

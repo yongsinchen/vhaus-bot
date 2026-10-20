@@ -29,23 +29,79 @@
 --      delivered-quantity ledger) and recompute each item's delivery_status;
 --   7. close the completed DOs' schedule stops (as migration 016 does) and, when
 --      given, the legacy (no-DO) schedule stop the confirmation came from;
---   8. roll the SO / legacy order status up from the ledger exactly like
---      migration 016: every item fully delivered → delivered / Delivered,
+--   8. roll the SO / legacy order status up from the ledger of its PHYSICAL
+--      lines: every physical item fully delivered → delivered / Delivered,
 --      otherwise partially_delivered / Partially Delivered (never a cancelled
 --      order);
 --   9. log a 'completed' (and, for a new DO, 'created') delivery_order_event and
 --      store the confirmation (who, when, source, lines, result).
 --
--- NOT touched: payments, balances, commissions, prices, the DO's planned item
--- quantities. complete_delivery_order() (migration 016) is unchanged and stays
--- the path for "the whole DO was delivered" (driver / schedule board).
+-- NON-GOODS (owner decision 2026-10-20): billing / service lines
+-- (delivery_line_is_non_goods(), below — the same exact rules as the Outgoing
+-- Forecast) are never delivered: they cannot be confirmed, their lines on a
+-- completed DO become 'not_applicable' with delivered_qty 0, and they never
+-- hold an order back from Delivered. An order with only such lines is refused
+-- (nothing to deliver) and keeps its status. Ambiguous lines are goods.
+-- complete_delivery_order() (migration 016) is re-stated at the end of this file
+-- with ONLY that change (non-goods lines + physical-only roll-up); it stays the
+-- path for "the whole DO was delivered" (driver / schedule board).
 --
--- Rollback (no other object depends on these):
---   DROP FUNCTION IF EXISTS confirm_delivered_items(UUID, UUID, UUID, JSONB, TEXT, TEXT, UUID);
---   DROP TABLE IF EXISTS delivery_confirmations;
---   (DO / item / ledger rows written by confirmations are ordinary delivery
---    data and are NOT removed by a rollback.)
+-- NOT touched: payments, balances, commissions, prices, the DO's planned item
+-- quantities, any quantity already recorded (no back-fill, no rewrite).
+--
+-- Rollback (in this order):
+--   1. re-run the CREATE OR REPLACE FUNCTION block of
+--      migrations/016_complete_delivery_order_rpc.sql (restores the 016 body);
+--   2. DROP FUNCTION IF EXISTS confirm_delivered_items(UUID, UUID, UUID, JSONB, TEXT, TEXT, UUID);
+--      DROP FUNCTION IF EXISTS delivery_line_is_non_goods(TEXT, TEXT);
+--   3. export, then DROP TABLE IF EXISTS delivery_confirmations;
+--   (DO / item / ledger rows written by confirmations or completions are
+--    ordinary delivery data and are NOT removed by a rollback; DO lines already
+--    set to 'not_applicable' stay so.)
+--   Migration 124 must be rolled back BEFORE this one (it calls
+--   delivery_line_is_non_goods).
 -- ══════════════════════════════════════════════════════════════════
+
+-- ── 0. Preflight: this migration writes delivery_order_items.status values
+--    'partially_delivered' / 'not_delivered' / 'not_applicable'. No migration ever
+--    put a CHECK constraint on that column; abort (writing nothing) if one exists.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint
+             WHERE conrelid = 'public.delivery_order_items'::regclass AND contype = 'c'
+               AND pg_get_constraintdef(oid) ILIKE '%status%') THEN
+    RAISE EXCEPTION 'delivery_order_items has a CHECK constraint on status — review it before applying migration 123';
+  END IF;
+END $$;
+
+-- ── Non-goods lines (owner decision 2026-10-20) ──────────────────
+-- Billing / service lines are not physical goods: they are never recorded as
+-- delivered, and an order's delivery status is decided by its PHYSICAL lines
+-- only. EXACT, conservative rules — identical to the Outgoing Forecast's
+-- lib/item-classification.js (parity-tested); anything ambiguous is goods:
+--   • code BILL and name exactly FULL BILL AMOUNT
+--   • the whole name is a delivery / installation / service charge
+--   • the name ends with FEE / FEES / CHARGE / CHARGES and does not contain WITH
+-- Normalised like the forecast: trimmed, upper-case, single spaces, trailing . , ; : removed.
+CREATE OR REPLACE FUNCTION delivery_line_is_non_goods(p_code TEXT, p_name TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+IMMUTABLE
+SET search_path = public, pg_temp
+AS $$
+  -- Whitespace = JavaScript's \s (incl. no-break / ideographic spaces), collapsed BEFORE trimming.
+  WITH n AS (
+    SELECT btrim(regexp_replace(btrim(regexp_replace(upper(coalesce(p_code, '')), '[\s   -     　﻿]+', ' ', 'g')), '[.,;:]+$', '')) AS code,
+           btrim(regexp_replace(btrim(regexp_replace(upper(coalesce(p_name, '')), '[\s   -     　﻿]+', ' ', 'g')), '[.,;:]+$', '')) AS name
+  )
+  SELECT (code = 'BILL' AND name = 'FULL BILL AMOUNT')
+      OR name IN ('DELIVERY CHARGE', 'DELIVERY CHARGES', 'DELIVERY FEE', 'DELIVERY FEES',
+                  'DELIVERY + INSTALL', 'DELIVERY & INSTALL', 'DELIVERY + INSTALLATION', 'DELIVERY & INSTALLATION',
+                  'INSTALLATION', 'INSTALLATION CHARGE', 'INSTALLATION FEE', 'SERVICE CHARGE', 'SERVICE FEE',
+                  'TRANSPORT CHARGE', 'TRANSPORTATION CHARGE', 'TRANSPORT FEE', 'TRANSPORTATION FEE')
+      OR (name ~ '(^| )(FEE|FEES|CHARGE|CHARGES)$' AND name !~ '(^|[^A-Z0-9_])WITH([^A-Z0-9_]|$)')
+  FROM n
+$$;
 
 CREATE TABLE IF NOT EXISTS delivery_confirmations (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -176,6 +232,18 @@ BEGIN
   END IF;
   PERFORM 1 FROM sales_order_items WHERE id IN (SELECT sales_order_item_id FROM _cdi_lines) ORDER BY id FOR UPDATE;
 
+  -- Billing / service lines are never delivered (owner decision 2026-10-20).
+  IF NOT EXISTS (SELECT 1 FROM sales_order_items WHERE order_id = p_sales_order_id
+                 AND NOT delivery_line_is_non_goods(product_code, product_name)) THEN
+    RAISE EXCEPTION 'confirm_invalid: this order has only billing / charge lines — there is nothing to deliver (flagged for review)';
+  END IF;
+  IF EXISTS (SELECT 1 FROM _cdi_lines l JOIN sales_order_items soi ON soi.id = l.sales_order_item_id
+             WHERE delivery_line_is_non_goods(soi.product_code, soi.product_name)) THEN
+    RAISE EXCEPTION 'confirm_invalid: % is a billing / charge line — it is not physically delivered',
+      (SELECT soi.product_name FROM _cdi_lines l JOIN sales_order_items soi ON soi.id = l.sales_order_item_id
+       WHERE delivery_line_is_non_goods(soi.product_code, soi.product_name) LIMIT 1);
+  END IF;
+
   -- Never more than the item's still-undelivered quantity.
   IF EXISTS (
     SELECT 1 FROM (SELECT sales_order_item_id, SUM(quantity) q FROM _cdi_lines GROUP BY 1) t
@@ -225,11 +293,13 @@ BEGIN
         v_left := v_left - v_take;
       END LOOP;
     END LOOP;
-    UPDATE delivery_order_items
-    SET status = CASE WHEN delivered_qty >= quantity THEN 'delivered'
-                      WHEN delivered_qty > 0 THEN 'partially_delivered'
+    UPDATE delivery_order_items doi
+    SET status = CASE WHEN soi.id IS NOT NULL AND delivery_line_is_non_goods(soi.product_code, soi.product_name) THEN 'not_applicable'
+                      WHEN doi.delivered_qty >= doi.quantity THEN 'delivered'
+                      WHEN doi.delivered_qty > 0 THEN 'partially_delivered'
                       ELSE 'not_delivered' END
-    WHERE delivery_order_id = v_do_id AND status <> 'cancelled';
+    FROM delivery_order_items d0 LEFT JOIN sales_order_items soi ON soi.id = d0.sales_order_item_id
+    WHERE d0.id = doi.id AND doi.delivery_order_id = v_do_id AND doi.status <> 'cancelled';
 
     SELECT COALESCE(SUM(delivered_qty), 0) INTO v_do_total FROM delivery_order_items
     WHERE delivery_order_id = v_do_id AND status <> 'cancelled';
@@ -320,8 +390,12 @@ BEGIN
   END IF;
 
   -- ── 7. Status roll-up from the ledger (as migration 016) ──────
+  -- Physical lines only: billing / service lines never hold an order back
+  -- (this call always records at least one physical quantity, so the order
+  -- is at least partially delivered).
   SELECT COALESCE(bool_and(COALESCE(delivered_qty, 0) >= quantity), false) INTO v_all_delivered
-  FROM sales_order_items WHERE order_id = p_sales_order_id;
+  FROM sales_order_items WHERE order_id = p_sales_order_id
+    AND NOT delivery_line_is_non_goods(product_code, product_name);
   v_so_status := CASE WHEN v_all_delivered THEN 'delivered' ELSE 'partially_delivered' END;
   UPDATE sales_orders SET status = v_so_status WHERE id = p_sales_order_id AND status <> 'cancelled';
   UPDATE orders SET status = CASE WHEN v_all_delivered THEN 'Delivered' ELSE 'Partially Delivered' END
@@ -348,6 +422,153 @@ $$;
 
 REVOKE ALL ON FUNCTION confirm_delivered_items(UUID, UUID, UUID, JSONB, TEXT, TEXT, UUID) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION confirm_delivered_items(UUID, UUID, UUID, JSONB, TEXT, TEXT, UUID) TO service_role;
+-- A pure classifier (reads nothing): callable by the roles that write sales
+-- orders, because migration 124's guard trigger runs it as the writing role.
+REVOKE ALL ON FUNCTION delivery_line_is_non_goods(TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION delivery_line_is_non_goods(TEXT, TEXT) TO authenticated, service_role;
+
+-- ══════════════════════════════════════════════════════════════════
+-- complete_delivery_order() — migration 016's canonical DO completion,
+-- re-stated with the MINIMUM change for non-goods lines (owner decision
+-- 2026-10-20). Everything else is byte-for-byte 016: the DO → SO locks,
+-- idempotent early return, cancelled guard, ledger increment, schedule close,
+-- legacy-order roll-up and the event. The two changes:
+--   (a) step 3: a DO line whose sales-order item is a billing / service line
+--       becomes 'not_applicable' with delivered_qty 0 (never "delivered"), so
+--       step 4 never adds it to the delivered ledger;
+--   (b) step 7: the order's status is rolled up from its PHYSICAL lines only —
+--       every physical line delivered → delivered; some → partially_delivered;
+--       an order with no physical line delivered keeps its current status.
+-- Grants are kept as they are (CREATE OR REPLACE does not change them).
+-- Rollback: re-run the CREATE OR REPLACE FUNCTION block of
+-- migrations/016_complete_delivery_order_rpc.sql (restores the 016 body).
+-- ══════════════════════════════════════════════════════════════════
+CREATE OR REPLACE FUNCTION complete_delivery_order(
+  p_delivery_order_id UUID,
+  p_company_id        UUID,
+  p_actor_id          UUID DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_do            delivery_orders%ROWTYPE;
+  v_all_delivered BOOLEAN;
+  v_any_delivered BOOLEAN;
+  v_goods         BIGINT;
+  v_so_status     TEXT;
+  v_items         JSONB;
+  v_not_applicable JSONB;
+BEGIN
+  -- 1. Lock + validate the DO
+  SELECT * INTO v_do FROM delivery_orders
+  WHERE id = p_delivery_order_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'delivery_order_not_found: %', p_delivery_order_id;
+  END IF;
+  IF v_do.company_id IS DISTINCT FROM p_company_id THEN
+    RAISE EXCEPTION 'delivery_order_wrong_company: % does not belong to company %', p_delivery_order_id, p_company_id;
+  END IF;
+  IF v_do.status = 'completed' THEN
+    RETURN jsonb_build_object(
+      'already_completed', true,
+      'delivery_order_id', v_do.id,
+      'do_status', 'completed'
+    );
+  END IF;
+  IF v_do.status = 'cancelled' THEN
+    RAISE EXCEPTION 'delivery_order_cancelled: cannot complete a cancelled delivery order';
+  END IF;
+
+  -- 2. Serialize concurrent completions on the same sales order.
+  PERFORM 1 FROM sales_orders WHERE id = v_do.sales_order_id FOR UPDATE;
+
+  -- 3. Mark this DO's items delivered — billing / service lines 'not_applicable' (a).
+  UPDATE delivery_order_items doi
+  SET status = CASE WHEN soi.id IS NOT NULL AND delivery_line_is_non_goods(soi.product_code, soi.product_name) THEN 'not_applicable' ELSE 'delivered' END,
+      delivered_qty = CASE WHEN soi.id IS NOT NULL AND delivery_line_is_non_goods(soi.product_code, soi.product_name) THEN 0 ELSE doi.quantity END
+  FROM delivery_order_items d0 LEFT JOIN sales_order_items soi ON soi.id = d0.sales_order_item_id
+  WHERE d0.id = doi.id AND doi.delivery_order_id = v_do.id AND doi.status <> 'cancelled';
+
+  -- 4. Increment the SO item quantity ledger (capped at ordered qty) — delivered lines only.
+  UPDATE sales_order_items soi
+  SET delivered_qty = LEAST(soi.quantity, soi.delivered_qty + d.qty),
+      delivery_status = CASE
+        WHEN soi.delivered_qty + d.qty >= soi.quantity THEN 'delivered'
+        ELSE 'partially_delivered'
+      END
+  FROM (
+    SELECT sales_order_item_id, SUM(quantity) AS qty
+    FROM delivery_order_items
+    WHERE delivery_order_id = v_do.id
+      AND status = 'delivered'
+      AND sales_order_item_id IS NOT NULL
+    GROUP BY sales_order_item_id
+  ) d
+  WHERE soi.id = d.sales_order_item_id;
+
+  -- 5. Complete the DO
+  UPDATE delivery_orders
+  SET status = 'completed', completed_at = now()
+  WHERE id = v_do.id;
+
+  -- 6. Close out this DO's schedule attempt(s)
+  UPDATE delivery_schedules
+  SET status = 'delivered', delivered_at = now()
+  WHERE delivery_order_id = v_do.id AND status <> 'delivered';
+
+  -- 7. Roll the sales order status up from its PHYSICAL lines (b).
+  SELECT count(*), COALESCE(bool_and(COALESCE(delivered_qty, 0) >= quantity), false), COALESCE(bool_or(COALESCE(delivered_qty, 0) > 0), false)
+  INTO v_goods, v_all_delivered, v_any_delivered
+  FROM sales_order_items
+  WHERE order_id = v_do.sales_order_id AND NOT delivery_line_is_non_goods(product_code, product_name);
+
+  IF v_goods > 0 AND v_any_delivered THEN
+    v_so_status := CASE WHEN v_all_delivered THEN 'delivered' ELSE 'partially_delivered' END;
+    UPDATE sales_orders
+    SET status = v_so_status
+    WHERE id = v_do.sales_order_id AND status <> 'cancelled';
+    IF v_do.order_id IS NOT NULL THEN
+      UPDATE orders
+      SET status = CASE WHEN v_all_delivered THEN 'Delivered' ELSE 'Partially Delivered' END
+      WHERE id = v_do.order_id AND status <> 'Cancelled';
+    END IF;
+  ELSE
+    -- No physical quantity delivered (e.g. a DO carrying only billing lines): status kept.
+    v_all_delivered := false;
+    SELECT status INTO v_so_status FROM sales_orders WHERE id = v_do.sales_order_id;
+  END IF;
+
+  -- 8. Event log
+  SELECT jsonb_agg(jsonb_build_object(
+    'sales_order_item_id', sales_order_item_id,
+    'product_name', product_name,
+    'quantity', quantity
+  ))
+  INTO v_items
+  FROM delivery_order_items
+  WHERE delivery_order_id = v_do.id AND status = 'delivered';
+  SELECT jsonb_agg(jsonb_build_object('sales_order_item_id', sales_order_item_id, 'product_name', product_name))
+  INTO v_not_applicable
+  FROM delivery_order_items
+  WHERE delivery_order_id = v_do.id AND status = 'not_applicable';
+
+  INSERT INTO delivery_order_events (delivery_order_id, event_type, payload, actor_id)
+  VALUES (v_do.id, 'completed', jsonb_build_object('sales_order_status', v_so_status, 'items', v_items)
+          || CASE WHEN v_not_applicable IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('not_applicable', v_not_applicable) END, p_actor_id);
+
+  RETURN jsonb_build_object(
+    'already_completed', false,
+    'delivery_order_id', v_do.id,
+    'do_status', 'completed',
+    'sales_order_status', v_so_status,
+    'all_items_delivered', v_all_delivered
+  );
+END;
+$$;
 
 -- Verification (read-only, run after applying):
 --   SELECT to_regclass('public.delivery_confirmations') IS NOT NULL AS table_ok,

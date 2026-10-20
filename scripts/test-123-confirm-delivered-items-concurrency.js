@@ -49,7 +49,12 @@ if (!serverConfigured()) {
       await q(`INSERT INTO sales_orders (id, company_id, order_number, status) VALUES ('${so}', '${A}', 'R${n}', 'confirmed')`);
       await q(`INSERT INTO orders (id, company_id, so_number, type, status) VALUES (${n}, '${A}', 'R${n}', 'Delivery', 'Pending')`);
       const itemIds = [];
-      for (let i = 0; i < items.length; i++) { const id = u(20000 + n * 100 + i); itemIds.push(id); await q(`INSERT INTO sales_order_items (id, order_id, product_name, quantity, delivered_qty) VALUES ('${id}', '${so}', 'Item ${i}', ${items[i]}, 0)`); }
+      // items: a quantity, or [quantity, product_code, product_name] (e.g. a BILL "Full Bill Amount" line)
+      for (let i = 0; i < items.length; i++) {
+        const id = u(20000 + n * 100 + i); itemIds.push(id);
+        const [qty, code, name] = Array.isArray(items[i]) ? items[i] : [items[i], null, `Item ${i}`];
+        await q("INSERT INTO sales_order_items (id, order_id, product_code, product_name, quantity, delivered_qty) VALUES ($1,$2,$3,$4,$5,0)", [id, so, code, name, qty]);
+      }
       const doIds = [];
       for (let d = 0; d < dos.length; d++) {
         const id = u(30000 + n * 100 + d); doIds.push(id);
@@ -144,6 +149,23 @@ if (!serverConfigured()) {
                    confirmSql(s.so, [{ sales_order_item_id: s.itemIds[0], delivery_order_id: s.doIds[0], quantity: 2 }], "race-r7-bbbb"), { rollbackFirst: true });
     assert("R7a. second waited, then succeeded once the first rolled back", r.waited && r.r2?.already_confirmed === false && !r.e2, r.e2?.message);
     assert("R7b. only the second's effect exists (2 of 2, one confirmation)", await delivered(s.itemIds[0]) === 2 && Number((await one("SELECT count(*) c FROM delivery_confirmations WHERE sales_order_id = $1", [s.so])).c) === 1);
+
+    out("\n══ R9. Sofa + BILL on one DO: confirmation vs driver completion ══\n");
+    const BILLROW = [1, "BILL", "Full Bill Amount"];
+    s = await seed([[1, "2202", "Sofa"], BILLROW], [{ items: [[0, 1], [1, 1]] }]);
+    r = await race(confirmSql(s.so, [{ sales_order_item_id: s.itemIds[0], delivery_order_id: s.doIds[0], quantity: 1 }], "race-r9-aaaa"), completeSql(s.doIds[0]));
+    assert("R9a. confirm first: driver's 016 waited, then already_completed; SO Delivered; BILL never recorded", r.waited && r.r1?.sales_order_status === "delivered" && r.r2?.already_completed === true && await delivered(s.itemIds[1]) === 0, JSON.stringify(r.r1) + (r.e2?.message || ""));
+    const bl = await one("SELECT status, delivered_qty FROM delivery_order_items WHERE sales_order_item_id = $1", [s.itemIds[1]]);
+    assert("R9b. the BILL line on the DO is not_applicable / 0", bl.status === "not_applicable" && Number(bl.delivered_qty) === 0);
+    s = await seed([[1, "2202", "Sofa"], BILLROW], [{ items: [[0, 1], [1, 1]] }]);
+    r = await race(completeSql(s.doIds[0]), confirmSql(s.so, [{ sales_order_item_id: s.itemIds[0], delivery_order_id: s.doIds[0], quantity: 1 }], "race-r9-bbbb"));
+    assert("R9c. driver first: SO Delivered by 016 (BILL ignored); the confirmation waited, then was refused — counted once", r.waited && r.r1?.sales_order_status === "delivered" && r.e2 && await delivered(s.itemIds[0]) === 1 && await delivered(s.itemIds[1]) === 0, r.e2?.message);
+
+    out("\n══ R10. complete_delivery_order double-tap (two parallel calls, re-stated 016 body) ══\n");
+    s = await seed([2], [{ items: [[0, 2]] }]);
+    r = await race(completeSql(s.doIds[0]), completeSql(s.doIds[0]));
+    assert("R10a. second call waited, then already_completed — exactly one did the work", r.waited && r.r1?.already_completed === false && r.r2?.already_completed === true, JSON.stringify(r.r2) + (r.e2?.message || ""));
+    assert("R10b. delivered_qty incremented exactly once (2)", await delivered(s.itemIds[0]) === 2);
 
     out("\n══ R8. Migration 124 under a race ══\n");
     await q(fs.readFileSync(path.join(REPO, "migrations", "124_guard_sales_order_delivered_status.sql"), "utf8"));
