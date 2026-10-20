@@ -125,7 +125,7 @@ const silently = async fn => { quietDepth++; console.log = () => {}; try { retur
     for (let i = 0; i < 40; i++) fake.fdb.add(A, `S${100 + i}`, "2026-10-17", 3); // a multi-part report
     let failPart2 = true;
     tg = fakeTelegram((chat, text) => (failPart2 && chat === CHAT[A] && /Part 2\//.test(text) ? new TelegramSendError("failed", "Telegram 429: Too Many Requests", { status: 429, retryAfter: 1 }) : null));
-    let s = await liveRun(fake, tg, { companyId: A });
+    let s = await liveRun(fake, tg, { companyIds: [A] });
     const r1 = await row(A);
     const totalParts = r1.parts.length;
     assert("15. the report is multi-part", totalParts >= 3, `parts=${totalParts}`);
@@ -134,23 +134,23 @@ const silently = async fn => { quietDepth++; console.log = () => {}; try { retur
     const frozen = r1.parts;
     fake.fdb.add(A, "LATE", "2026-10-17"); // data changes between attempts
     failPart2 = false;
-    s = await liveRun(fake, tg, { companyId: A });
+    s = await liveRun(fake, tg, { companyIds: [A] });
     const r2 = await row(A);
     assert("15. the next run resumes AFTER the confirmed part: parts 2…n sent, part 1 not re-sent", s.companies[0].outcome === "sent" && tg.sent.length === totalParts && tg.sent.filter(m => /Part 1\//.test(m.text)).length === 1);
     assert("15. the resumed parts are the SAME frozen text (one coherent report, not a re-render)", JSON.stringify(r2.parts) === JSON.stringify(frozen) && !tg.sent.some(m => /LATE/.test(m.text)) && tg.sent.every((m, i) => m.text === frozen[i]));
     assert("15. row is 'sent' with one message id per part and attempt_count 2", r2.status === "sent" && r2.telegram_message_ids.length === totalParts && r2.attempt_count === 2);
-    await liveRun(fake, tg, { companyId: A });
+    await liveRun(fake, tg, { companyIds: [A] });
     assert("15. a further run sends nothing more", tg.sent.length === totalParts);
 
     await q("DELETE FROM telegram_report_dispatches");
     fake = makeFake(); fake.fdb.add(A, "R1", "2026-10-17");
     tg = fakeTelegram((chat, text, n) => (n === 1 ? new TelegramSendError("failed", "connection not established (ECONNREFUSED)") : null));
-    s = await liveRun(fake, tg, { companyId: A });
+    s = await liveRun(fake, tg, { companyIds: [A] });
     assert("15. a transient definite failure is retried within the run and then sent once", s.companies[0].outcome === "sent" && tg.sent.length === 1 && tg.calls() === 2);
 
     await q("DELETE FROM telegram_report_dispatches");
     tg = fakeTelegram(() => new TelegramSendError("failed", "Telegram 403: bot was kicked", { status: 403 }));
-    for (let i = 0; i < 6; i++) s = await liveRun(fake, tg, { companyId: A });
+    for (let i = 0; i < 6; i++) s = await liveRun(fake, tg, { companyIds: [A] });
     const r3 = await row(A);
     assert("15. a permanently refused destination stops after max attempts (gave_up), no message sent", s.companies[0].outcome === "gave_up" && r3.attempt_count === 5 && tg.sent.length === 0 && /403/.test(r3.last_error));
 
@@ -160,10 +160,10 @@ const silently = async fn => { quietDepth++; console.log = () => {}; try { retur
     fake = makeFake(); fake.fdb.add(A, "U1", "2026-10-17");
     let timeoutOnce = true;
     tg = fakeTelegram(() => (timeoutOnce ? (timeoutOnce = false, new TelegramSendError("uncertain", "no response from Telegram (ECONNABORTED)")) : null));
-    s = await liveRun(fake, tg, { companyId: A });
+    s = await liveRun(fake, tg, { companyIds: [A] });
     let ru = await row(A);
     assert("16. a timeout is NOT retried (it may have been delivered) → 'uncertain', part 1 in flight", s.companies[0].outcome === "uncertain" && ru.status === "uncertain" && ru.in_flight_part === 1 && tg.calls() === 1);
-    s = await liveRun(fake, tg, { companyId: A });
+    s = await liveRun(fake, tg, { companyIds: [A] });
     assert("16. later runs do not resend an uncertain report (outcome uncertain, still 1 call)", s.companies[0].outcome === "uncertain" && tg.calls() === 1);
     assert("16. the run exits non-zero so the cron run shows as failed", s.ok === false);
     let bad = null; try { await store.resolve(ru.id, "delivered", ""); } catch (e) { bad = e; }
@@ -171,17 +171,17 @@ const silently = async fn => { quietDepth++; console.log = () => {}; try { retur
     let res = await store.resolve(ru.id, "delivered", "seen in the group at 10:31");
     ru = await row(A);
     assert("16. operator resolves 'delivered' (seen in chat) → 'sent'; no message sent by the resolve", res.ok && ru.status === "sent" && ru.parts_sent === 1 && tg.calls() === 1 && /delivered: seen/.test(ru.resolution_note));
-    await liveRun(fake, tg, { companyId: A });
+    await liveRun(fake, tg, { companyIds: [A] });
     assert("16. …and it is never posted again", tg.calls() === 1);
 
     await q("DELETE FROM telegram_report_dispatches");
     timeoutOnce = true;
     tg = fakeTelegram(() => (timeoutOnce ? (timeoutOnce = false, new TelegramSendError("uncertain", "Telegram 502: Bad Gateway", { status: 502 })) : null));
-    await liveRun(fake, tg, { companyId: A });
+    await liveRun(fake, tg, { companyIds: [A] });
     ru = await row(A);
     res = await store.resolve(ru.id, "not_delivered", "not in the group");
     assert("16. operator resolves 'not_delivered' → 'failed' (retryable)", res.ok && (await row(A)).status === "failed");
-    s = await liveRun(fake, tg, { companyId: A });
+    s = await liveRun(fake, tg, { companyIds: [A] });
     assert("16. …the next run sends it once", s.companies[0].outcome === "sent" && tg.sent.length === 1 && tg.calls() === 2);
 
     out("\n══ Worker dies mid-send (lease expiry) ══\n");

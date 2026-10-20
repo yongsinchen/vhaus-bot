@@ -17,14 +17,15 @@
  * A live run before TG02_SEND_AFTER (default 10:30, Malaysia time) does nothing.
  *
  * Environment: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN,
- *   TG02_SEND_ENABLED, TG02_SEND_AFTER (HH:MM), TG02_OVERDUE_SINCE (optional YYYY-MM-DD floor for OVERDUE).
+ *   TG02_SEND_ENABLED, TG02_SEND_AFTER (HH:MM),
+ *   TG02_OVERDUE_SINCE (YYYY-MM-DD floor for OVERDUE; default 2026-09-01 — DEFAULT_OVERDUE_SINCE; 'none' = no floor).
  *
  * Usage:
  *   node scripts/run-daily-delivery-report.js                       dry run, EVERY company: counts (no message text)
  *   node scripts/run-daily-delivery-report.js --print               dry run + the full message text
  *   (a dry run reads only — no sends, no writes — and works before migration 121 / any destination exists)
  *   node scripts/run-daily-delivery-report.js --date 2026-10-20     dry run for another report date
- *   node scripts/run-daily-delivery-report.js --company <uuid>      only that company (dry run or live)
+ *   node scripts/run-daily-delivery-report.js --company <uuid>[,<uuid>…]   only those companies (dry run or live)
  *   node scripts/run-daily-delivery-report.js --send                live (needs TG02_SEND_ENABLED=true)
  *   node scripts/run-daily-delivery-report.js --status [--date D]   dispatch rows for a date (default today)
  *   node scripts/run-daily-delivery-report.js --resolve <dispatch_id> delivered|not_delivered --note "checked the chat"
@@ -37,7 +38,7 @@
  */
 require("dotenv").config();
 const malaysiaDate = require("../lib/malaysia-date");
-const { REPORT_TYPE, buildDailyDeliveryReport, renderReportMessages, isCalendarDate } = require("../lib/daily-delivery-report");
+const { REPORT_TYPE, DEFAULT_OVERDUE_SINCE, buildDailyDeliveryReport, renderReportMessages, isCalendarDate } = require("../lib/daily-delivery-report");
 const { createReportDispatchStore, deliverReport } = require("../lib/telegram-report-dispatch");
 
 const BAD_OUTCOMES = new Set(["failed", "uncertain", "gave_up", "error", "lost_claim"]);
@@ -67,7 +68,7 @@ async function fetchAll(supabase, table, select, filter) {
 
 /**
  * One run: live over every company with an enabled 'daily_delivery_report' destination; dry run over every company.
- * deps: { supabase, computeDeliveryReadiness, store, send, live, now, reportDate, companyId, overdueSince,
+ * deps: { supabase, computeDeliveryReadiness, store, send, live, now, reportDate, companyIds, overdueSince,
  *         sendAfter, print, sleep } — tests inject fakes; nothing here reaches Telegram unless `send` does.
  */
 async function run(deps) {
@@ -76,7 +77,7 @@ async function run(deps) {
   const clock = malaysiaNow(now);
   const reportDate = deps.reportDate || clock.date;
   const sendAfter = deps.sendAfter || "10:30";
-  const overdueSince = deps.overdueSince || null;
+  const overdueSince = deps.overdueSince === undefined ? DEFAULT_OVERDUE_SINCE : deps.overdueSince; // null = no floor
   const summary = { report_date: reportDate, mode: live ? "live" : "dry_run", companies: [] };
 
   if (live && reportDate !== clock.date) throw new Error("a live run always reports today's Malaysia date (--date is dry-run only)");
@@ -91,13 +92,13 @@ async function run(deps) {
   // Live: only companies with a destination. Dry run: every company, so a report can be checked
   // before any destination exists.
   let targetIds = live ? destinations.map(d => d.company_id) : null;
-  if (deps.companyId) targetIds = (targetIds || [deps.companyId]).filter(cid => cid === deps.companyId);
+  if (deps.companyIds?.length) targetIds = (targetIds || deps.companyIds).filter(cid => deps.companyIds.includes(cid));
   const companies = targetIds === null
     ? await fetchAll(supabase, "companies", "id, name, is_active")
     : targetIds.length ? await fetchAll(supabase, "companies", "id, name, is_active", q => q.in("id", targetIds)) : [];
   const companyById = new Map(companies.map(c => [c.id, c]));
   if (targetIds === null) targetIds = companies.map(c => c.id);
-  logEvent("run_started", { report_date: reportDate, mode: summary.mode, malaysia_time: clock.time, companies: targetIds.length, destinations: destinations.length });
+  logEvent("run_started", { report_date: reportDate, mode: summary.mode, malaysia_time: clock.time, overdue_since: overdueSince, companies: targetIds.length, destinations: destinations.length });
 
   // One company's failure never stops the others.
   for (const companyId of targetIds) {
@@ -167,8 +168,10 @@ async function main() {
     return 0;
   }
 
-  const overdueSince = process.env.TG02_OVERDUE_SINCE || null;
-  if (overdueSince && !isCalendarDate(overdueSince)) throw new Error("TG02_OVERDUE_SINCE must be YYYY-MM-DD");
+  const envSince = process.env.TG02_OVERDUE_SINCE;
+  const overdueSince = !envSince ? undefined : envSince === "none" ? null : envSince;
+  if (overdueSince && !isCalendarDate(overdueSince)) throw new Error("TG02_OVERDUE_SINCE must be YYYY-MM-DD or 'none'");
+  const companyIds = (argValue("--company") || "").split(",").map(x => x.trim()).filter(Boolean);
   const sendAfter = process.env.TG02_SEND_AFTER || "10:30";
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(sendAfter)) throw new Error("TG02_SEND_AFTER must be HH:MM");
 
@@ -177,7 +180,7 @@ async function main() {
   const { sendMessageConfirmed } = require("../lib/telegram-send").createTelegramSender({});
   const summary = await run({
     supabase, computeDeliveryReadiness, store, send: sendMessageConfirmed, live: wantsSend,
-    reportDate: date, companyId: argValue("--company"), overdueSince, sendAfter, print: process.argv.includes("--print"),
+    reportDate: date, companyIds, overdueSince, sendAfter, print: process.argv.includes("--print"),
   });
   return summary.ok === false ? 1 : 0;
 }
