@@ -45,6 +45,7 @@ const { createAssistantReadService } = require("./lib/assistant-read");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
+const { SECRET_HEADER: TELEGRAM_SECRET_HEADER, isValidWebhookSecret, isTelegramWebhookAuthorized } = require("./lib/telegram-webhook-auth");
 const { createActiveDoAmendmentService, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
 const { threeWayMerge, applyResolutions, canonicalConflictPath, canonicalStateChanged } = require("./lib/amendment-three-way-merge");
 const { createItemArrivalEventService, SOURCES: ARRIVAL_EVENT_SOURCES } = require("./lib/item-arrival-events");
@@ -99,6 +100,13 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const DELIVERY_GROUP_CHAT_ID = process.env.DELIVERY_GROUP_CHAT_ID;
 const DO_GROUP_CHAT_ID = process.env.DO_GROUP_CHAT_ID; // Group C — warehouse snaps supplier DOs
+// Must equal the secret_token the webhook was registered with (scripts/set-telegram-webhook.js).
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
+if (!TELEGRAM_WEBHOOK_SECRET) {
+  console.warn("⚠️  TELEGRAM_WEBHOOK_SECRET is not set — /telegram/webhook accepts unauthenticated (forgeable) updates.");
+} else if (!isValidWebhookSecret(TELEGRAM_WEBHOOK_SECRET)) {
+  console.warn("⚠️  TELEGRAM_WEBHOOK_SECRET has characters Telegram rejects (allowed: A-Z a-z 0-9 _ -, max 256) — setWebhook will fail and every update will be refused.");
+}
 
 // Cancelled-order commission clawback — the one write path for it (cancel
 // route + SO edit). Paid rows are never touched; see lib/commission-lifecycle.js.
@@ -10263,6 +10271,11 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
 
 // ── Telegram Webhook ──────────────────────────────────────────────
 app.post("/telegram/webhook", async (req, res) => {
+  // Refuse forged updates before anything is read (see lib/telegram-webhook-auth.js).
+  if (!isTelegramWebhookAuthorized(req.get(TELEGRAM_SECRET_HEADER), TELEGRAM_WEBHOOK_SECRET)) {
+    console.warn(`Telegram webhook: refused an update with a missing/wrong secret token (ip=${req.ip})`);
+    return res.sendStatus(401);
+  }
   res.sendStatus(200);
   try {
     const message = req.body.message;
