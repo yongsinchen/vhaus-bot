@@ -83,7 +83,9 @@ const ahead = new Date(Date.now() + 8 * 3600e3 + 21 * 86400e3).toISOString().sli
     assert("3d. company B sees its own product named, and only its own rows", rb.status === 200 && b3?.product?.name === "Company B Sofa" && (rb.body.products || []).length === 1 && !JSON.stringify(rb.body).includes("KAYLA"), JSON.stringify(rb.body).slice(0, 300));
 
     assert("5. read only — every table identical afterwards", snapshot() === before);
-  } finally { await h.close(); }
+  } catch (e) { h.quiet(false); out("❌ FATAL:", e.stack || e.message); fail++; }
+  finally { h.quiet(false); await h.close(); }
   out(`\n${fail === 0 ? "✅ ALL PASS" : "❌ FAILURES"} — ${pass} passed, ${fail} failed`);
-  process.exit(fail === 0 ? 0 : 1);
-})().catch(e => { console.error(e); process.exit(1); });
+  // Let the server's handles finish closing before exiting (an immediate exit trips a libuv assertion on Windows).
+  setTimeout(() => process.exit(fail ? 1 : 0), 100);
+})();
