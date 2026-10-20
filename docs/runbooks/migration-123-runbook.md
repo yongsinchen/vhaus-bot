@@ -172,4 +172,4 @@ rows) — they are real delivery history and are not rewritten. Roll back 124 fi
 - V1 PASS (4 objects). V2 PASS (`b48c8e2f…`, `7b1fff30…`, `4e99f9ee…`). V3 PASS (true, true, false, false, false).
   V4 PASS (false, false, true, false, false, true; `{search_path=public, pg_temp}`).
   V5 PASS — every P5 value identical; `delivery_confirmations` 0 rows (29 delivery_order_events in the prior 6 h did not
-  change any counted value). V6 pending.
+  change any counted value). V6 PASS (117 non-goods lines, 9 distinct pairs, 8,404 lines — matches JS). **KEEP.**
