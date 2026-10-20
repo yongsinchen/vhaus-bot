@@ -140,13 +140,14 @@ const silentRun = async deps => { const l = console.log; console.log = () => {};
     assert("a non-calendar delivery date is left out (counted in excluded.undated); TBC is never in a window", !sos(r.upcoming).includes("L2") && !sos(r.overdue).includes("L2") && r.excluded.undated === 1 && !sos(r.upcoming).includes("L3"));
     assert("a cancelled legacy order is not reported", !sos(r.upcoming).includes("L4"));
 
-    console.log("\n══ Query row cap (never a silently truncated report) ══\n");
+    console.log("\n══ Past the 1000-row PostgREST cap (never a silently truncated report) ══\n");
     const dbCap = makeDb();
-    for (let i = 0; i < 1000; i++) dbCap.table("delivery_orders").push({ id: "cap" + i, company_id: A, do_number: "C" + i, sales_order_id: null, status: "draft", delivery_date: "2025-01-01", superseded_at: null });
-    let capErr = null; try { await build(dbCap); } catch (e) { capErr = e; }
-    assert("1000+ active DOs in range → the build refuses (report fails, is retried) instead of dropping rows", !!capErr && /row query cap/.test(capErr.message));
-    capErr = null; try { await build(dbCap, TODAY, A, { overdueSince: "2026-01-01" }); } catch (e) { capErr = e; }
-    assert("…and TG02_OVERDUE_SINCE narrows it below the cap", capErr === null);
+    for (let i = 1; i <= 1426; i++) dbCap.table("orders").push({ id: i, company_id: A, so_number: `LG${i}`, customer_name: "c", status: "Pending", balance: 0, delivery_date: i === 1426 ? "2026-10-18" : "2026-01-01", items: JSON.stringify([{ itemName: "Legacy " + i }]) });
+    for (let i = 1; i <= 1100; i++) addDelivery(dbCap, { so: `CAP${String(i).padStart(4, "0")}`, date: "2026-10-19", items: [{ name: "Cap item", qty: 1 }] });
+    const capped = createFakeSupabase(dbCap, { maxRows: 1000 });
+    r = await buildDailyDeliveryReport({ supabase: capped, computeDeliveryReadiness: createDeliveryReadinessService({ supabase: capped, doLib }).computeDeliveryReadiness, companyId: A, today: TODAY });
+    assert("with production's 1000-row cap: the legacy order at row 1,426 is still reported", sos(r.upcoming).includes("LG1426"));
+    assert("with production's 1000-row cap: all 1,100 outstanding DOs are reported, each with its item line", r.upcoming.filter(e => /^CAP/.test(e.so_number)).length === 1100 && r.upcoming.filter(e => /^CAP/.test(e.so_number)).every(e => e.lines.length === 1));
 
     console.log("\n══ 11. Company isolation ══\n");
     const db5 = makeDb();
