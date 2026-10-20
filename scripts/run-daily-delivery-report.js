@@ -29,6 +29,10 @@
  *   node scripts/run-daily-delivery-report.js --resolve <dispatch_id> delivered|not_delivered --note "checked the chat"
  *
  * Exit code 1 when any company ended failed / uncertain / gave_up / error, so the cron run shows as failed.
+ *
+ * Replaces the P1-6 09:00 reminder (scripts/run-delivery-readiness-reminder.js — decision 2026-10-20): once this
+ * report is live, switch that reminder off (its Railway cron service, or enabled=false on its 'delivery_readiness'
+ * destination rows). Keep its file — test-telegram-message-splitting.js imports its splitter.
  */
 require("dotenv").config();
 const malaysiaDate = require("../lib/malaysia-date");
