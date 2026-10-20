@@ -294,8 +294,29 @@ const commsFor = (db, oid) => db.tables.commissions.filter(c => c.order_id === o
   const block = (route) => { const i = serverSrc.indexOf(route); return serverSrc.slice(i, serverSrc.indexOf("\napp.", i + 10)); };
   const payout = block('app.get("/commission-payout"'), summary = block('app.get("/commission-summary"'), boot = block('app.get("/dashboard/bootstrap"');
   assert("D3. GET /commission-payout filters through splitPayoutRows on orders.status and reports excluded_cancelled", /commissionLifecycle\.splitPayoutRows\(/.test(payout) && /c => c\.orders\?\.status/.test(payout) && /excluded_cancelled/.test(payout));
-  assert("D4. GET /commission-summary applies the same exclusion (selects orders(status))", /commissionLifecycle\.splitPayoutRows\(/.test(summary) && (summary.match(/orders\(status\)/g) || []).length === 2);
-  assert("D5. /dashboard/bootstrap salesman total applies the same exclusion", /commissionLifecycle\.splitPayoutRows\(/.test(boot) && (boot.match(/orders\(status\)/g) || []).length >= 2);
+  assert("D4. GET /commission-summary applies the same exclusion (selects orders(status…))", /commissionLifecycle\.splitPayoutRows\(/.test(summary) && (summary.match(/orders\(status[,)]/g) || []).length === 2);
+  assert("D5. /dashboard/bootstrap salesman total applies the same exclusion", /commissionLifecycle\.splitPayoutRows\(/.test(boot) && (boot.match(/orders\(status[,)]/g) || []).length >= 2);
+
+  console.log("\n── D'. payout month scope: previous month only, pending never in the payable total ──");
+  const P = [
+    { id: "sep-pend", status: "pending", orders: { order_date: "2026-09-12" } },
+    { id: "sep-pend-ts", status: "pending", orders: { order_date: "2026-09-30T18:30:00Z" } }, // 1 Oct 02:30 MY → November payout
+    { id: "aug-pend", status: "pending", orders: { order_date: "2026-08-31" } },
+    { id: "old-pend", status: "pending", orders: { order_date: "2025-05-31" } },
+    { id: "no-date", status: "pending", orders: { order_date: null } },
+    { id: "bad-date", status: "pending", orders: { order_date: "TBC" } },
+    { id: "sep-elig", status: "eligible", orders: { order_date: "2026-09-12" } },
+  ];
+  const inOct = lifecycle.pendingInPayoutMonth(P, "2026-10-01", r => r.orders?.order_date).map(r => r.id);
+  assert("D6. October payout keeps only September's pending", JSON.stringify(inOct) === JSON.stringify(["sep-pend"]), JSON.stringify(inOct));
+  assert("D7. pending dated 1 Oct (Malaysia) belongs to November, not October", lifecycle.pendingInPayoutMonth(P, "2026-11-01", r => r.orders?.order_date).map(r => r.id).join() === "sep-pend-ts");
+  assert("D8. no / unparseable order date → in no payout month; non-pending rows never returned", !inOct.includes("no-date") && !inOct.includes("bad-date") && !inOct.includes("sep-elig"));
+  assert("D9. only pending is non-payable", !lifecycle.isPayableStatus("pending") && ["eligible", "held", "paid"].every(lifecycle.isPayableStatus));
+  assert("D10. /commission-payout scopes pending to the month and keeps it out of total (pending_total apart)",
+    /pendingInPayoutMonth\(allPendingComms, month, c => c\.orders\?\.order_date\)/.test(payout) && /isPayableStatus\(c\.status\)\) byUser\[uid\]\.total \+= net/.test(payout) && /else byUser\[uid\]\.pending_total \+= net/.test(payout) && /pending_total:/.test(payout));
+  assert("D11. /commission-summary: same scope; pending not added to total", /pendingInPayoutMonth\(allPendingComms, month/.test(summary) && /if \(c\.status === "pending"\) \{ pending \+= net; continue; \}/.test(summary) && /orders\(status, order_date\)/.test(summary));
+  assert("D12. /dashboard/bootstrap: same scope; pending not added to total", /pendingInPayoutMonth\(pend, month/.test(boot) && /isPayableStatus\(c\.status\)\) total \+= net; else pending \+= net/.test(boot));
+  assert("D13. COMMISSION_LIST_SELECT carries orders.order_date (needed for the scope)", /orders\([^)]*order_date/.test(require("../lib/selects").COMMISSION_LIST_SELECT));
 
   console.log("\n── E. wiring (source-level) ──");
   const calcSrc = commissionCode.slice(commissionCode.indexOf("async function calculateCommission("));
