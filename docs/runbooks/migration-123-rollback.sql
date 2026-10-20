@@ -6,9 +6,9 @@
 -- ORDER:
 --   0. If migration 124 was applied, run step 0 first (it depends on 123).
 --   1. Restore complete_delivery_order() to the definition captured in preflight
---      step P2 (preferred — exactly what production ran before 123). If P2
---      confirmed production matched migration 016 (fingerprint 818451a1…),
---      the 016 body below is that same definition.
+--      step P2 (preferred — exactly what production ran before 123). Production was
+--      verified on 2026-10-20 to run migration 090 (fingerprint 2f3c975a…):
+--      the block below is that exact definition.
 --   2. Drop the functions 123 added.
 --   3. Export delivery_confirmations, then (optionally) drop it.
 --
@@ -25,7 +25,7 @@ BEGIN;
 -- DROP TRIGGER IF EXISTS trg_guard_sales_order_delivered_status ON sales_orders;
 -- DROP FUNCTION IF EXISTS guard_sales_order_delivered_status();
 
--- 1. complete_delivery_order() — migration 016 body, verbatim
+-- 1. complete_delivery_order() — production body before 123 (migration 090 = 016 + superseded guard, search_path pinned), verbatim
 --    (grants are unchanged by CREATE OR REPLACE).
 CREATE OR REPLACE FUNCTION complete_delivery_order(
   p_delivery_order_id UUID,
@@ -35,6 +35,7 @@ CREATE OR REPLACE FUNCTION complete_delivery_order(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_do            delivery_orders%ROWTYPE;
@@ -64,6 +65,14 @@ BEGIN
   END IF;
   IF v_do.status = 'cancelled' THEN
     RAISE EXCEPTION 'delivery_order_cancelled: cannot complete a cancelled delivery order';
+  END IF;
+  -- P1-1 (migration 085/089): a superseded DO's status is left exactly as
+  -- it was at the moment of supersession (draft/scheduled) — it is never
+  -- flipped to 'cancelled' — so it would otherwise pass every check above
+  -- and be "completed" even though a regenerated replacement DO has
+  -- already taken over its item set.
+  IF v_do.superseded_at IS NOT NULL THEN
+    RAISE EXCEPTION 'delivery_order_superseded: cannot complete a superseded delivery order';
   END IF;
 
   -- 2. Serialize concurrent completions on the same sales order so the
@@ -151,7 +160,7 @@ DROP FUNCTION IF EXISTS delivery_line_is_non_goods(TEXT, TEXT);
 -- 3. Audit table — EXPORT IT FIRST (Table editor → delivery_confirmations → Export CSV), then uncomment:
 -- DROP TABLE IF EXISTS delivery_confirmations;
 
--- Verify before COMMIT (expect 818451a19034c171e80863cb56eb3daa, then 0, 0):
+-- Verify before COMMIT (expect 2f3c975a06d0417c55c6298537e0e75f, then 0, 0):
 SELECT md5(replace(prosrc, E'\r', '')) AS complete_delivery_order_md5 FROM pg_proc WHERE proname = 'complete_delivery_order';
 SELECT count(*) AS confirm_fn FROM pg_proc WHERE proname = 'confirm_delivered_items';
 SELECT count(*) AS classifier_fn FROM pg_proc WHERE proname = 'delivery_line_is_non_goods';

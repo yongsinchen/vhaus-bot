@@ -5,12 +5,12 @@ Owner approval is required before step E1 (the first production database write).
 
 | | |
 |---|---|
-| File | `migrations/123_confirm_delivered_items.sql` at commit `e57a7ba` (branch `feat/delivery-confirmation`) |
-| SHA-256 (as committed, LF) | `43d48dcb01bbdfc9c813b558f53b40495ec304bcaed3b224a882c11c09e18e2d` (575 lines) |
+| File | `migrations/123_confirm_delivered_items.sql` at commit `27a9549` (branch `feat/delivery-confirmation`) |
+| SHA-256 (as committed, LF) | `5c80e6aa072410254c274e0efe9ab7dda56cc7a04adf83c50a225bcd07e2af83` (590 lines) |
 | Supabase project | `lrfyjcupucpdqmbqqbbk` (production) |
 | Depends on | tables `companies`, `sales_orders`, `sales_order_items`, `orders`, `delivery_orders`, `delivery_order_items`, `delivery_schedules`, `delivery_order_events`; function `next_do_number(uuid)` (015); roles `anon`, `authenticated`, `service_role` |
 | Adds | table `delivery_confirmations`; functions `delivery_line_is_non_goods(text,text)`, `confirm_delivered_items(uuid,uuid,uuid,jsonb,text,text,uuid)` |
-| Replaces | `complete_delivery_order(uuid,uuid,uuid)` (migration 016) — only non-goods lines → `not_applicable` / 0 and physical-only status roll-up |
+| Replaces | `complete_delivery_order(uuid,uuid,uuid)` — production runs migration **090**'s body (016 + superseded-DO guard, `search_path` pinned; EXECUTE `service_role` only per 084 — 084–092 were applied by hand, source on branch `claude/payment-allocation-103`). 123 keeps all of that and changes only: non-goods lines → `not_applicable` / 0 and physical-only status roll-up |
 | Changes existing rows | **none** (no top-level UPDATE / INSERT / DELETE; verified on PostgreSQL: 13 tables byte-identical after applying, and after re-applying) |
 | Next steps (separate approvals) | deploy backend `feat/delivery-confirmation` → frontend `feat/delivery-confirmation` → verify → migration 124 → Phase C |
 
@@ -23,7 +23,8 @@ SELECT to_regclass('public.delivery_confirmations')                             
        to_regprocedure('public.delivery_line_is_non_goods(text,text)')                         AS classifier_fn,
        to_regprocedure('public.guard_sales_order_delivered_status()')                         AS guard_124;
 
--- P2. What production runs today for complete_delivery_order — expect md5 818451a19034c171e80863cb56eb3daa (= migration 016).
+-- P2. What production runs today for complete_delivery_order — expect md5 2f3c975a06d0417c55c6298537e0e75f (= migration 090;
+--     verified 2026-10-20 — scripts/fixtures/prod-baseline-complete_delivery_order.sql).
 --     SAVE the full functiondef output: it is the exact rollback source if the md5 differs.
 SELECT md5(replace(prosrc, E'\r', '')) AS body_md5,
        pg_get_functiondef('public.complete_delivery_order(uuid,uuid,uuid)'::regprocedure) AS current_definition
@@ -50,8 +51,14 @@ SELECT (SELECT count(*) FROM sales_orders) AS so, (SELECT count(*) FROM sales_or
        (SELECT coalesce(sum(commission_amt), 0) FROM delivery_commissions) AS driver_commissions_sum,
        (SELECT coalesce(sum(balance), 0) FROM orders) AS balances_sum;
 
+-- P4b. What those triggers do (informational; the completion functions already fire them today).
+SELECT tgrelid::regclass AS table_name, tgname, pg_get_triggerdef(t.oid) AS trigger_def, pg_get_functiondef(t.tgfoid) AS function_def
+FROM pg_trigger t
+WHERE NOT tgisinternal AND tgname IN ('trg_orders_lock_on_deliver', 'trg_orders_updated_at', 'trg_sales_orders_auto_archive', 'trg_sync_so_delivery_date');
+
 -- P6. Engine / locale (the classifier only matches ASCII words; recorded for the file).
-SELECT version(), current_setting('lc_ctype') AS lc_ctype, current_setting('server_encoding') AS encoding;
+SELECT version(), datcollate, datctype, pg_encoding_to_char(encoding) AS encoding
+FROM pg_database WHERE datname = current_database();
 ```
 
 **P7. Recovery point** — Supabase Dashboard → Project `lrfyjcupucpdqmbqqbbk` → Database → Backups: note the latest
@@ -60,7 +67,7 @@ backup time (and PITR window, if enabled). Do not proceed without a backup newer
 ## E. Execution — ONLY after owner approval
 
 E1. Supabase SQL editor → new query → paste `BEGIN;`, then the **entire** content of
-`migrations/123_confirm_delivered_items.sql` (commit `e57a7ba`), then `COMMIT;` → Run **once**.
+`migrations/123_confirm_delivered_items.sql` (commit `27a9549`), then `COMMIT;` → Run **once**.
 Any error rolls the whole script back (nothing applied); stop and report the error.
 
 ## V. Verification — right after E1 (read only)
@@ -73,7 +80,7 @@ SELECT to_regclass('public.delivery_confirmations'),
        to_regprocedure('public.complete_delivery_order(uuid,uuid,uuid)');
 
 -- V2. Exact bodies — expect:
---   complete_delivery_order    c83ac2dd61e9c6518ad60e1d03d915d1
+--   complete_delivery_order    b48c8e2fe551f83bd993ccddd4cd9b08   (090 + non-goods change)
 --   confirm_delivered_items    7b1fff30537eca5aabe23025150a9ab2
 --   delivery_line_is_non_goods 4e99f9ee8f065c257333915ed877fbc9
 SELECT proname, md5(replace(prosrc, E'\r', '')) FROM pg_proc
@@ -84,12 +91,15 @@ SELECT delivery_line_is_non_goods('BILL', 'Full Bill Amount'), delivery_line_is_
        delivery_line_is_non_goods('2202', 'Sofa'), delivery_line_is_non_goods('BILL', '2202 A+C+B+D Sofa'),
        delivery_line_is_non_goods('CUSTOM', '500MM LED 3C (WALNUT) WITH INSTALLATION FEE');
 
--- V4. Grants — confirm_delivered_items: service_role only (expect false, false, true);
---     complete_delivery_order keeps its 016 grants (expect true for authenticated, as before).
+-- V4. Grants — confirm_delivered_items and complete_delivery_order: service_role only, as 084 left it
+--     (expect false, false, true, false, false, true) — and search_path still pinned (expect {search_path=public, pg_temp}).
 SELECT has_function_privilege('anon', 'public.confirm_delivered_items(uuid,uuid,uuid,jsonb,text,text,uuid)', 'EXECUTE'),
        has_function_privilege('authenticated', 'public.confirm_delivered_items(uuid,uuid,uuid,jsonb,text,text,uuid)', 'EXECUTE'),
        has_function_privilege('service_role', 'public.confirm_delivered_items(uuid,uuid,uuid,jsonb,text,text,uuid)', 'EXECUTE'),
-       has_function_privilege('authenticated', 'public.complete_delivery_order(uuid,uuid,uuid)', 'EXECUTE');
+       has_function_privilege('anon', 'public.complete_delivery_order(uuid,uuid,uuid)', 'EXECUTE'),
+       has_function_privilege('authenticated', 'public.complete_delivery_order(uuid,uuid,uuid)', 'EXECUTE'),
+       has_function_privilege('service_role', 'public.complete_delivery_order(uuid,uuid,uuid)', 'EXECUTE'),
+       (SELECT proconfig FROM pg_proc WHERE oid = 'public.complete_delivery_order(uuid,uuid,uuid)'::regprocedure);
 
 -- V5. Re-run P5 — every value must equal the baseline (unless real deliveries / payments happened in between;
 --     then only those rows differ). delivery_confirmations must have 0 rows:
@@ -111,7 +121,8 @@ SELECT count(*) FROM delivery_confirmations;
 ### Compatibility with the currently deployed backend (`d6859e4`) until backend A is deployed
 
 - The old backend never calls `confirm_delivered_items`; it only calls `complete_delivery_order` (driver app / board),
-  whose behaviour is unchanged for goods-only orders (proven: 016 vs re-stated body give identical results).
+  whose behaviour is unchanged for goods-only orders (proven: production's 090 body vs the re-stated body give
+  identical results; the superseded-DO guard, search_path pin and service_role-only grant are kept).
 - Orders with billing / charge lines completed by the driver now record those lines as `not_applicable` and do not
   wait for them — the approved non-goods rule, earlier than the rest of the release; harmless for the old code
   (every reader of DO-line status only skips `cancelled`).
@@ -120,9 +131,10 @@ SELECT count(*) FROM delivery_confirmations;
 
 ## R. Rollback
 
-Use `docs/runbooks/migration-123-rollback.sql` (verified on PostgreSQL: restores the exact 016 body, fingerprint back to
-`818451a19034c171e80863cb56eb3daa`, removes the two new functions, keeps `delivery_confirmations` until you export it).
-If P2's md5 was NOT `818451a1…`, replace its step-1 block with the `current_definition` saved in P2.
+Use `docs/runbooks/migration-123-rollback.sql` (verified on PostgreSQL set up like production — 090 body + 084 grants:
+restores the exact pre-123 body, fingerprint back to `2f3c975a06d0417c55c6298537e0e75f`, search_path pin and
+service_role-only grant unchanged, removes the two new functions, keeps `delivery_confirmations` until you export it).
+If P2's md5 is ever NOT `2f3c975a…` at execution time, STOP: production changed since this preflight.
 
 Limitations: delivery records written while 123 was live remain (DOs created / completed by confirmations, DO lines
 `not_applicable` / `not_delivered` / `partially_delivered`, delivered quantities, rolled-up statuses, driver-commission
