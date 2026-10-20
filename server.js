@@ -13416,6 +13416,23 @@ app.get("/inventory/projection", requireAuth, async (req, res) => {
       prod.get(r.product_id).events.push({ date: String(d).slice(0, 10), type: "in", qty: remaining, ref: r.purchase_orders?.po_number || "" });
     }
 
+    // 3b. Product details for EVERY product in the projection. A product reached
+    //     only through a sales-order / PO line used to carry just { id }, and
+    //     the page then printed a generic "Product" label. Read-only lookup,
+    //     scoped to the active company: a product row that is missing, or that
+    //     belongs to another company, is never named — it is flagged instead
+    //     (product_missing) so staff can review the data behind it.
+    const productIds = [...prod.keys()];
+    const meta = new Map();
+    for (let i = 0; i < productIds.length; i += 100) {
+      const { data: rows, error: pErr } = await supabase.from("products")
+        .select("id, code, name, size, color, reorder_point")
+        .eq("company_id", cid).in("id", productIds.slice(i, i + 100));
+      if (pErr) throw pErr;
+      for (const r of (rows || [])) meta.set(r.id, r);
+    }
+    for (const [pid, p] of prod) p.product = meta.get(pid) || { id: pid, product_missing: true };
+
     // 4. Build a month-by-month running balance per product.
     const lastMonth = malaysiaDate.addMonths(today.slice(0, 7), horizon);
     const thisMonth = today.slice(0, 7);
