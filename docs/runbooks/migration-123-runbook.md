@@ -164,3 +164,12 @@ If P2's md5 is ever NOT `2f3c975a…` at execution time, STOP: production change
 Limitations: delivery records written while 123 was live remain (DOs created / completed by confirmations, DO lines
 `not_applicable` / `not_delivered` / `partially_delivered`, delivered quantities, rolled-up statuses, driver-commission
 rows) — they are real delivery history and are not rewritten. Roll back 124 first if it was applied.
+
+## Execution record
+
+- 2026-10-20: E0 re-check PASS (P1 all null; P2 `2f3c975a06d0417c55c6298537e0e75f`). E1 applied by the owner in the
+  Supabase SQL editor (BEGIN + 123 @ `27a9549` + COMMIT), no error.
+- V1 PASS (4 objects). V2 PASS (`b48c8e2f…`, `7b1fff30…`, `4e99f9ee…`). V3 PASS (true, true, false, false, false).
+  V4 PASS (false, false, true, false, false, true; `{search_path=public, pg_temp}`).
+  V5 PASS — every P5 value identical; `delivery_confirmations` 0 rows (29 delivery_order_events in the prior 6 h did not
+  change any counted value). V6 pending.
