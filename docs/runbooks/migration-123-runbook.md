@@ -51,7 +51,8 @@ SELECT (SELECT count(*) FROM sales_orders) AS so, (SELECT count(*) FROM sales_or
        (SELECT coalesce(sum(commission_amt), 0) FROM delivery_commissions) AS driver_commissions_sum,
        (SELECT coalesce(sum(balance), 0) FROM orders) AS balances_sum;
 
--- P4b. What those triggers do (informational; the completion functions already fire them today).
+-- P4b. What those triggers do (captured 2026-10-20 → scripts/fixtures/prod-triggers-orders-sales_orders.sql;
+--      exercised with 123 + 124 by scripts/test-123-with-production-triggers-pg.js, 9/9).
 SELECT tgrelid::regclass AS table_name, tgname, pg_get_triggerdef(t.oid) AS trigger_def, pg_get_functiondef(t.tgfoid) AS function_def
 FROM pg_trigger t
 WHERE NOT tgisinternal AND tgname IN ('trg_orders_lock_on_deliver', 'trg_orders_updated_at', 'trg_sales_orders_auto_archive', 'trg_sync_so_delivery_date');
@@ -104,6 +105,13 @@ SELECT has_function_privilege('anon', 'public.confirm_delivered_items(uuid,uuid,
 -- V5. Re-run P5 — every value must equal the baseline (unless real deliveries / payments happened in between;
 --     then only those rows differ). delivery_confirmations must have 0 rows:
 SELECT count(*) FROM delivery_confirmations;
+
+-- V6. Classifier parity INSIDE production (PostgreSQL 17.6, en_US.UTF-8) — read only.
+--     Expect 117 lines / 9 distinct pairs (the JavaScript classifier's count on 2026-10-20, 8,404 lines; if new orders
+--     were added since, ask for a fresh JS count before comparing).
+SELECT count(*) AS non_goods_lines, count(DISTINCT coalesce(product_code, '') || '|' || coalesce(product_name, '')) AS distinct_pairs,
+       (SELECT count(*) FROM sales_order_items) AS all_lines
+FROM sales_order_items WHERE delivery_line_is_non_goods(product_code, product_name);
 ```
 
 ## S. Post-migration smoke test (old backend `d6859e4` still deployed — compatible)
