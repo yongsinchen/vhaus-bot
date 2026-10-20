@@ -65,7 +65,24 @@ FROM pg_database WHERE datname = current_database();
 **P7. Recovery point** — Supabase Dashboard → Project `lrfyjcupucpdqmbqqbbk` → Database → Backups: note the latest
 backup time (and PITR window, if enabled). Do not proceed without a backup newer than the last business day.
 
+**P7 result (owner, 2026-10-20): BACKUP EXISTS — recovery capability not independently tested.**
+Scheduled physical backups available; 7 visible; latest 2026-10-19 17:04:36 UTC (2026-10-20 01:04:36 MYT).
+Point-in-Time Recovery not confirmed; no restore test performed. A physical backup restores the whole database to
+that moment (later writes are lost), so it is the last resort — the primary recovery path is the rollback SQL (R).
+
+**Version match, verified 2026-10-20 (local, read only):**
+- 123 at `27a9549` and at branch head `acb18e4`: SHA-256 `5c80e6aa…e2af83`, identical, 590 lines.
+- Rollback file: its `complete_delivery_order` block is text-identical to migration 090 (`b34fbf5`);
+  090 = rollback = `2f3c975a06d0417c55c6298537e0e75f` = production P2.
+- 123's re-stated function keeps 090's superseded-DO guard, wrong-company / cancelled / already-completed guards,
+  DO → SO lock order and `SET search_path = public, pg_temp`. 123 has no GRANT / REVOKE on it (084 grants stay).
+  Code diff vs 090 is limited to the non-goods `not_applicable` update, the physical-only roll-up and the event payload.
+- Applied fingerprints match V2 (`b48c8e2f…`, `7b1fff30…`, `4e99f9ee…`).
+
 ## E. Execution — ONLY after owner approval
+
+E0. Immediately before E1, re-run P1 (expect all null) and P2 (expect `2f3c975a06d0417c55c6298537e0e75f`).
+Any difference → STOP: production changed since the preflight.
 
 E1. Supabase SQL editor → new query → paste `BEGIN;`, then the **entire** content of
 `migrations/123_confirm_delivered_items.sql` (commit `27a9549`), then `COMMIT;` → Run **once**.
