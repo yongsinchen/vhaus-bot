@@ -81,20 +81,23 @@ const sched = (id, n, doId = null, extra = {}) => ({ id, order_id: n, delivery_o
   const seed = {
     companies: [{ id: A, name: "A", driver_commission_rate: 0 }, { id: B, name: "B", driver_commission_rate: 0 }],
     sales_orders: [soRow(1), soRow(2), soRow(3), soRow(4), soRow(5), soRow(6), soRow(7), soRow(8), soRow(9), soRow(10), soRow(11),
-      soRow(12, { company_id: B }), soRow(13, { status: "delivered" }), soRow(14, { salesman_name: "Zed" })],
-    sales_order_items: [item(1), item(2), item(3), item(4), item(5), item(6), item(7), item(8), item(9), item(10), item(11), item(12), item(13, { delivered_qty: 0 }), item(14)],
+      soRow(12, { company_id: B }), soRow(13, { status: "delivered" }), soRow(14, { salesman_name: "Zed" }), soRow(15)],
+    sales_order_items: [item(1), item(2), item(3), item(4), item(5), item(6), item(7), item(8), item(9), item(10), item(11), item(12), item(13, { delivered_qty: 0 }), item(14), item(15)],
     orders: [legRow(1), legRow(2), legRow(3), legRow(4), legRow(5), legRow(6), legRow(7), legRow(8), legRow(9), legRow(10), legRow(11),
       legRow(12, { company_id: B }), legRow(13, { status: "Delivered" }), legRow(14),
       { id: 50, company_id: A, so_number: "SV-1", type: "Service", status: "Confirmed", customer_name: "Svc", remark: null, is_multi_trip: false },
       { id: 51, company_id: A, so_number: "LEGACY-9", type: "Delivery", status: "Confirmed", customer_name: "Old", remark: null, is_multi_trip: false },
-      { id: 52, company_id: A, so_number: "LEGACY-8", type: "Delivery", status: "Confirmed", customer_name: "Old2", remark: null, is_multi_trip: false }],
+      { id: 52, company_id: A, so_number: "LEGACY-8", type: "Delivery", status: "Confirmed", customer_name: "Old2", remark: null, is_multi_trip: false },
+      // Service cases that carry the SAME number as a real sales order (SO 7015) — 2 such rows exist in production.
+      { id: 53, company_id: A, so_number: "7015", type: "Service", status: "Confirmed", customer_name: "Svc15", remark: null, is_multi_trip: false },
+      { id: 54, company_id: A, so_number: "7015", type: "Service", status: "Confirmed", customer_name: "Svc15b", remark: null, is_multi_trip: false }],
     // SO 2: one open DO · SO 3: two open DOs · SO 4: no DO · SO 5: open + cancelled + completed + superseded + failed · SO 9: DO stop
     delivery_orders: [doRow(2, 0), doRow(3, 0), doRow(3, 1, { delivery_date: "2026-11-05" }),
       doRow(5, 0), doRow(5, 1, { status: "cancelled" }), doRow(5, 2, { status: "completed" }), doRow(5, 3, { superseded_at: "2026-10-01T00:00:00Z" }), doRow(5, 4, { status: "failed" }),
       doRow(9, 0), doRow(10, 0), doRow(11, 0), doRow(11, 1)],
     delivery_order_items: [doItem(2, 0), doItem(3, 0, 1), doItem(3, 1, 1), doItem(5, 0, 1), doItem(5, 1, 2, { status: "cancelled" }), doItem(5, 2, 1, { delivered_qty: 1, status: "delivered" }),
       doItem(5, 3, 1), doItem(5, 4, 1), doItem(9, 0), doItem(10, 0), doItem(11, 0, 1), doItem(11, 1, 1)],
-    delivery_schedules: [sched(u(4004), 4), sched(u(4009), 9, DOID(9, 0)), sched(u(4050), 50), sched(u(4051), 51), sched(u(4006), 6), sched(u(4012), 12, null, { company_id: B })],
+    delivery_schedules: [sched(u(4004), 4), sched(u(4009), 9, DOID(9, 0)), sched(u(4050), 50), sched(u(4051), 51), sched(u(4006), 6), sched(u(4012), 12, null, { company_id: B }), sched(u(4053), 53), sched(u(4054), 54)],
     delivery_order_events: [], delivery_confirmations: [], sales_order_amendments: [], delivery_date_requests: [], branches: [],
     services: [], service_items: [], service_legs: [], service_pending: [], order_trips: [], delivery_teams: [], delivery_vehicles: [],
     delivery_routes: [{ id: 81, company_id: A, status: "Out for Delivery", delivery_date: today }, { id: 82, company_id: A, status: "Confirmed", delivery_date: today }],
@@ -180,6 +183,8 @@ const sched = (id, n, doId = null, extra = {}) => ({ id, order_id: n, delivery_o
     assert("3e. a Service-case stop keeps the previous behaviour (Delivered, no quantities)", r.status === 200 && leg(50).status === "Delivered" && sc(u(4050)).status === "delivered", JSON.stringify(r.body));
     r = await h.call("PATCH", `/driver/schedule/${u(4051)}/status`, { user: "drv", body: { status: "delivered" } });
     assert("3f. a pre-sales-order legacy row (no items) keeps the previous behaviour", r.status === 200 && leg(51).status === "Delivered");
+    r = await h.call("PATCH", `/driver/schedule/${u(4053)}/status`, { user: "drv", body: { status: "delivered" } });
+    assert("3f2. a Service stop sharing a real SO's number → Service order Delivered, but the SALES ORDER is untouched (no quantities)", r.status === 200 && leg(53).status === "Delivered" && so(15).status === "confirmed", JSON.stringify([r.status, leg(53).status, so(15).status]));
     r = await h.call("PATCH", `/driver/schedule/${u(4009)}/status`, { user: "drv", body: { status: "delivered" } });
     assert("3g. a DO stop still completes its DO through complete_delivery_order (unchanged)", r.status === 200 && callsOf("complete_delivery_order").at(-1)?.a.p_delivery_order_id === DOID(9, 0) && so(9).status === "delivered");
     r = await h.call("GET", `/driver/schedule/${u(4009)}/delivery-confirmation`, { user: "drv" });
@@ -198,6 +203,8 @@ const sched = (id, n, doId = null, extra = {}) => ({ id, order_id: n, delivery_o
     assert("4b. confirm from the board: source 'schedule_admin', stop id passed; partial → partially_delivered", r.status === 201 && cb.p_source === "schedule_admin" && cb.p_legacy_schedule_id === u(4006) && so(6).status === "partially_delivered");
     r = await h.call("POST", `/delivery-schedules/${u(4006)}/confirm-delivered-items`, { user: "ops", body: { idempotency_key: "board-key-0000002", lines: [{ sales_order_item_id: IT(6), quantity: 1 }] } });
     assert("4c. without DELIVERY_EDIT → 403", r.status === 403);
+    r = await h.call("PATCH", `/delivery-schedules/${u(4054)}`, { user: "mgr", body: { status: "Delivered" } });
+    assert("4c2. board: a Service stop sharing a real SO's number → Service order Delivered, SALES ORDER untouched", r.status === 200 && leg(54).status === "Delivered" && so(15).status === "confirmed", JSON.stringify([r.status, leg(54).status, so(15).status]));
 
     out("\n══ 5. Telegram settle ══\n");
     const send = async text => {

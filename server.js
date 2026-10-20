@@ -11626,7 +11626,7 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     if (is_ready !== undefined) updates.is_ready = is_ready;
     if (notes !== undefined) updates.notes = notes;
     if (statusLower === "delivered") updates.delivered_at = new Date().toISOString();
-    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
+    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status, type)").single();
     if (error) throw error;
     // Fix #3: legacy schedules (no delivery_order_id) marked delivered by the
     // dispatcher UI must sync orders.status the same way the driver endpoint
@@ -11635,7 +11635,9 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     if (statusLower === "delivered" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
       // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
-      await syncLegacyDeliveredToSalesOrder(cid, data.orders.so_number);
+      // Never for a Service case: it carries no item quantities and may share the
+      // number of a real sales order (owner decision 2026-10-20 — quantities first).
+      if (deliveryConfirmation.needsItemConfirmation(data.orders)) await syncLegacyDeliveredToSalesOrder(cid, data.orders.so_number);
       // If this order is a Service case's inert order, resolve the case too.
       await resolveServiceOnDelivery(data.orders.id);
     }
@@ -12285,13 +12287,14 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
     const updates = { status };
     if (status === "arrived") updates.notes = (updates.notes || "") + `\nArrived: ${new Date().toLocaleString("en-MY", { timeZone: "Asia/Kuala_Lumpur" })}`;
     if (status === "delivered") updates.delivered_at = new Date().toISOString();
-    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
+    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status, type)").single();
     if (error) throw error;
 
     if (status === "delivered" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
       // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
-      await syncLegacyDeliveredToSalesOrder(getActiveCompanyId(req), data.orders.so_number);
+      // Never for a Service case (no item quantities; may share a real SO's number).
+      if (deliveryConfirmation.needsItemConfirmation(data.orders)) await syncLegacyDeliveredToSalesOrder(getActiveCompanyId(req), data.orders.so_number);
       // If this order is a Service case's inert order, resolve the case too.
       await resolveServiceOnDelivery(data.orders.id);
     }
