@@ -20,8 +20,9 @@
  *   TG02_SEND_ENABLED, TG02_SEND_AFTER (HH:MM), TG02_OVERDUE_SINCE (optional YYYY-MM-DD floor for OVERDUE).
  *
  * Usage:
- *   node scripts/run-daily-delivery-report.js                       dry run: counts per company (no message text)
+ *   node scripts/run-daily-delivery-report.js                       dry run, EVERY company: counts (no message text)
  *   node scripts/run-daily-delivery-report.js --print               dry run + the full message text
+ *   (a dry run reads only — no sends, no writes — and works before migration 121 / any destination exists)
  *   node scripts/run-daily-delivery-report.js --date 2026-10-20     dry run for another report date
  *   node scripts/run-daily-delivery-report.js --company <uuid>      only that company (dry run or live)
  *   node scripts/run-daily-delivery-report.js --send                live (needs TG02_SEND_ENABLED=true)
@@ -65,7 +66,7 @@ async function fetchAll(supabase, table, select, filter) {
 }
 
 /**
- * One run over every company with an enabled 'daily_delivery_report' destination.
+ * One run: live over every company with an enabled 'daily_delivery_report' destination; dry run over every company.
  * deps: { supabase, computeDeliveryReadiness, store, send, live, now, reportDate, companyId, overdueSince,
  *         sendAfter, print, sleep } — tests inject fakes; nothing here reaches Telegram unless `send` does.
  */
@@ -86,17 +87,23 @@ async function run(deps) {
 
   const destinations = await fetchAll(supabase, "company_telegram_destinations", "company_id, chat_id, enabled",
     q => q.eq("notification_type", REPORT_TYPE).eq("enabled", true));
-  const wanted = deps.companyId ? destinations.filter(d => d.company_id === deps.companyId) : destinations;
-  const companies = wanted.length
-    ? await fetchAll(supabase, "companies", "id, name, is_active", q => q.in("id", wanted.map(d => d.company_id)))
-    : [];
+  const destByCompany = new Map(destinations.map(d => [d.company_id, d]));
+  // Live: only companies with a destination. Dry run: every company, so a report can be checked
+  // before any destination exists.
+  let targetIds = live ? destinations.map(d => d.company_id) : null;
+  if (deps.companyId) targetIds = (targetIds || [deps.companyId]).filter(cid => cid === deps.companyId);
+  const companies = targetIds === null
+    ? await fetchAll(supabase, "companies", "id, name, is_active")
+    : targetIds.length ? await fetchAll(supabase, "companies", "id, name, is_active", q => q.in("id", targetIds)) : [];
   const companyById = new Map(companies.map(c => [c.id, c]));
-  logEvent("run_started", { report_date: reportDate, mode: summary.mode, malaysia_time: clock.time, destinations: wanted.length });
+  if (targetIds === null) targetIds = companies.map(c => c.id);
+  logEvent("run_started", { report_date: reportDate, mode: summary.mode, malaysia_time: clock.time, companies: targetIds.length, destinations: destinations.length });
 
   // One company's failure never stops the others.
-  for (const dest of wanted) {
-    const company = companyById.get(dest.company_id);
-    const row = { company_id: dest.company_id, chat: maskChat(dest.chat_id) };
+  for (const companyId of targetIds) {
+    const company = companyById.get(companyId);
+    const dest = destByCompany.get(companyId) || null;
+    const row = { company_id: companyId, chat: dest ? maskChat(dest.chat_id) : null };
     try {
       if (!company || company.is_active === false) { row.outcome = "company_inactive"; continue; }
       row.company = company.name;
@@ -108,7 +115,7 @@ async function run(deps) {
 
       if (!live) {
         const parts = await build();
-        Object.assign(row, { outcome: "dry_run", overdue: report.overdue.length, upcoming: report.upcoming.length, parts: parts.length, excluded: report.excluded });
+        Object.assign(row, { outcome: "dry_run", destination: dest ? "configured" : "none", overdue: report.overdue.length, upcoming: report.upcoming.length, parts: parts.length, excluded: report.excluded });
         if (print) parts.forEach((p, i) => console.log(`\n--- ${company.name} · part ${i + 1}/${parts.length} (${p.length} chars) ---\n${p}`));
         continue;
       }

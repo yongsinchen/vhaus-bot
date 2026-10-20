@@ -46,6 +46,7 @@ function services(db) {
 }
 const build = (db, today = TODAY, companyId = A, extra = {}) => buildDailyDeliveryReport({ ...services(db), companyId, today, ...extra });
 const sos = list => list.map(e => e.so_number);
+const silentRun = async deps => { const l = console.log; console.log = () => {}; try { return await run(deps); } finally { console.log = l; } };
 
 (async () => {
   try {
@@ -216,10 +217,20 @@ const sos = list => list.map(e => e.so_number);
     const quietLog = console.log; console.log = () => {};
     const summary = await run({ ...services(dbD), store: trap, send: async () => { sends++; return { message_id: 1 }; }, now: new Date("2026-10-16T03:00:00Z") });
     console.log = quietLog;
-    assert("dry run: report computed for the company with a daily_delivery_report destination only", summary.companies.length === 1 && summary.companies[0].company_id === A && summary.companies[0].outcome === "dry_run" && summary.companies[0].upcoming === 1);
+    const dA = summary.companies.find(c => c.company_id === A), dB = summary.companies.find(c => c.company_id === B);
+    assert("dry run covers EVERY active company, with or without a destination (checkable before go-live)", summary.companies.length === 2 && dA?.outcome === "dry_run" && dA.upcoming === 1 && dB?.outcome === "dry_run");
     assert("dry run: no send, no dispatch claim", sends === 0 && storeCalls === 0);
-    assert("18. a P1-6 'delivery_readiness' destination is never used by TG-02", !summary.companies.some(c => c.company_id === B));
-    assert("logged chat id is masked", summary.companies[0].chat === "…7890");
+    assert("18. a P1-6 'delivery_readiness' row is not a TG-02 destination", dA.destination === "configured" && dB.destination === "none" && dB.chat === null);
+    assert("logged chat id is masked", dA.chat === "…7890");
+    const one = await silentRun({ ...services(dbD), store: trap, send: async () => { sends++; return { message_id: 1 }; }, now: new Date("2026-10-16T03:00:00Z"), companyId: B });
+    assert("dry run --company: just that company, even without a destination", one.companies.length === 1 && one.companies[0].company_id === B);
+    const claimed = [];
+    const recorder = { claim: async cid => { claimed.push(cid); return { outcome: "already_sent" }; } };
+    await silentRun({ ...services(dbD), store: recorder, send: async () => { sends++; return { message_id: 1 }; }, live: true, now: new Date("2026-10-16T03:00:00Z") });
+    assert("18. a LIVE run only touches companies with a daily_delivery_report destination", JSON.stringify(claimed) === JSON.stringify([A]) && sends === 0);
+    claimed.length = 0;
+    await silentRun({ ...services(dbD), store: recorder, send: async () => { sends++; return { message_id: 1 }; }, live: true, now: new Date("2026-10-16T03:00:00Z"), companyId: B });
+    assert("18. a LIVE --company run for a company without a destination does nothing", claimed.length === 0 && sends === 0);
 
     console.log("\n══ CLI send gate ══\n");
     const cli = spawnSync(process.execPath, [require.resolve("./run-daily-delivery-report"), "--send"], { env: { ...process.env, TG02_SEND_ENABLED: "", SUPABASE_URL: "", TELEGRAM_BOT_TOKEN: "" }, encoding: "utf8" });
