@@ -4160,10 +4160,12 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
     const commissionPromise = (isSalesman && cid) ? (async () => {
       const [{ data: elig }, { data: pend }] = await Promise.all([
         supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)").eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid).eq("user_id", req.user.id),
-        supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)").eq("status", "pending").eq("company_id", cid).eq("user_id", req.user.id),
+        supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status, order_date)").eq("status", "pending").eq("company_id", cid).eq("user_id", req.user.id),
       ]);
-      // Same Cancelled-order exclusion as GET /commission-payout.
-      const { payable: comms } = commissionLifecycle.splitPayoutRows([...(elig || []), ...(pend || [])], c => c.orders?.status);
+      // Same Cancelled-order exclusion and payout-month scope (pending of this
+      // order month only) as GET /commission-payout.
+      const pendThisMonth = commissionLifecycle.pendingInPayoutMonth(pend, month, c => c.orders?.order_date);
+      const { payable: comms } = commissionLifecycle.splitPayoutRows([...(elig || []), ...pendThisMonth], c => c.orders?.status);
       const ids = comms.map(c => c.id);
       let adjustments = [], holds = [];
       if (ids.length > 0) {
@@ -4173,13 +4175,14 @@ app.get("/dashboard/bootstrap", requireAuth, async (req, res) => {
         ]);
         adjustments = adjs || []; holds = hs || [];
       }
-      let total = 0;
+      let total = 0, pending = 0;
       for (const c of comms) {
         const adj = adjustments.filter(a => a.commission_id === c.id).reduce((s, a) => s + (Number(a.delta_amt) || 0), 0);
         const hold = holds.filter(h => h.commission_id === c.id && h.status === "held").reduce((s, h) => s + (Number(h.held_amt) || 0), 0);
-        total += (Number(c.commission_amt) || 0) + adj - hold;
+        const net = (Number(c.commission_amt) || 0) + adj - hold;
+        if (commissionLifecycle.isPayableStatus(c.status)) total += net; else pending += net;
       }
-      return { payout_month: month, total };
+      return { payout_month: month, total, pending };
     })() : Promise.resolve(null);
 
     const [{ data: services }, { count: sp }, { count: dr }, commission, deliveryReq, amendReq] = await Promise.all([svcQ, spQ, drQ, commissionPromise, deliveryReqPromise, amendReqPromise]);
@@ -8472,7 +8475,9 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     // to everyone in the company if omitted.
     const isSalesman = (req.activeRoleKey || req.user.role || "").toLowerCase() === "salesman";
     const user_id = isSalesman ? req.user.id : req.query.user_id;
-    // Get eligible commissions for payout month + all pending (any month)
+    // Get eligible commissions for the payout month + pending of the SAME order
+    // month only (October's payout = September's orders). Earlier months are
+    // settled on their own payout and are not carried forward here.
     let eq = supabase.from("commissions").select(SELECTS.COMMISSION_LIST_SELECT)
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]);
     if (cid) eq = eq.eq("company_id", cid);
@@ -8482,7 +8487,8 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
       .eq("status", "pending");
     if (user_id) pq = pq.eq("user_id", user_id);
     if (cid) pq = pq.eq("company_id", cid);
-    const { data: pendingComms } = await pq;
+    const { data: allPendingComms } = await pq;
+    const pendingComms = commissionLifecycle.pendingInPayoutMonth(allPendingComms, month, c => c.orders?.order_date);
     // Defense in depth: a stale pending/eligible/held row on a Cancelled order is
     // never payable, whatever its own status says (paid rows stay as history).
     const { payable: comms, excludedCancelled } = commissionLifecycle.splitPayoutRows(
@@ -8504,7 +8510,7 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     const byUser = {};
     for (const c of (comms || [])) {
       const uid = c.user_id;
-      if (!byUser[uid]) byUser[uid] = { user_id: uid, name: c.users?.name || c.users?.salesman_name || "?", role: c.role_name, commissions: [], adjustments: [], holds: [], total: 0 };
+      if (!byUser[uid]) byUser[uid] = { user_id: uid, name: c.users?.name || c.users?.salesman_name || "?", role: c.role_name, commissions: [], adjustments: [], holds: [], total: 0, pending_total: 0 };
       const userAdjs = adjustments.filter(a => a.commission_id === c.id);
       const userHolds = holds.filter(h => h.commission_id === c.id);
       const adjTotal = userAdjs.reduce((s, a) => s + (Number(a.delta_amt) || 0), 0);
@@ -8512,10 +8518,15 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
       byUser[uid].commissions.push(c);
       byUser[uid].adjustments.push(...userAdjs);
       byUser[uid].holds.push(...userHolds);
-      byUser[uid].total += (Number(c.commission_amt) || 0) + adjTotal - holdTotal;
+      // total = what is payable this month; pending (deposit gate not met) is
+      // reported apart and never inflates it.
+      const net = (Number(c.commission_amt) || 0) + adjTotal - holdTotal;
+      if (commissionLifecycle.isPayableStatus(c.status)) byUser[uid].total += net;
+      else byUser[uid].pending_total += net;
     }
     res.json({
       payout_month: month, users: Object.values(byUser), total: Object.values(byUser).reduce((s, u) => s + u.total, 0),
+      pending_total: Object.values(byUser).reduce((s, u) => s + u.pending_total, 0),
       excluded_cancelled: excludedCancelled.map(c => ({ id: c.id, order_id: c.order_id, so_number: c.orders?.so_number || null, user_id: c.user_id, status: c.status, commission_amt: Number(c.commission_amt) || 0 })),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -8538,10 +8549,12 @@ app.get("/commission-summary", requireAuth, async (req, res) => {
     let eq = supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)")
       .eq("payout_month", month).in("status", ["eligible", "held", "paid"]).eq("company_id", cid);
     if (user_id) eq = eq.eq("user_id", user_id);
-    let pq = supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status)")
+    let pq = supabase.from("commissions").select("id, commission_amt, status, paid_at, orders(status, order_date)")
       .eq("status", "pending").eq("company_id", cid);
     if (user_id) pq = pq.eq("user_id", user_id);
-    const [{ data: eligibleComms }, { data: pendingComms }] = await Promise.all([eq, pq]);
+    const [{ data: eligibleComms }, { data: allPendingComms }] = await Promise.all([eq, pq]);
+    // Same payout-month scope as GET /commission-payout: pending of this order month only.
+    const pendingComms = commissionLifecycle.pendingInPayoutMonth(allPendingComms, month, c => c.orders?.order_date);
     // Same Cancelled-order exclusion as GET /commission-payout.
     const { payable: comms } = commissionLifecycle.splitPayoutRows([...(eligibleComms || []), ...(pendingComms || [])], c => c.orders?.status);
 
@@ -8563,9 +8576,9 @@ app.get("/commission-summary", requireAuth, async (req, res) => {
     let total = 0, paid = 0, pending = 0, eligible = 0;
     for (const c of comms) {
       const net = netOf(c);
+      if (c.status === "pending") { pending += net; continue; } // reported apart, not payable
       total += net;
       if (c.status === "paid") paid += net;
-      else if (c.status === "pending") pending += net;
       else eligible += net; // eligible + held
     }
     res.json({ payout_month: month, total, paid, unpaid: total - paid, eligible, pending });
