@@ -128,6 +128,24 @@ const silentRun = async deps => { const l = console.log; console.log = () => {};
     assert("10. completed / out-for-delivery DOs are not reported, even when past their date", !all3.includes("DN") && !all3.includes("OD"));
     assert("10. a superseded DO is not reported", !all3.includes("SP"));
 
+    const db3b = makeDb();
+    addDelivery(db3b, { so: "DR", date: "2026-10-17", soStatus: "draft", items: [{ name: "Draft item", qty: 1 }] });
+    addDelivery(db3b, { so: "PD", date: "2026-10-12", soStatus: "pending_deposit", items: [{ name: "Deposit item", qty: 1 }] });
+    addDelivery(db3b, { so: "AM", date: "2026-10-17", soStatus: "amended", items: [{ name: "Amended item", qty: 1 }] });
+    db3b.table("sales_orders").push({ id: "so-lg-draft", company_id: A, order_number: "LGD", status: "draft" });
+    db3b.table("orders").push({ id: 601, company_id: A, so_number: "LGD", type: "Delivery", customer_name: "c", delivery_date: "2026-10-18", status: "Pending", items: JSON.stringify([{ itemName: "Legacy draft item" }]), balance: 0 });
+    db3b.table("sales_orders").push({ id: "so-lg-ok", company_id: A, order_number: "LGC", status: "confirmed" });
+    db3b.table("orders").push({ id: 602, company_id: A, so_number: "LGC", type: "Delivery", customer_name: "c", delivery_date: "2026-10-18", status: "Pending", items: JSON.stringify([{ itemName: "Legacy confirmed item" }]), balance: 0 });
+    db3b.table("sales_orders").push({ id: "so-lg-b", company_id: B, order_number: "LGO", status: "draft" });
+    db3b.table("orders").push({ id: 603, company_id: A, so_number: "LGO", type: "Delivery", customer_name: "c", delivery_date: "2026-10-18", status: "Pending", items: JSON.stringify([{ itemName: "Legacy only item" }]), balance: 0 });
+    r = await build(db3b);
+    const all3b = [...sos(r.upcoming), ...sos(r.overdue)];
+    assert("7. a DRAFT sales order is not reported", !all3b.includes("DR"));
+    assert("7. a sales order AWAITING DEPOSIT is not reported (even when overdue)", !all3b.includes("PD"));
+    assert("7. a legacy row whose sales order is a draft is not reported", !all3b.includes("LGD") && r.excluded.not_confirmed === 3);
+    assert("7. confirmed / amended orders are still reported (DO and legacy)", all3b.includes("AM") && all3b.includes("LGC"));
+    assert("7. another company's draft SO with the same number never affects this company's legacy order", all3b.includes("LGO"));
+
     console.log("\n══ Legacy whole-order rows (no DO) + undated rows ══\n");
     const db4 = makeDb();
     db4.table("orders").push({ id: 501, company_id: A, so_number: "L1", customer_name: "Legacy Cust", delivery_date: "2026-10-18", status: "Confirmed", items: JSON.stringify([{ itemName: "Legacy sofa" }, { itemName: "Legacy table", arrivalDate: "2026-10-01" }]), balance: 0 });
