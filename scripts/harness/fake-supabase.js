@@ -199,6 +199,8 @@ class Query {
       for (const { c, asc } of [...this.ord].reverse()) out = [...out].sort((a, b) => (asc ? 1 : -1) * cmp(a[c], b[c]));
       if (this.rng) out = out.slice(this.rng[0], this.rng[1] + 1);
       if (this.lim != null) out = out.slice(0, this.lim);
+      // PostgREST max-rows: a select silently returns at most this many rows (opt-in, see createFakeSupabase).
+      if (this.op === "select" && db.maxRows != null) out = out.slice(0, db.maxRows);
       if (this.opts.head) return { data: null, error: null, count: this.opts.count ? count : null };
       const projected = out.map(r => db.project(this.table, r, this.sel));
       return this.finish(projected, this.opts.count ? count : null);
@@ -211,7 +213,9 @@ class Query {
   }
 }
 
-function createFakeSupabase(db, { authUsers = {} } = {}) {
+// maxRows: mimic the production PostgREST max-rows cap (Supabase default 1000) — off unless given.
+function createFakeSupabase(db, { authUsers = {}, maxRows = null } = {}) {
+  db.maxRows = maxRows;
   return {
     from: t => new Query(db, t),
     rpc: (name, args) => {
