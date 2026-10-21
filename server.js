@@ -12,6 +12,7 @@ const { MODULE_REGISTRY, ALL_ACTION_KEYS, PERMS } = require("./module-registry")
 const { OrganizationIdentityService } = require("./organization-identity-service");
 const { composeProductView, composeSupplierView } = require("./lib/product-view-composer");
 const doLib = require("./lib/delivery-orders");
+const deliveryConfirmation = require("./lib/delivery-confirmation");
 const malaysiaDate = require("./lib/malaysia-date");
 const companyScope = require("./lib/company-scope");
 const { classifySalesOrderItemEdit, identityKey: soItemIdentityKey } = require("./lib/sales-order-item-diff");
@@ -961,6 +962,81 @@ async function syncLegacyDeliveredToSalesOrder(companyId, soNumber) {
   } catch (e) {
     console.error("[syncLegacyDeliveredToSalesOrder] failed (non-fatal):", e.message);
   }
+}
+
+// What follows EVERY Delivery Order completion, whichever screen it came from
+// (driver app, schedule board, Orders page / driver / board item confirmation,
+// Telegram settle, route status) — so the same DO always has the same outcome.
+// calculateDeliveryCommission() is the canonical driver-commission rule: it
+// pays only for a COMPLETED DO, only the DO schedule team's driver / vehicle
+// leaders, once per sales order per person (code guard + the partial unique
+// index of migration 053) — calling it again is a no-op. No new rule here.
+// deductStockOnDeliveredDO() is unchanged (switched off: INVENTORY_AUTO_DEDUCT_ON_DELIVERY).
+async function afterDeliveryOrderCompleted(deliveryOrderId, cid, actorId) {
+  try { await calculateDeliveryCommission(deliveryOrderId, cid); }
+  catch (e) { console.error("delivery commission calc:", e.message); }
+  await deductStockOnDeliveredDO(deliveryOrderId, cid, actorId);
+}
+
+// An un-itemised "Delivered" (Telegram settle, route status Delivered) for a
+// legacy order (owner decision 2026-10-20): never marks the order Delivered
+// directly. Only when its sales order has EXACTLY ONE open Delivery Order is
+// that DO completed through the canonical complete_delivery_order() (its own
+// quantities, atomic, idempotent); with none or several, nothing changes and
+// staff must confirm the delivered items in PulseOS. Never guessed.
+// → { completed, reason?, do_number?, sales_order_status?, so_number, text }
+async function completeSingleOpenDoForLegacyOrder(legacyOrder, actorId) {
+  const soNumber = legacyOrder?.so_number || "?";
+  const cid = legacyOrder?.company_id;
+  const { so, matches } = await deliveryConfirmation.findSalesOrderForLegacyOrder({ supabase, companyId: cid, legacyOrder });
+  if (!so && matches === 0) {
+    // A pre-sales-order legacy row: it has no item lines, so there is no
+    // quantity to record — keep the previous behaviour (status only).
+    await supabase.from("orders").update({ status: "Delivered" }).eq("id", legacyOrder.id).eq("company_id", cid);
+    return { completed: true, legacy_only: true, so_number: soNumber, sales_order_id: null, text: "Order marked Delivered (legacy order without item lines)." };
+  }
+  const ctx = so ? await deliveryConfirmation.loadConfirmationContext({ supabase, companyId: cid, salesOrderId: so.id }) : null;
+  const pick = so ? deliveryConfirmation.autoCompletableDo(ctx) : { reason: "ambiguous_sales_order" };
+  if (!pick.deliveryOrder) {
+    const why = deliveryConfirmation.AUTO_REASON_TEXT[pick.reason] || pick.reason;
+    return { completed: false, reason: pick.reason, so_number: soNumber, sales_order_id: so?.id || null,
+      text: `NOT marked Delivered — ${why}. Please confirm the delivered items in PulseOS (Orders → Confirm Delivered Items).` };
+  }
+  const { data, error } = await supabase.rpc("complete_delivery_order", {
+    p_delivery_order_id: pick.deliveryOrder.id, p_company_id: cid, p_actor_id: actorId || null,
+  });
+  if (error) {
+    console.error("[completeSingleOpenDoForLegacyOrder]", soNumber, error.message);
+    return { completed: false, reason: "completion_failed", so_number: soNumber, sales_order_id: so.id,
+      text: `NOT marked Delivered — Delivery Order ${pick.deliveryOrder.do_number} could not be completed (${String(error.message).replace(/[_*`[\]]/g, " ")}). Please confirm in PulseOS.` };
+  }
+  if (!data?.already_completed) await afterDeliveryOrderCompleted(pick.deliveryOrder.id, cid, actorId);
+  const label = data?.sales_order_status === "delivered" ? "Delivered" : "Partially Delivered";
+  return { completed: true, do_number: pick.deliveryOrder.do_number, sales_order_status: data?.sales_order_status || null,
+    already_completed: !!data?.already_completed, so_number: soNumber, sales_order_id: so.id,
+    text: `Delivery Order ${pick.deliveryOrder.do_number} completed — order now ${label}.` };
+}
+const settleDeliveryFromTelegram = (order, actorId) => completeSingleOpenDoForLegacyOrder(order, actorId);
+
+// A legacy (no-DO) schedule stop marked "delivered" (driver app / schedule
+// board): a sales-order delivery needs its delivered item quantities first
+// (owner decision 2026-10-20) — the client then calls
+// …/confirm-delivered-items with the quantities. Service-case stops and
+// pre-sales-order legacy rows (no item lines) keep the previous behaviour.
+// → null when the plain status update may proceed, else { status, body }.
+async function legacyStopDeliveredGuard(cid, scheduleId) {
+  let sq = supabase.from("delivery_schedules").select("id, order_id, delivery_order_id").eq("id", scheduleId);
+  if (cid) sq = sq.eq("company_id", cid);
+  const { data: sched } = await sq.maybeSingle();
+  if (!sched || sched.delivery_order_id || !sched.order_id) return null;
+  const { data: leg } = await supabase.from("orders").select("id, so_number, type, company_id").eq("id", sched.order_id).maybeSingle();
+  if (!deliveryConfirmation.needsItemConfirmation(leg)) return null;
+  const { so, matches } = await deliveryConfirmation.findSalesOrderForLegacyOrder({ supabase, companyId: leg.company_id, legacyOrder: leg });
+  if (!so && matches === 0) return null;
+  return { status: 409, body: {
+    error: `Confirm the delivered items of SO ${leg.so_number} first — an order is only Delivered once its item quantities are recorded.`,
+    code: "delivery_items_confirmation_required", schedule_id: sched.id, so_number: leg.so_number, sales_order_id: so?.id || null,
+  } };
 }
 
 // When a Service case's inert legacy order is delivered on the route, resolve
@@ -3017,8 +3093,9 @@ const handleDeliveryTemplate = async (chatId, text, from) => {
       .eq("id", order.id);
 
     if (isSettle) {
-      // Settled — mark order Delivered, cancel remaining trips
-      await supabase.from("orders").update({ status: "Delivered" }).eq("id", order.id);
+      // Settled — cancel remaining trips. The order becomes Delivered ONLY through
+      // the canonical DO completion (owner decision 2026-10-20), never directly.
+      const settle = await settleDeliveryFromTelegram(order, tgUser.id);
       await supabase.from("order_trips")
         .update({ status: "Cancelled" })
         .eq("company_id", order.company_id).eq("so_number", soNumber)
@@ -3030,7 +3107,7 @@ const handleDeliveryTemplate = async (chatId, text, from) => {
         `👤 Customer: ${order.customer_name || "-"}\n` +
         `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
         `📅 Date: ${date || "-"}\n\n` +
-        `_Remaining trips cancelled. Order marked Delivered._`
+        `_Remaining trips cancelled._ ${settle.text}`
       );
       if (ADMIN_CHAT_ID) await sendMessage(ADMIN_CHAT_ID,
         `✅ *Multi-Trip Settled*\n📋 SO: ${soNumber} | 👤 ${order.customer_name || "-"}\n` +
@@ -3092,20 +3169,24 @@ const handleDeliveryTemplate = async (chatId, text, from) => {
 
   // ── SINGLE TRIP ORDER ─────────────────────────────────────────
   if (isSettle) {
+    // Remark + first delivery date are recorded as before; the order becomes
+    // Delivered ONLY through the canonical DO completion (owner decision
+    // 2026-10-20) — exactly one open DO, else staff confirm items in PulseOS.
     await supabase.from("orders")
-      .update({ status: "Delivered", remark: updatedRemark, first_delivery_date: firstDeliveryDate })
+      .update({ remark: updatedRemark, first_delivery_date: firstDeliveryDate })
       .eq("id", order.id);
+    const settle = await settleDeliveryFromTelegram(order, tgUser.id);
 
     await sendMessage(chatId,
-      `✅ *SO ${soNumber} — Settled*\n\n` +
+      `${settle.completed ? "✅" : "⚠️"} *SO ${soNumber} — Settled*\n\n` +
       `👤 Customer: ${order.customer_name || "-"}\n` +
       `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n` +
       `📅 Date: ${date || "-"}\n\n` +
-      `_Order marked as Delivered._`
+      settle.text
     );
     if (ADMIN_CHAT_ID) await sendMessage(ADMIN_CHAT_ID,
-      `✅ *Delivery Settled*\n📋 SO: ${soNumber} | 👤 ${order.customer_name || "-"}\n` +
-      `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n📅 ${date || "-"}`
+      `${settle.completed ? "✅" : "⚠️"} *Delivery Settled*\n📋 SO: ${soNumber} | 👤 ${order.customer_name || "-"}\n` +
+      `🚛 Driver: ${driver}${helper ? ` | Helper: ${helper}` : ""}\n📅 ${date || "-"}\n` + settle.text
     );
 
   } else {
@@ -3462,9 +3543,27 @@ app.patch("/delivery/routes/:id", requireRole(MANAGE_ROLES), async (req, res) =>
 
       // Update regular orders — skip multi-trip orders (they are managed by driver template)
       const { data: regularOrders } = await supabase
-        .from("orders").select("id, is_multi_trip").in("id", orderIds);
+        .from("orders").select("id, is_multi_trip, so_number, type, company_id").in("id", orderIds);
       const regularOrderIds = (regularOrders || []).filter(o => !o.is_multi_trip).map(o => o.id);
-      if (regularOrderIds.length > 0) {
+      if (regularOrderIds.length > 0 && orderStatus === "Delivered") {
+        // Owner decision 2026-10-20: the ROUTE becomes Delivered (above) but its
+        // sales-order deliveries are not marked Delivered directly — each order is
+        // completed through its single open Delivery Order (canonical, atomic), or
+        // listed for staff to confirm its delivered items. Service-case orders keep
+        // the previous behaviour (they carry no item quantities).
+        const completed = [], needsConfirmation = [];
+        for (const o of (regularOrders || []).filter(r => !r.is_multi_trip && r.company_id === cid)) {
+          if (!deliveryConfirmation.needsItemConfirmation(o)) {
+            await supabase.from("orders").update({ status: "Delivered" }).eq("id", o.id).eq("company_id", cid);
+            await resolveServiceOnDelivery(o.id);
+            continue;
+          }
+          const out = await completeSingleOpenDoForLegacyOrder(o, req.user?.id);
+          (out.completed ? completed : needsConfirmation).push({ order_id: o.id, so_number: o.so_number, sales_order_id: out.sales_order_id || null,
+            do_number: out.do_number || null, sales_order_status: out.sales_order_status || null, reason: out.reason || null });
+        }
+        data.delivery_confirmation = { completed, needs_confirmation: needsConfirmation };
+      } else if (regularOrderIds.length > 0) {
         await supabase.from("orders").update({ status: orderStatus }).in("id", regularOrderIds);
       }
 
@@ -11488,14 +11587,14 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
         // Driver commission: earned once, on the FIRST trip of the order to
         // complete. No-op on a double-tap (already_completed) or when the
         // company hasn't opted in. Non-fatal — never block completion.
-        if (!result?.already_completed) {
-          try { await calculateDeliveryCommission(schedRow.delivery_order_id, cid); }
-          catch (e) { console.error("delivery commission calc:", e.message); }
-          await deductStockOnDeliveredDO(schedRow.delivery_order_id, cid, req.user.id);
-        }
+        if (!result?.already_completed) await afterDeliveryOrderCompleted(schedRow.delivery_order_id, cid, req.user.id);
         const { data: fresh } = await supabase.from("delivery_schedules").select("*").eq("id", req.params.id).single();
         return res.json({ schedule: fresh, delivery_order: result });
       }
+      // Legacy (no-DO) stop of a sales-order delivery: quantities first —
+      // POST /delivery-schedules/:id/confirm-delivered-items.
+      const blocked = await legacyStopDeliveredGuard(cid, req.params.id);
+      if (blocked) return res.status(blocked.status).json(blocked.body);
     }
     const updates = {};
     if (team_id !== undefined) updates.team_id = team_id;
@@ -11527,7 +11626,7 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     if (is_ready !== undefined) updates.is_ready = is_ready;
     if (notes !== undefined) updates.notes = notes;
     if (statusLower === "delivered") updates.delivered_at = new Date().toISOString();
-    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
+    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status, type)").single();
     if (error) throw error;
     // Fix #3: legacy schedules (no delivery_order_id) marked delivered by the
     // dispatcher UI must sync orders.status the same way the driver endpoint
@@ -11536,7 +11635,9 @@ app.patch("/delivery-schedules/:id", ...requirePerm(PERMS.DELIVERY_EDIT), async 
     if (statusLower === "delivered" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
       // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
-      await syncLegacyDeliveredToSalesOrder(cid, data.orders.so_number);
+      // Never for a Service case: it carries no item quantities and may share the
+      // number of a real sales order (owner decision 2026-10-20 — quantities first).
+      if (deliveryConfirmation.needsItemConfirmation(data.orders)) await syncLegacyDeliveredToSalesOrder(cid, data.orders.so_number);
       // If this order is a Service case's inert order, resolve the case too.
       await resolveServiceOnDelivery(data.orders.id);
     }
@@ -12135,11 +12236,7 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       // Driver commission: earned once, on the FIRST trip of the order to
       // complete. No-op on a double-tap (already_completed) or when the
       // company hasn't opted in. Non-fatal — never block completion.
-      if (!result?.already_completed) {
-        try { await calculateDeliveryCommission(existing.delivery_order_id, cid); }
-        catch (e) { console.error("delivery commission calc:", e.message); }
-        await deductStockOnDeliveredDO(existing.delivery_order_id, cid, req.user.id);
-      }
+      if (!result?.already_completed) await afterDeliveryOrderCompleted(existing.delivery_order_id, cid, req.user.id);
       const { data: fresh } = await supabase.from("delivery_schedules")
         .select("*, orders(id, so_number, status)").eq("id", existing.id).single();
       return res.json({ schedule: fresh, delivery_order: result });
@@ -12179,17 +12276,25 @@ app.patch("/driver/schedule/:id/status", requireRole(DRIVER_ROLES), async (req, 
       return res.json({ schedule: data });
     }
 
-    // ── Legacy (non-DO) schedule — unchanged, byte-for-byte ─────────────
+    // ── Legacy (non-DO) schedule ─────────────────────────────────────────
+    // "delivered" on a sales-order delivery needs its item quantities first
+    // (POST /driver/schedule/:id/confirm-delivered-items); Service-case stops
+    // and pre-sales-order rows keep the previous behaviour below.
+    if (status === "delivered") {
+      const blocked = await legacyStopDeliveredGuard(driverCid, existing.id);
+      if (blocked) return res.status(blocked.status).json(blocked.body);
+    }
     const updates = { status };
     if (status === "arrived") updates.notes = (updates.notes || "") + `\nArrived: ${new Date().toLocaleString("en-MY", { timeZone: "Asia/Kuala_Lumpur" })}`;
     if (status === "delivered") updates.delivered_at = new Date().toISOString();
-    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status)").single();
+    const { data, error } = await supabase.from("delivery_schedules").update(updates).eq("id", req.params.id).select("*, orders(id, so_number, status, type)").single();
     if (error) throw error;
 
     if (status === "delivered" && data.orders?.id) {
       await supabase.from("orders").update({ status: "Delivered" }).eq("id", data.orders.id);
       // QA SEV-1: also flip sales_orders — see syncLegacyDeliveredToSalesOrder.
-      await syncLegacyDeliveredToSalesOrder(getActiveCompanyId(req), data.orders.so_number);
+      // Never for a Service case (no item quantities; may share a real SO's number).
+      if (deliveryConfirmation.needsItemConfirmation(data.orders)) await syncLegacyDeliveredToSalesOrder(getActiveCompanyId(req), data.orders.so_number);
       // If this order is a Service case's inert order, resolve the case too.
       await resolveServiceOnDelivery(data.orders.id);
     }
@@ -13310,6 +13415,23 @@ app.get("/inventory/projection", requireAuth, async (req, res) => {
       if (!prod.has(r.product_id)) prod.set(r.product_id, { product: { id: r.product_id }, on_hand: 0, events: [] });
       prod.get(r.product_id).events.push({ date: String(d).slice(0, 10), type: "in", qty: remaining, ref: r.purchase_orders?.po_number || "" });
     }
+
+    // 3b. Product details for EVERY product in the projection. A product reached
+    //     only through a sales-order / PO line used to carry just { id }, and
+    //     the page then printed a generic "Product" label. Read-only lookup,
+    //     scoped to the active company: a product row that is missing, or that
+    //     belongs to another company, is never named — it is flagged instead
+    //     (product_missing) so staff can review the data behind it.
+    const productIds = [...prod.keys()];
+    const meta = new Map();
+    for (let i = 0; i < productIds.length; i += 100) {
+      const { data: rows, error: pErr } = await supabase.from("products")
+        .select("id, code, name, size, color, reorder_point")
+        .eq("company_id", cid).in("id", productIds.slice(i, i + 100));
+      if (pErr) throw pErr;
+      for (const r of (rows || [])) meta.set(r.id, r);
+    }
+    for (const [pid, p] of prod) p.product = meta.get(pid) || { id: pid, product_missing: true };
 
     // 4. Build a month-by-month running balance per product.
     const lastMonth = malaysiaDate.addMonths(today.slice(0, 7), horizon);
@@ -16433,6 +16555,11 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
 
     const { data: existing } = await supabase.from("sales_orders").select("*, sales_order_items(*)").eq("id", id).eq("company_id", company_id).single();
     if (!existing) return res.status(404).json({ error: "Order not found" });
+    // The edit form's Status dropdown cannot TYPE a delivery status (owner
+    // decision 2026-10-20) — keeping the current one on save is fine.
+    if (deliveryConfirmation.SO_DELIVERY_STATUSES.includes(status) && status !== existing.status) {
+      return res.status(409).json({ error: "Use Confirm Delivered Items to record which items were delivered — an order is only Delivered once its item quantities are recorded.", code: "delivery_confirmation_required" });
+    }
 
     // P1-1: fresh "does ANY Delivery Order exist for this SO" check — any
     // status, not just an operationally-active one. A critical amendment on
@@ -17783,12 +17910,120 @@ app.post("/order-amendments/:id/supersede", requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Confirm Delivered Items (migration 123; owner decision 2026-10-20) ──────
+// Every "Delivered" a person makes goes through these: the dialog loads the
+// items / open Delivery Orders, staff enter the quantities actually delivered,
+// and confirm_delivered_items() records them atomically (idempotent per key).
+// "Delivered" = customer-confirmed delivery. Payments, balances and
+// commissions are not touched.
+function confirmationContextBody(ctx, extra = {}) {
+  return {
+    sales_order: { id: ctx.so.id, order_number: ctx.so.order_number, status: ctx.so.status, customer_name: ctx.so.customer_name,
+      delivery_date: ctx.so.delivery_date, salesman_name: ctx.so.salesman_name },
+    items: ctx.items, open_delivery_orders: ctx.openDos, failed_delivery_orders: ctx.failedDos,
+    // Billing / service lines are shown read-only; an order with only those has nothing to deliver.
+    goods_count: ctx.goods_count, only_non_goods: ctx.only_non_goods, ...extra,
+  };
+}
+async function salesOrderForConfirmation(req, res, cid) {
+  if (!ORDER_ROLES.includes(req.user.role)) { res.status(403).json({ error: "Insufficient permissions" }); return null; }
+  const { data: so } = await supabase.from("sales_orders").select("id, order_number, salesman_name, created_by")
+    .eq("company_id", cid).eq("id", req.params.id).maybeSingle();
+  if (!so) { res.status(404).json({ error: "Sales order not found" }); return null; }
+  if (String(req.user.role || "").toLowerCase() === "salesman" && !mayRequestForSo(req, so)) { res.status(403).json({ error: "Not allowed" }); return null; }
+  return { cid, so };
+}
+// A legacy (no-DO) schedule stop → its sales order (driver app / schedule board).
+async function legacyStopForConfirmation(req, res, cid) {
+  const { data: sched } = await supabase.from("delivery_schedules").select("id, order_id, delivery_order_id, status")
+    .eq("company_id", cid).eq("id", req.params.id).maybeSingle();
+  if (!sched) { res.status(404).json({ error: "Schedule not found" }); return null; }
+  if (sched.delivery_order_id) {
+    res.status(409).json({ error: "This stop has a Delivery Order — mark it Delivered to complete that Delivery Order, or confirm partial quantities from the Orders page.", code: "has_delivery_order" });
+    return null;
+  }
+  const { data: leg } = await supabase.from("orders").select("id, so_number, type, company_id").eq("company_id", cid).eq("id", sched.order_id).maybeSingle();
+  if (!deliveryConfirmation.needsItemConfirmation(leg)) { res.status(409).json({ error: "This stop is not a sales-order delivery", code: "not_a_sales_order_delivery" }); return null; }
+  const { so, matches } = await deliveryConfirmation.findSalesOrderForLegacyOrder({ supabase, companyId: cid, legacyOrder: leg });
+  if (!so) { res.status(409).json({ error: matches ? `More than one sales order is numbered ${leg.so_number}` : `No sales order found for SO ${leg.so_number}`, code: "no_sales_order" }); return null; }
+  return { cid, so, sched };
+}
+const sendConfirmContext = async (res, cid, soId, extra) => {
+  const ctx = await deliveryConfirmation.loadConfirmationContext({ supabase, companyId: cid, salesOrderId: soId });
+  if (!ctx) return res.status(404).json({ error: "Sales order not found" });
+  res.json(confirmationContextBody(ctx, extra));
+};
+const runConfirm = async (req, res, { cid, soId, source, scheduleId = null }) => {
+  const out = await deliveryConfirmation.confirmDeliveredItems({ supabase, companyId: cid, salesOrderId: soId, actorId: req.user.id,
+    lines: req.body?.lines, idempotencyKey: req.body?.idempotency_key, source, legacyScheduleId: scheduleId });
+  // Every DO this confirmation completed gets the same follow-up as any other
+  // DO completion (driver commission, once per order per person). A replayed
+  // key (already_confirmed) completed nothing new and triggers nothing.
+  const conf = out.body?.confirmation;
+  if (out.status === 201 && conf && !conf.already_confirmed) {
+    for (const d of conf.delivery_orders || []) if (d?.delivery_order_id) await afterDeliveryOrderCompleted(d.delivery_order_id, cid, req.user.id);
+  }
+  res.status(out.status).json(out.body);
+};
+
+app.get("/sales-orders/:id/delivery-confirmation", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const r = await salesOrderForConfirmation(req, res, cid); if (!r) return;
+    await sendConfirmContext(res, cid, r.so.id);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post("/sales-orders/:id/confirm-delivered-items", requireAuth, async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const r = await salesOrderForConfirmation(req, res, cid); if (!r) return;
+    await runConfirm(req, res, { cid, soId: r.so.id, source: "orders_page" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get("/driver/schedule/:id/delivery-confirmation", requireRole(DRIVER_ROLES), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const r = await legacyStopForConfirmation(req, res, cid); if (!r) return;
+    await sendConfirmContext(res, cid, r.so.id, { schedule_id: r.sched.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post("/driver/schedule/:id/confirm-delivered-items", requireRole(DRIVER_ROLES), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const r = await legacyStopForConfirmation(req, res, cid); if (!r) return;
+    await runConfirm(req, res, { cid, soId: r.so.id, source: "driver", scheduleId: r.sched.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get("/delivery-schedules/:id/delivery-confirmation", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const r = await legacyStopForConfirmation(req, res, cid); if (!r) return;
+    await sendConfirmContext(res, cid, r.so.id, { schedule_id: r.sched.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post("/delivery-schedules/:id/confirm-delivered-items", ...requirePerm(PERMS.DELIVERY_EDIT), async (req, res) => {
+  try {
+    const cid = companyScope.requireActiveCompany(getActiveCompanyId(req), res); if (!cid) return;
+    const r = await legacyStopForConfirmation(req, res, cid); if (!r) return;
+    await runConfirm(req, res, { cid, soId: r.so.id, source: "schedule_admin", scheduleId: r.sched.id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // PATCH /sales-orders/:id/status
 app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
   try {
     if (!ORDER_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Insufficient permissions" });
     const { status, cancel_reason } = req.body;
     const cidForStatus = getActiveCompanyId(req);
+    // Owner decision 2026-10-20: delivery progress is never typed in — it comes
+    // from recorded item quantities (POST /sales-orders/:id/confirm-delivered-items).
+    if (deliveryConfirmation.SO_DELIVERY_STATUSES.includes(status)) {
+      const { data: cur } = await supabase.from("sales_orders").select("status").eq("id", req.params.id).eq("company_id", cidForStatus).maybeSingle();
+      if (!cur) return res.status(404).json({ error: "Order not found" });
+      if (cur.status !== status) {
+        return res.status(409).json({ error: "Use Confirm Delivered Items to record which items were delivered — an order is only Delivered once its item quantities are recorded.", code: "delivery_confirmation_required" });
+      }
+    }
     // Both committing statuses share the amended-reconfirm and e-invoice guards.
     if (status === "confirmed" || status === "pending_deposit") {
       const { data: existing } = await supabase.from("sales_orders")

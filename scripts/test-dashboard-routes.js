@@ -92,8 +92,10 @@ const M = MONTH.slice(0, 7);
     r = await h.call("GET", "/dashboard/bootstrap", { user: "masterB" });
     assert("COMPANY ISOLATION: Company B master sees only B's counts and services", r.body.pending_counts.service_pending === 1 && r.body.pending_counts.delivery_requests === 1 && r.body.pending_counts.order_amendments === 1 && r.body.services.map(s => s.id).join() === "10", JSON.stringify(r.body));
     r = await h.call("GET", "/dashboard/bootstrap", { user: "tina" });
-    // eligible/held/paid of the current payout month (100 + 50, cancelled-order row 70 excluded) + pending (30), minus adjustments (−10) and held amounts (−5)
-    assert("salesman commission_summary: own rows only, current payout month, cancelled-order row excluded, adjustments/holds applied → 100+50+30−10−5 = 165", r.body.commission_summary && r.body.commission_summary.total === 165 && r.body.commission_summary.payout_month === MONTH, JSON.stringify(r.body.commission_summary));
+    // eligible/held/paid of the current payout month (100 + 50, cancelled-order row 70 excluded), minus adjustments (−10).
+    // Owner rule (d6859e4, 2026-10-20): pending (deposit gate not met) is never in the payable total, and only the payout
+    // month's OWN pending is reported apart — the old-month pending row 4 (30, and its hold −5) is not counted at all.
+    assert("salesman commission_summary: own rows only, current payout month, cancelled-order row excluded, adjustment applied, pending NOT in the total → 100+50−10 = 140", r.body.commission_summary && r.body.commission_summary.total === 140 && r.body.commission_summary.pending === 0 && r.body.commission_summary.payout_month === MONTH, JSON.stringify(r.body.commission_summary));
     assert("…never another salesman's (999) or another company's (555) commission", r.body.commission_summary.total < 500);
 
     out("\n══ GET /dashboard/branch-sales (master only) ══\n");
