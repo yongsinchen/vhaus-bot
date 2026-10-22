@@ -14,6 +14,7 @@ const { composeProductView, composeSupplierView } = require("./lib/product-view-
 const doLib = require("./lib/delivery-orders");
 const deliveryConfirmation = require("./lib/delivery-confirmation");
 const malaysiaDate = require("./lib/malaysia-date");
+const chatRemark = require("./lib/chat-remark");
 const companyScope = require("./lib/company-scope");
 const { classifySalesOrderItemEdit, identityKey: soItemIdentityKey } = require("./lib/sales-order-item-diff");
 const { createSupplierDOService } = require("./lib/supplier-do");
@@ -1876,7 +1877,7 @@ User message:
 "${text}"
 
 Classify into ONE intent and extract fields. Return ONLY a JSON object, no markdown:
-{"intent": "...", "so_number": "...", "date": "..."}
+{"intent": "...", "so_number": "...", "date": "...", "remark": "..."}
 
 Intents:
 - "schedule"     — wants to schedule/reschedule/move/postpone a delivery. Extract so_number if mentioned, and date if mentioned.
@@ -1889,6 +1890,7 @@ Intents:
 Rules:
 - date must be strict YYYY-MM-DD resolved against today (${today}). "tomorrow"/"esok" = day after today. "next friday" = the first Friday after today. Ambiguous numeric dates are DD/MM. Omit the field when no date is given. Use "TBC" if the user says TBC/no date yet.
 - so_number: the order number token only (e.g. "31006"). Omit if absent.
+- remark: for "schedule" only — any delivery instruction or reason the user added (time preference, disposal, access, why the date changes), copied in the user's OWN words and language. Never include the SO number, the date or the scheduling verb. Omit when there is none; never invent one.
 - Return valid JSON only.`;
   try {
     const response = await openai.chat.completions.create({
@@ -10075,19 +10077,7 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
     // Pull a free-text remark (the salesman's justification for the PIC) out
     // of a message like "11741 move to sunday, customer very annoying" or
     // "15/7 because customer is overseas". Returns null when there's none.
-    const extractRemark = (raw) => {
-      if (!raw) return null;
-      let m = raw.match(/\b(?:remark|note|reason)\s*[:\-]\s*(.+)$/i);
-      if (m) return m[1].trim();
-      m = raw.match(/\bbecause\s+(.+)$/i);
-      if (m) return m[1].trim();
-      const ci = raw.indexOf(",");
-      if (ci !== -1) {
-        const after = raw.slice(ci + 1).trim();
-        if (after) return after;
-      }
-      return null;
-    };
+    const extractRemark = chatRemark.extractRemark;
 
     // Process a chosen date for a scheduling session: busy-day gate, OM
     // approval rule, then apply. `step` distinguishes first ask vs confirm.
@@ -10270,9 +10260,10 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       if (session.step === "confirm_busy" && ["yes", "confirm", "ok"].includes(lower)) {
         newDate = session.data.pendingDate;
       } else {
-        // Allow "sunday, customer very annoying" — parse the date from the
-        // part before any remark.
-        newDate = parseDateInput(text) || parseDateInput(text.split(/[,;]/)[0]);
+        // The date may be followed by a remark, with or without a separator:
+        // "25/10, customer very annoying", "25/10 after 3pm", or the remark on
+        // the next line.
+        newDate = parseDateInput(text) || chatRemark.splitDateAndRemark(text).date;
         if (!newDate) {
           return reply(session.step === "confirm_busy"
             ? `Reply YES to keep ${fmtDate(session.data.pendingDate)}, send a different date, or "cancel".`
@@ -10280,7 +10271,7 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
             session.step === "confirm_busy" ? ["YES", "cancel"] : ["cancel"]);
         }
       }
-      const sessRemark = extractRemark(text);
+      const sessRemark = extractRemark(text) || chatRemark.splitDateAndRemark(text).remark;
       const sessData = sessRemark ? { ...session.data, remark: sessRemark } : session.data;
       return processDate(sessData, session.step, newDate);
     }
@@ -10357,7 +10348,7 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
       if (!intent.so_number) return reply("Which SO number do you want to schedule?");
       const data = await beginSchedule(intent.so_number);
       if (!data) return;
-      const remark = extractRemark(text);
+      const remark = extractRemark(text) || chatRemark.intentRemark(intent.remark, { soNumber: intent.so_number });
       const withRemark = { ...data, remark };
       // Preserve the remark across the follow-up date prompt / busy-day confirm.
       if (remark) setSession(key, "web_schedule", "waiting_date", withRemark);
