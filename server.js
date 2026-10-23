@@ -8964,11 +8964,29 @@ app.get("/service-cases", requireAuth, async (req, res) => {
     }
     // Attach each case's legs + items (with arrival dates) so the list rows can
     // show leg status and item arrival at a glance — batched to avoid N+1.
+    // Read in batches of 100 cases, every page: one .in() over all of a large
+    // company's cases (397 ids ≈ 15 KB of URL) failed outright, so every case
+    // listed with no legs / items and the Arrival filter misjudged them all.
+    // A failed read now errors instead of silently showing an empty list.
     const svcIds = (data || []).map(s => s.id);
     if (svcIds.length) {
-      const [{ data: allLegs }, { data: allItems }] = await Promise.all([
-        supabase.from("service_legs").select("id, service_id, leg_order, from_location, to_location, status, scheduled_at, scheduled_date").in("service_id", svcIds).order("leg_order"),
-        supabase.from("service_items").select("id, service_id, item_no, description, action_type, quantity, status, arrival_date").in("service_id", svcIds).order("item_no"),
+      const readByService = async (table, cols, orderCol) => {
+        let rows = [];
+        for (let i = 0; i < svcIds.length; i += 100) {
+          const ids = svcIds.slice(i, i + 100);
+          for (let from = 0; ; from += 1000) {
+            const { data: page, error: e } = await supabase.from(table).select(cols).in("service_id", ids)
+              .order(orderCol).order("id").range(from, from + 999);
+            if (e) throw new Error(`${table}: ${e.message}`);
+            rows = rows.concat(page || []);
+            if (!page || page.length < 1000) break;
+          }
+        }
+        return rows;
+      };
+      const [allLegs, allItems] = await Promise.all([
+        readByService("service_legs", "id, service_id, leg_order, from_location, to_location, status, scheduled_at, scheduled_date", "leg_order"),
+        readByService("service_items", "id, service_id, item_no, description, action_type, quantity, status, arrival_date", "item_no"),
       ]);
       const legsBy = {}; for (const l of (allLegs || [])) (legsBy[l.service_id] ||= []).push(l);
       const itemsBy = {}; for (const it of (allItems || [])) (itemsBy[it.service_id] ||= []).push(it);
