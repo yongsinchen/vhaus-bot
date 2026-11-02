@@ -22,6 +22,7 @@ const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
 const scheduleTeamDate = require("./lib/schedule-team-date");
 const commissionLifecycle = require("./lib/commission-lifecycle");
+const { buildPayoutReportRow, OVERRIDE_ROLES: PAYOUT_REPORT_OVERRIDE_ROLES } = require("./lib/commission-payout-report");
 const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { validatePaymentDate } = require("./lib/payment-date");
 const ledgerView = require("./lib/payment-ledger-view");
@@ -8208,6 +8209,49 @@ async function loadOrderIncentiveItems(orderId, cid) {
   return { order, rows: commissionLib.matchProductIncentives(enriched, cache.incentives, order.incentive_excluded_ids || []) };
 }
 
+// Attach `report` (lib/commission-payout-report.js) to every commission of a payout batch.
+// Orders and branches are read company-scoped in batches; the incentive item names use the
+// same matching as GET /orders/:id/incentive-items and calculateCommission, and are resolved
+// only for orders that actually earn a product incentive.
+async function attachPayoutReportRows(comms, cid) {
+  const orderIds = [...new Set(comms.map(c => c.order_id).filter(id => id != null))];
+  const orders = new Map();
+  for (let k = 0; k < orderIds.length; k += 150) {
+    const { data, error } = await supabase.from("orders")
+      .select("id, so_number, company_id, order_date, order_amount, balance, salesman, country, address, branch_id, items, incentive_excluded_ids")
+      .eq("company_id", cid).in("id", orderIds.slice(k, k + 150));
+    if (error) throw new Error(`payout report: could not read orders: ${error.message}`);
+    for (const o of data || []) orders.set(String(o.id), o);
+  }
+  const { data: branches, error: brErr } = await supabase.from("branches").select("id, name").eq("company_id", cid);
+  if (brErr) throw new Error(`payout report: could not read branches: ${brErr.message}`);
+  const branchName = new Map((branches || []).map(b => [b.id, b.name]));
+
+  const earning = new Set(comms
+    .filter(c => !PAYOUT_REPORT_OVERRIDE_ROLES.includes(c.role_name) && (Number(c.product_incentive_amt) || 0) > 0)
+    .map(c => String(c.order_id)));
+  const incentiveRowsByOrder = new Map();
+  if (earning.size) {
+    const cache = await getCommCache(cid);
+    for (const id of earning) {
+      const o = orders.get(id);
+      if (!o) continue;
+      let items = [];
+      try { items = typeof o.items === "string" ? JSON.parse(o.items || "[]") : (o.items || []); } catch { items = []; }
+      const enriched = await enrichItemsWithProductId(items, { company_id: o.company_id, so_number: o.so_number });
+      incentiveRowsByOrder.set(id, commissionLib.matchProductIncentives(enriched, cache.incentives, o.incentive_excluded_ids || []));
+    }
+  }
+  for (const c of comms) {
+    const o = orders.get(String(c.order_id));
+    c.report = buildPayoutReportRow({
+      commission: c, order: o || c.orders || {},
+      branchName: o?.branch_id ? branchName.get(o.branch_id) || null : null,
+      incentiveRows: incentiveRowsByOrder.get(String(c.order_id)) || [],
+    });
+  }
+}
+
 // Which product incentives a sales order earns, and whether each is switched on.
 // One row per earning item, keyed on the product_incentives id — order items carry
 // no stable id of their own.
@@ -8594,6 +8638,9 @@ app.get("/commission-payout", requireAuth, async (req, res) => {
     // never payable, whatever its own status says (paid rows stay as history).
     const { payable: comms, excludedCancelled } = commissionLifecycle.splitPayoutRows(
       [...(eligibleComms || []), ...(pendingComms || [])], c => c.orders?.status);
+    // ?report=1 — each commission also carries its Commission Payout Report row (the
+    // Excel / print layout), built from the SAME selection as the payout itself.
+    if (req.query.report === "1" && (comms || []).length) await attachPayoutReportRows(comms, cid);
     // Get adjustments
     const commIds = (comms || []).map(c => c.id);
     let adjustments = [];
