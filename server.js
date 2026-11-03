@@ -4335,12 +4335,15 @@ app.get("/dashboard/branch-sales", requireAuth, async (req, res) => {
     const depositBySo = new Map();
     if (soNumbers.length) {
       const { data: soRows } = await supabase.from("sales_orders")
-        .select("order_number, deposit").eq("company_id", cid).in("order_number", soNumbers);
-      for (const s of (soRows || [])) depositBySo.set(s.order_number, Number(s.deposit) || 0);
+        .select("order_number, deposit, status").eq("company_id", cid).in("order_number", soNumbers);
+      for (const s of (soRows || [])) depositBySo.set(s.order_number, { deposit: Number(s.deposit) || 0, status: s.status });
     }
+    // A DRAFT sales order is never a sale, deposit or not (owner decision
+    // 2026-11-03 — same rule as commission, commissionLifecycle.isDraftSoStatus).
     const countsAsSale = (o) => {
       if (!o.so_number || !depositBySo.has(o.so_number)) return true; // legacy/unmatched → unchanged
-      return depositBySo.get(o.so_number) > 0;
+      const so = depositBySo.get(o.so_number);
+      return so.deposit > 0 && !commissionLifecycle.isDraftSoStatus(so.status);
     };
 
     const totals = {};
@@ -4410,7 +4413,9 @@ app.get("/branch-performance", requireAuth, async (req, res) => {
         for (const s of (soRows || [])) depBySo.set(s.order_number, { deposit: Number(s.deposit) || 0, status: s.status });
       }
     }
-    const isLegit = (o) => { const d = o.so_number ? depBySo.get(o.so_number) : null; return d ? d.deposit > 0 : true; };
+    // Legit sale: deposit paid AND not a draft (same rule as Branch Performance
+    // and commission — a draft is never a sale).
+    const isLegit = (o) => { const d = o.so_number ? depBySo.get(o.so_number) : null; return d ? d.deposit > 0 && !commissionLifecycle.isDraftSoStatus(d.status) : true; };
     const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
 
     // Collections in the period: non-rejected payments against this branch's orders.
@@ -7596,6 +7601,24 @@ async function enrichItemsWithProductId(items, orderCtx = null) {
   return out;
 }
 
+// Which of these sales-order numbers are still DRAFT (company-scoped). A
+// draft is not a sale: no commission, no monthly-tier contribution (see
+// commissionLifecycle.isDraftSoStatus — legacy orders.status reads "Pending"
+// for a draft, so only sales_orders.status can tell). A failed read throws:
+// guessing "not draft" would pay commission on a draft, guessing "draft"
+// would claw back a real sale.
+async function draftSoNumbersOf(companyId, soNumbers) {
+  const want = [...new Set((soNumbers || []).filter(Boolean).map(String))];
+  const drafts = new Set();
+  for (let i = 0; i < want.length; i += 300) {
+    const { data, error } = await supabase.from("sales_orders").select("order_number, status")
+      .eq("company_id", companyId).in("order_number", want.slice(i, i + 300));
+    if (error) throw new Error(`could not read sales order status for commission: ${error.message}`);
+    for (const so of (data || [])) if (commissionLifecycle.isDraftSoStatus(so.status)) drafts.add(String(so.order_number));
+  }
+  return drafts;
+}
+
 // Orders counting toward ONE salesperson's monthly tier total: same company,
 // sales month (order_date in [dStart, dEnd)) and non-Service scope as before,
 // but matched by EXACT salesperson token — never substring (so "Jim" does not
@@ -7646,6 +7669,17 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // rewrite a clawback row as pending/eligible or create a new payable row.
   // Historical bad rows are cleaned up by an explicit, reviewed clawback.
   if (commissionLifecycle.isCancelledStatus(order.status)) return;
+  // A DRAFT sales order is not a sale yet: claw back any unpaid rows it has
+  // (same write path as a cancellation; paid rows are never touched) and
+  // re-tier the salesman's month without it. This is also how existing drafts
+  // are cleaned up — Recalculate All visits every order. Confirming the order
+  // recalculates its commission from scratch (the clawback rows are rewritten).
+  if (order.so_number && (await draftSoNumbersOf(companyId, [order.so_number])).has(String(order.so_number))) {
+    await commissionLifecycle.createCommissionLifecycle({ supabase })
+      .clawbackOrderCommissions(orderId, companyId, { reason: commissionLifecycle.DRAFT_CLAWBACK_REASON });
+    if (cascade) await retierSalesmanMonth(order, companyId, orderId);
+    return;
+  }
 
   // Which month an order belongs to is driven by the order's own date, not when the
   // commission record happened to be created. Editing an order's date (e.g. back-dating
@@ -7738,7 +7772,8 @@ async function calculateCommission(orderId, companyId, opts = {}) {
         const dStart = win.start, dEnd = win.end;
         // Exact-token match (lib/salesperson-tokens.js): "Jim" never counts
         // "Jimmy" sales. Same company / sales-month / non-Service scope as before.
-        const monthOrders = await fetchSalespersonMonthOrders(companyId, name, "order_amount, salesman, country, address, status", dStart, dEnd);
+        const monthOrders = await fetchSalespersonMonthOrders(companyId, name, "order_amount, salesman, country, address, status, so_number", dStart, dEnd);
+        const draftSos = await draftSoNumbersOf(companyId, monthOrders.map(o => o.so_number));
         // Orders shared between multiple sales assistants count only this salesman's
         // fractional share toward their own monthly cumulative sales (and therefore
         // tier matching) — not the full order amount for every assistant on it.
@@ -7746,7 +7781,8 @@ async function calculateCommission(orderId, companyId, opts = {}) {
         // same commissionable base as the commission itself.
         // Cancelled sales never count toward the monthly total / tier (filtered
         // here, null-safe — a SQL status filter would also drop NULL statuses).
-        monthlySales = (monthOrders || []).filter(o => !commissionLifecycle.isCancelledStatus(o.status)).reduce((s, o) => {
+        // Neither do DRAFT sales orders — not a sale until confirmed.
+        monthlySales = (monthOrders || []).filter(o => !commissionLifecycle.isCancelledStatus(o.status) && !draftSos.has(String(o.so_number))).reduce((s, o) => {
           const namesOnOrder = salespersonTokens(o.salesman);
           const commissionable = getCommissionableAmount(o);
           const share = namesOnOrder.length > 0 ? commissionable / namesOnOrder.length : commissionable;
@@ -7984,22 +8020,30 @@ async function calculateCommission(orderId, companyId, opts = {}) {
   // after computing this order, recompute every sibling in the same business
   // month for each of its salesmen, lifting them all to the current tier.
   // cascade:false on the sibling calls fans this out exactly one level.
-  if (cascade) {
-    const monthBasis = order.order_date || order.created_at || new Date();
-    const { start: dStart, end: dEnd } = businessMonth.businessMonthWindow(monthBasis);
-    const siblingIds = new Set();
-    for (const name of salesmanNames) {
-      const { data: sibs } = await supabase.from("orders").select("id, status")
-        .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
-        .gte("order_date", dStart).lt("order_date", dEnd);
-      // Never re-tier a Cancelled sibling (calculateCommission would no-op on
-      // it anyway — skipping it here keeps the cascade from even trying).
-      for (const s of (sibs || [])) if (Number(s.id) !== Number(orderId) && !commissionLifecycle.isCancelledStatus(s.status)) siblingIds.add(s.id);
-    }
-    for (const sid of siblingIds) {
-      try { await calculateCommission(sid, companyId, { cascade: false }); }
-      catch (e) { console.error(`[calculateCommission] sibling re-tier failed for order ${sid}:`, e.message); }
-    }
+  if (cascade) await retierSalesmanMonth(order, companyId, orderId);
+}
+
+// Recompute every other order of this order's salesmen in the same business
+// month (cascade:false — exactly one level), so a month total that moved —
+// up on a new sale, down when an order turns draft — re-tiers all of them.
+async function retierSalesmanMonth(order, companyId, orderId) {
+  // The cached month totals may predate the change that triggered this.
+  (await getCommCache(companyId)).monthlySales = {};
+  const salesmanNames = salespersonTokens(order.salesman);
+  const monthBasis = order.order_date || order.created_at || new Date();
+  const { start: dStart, end: dEnd } = businessMonth.businessMonthWindow(monthBasis);
+  const siblingIds = new Set();
+  for (const name of salesmanNames) {
+    const { data: sibs } = await supabase.from("orders").select("id, status")
+      .eq("company_id", companyId).ilike("salesman", `%${name}%`).or("type.is.null,type.neq.Service")
+      .gte("order_date", dStart).lt("order_date", dEnd);
+    // Never re-tier a Cancelled sibling (calculateCommission would no-op on
+    // it anyway — skipping it here keeps the cascade from even trying).
+    for (const s of (sibs || [])) if (Number(s.id) !== Number(orderId) && !commissionLifecycle.isCancelledStatus(s.status)) siblingIds.add(s.id);
+  }
+  for (const sid of siblingIds) {
+    try { await calculateCommission(sid, companyId, { cascade: false }); }
+    catch (e) { console.error(`[calculateCommission] sibling re-tier failed for order ${sid}:`, e.message); }
   }
 }
 
@@ -17281,7 +17325,9 @@ app.put("/sales-orders/:id", requireAuth, async (req, res) => {
     if (deliveryOrderId) {
       try {
         const { data: existingComm } = await supabase.from("commissions").select("id").eq("order_id", deliveryOrderId).limit(1).maybeSingle();
-        if (existingComm || (orderDateChanged && wasConfirmed)) await calculateCommission(deliveryOrderId, company_id);
+        // Into or out of draft: claw back + re-tier, or commission it now.
+        const draftChanged = (existing.status === "draft") !== ((finalStatus || existing.status) === "draft");
+        if (existingComm || (orderDateChanged && wasConfirmed) || draftChanged) await calculateCommission(deliveryOrderId, company_id);
       } catch (e) { console.error("commission recalc on order edit:", e.message); }
     }
     // Record the before/after audit trail for a non-critical edit on a
@@ -18177,7 +18223,9 @@ app.patch("/sales-orders/:id/status", requireAuth, async (req, res) => {
       // sales order (data.id), unpaid rows only.
       try { await reverseDeliveryCommission(data.id, cancel_reason || "sales order cancelled"); }
       catch (e) { console.error("driver commission reversal on cancel:", e.message); }
-    } else if (["confirmed", "amended"].includes(status)) {
+    } else if (["confirmed", "amended", "draft"].includes(status)) {
+      // Back to draft: calculateCommission claws the rows back and re-tiers
+      // the salesman's month without it (a draft is not a sale).
       try {
         const { data: legacyOrder } = await supabase.from("orders").select("id, company_id").eq("company_id", data.company_id).eq("so_number", data.order_number).maybeSingle();
         if (legacyOrder) await calculateCommission(legacyOrder.id, data.company_id);

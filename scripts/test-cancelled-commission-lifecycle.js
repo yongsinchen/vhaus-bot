@@ -322,10 +322,10 @@ const commsFor = (db, oid) => db.tables.commissions.filter(c => c.order_id === o
   const calcSrc = commissionCode.slice(commissionCode.indexOf("async function calculateCommission("));
   const svcIdx = calcSrc.indexOf('if (order.type === "Service") return;'), canIdx = calcSrc.indexOf("if (commissionLifecycle.isCancelledStatus(order.status)) return;");
   assert("E1. calculateCommission reads orders.status and returns before any commission read/write when Cancelled", /incentive_excluded_ids, status"\)/.test(calcSrc) && canIdx > svcIdx && canIdx < calcSrc.indexOf('from("commissions")'));
-  assert("E2. monthly tier total filters Cancelled orders (null-safe, in JS)", /"order_amount, salesman, country, address, status"/.test(calcSrc) && /monthOrders \|\| \[\]\)\.filter\(o => !commissionLifecycle\.isCancelledStatus\(o\.status\)\)/.test(calcSrc));
+  assert("E2. monthly tier total filters Cancelled orders (null-safe, in JS)", /"order_amount, salesman, country, address, status, so_number"/.test(calcSrc) && /monthOrders \|\| \[\]\)\.filter\(o => !commissionLifecycle\.isCancelledStatus\(o\.status\) && !draftSos\.has\(String\(o\.so_number\)\)\)/.test(calcSrc));
   assert("E3. re-tier cascade skips Cancelled siblings", /!commissionLifecycle\.isCancelledStatus\(s\.status\)\) siblingIds\.add/.test(calcSrc));
   const statusRoute = block('app.patch("/sales-orders/:id/status"');
-  const cancelBranch = statusRoute.slice(statusRoute.indexOf('if (status === "cancelled") {'), statusRoute.indexOf('} else if (["confirmed", "amended"]'));
+  const cancelBranch = statusRoute.slice(statusRoute.indexOf('if (status === "cancelled") {'), statusRoute.indexOf('} else if (["confirmed", "amended", "draft"]'));
   assert("E4. PATCH /sales-orders/:id/status cancels via clawbackCancelledSalesOrder (company-scoped list lookup, paid-safe) — no raw clawback UPDATE left anywhere",
     /clawbackCancelledSalesOrder\(\{ companyId: data\.company_id, orderNumber: data\.order_number/.test(cancelBranch) && !/maybeSingle/.test(cancelBranch) && !/update\(\{ status: "clawback"/.test(serverSrc));
   assert("E4b. cancel route surfaces the lookup outcome (commission_clawback_warning) and still reverses driver commission", /commission_clawback_warning: clawbackWarning/.test(statusRoute) && /reverseDeliveryCommission\(data\.id/.test(cancelBranch));
@@ -392,6 +392,101 @@ const commsFor = (db, oid) => db.tables.commissions.filter(c => c.order_id === o
     const { errs, api } = svc(db);
     const r = await api.clawbackCancelledSalesOrder({ companyId: null, orderNumber: "SO-1" });
     assert("F7. missing company context → explicit lookup_error, no unscoped query", r.status === "lookup_error" && errs.length === 1 && db.writes.length === 0);
+  }
+
+  // ── G. DRAFT sales orders (owner decision 2026-11-03) ──────────────────────
+  // A draft is not a sale: no commission, no monthly-tier contribution, and any
+  // existing unpaid rows are clawed back. orders.status reads "Pending" for a
+  // draft, so the REAL calculateCommission must check sales_orders.status.
+  console.log("\n── G. draft sales orders: not a sale ──");
+  const draftSeed = () => {
+    const seed = baseSeed();
+    seed.orders[1].status = "Pending"; // 102 = 8,000: a DRAFT SO, which the legacy row shows as "Pending"
+    seed.sales_orders.push(
+      { id: "so-101", company_id: CO, order_number: "S101", status: "confirmed" },
+      { id: "so-102", company_id: CO, order_number: "S102", status: "draft" },
+      { id: "so-103", company_id: CO, order_number: "S103", status: "confirmed" },
+      { id: "so-102-other", company_id: "co-2", order_number: "S102", status: "confirmed" }, // same number, other company
+    );
+    return seed;
+  };
+  const row102 = (extra = {}) => ({ id: "d-el", order_id: 102, user_id: "u-alice", company_id: CO, role_name: "salesman", status: "eligible", paid_at: null, net_amount: 8000, rate_pct: 3, commission_amt: 240, tier_commission_amt: 240, clearance_commission_amt: 0, product_incentive_amt: 0, package_incentive_amt: 0, payout_month: "2026-09-01", ...extra });
+  assert("G1. isDraftSoStatus: 'draft' / ' Draft ' only", ["draft", " Draft "].every(lifecycle.isDraftSoStatus) && ![null, undefined, "", "pending_deposit", "confirmed", "Pending", "cancelled"].some(lifecycle.isDraftSoStatus));
+  {
+    const seed = draftSeed();
+    seed.commissions.push(row102());
+    const db = makeDb(seed);
+    await loadCalc(db)(102, CO, { cascade: false });
+    const r = commsFor(db, 102)[0];
+    assert("G2. existing eligible row on a DRAFT order → clawed back: status clawback, every amount 0", r.status === "clawback" && lifecycle.AMOUNT_FIELDS.every(k => r[k] === 0), JSON.stringify(r));
+    assert("G3. …pre-clawback figures kept in the snapshot, reason says draft", r.clawback_snapshot && r.clawback_snapshot.commission_amt === 240 && r.clawback_snapshot.status === "eligible" && r.clawback_reason === lifecycle.DRAFT_CLAWBACK_REASON);
+    assert("G4. …row kept, not deleted; no new row created", commsFor(db, 102).length === 1 && !db.writes.some(w => w.op === "delete" || (w.op === "insert" && w.table === "commissions")));
+  }
+  {
+    const seed = draftSeed();
+    seed.commissions.push(row102({ id: "d-paid", status: "paid", paid_at: "2026-09-01T00:00:00Z" }));
+    const db = makeDb(seed);
+    await loadCalc(db)(102, CO, { cascade: false });
+    assert("G5. an already-PAID row on a draft is never touched", JSON.stringify(commsFor(db, 102)[0]) === JSON.stringify(seed.commissions[0]) && !db.writes.some(w => w.table === "commissions"));
+  }
+  {
+    const db = makeDb(draftSeed());
+    await loadCalc(db)(102, CO, { cascade: false });
+    assert("G6. a draft with no rows → no commission created", commsFor(db, 102).length === 0 && !db.writes.some(w => w.table === "commissions"));
+  }
+  {
+    const db = makeDb(draftSeed());
+    await loadCalc(db)(101, CO, { cascade: false });
+    const r = commsFor(db, 101)[0];
+    assert("G7. monthly tier excludes the draft: Alice at 2.5% (9,000), not 3% (17,000 with the draft 8,000)", r && r.rate_pct === 2.5 && r.tier_commission_amt === 150, r && `rate ${r.rate_pct}`);
+  }
+  {
+    // Before the fix Alice's August siblings were tiered at 3% because the
+    // draft counted. Turning the order draft (calc with cascade) must re-tier
+    // them down to 2.5%.
+    const seed = draftSeed();
+    seed.commissions.push(row102(),
+      { id: "s-101", order_id: 101, user_id: "u-alice", company_id: CO, role_name: "salesman", status: "eligible", paid_at: null, net_amount: 6000, rate_pct: 3, commission_amt: 340, tier_commission_amt: 180, clearance_commission_amt: 0, product_incentive_amt: 160, package_incentive_amt: 0, payout_month: "2026-09-01" });
+    const db = makeDb(seed);
+    await loadCalc(db)(102, CO); // cascade ON
+    const s101 = commsFor(db, 101)[0], s103 = commsFor(db, 103)[0];
+    assert("G8. draft clawback re-tiers the month: sibling 101 back to 2.5% (150 tier + 160 incentive = 310)", s101.rate_pct === 2.5 && s101.tier_commission_amt === 150 && s101.commission_amt === 310, JSON.stringify(s101));
+    assert("G9. …and sibling 103 is commissioned at 2.5% (75)", s103 && s103.rate_pct === 2.5 && s103.tier_commission_amt === 75);
+    assert("G10. …while the draft itself stays clawed back", commsFor(db, 102)[0].status === "clawback" && commsFor(db, 102)[0].commission_amt === 0);
+  }
+  {
+    // Draft → confirmed: the clawback row is recalculated into a live row.
+    const seed = draftSeed();
+    seed.sales_orders.find(x => x.id === "so-102").status = "confirmed";
+    seed.commissions.push(row102({ status: "clawback", commission_amt: 0, tier_commission_amt: 0, clawback_reason: lifecycle.DRAFT_CLAWBACK_REASON }));
+    const db = makeDb(seed);
+    await loadCalc(db)(102, CO, { cascade: false });
+    const r = commsFor(db, 102)[0];
+    assert("G11. once confirmed, the clawed-back draft is commissioned again (3% on the 17,000 month = 240, eligible)", r.status === "eligible" && r.rate_pct === 3 && r.tier_commission_amt === 240 && r.commission_amt === 240, JSON.stringify({ st: r.status, rate: r.rate_pct, amt: r.commission_amt }));
+  }
+  {
+    const seed = draftSeed();
+    seed.sales_orders = seed.sales_orders.filter(x => x.company_id !== CO); // only the other company's S102 (confirmed) remains
+    seed.commissions.push(row102());
+    const db = makeDb(seed);
+    await loadCalc(db)(102, CO, { cascade: false });
+    assert("G12. company-scoped: another company's same-numbered SO is never read as this order's status", commsFor(db, 102)[0].status === "eligible");
+  }
+  {
+    const seed = draftSeed();
+    seed.commissions.push(row102());
+    const db = makeDb(seed);
+    db.failSelect.push("sales_orders");
+    let threw = false;
+    try { await loadCalc(db)(102, CO, { cascade: false }); } catch (e) { threw = /sales order status/.test(e.message); }
+    assert("G13. a failed sales-order status read throws — never guesses draft / not draft — and writes nothing", threw && !db.writes.some(w => w.table === "commissions"));
+  }
+  {
+    const statusRoute = block('app.patch("/sales-orders/:id/status"');
+    assert("G14. PATCH /sales-orders/:id/status recalculates on → draft (claw back + re-tier)", /\["confirmed", "amended", "draft"\]\.includes\(status\)/.test(statusRoute) && /calculateCommission\(legacyOrder\.id/.test(statusRoute));
+    const editRoute = block('app.put("/sales-orders/:id"');
+    assert("G15. SO edit recalculates when the status moves into or out of draft", /const draftChanged = \(existing\.status === "draft"\) !== \(\(finalStatus \|\| existing\.status\) === "draft"\)/.test(editRoute) && /\|\| draftChanged\) await calculateCommission/.test(editRoute));
+    assert("G16. Branch Performance + Performance totals exclude drafts via the same rule", /so\.deposit > 0 && !commissionLifecycle\.isDraftSoStatus\(so\.status\)/.test(block('app.get("/dashboard/branch-sales"')) && /d\.deposit > 0 && !commissionLifecycle\.isDraftSoStatus\(d\.status\)/.test(serverSrc));
   }
 
   console.log(`\n${fail === 0 ? "✅ ALL PASS" : "❌ FAILURES"} — ${pass} passed, ${fail} failed`);
