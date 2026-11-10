@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 /**
- * Migration 126 — a DRAFT sales order with a deposit auto-confirms — REAL PostgreSQL (PGlite; production never touched).
+ * Migrations 126 + 127 — a DRAFT sales order with a deposit auto-confirms — REAL PostgreSQL (PGlite; production never touched).
  *
- * Loads the real finance functions (105 + 113 + 116), migrations 117 + 118, then 126, and checks:
+ * Loads the real finance functions (105 + 113 + 116), migrations 117 + 118, then 126 and 127, and checks:
  * a paid draft confirms on the ledger recompute (payment path) and on a direct deposit edit (118) · an unpaid draft
- * stays draft · a draft over RM10,000 without I/C + email stays draft (e-invoice rule) and confirms once the details
- * exist · e-invoice requested on a small order needs the details too · pending_deposit still confirms · a rejected
- * payment does not confirm · confirmed / cancelled are never touched · the one-time repair SQL
- * (scripts/sql/126_confirm_paid_drafts.sql): dry run reads only and flags the blocked draft, apply confirms exactly
- * the eligible drafts.
+ * stays draft · since 127 a paid draft confirms WITHOUT the e-invoice details (over RM10,000 / e-invoice requested,
+ * no I/C + email) — owner decision 2026-11-10 · pending_deposit still confirms · a rejected payment does not
+ * confirm · confirmed / cancelled are never touched · the one-time repair SQL (scripts/sql/126_confirm_paid_drafts.sql):
+ * dry run reads only and flags orders missing e-invoice details, apply confirms every paid draft.
  *
  * Usage: node scripts/test-126-draft-auto-confirm-pg.js
  */
@@ -27,6 +26,7 @@ const A = u(1), SALES = u(11), R_SALES = u(21);
   await runMigrationFile(db, "117_deposit_and_payment_amendment_requests.sql");
   await runMigrationFile(db, "118_direct_deposit_edit.sql");
   await runMigrationFile(db, "126_draft_auto_confirm_on_deposit.sql");
+  await runMigrationFile(db, "127_draft_auto_confirm_skip_einvoice.sql");
   const q = async (sql, p = []) => (await db.query(sql, p)).rows;
   const one = async (sql, p = []) => (await q(sql, p))[0];
   const status = async no => (await one("SELECT status FROM sales_orders WHERE order_number = $1", [no])).status;
@@ -70,17 +70,17 @@ const A = u(1), SALES = u(11), R_SALES = u(21);
   const list = await q(dry);
   const byNo = Object.fromEntries(list.map(r => [r.order_number, r]));
   assert("dry run lists exactly the paid drafts (3001, 3003, 3004, 3005, 3010)", JSON.stringify(Object.keys(byNo).sort()) === JSON.stringify(["3001", "3003", "3004", "3005", "3010"]), JSON.stringify(Object.keys(byNo)));
-  assert("…3001 shows paid 969 and 'will confirm'", Number(byNo["3001"]?.paid) === 969 && byNo["3001"].outcome === "will confirm");
-  assert("…the RM15,000 draft without I/C + email is flagged BLOCKED", /^BLOCKED/.test(byNo["3003"]?.outcome || ""));
-  assert("…e-invoice requested without details is flagged BLOCKED", /^BLOCKED/.test(byNo["3005"]?.outcome || ""));
+  assert("…3001 shows paid 969, e-invoice details ok", Number(byNo["3001"]?.paid) === 969 && byNo["3001"].einvoice_details === "ok");
+  assert("…the RM15,000 draft without I/C + email is flagged MISSING (details, not a block)", /^MISSING/.test(byNo["3003"]?.einvoice_details || ""));
+  assert("…e-invoice requested without details is flagged MISSING", /^MISSING/.test(byNo["3005"]?.einvoice_details || "") && byNo["3004"].einvoice_details === "ok");
   assert("…unpaid, rejected-only, pending_deposit, cancelled are not listed", !["3002", "3006", "3007", "3008", "3009"].some(n => byNo[n]));
   assert("dry run wrote nothing", JSON.stringify(await q("SELECT order_number, status, deposit FROM sales_orders ORDER BY order_number")) === JSON.stringify(before));
 
   out("\n══ Repair SQL — apply ══\n");
   const applySql = repair.slice(repair.indexOf("-- SELECT s.order_number, _finance_apply_ledger(s.id)")).split("\n").filter(l => l.startsWith("-- ")).map(l => l.slice(3)).join("\n");
   const applied = Object.fromEntries((await q(applySql)).map(r => [r.order_number, r.new_status]));
-  assert("apply confirms the eligible paid drafts (3001 SO-23061 shape, 3004 with e-invoice details, 3010 legacy deposit)", applied["3001"] === "confirmed" && applied["3004"] === "confirmed" && applied["3010"] === "confirmed", JSON.stringify(applied));
-  assert("…and leaves the blocked ones draft (3003, 3005)", applied["3003"] === "draft" && applied["3005"] === "draft" && (await status("3003")) === "draft" && (await status("3005")) === "draft");
+  assert("apply confirms every paid draft (3001 SO-23061 shape, 3004 with e-invoice details, 3010 legacy deposit)", applied["3001"] === "confirmed" && applied["3004"] === "confirmed" && applied["3010"] === "confirmed", JSON.stringify(applied));
+  assert("…including those without e-invoice details (3003 RM15,000, 3005 e-invoice requested) — 127", applied["3003"] === "confirmed" && applied["3005"] === "confirmed" && (await status("3003")) === "confirmed" && (await status("3005")) === "confirmed");
   assert("…3001 now confirmed with deposit 969 and balance 2,250", (await status("3001")) === "confirmed" && Number((await one("SELECT deposit FROM sales_orders WHERE order_number='3001'")).deposit) === 969 && Number((await one("SELECT balance FROM orders WHERE id = 1")).balance) === 2250);
   assert("…legacy orders row of a confirmed draft stays 'Pending' (open for delivery)", (await one("SELECT status FROM orders WHERE id = 1")).status === "Pending");
   assert("…untouched: unpaid draft, rejected-only draft, cancelled order", (await status("3002")) === "draft" && (await status("3007")) === "draft" && (await status("3008")) === "cancelled");
@@ -95,11 +95,12 @@ const A = u(1), SALES = u(11), R_SALES = u(21);
   await db.exec(`INSERT INTO payments (id, company_id, order_id, amount, approval_status, or_number, recorded_by, payment_method) VALUES ('${u(202)}', '${A}', 2, 500, 'pending', 7, '${SALES}', 'Cash')`);
   r = await ledger("3002");
   assert("draft gets its first payment (pending approval counts, as for pending_deposit) → confirmed", r.status === "confirmed" && r.auto_confirmed === true && (await status("3002")) === "confirmed");
-  await db.exec(`UPDATE sales_orders SET customer_id_no = '800101-01-5555', customer_email = 'big@x.my' WHERE order_number = '3003'`);
-  r = await ledger("3003");
-  assert("blocked RM15,000 draft confirms once I/C + email are added", r.status === "confirmed" && r.auto_confirmed === true);
-  await db.exec(`UPDATE sales_orders SET customer_id_no = '   ', customer_email = 'x@y' WHERE order_number = '3005'`);
-  assert("blank-space I/C still counts as missing", (await ledger("3005")).status === "draft");
+  await db.exec(`INSERT INTO sales_orders (id, company_id, order_number, status, subtotal, discount, gst_amount, gst_waived, initial_deposit, deposit, einvoice_requested, admin_charges)
+    VALUES ('${u(111)}', '${A}', '3011', 'draft', 25000, 0, 0, false, 0, 0, true, 0);
+    INSERT INTO orders (id, company_id, so_number, type, status, order_amount, balance) VALUES (11, '${A}', '3011', 'Delivery', 'Pending', 25000, 25000);
+    INSERT INTO payments (id, company_id, order_id, amount, approval_status, or_number, recorded_by, payment_method) VALUES ('${u(211)}', '${A}', 11, 1000, 'approved', 8, '${SALES}', 'Cash');`);
+  r = await ledger("3011");
+  assert("a new payment on a RM25,000 e-invoice-requested draft with no I/C / email → confirmed (127: no e-invoice condition)", r.status === "confirmed" && r.auto_confirmed === true);
   r = await ledger("3001");
   assert("forward-only / idempotent: recomputing a confirmed order changes nothing", r.status === "confirmed" && r.auto_confirmed === false);
   r = await ledger("3008");

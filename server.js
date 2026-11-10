@@ -6464,7 +6464,7 @@ async function recomputeOrderPaid(orderId) {
   // Service orders are financially inert — never recompute paid/balance from them.
   if (ord.type === "Service") return;
   const { data: so } = await supabase.from("sales_orders")
-    .select("id, status, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges, einvoice_requested, customer_id_no, customer_email")
+    .select("id, status, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges")
     .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
   if (!so) return;
 
@@ -6503,10 +6503,9 @@ async function recomputeOrderPaid(orderId) {
   await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
   for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
 
-  // Auto-confirm: a "pending_deposit" order — or a DRAFT that would not break
-  // the e-invoice rule (lib/sales-order-auto-confirm.js, same rule as
-  // migration 126) — becomes a real, confirmed sale the moment any deposit
-  // lands. Forward-only — never revert a confirmed/delivered
+  // Auto-confirm: a "pending_deposit" order or a DRAFT
+  // (lib/sales-order-auto-confirm.js, same rule as migration 127) becomes a
+  // real, confirmed sale the moment any deposit lands. Forward-only — never revert a confirmed/delivered
   // order if its paid amount later drops back to zero (refund / edit). This is
   // the single choke point every payment path flows through, so recording a
   // deposit anywhere (customer screen, driver collection, reconciliation) flips
@@ -16505,11 +16504,9 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     const depositOrNumber = depositAtCreate > 0 ? await nextOrNumber(company_id) : null;
     // A draft (or pending-deposit) order created WITH a deposit is a sale:
     // save it confirmed — same rule as every later payment path
-    // (lib/sales-order-auto-confirm.js / migration 126). A draft that would
-    // break the e-invoice rule stays draft.
-    const createStatus = salesOrderAutoConfirm.autoConfirmsOnDeposit(
-      { status: status || "draft", subtotal, discount, gst_amount, gst_waived, einvoice_requested: einvoice_requested === true, customer_id_no, customer_email },
-      depositAtCreate) ? "confirmed" : (status || "draft");
+    // (lib/sales-order-auto-confirm.js / migration 127; no e-invoice details
+    // needed for this automatic confirm).
+    const createStatus = salesOrderAutoConfirm.autoConfirmsOnDeposit({ status: status || "draft" }, depositAtCreate) ? "confirmed" : (status || "draft");
 
     const { data: order, error: orderErr } = await supabase
       .from("sales_orders")

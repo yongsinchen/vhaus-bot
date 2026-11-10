@@ -10,7 +10,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { autoConfirmsOnDeposit, einvoiceDetailsMissing } = require("../lib/sales-order-auto-confirm");
+const { autoConfirmsOnDeposit } = require("../lib/sales-order-auto-confirm");
 
 let pass = 0, fail = 0;
 const assert = (n, c, d) => { if (c) { console.log(`  ✅ ${n}`); pass++; } else { console.log(`  ❌ ${n}${d ? " — " + d : ""}`); fail++; } };
@@ -20,25 +20,23 @@ console.log("\n── rule ──");
 assert("paid draft → confirms", autoConfirmsOnDeposit(so(), 969));
 assert("unpaid draft → no", !autoConfirmsOnDeposit(so(), 0) && !autoConfirmsOnDeposit(so(), null));
 assert("pending_deposit with a deposit → confirms (unchanged)", autoConfirmsOnDeposit(so({ status: "pending_deposit" }), 1));
-assert("pending_deposit is never blocked by e-invoice here (creation already enforces it)", autoConfirmsOnDeposit(so({ status: "pending_deposit", subtotal: 20000 }), 1));
 assert("confirmed / cancelled / amended / delivered → never", ["confirmed", "cancelled", "amended", "delivered"].every(st => !autoConfirmsOnDeposit(so({ status: st }), 500)));
-assert("draft over RM10,000 without I/C + email → stays draft", !autoConfirmsOnDeposit(so({ subtotal: 15000 }), 5000));
-assert("…with I/C + email → confirms", autoConfirmsOnDeposit(so({ subtotal: 15000, customer_id_no: "900101-01-1234", customer_email: "c@x.my" }), 5000));
-assert("…total is after discount, GST counted unless waived", !einvoiceDetailsMissing(so({ subtotal: 10500, discount: 600 })) && einvoiceDetailsMissing(so({ subtotal: 9500, gst_amount: 855 })) && !einvoiceDetailsMissing(so({ subtotal: 9500, gst_amount: 855, gst_waived: true })));
-assert("exactly RM10,000 does not require details (> 10000, as on create)", !einvoiceDetailsMissing(so({ subtotal: 10000 })));
-assert("e-invoice requested on a small order needs the details", !autoConfirmsOnDeposit(so({ einvoice_requested: true }), 100) && autoConfirmsOnDeposit(so({ einvoice_requested: true, customer_id_no: "x", customer_email: "y" }), 100));
-assert("blank-space I/C counts as missing", einvoiceDetailsMissing(so({ subtotal: 20000, customer_id_no: "   ", customer_email: "a@b" })));
+assert("127: a paid draft over RM10,000 WITHOUT I/C + email still confirms (owner decision 2026-11-10)", autoConfirmsOnDeposit(so({ subtotal: 25000 }), 5000));
+assert("127: e-invoice requested without details still confirms", autoConfirmsOnDeposit(so({ einvoice_requested: true }), 100));
 
-console.log("\n── parity with migration 126 ──");
-const sql = fs.readFileSync(path.join(__dirname, "..", "migrations", "126_draft_auto_confirm_on_deposit.sql"), "utf8");
-assert("the SQL rule uses the same threshold, flag and fields", /v_total > 10000 OR COALESCE\(v_so\.einvoice_requested, false\)/.test(sql) && /btrim\(v_so\.customer_id_no\)/.test(sql) && /btrim\(v_so\.customer_email\)/.test(sql) && /v_so\.status = 'pending_deposit'/.test(sql));
+console.log("\n── parity with migration 127 ──");
+const sql = fs.readFileSync(path.join(__dirname, "..", "migrations", "127_draft_auto_confirm_skip_einvoice.sql"), "utf8");
+const fnBodySql = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION"));
+assert("the SQL rule is exactly: paid > 0 and status pending_deposit / draft — no e-invoice condition", /IF v_paid > 0 AND v_so\.status IN \('pending_deposit', 'draft'\) THEN/.test(fnBodySql) && !/customer_id_no|einvoice_requested/.test(fnBodySql));
 
 console.log("\n── wiring (source level) ──");
 const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8").replace(/\r\n/g, "\n");
 const fnBody = (marker) => { const i = src.indexOf(marker); return src.slice(i, src.indexOf("\n}\n", i)); };
 const recompute = fnBody("async function recomputeOrderPaid(");
 assert("recomputeOrderPaid confirms through the shared rule (no pending_deposit-only check left)", /salesOrderAutoConfirm\.autoConfirmsOnDeposit\(so, paid\)/.test(recompute) && !/so\.status === "pending_deposit" && paid > 0/.test(recompute));
-assert("recomputeOrderPaid reads the e-invoice fields the rule needs", /einvoice_requested, customer_id_no, customer_email"\)/.test(recompute));
+const statusRoute = src.slice(src.indexOf('app.patch("/sales-orders/:id/status"'), src.indexOf("\napp.", src.indexOf('app.patch("/sales-orders/:id/status"') + 10));
+assert("confirming BY HAND still enforces the e-invoice rule (status route unchanged)", /\(einvTotal > 10000 \|\| existing\?\.einvoice_requested\) && \(!existing\?\.customer_id_no \|\| !existing\?\.customer_email\)/.test(statusRoute));
+assert("…and creating an order AS confirmed still does", /\(status === "confirmed" \|\| status === "pending_deposit"\) && \(einvTotal > 10000 \|\| einvoice_requested\) && \(!customer_id_no\?\.trim\(\) \|\| !customer_email\?\.trim\(\)\)/.test(src));
 const create = src.slice(src.indexOf('app.post("/sales-orders", '), src.indexOf("\napp.", src.indexOf('app.post("/sales-orders", ') + 10));
 assert("POST /sales-orders saves a draft created with a deposit as confirmed (shared rule)", /const createStatus = salesOrderAutoConfirm\.autoConfirmsOnDeposit\(/.test(create) && /salesman_name: resolvedSalesman, status: createStatus,/.test(create) && !/resolvedSalesman, status: status \|\| "draft"/.test(create));
 assert("…commission on create still keys off the saved status", /full\?\.status === "confirmed"/.test(create));

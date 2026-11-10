@@ -4,9 +4,10 @@
 -- ╚══════════════════════════════════════════════════════════════════╝
 -- Confirms existing DRAFT sales orders that already have a deposit (paid > 0),
 -- through the same function every payment uses (_finance_apply_ledger, with
--- migration 126's draft rule). A draft that would break the e-invoice rule
--- (total > RM10,000 or e-invoice requested, without I/C + email) is NOT
--- confirmed — the function leaves it draft; STEP 1 lists it as blocked.
+-- the draft rule of migrations 126 + 127). Since 127 the automatic confirm
+-- does not need the e-invoice details: every paid draft is confirmed.
+-- STEP 1's `einvoice_details` column still shows which confirmed orders lack
+-- I/C + email for an e-invoice (above RM10,000 or e-invoice requested).
 -- The ledger also re-saves each order's paid / balance from its payments
 -- (the same recompute any new payment would trigger).
 -- Commission is NOT calculated by SQL: afterwards press
@@ -18,7 +19,7 @@ SELECT c.name AS company, b.name AS branch, s.order_number, s.salesman_name, s.o
        CASE WHEN ((COALESCE(s.subtotal,0) - COALESCE(s.discount,0) + CASE WHEN s.gst_waived THEN 0 ELSE COALESCE(s.gst_amount,0) END) > 10000
                   OR COALESCE(s.einvoice_requested, false))
              AND (COALESCE(btrim(s.customer_id_no),'') = '' OR COALESCE(btrim(s.customer_email),'') = '')
-            THEN 'BLOCKED — add I/C + email, then confirm by hand' ELSE 'will confirm' END AS outcome
+            THEN 'MISSING — add I/C + email before issuing the e-invoice' ELSE 'ok' END AS einvoice_details
 FROM sales_orders s
 CROSS JOIN LATERAL (SELECT _finance_apply_ledger(s.id, true) AS r) l
 JOIN companies c ON c.id = s.company_id
@@ -27,7 +28,7 @@ WHERE s.status = 'draft' AND (l.r->>'paid')::numeric > 0
 ORDER BY c.name, b.name, s.order_number;
 
 -- STEP 2 — APPLY (writes). Run only after STEP 1 was reviewed and approved.
--- Returns one row per order with its new status ('confirmed', or 'draft' if blocked).
+-- Returns one row per order with its new status ('confirmed').
 -- SELECT s.order_number, _finance_apply_ledger(s.id)->>'status' AS new_status
 -- FROM sales_orders s
 -- WHERE s.status = 'draft' AND (_finance_apply_ledger(s.id, true)->>'paid')::numeric > 0
