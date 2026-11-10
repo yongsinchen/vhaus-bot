@@ -22,6 +22,7 @@ const SELECTS = require("./lib/selects");
 const commissionLib = require("./lib/commission");
 const scheduleTeamDate = require("./lib/schedule-team-date");
 const commissionLifecycle = require("./lib/commission-lifecycle");
+const salesOrderAutoConfirm = require("./lib/sales-order-auto-confirm");
 const { buildPayoutReportRow, OVERRIDE_ROLES: PAYOUT_REPORT_OVERRIDE_ROLES } = require("./lib/commission-payout-report");
 const { createPaymentAllocationService } = require("./lib/payment-allocation");
 const { validatePaymentDate } = require("./lib/payment-date");
@@ -4453,7 +4454,7 @@ app.get("/branch-performance", requireAuth, async (req, res) => {
       }
       return {
         so_number: o.so_number, order_date: o.order_date, customer_name: o.customer_name,
-        salesman: o.salesman, status: o.status, order_amount: amt,
+        salesman: o.salesman, status: o.status, so_status: soDep ? soDep.status : null, order_amount: amt,
         deposit: soDep ? soDep.deposit : null, balance: bal, legit,
       };
     });
@@ -6463,7 +6464,7 @@ async function recomputeOrderPaid(orderId) {
   // Service orders are financially inert — never recompute paid/balance from them.
   if (ord.type === "Service") return;
   const { data: so } = await supabase.from("sales_orders")
-    .select("id, status, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges")
+    .select("id, status, subtotal, discount, gst_amount, gst_waived, deposit, initial_deposit, admin_charges, einvoice_requested, customer_id_no, customer_email")
     .eq("company_id", ord.company_id).eq("order_number", ord.so_number).maybeSingle();
   if (!so) return;
 
@@ -6502,13 +6503,15 @@ async function recomputeOrderPaid(orderId) {
   await supabase.from("sales_orders").update({ deposit: paid }).eq("id", so.id);
   for (const id of ids) await supabase.from("orders").update({ balance }).eq("id", id);
 
-  // Auto-confirm: a "pending_deposit" order becomes a real, confirmed sale the
-  // moment any deposit lands. Forward-only — never revert a confirmed/delivered
+  // Auto-confirm: a "pending_deposit" order — or a DRAFT that would not break
+  // the e-invoice rule (lib/sales-order-auto-confirm.js, same rule as
+  // migration 126) — becomes a real, confirmed sale the moment any deposit
+  // lands. Forward-only — never revert a confirmed/delivered
   // order if its paid amount later drops back to zero (refund / edit). This is
   // the single choke point every payment path flows through, so recording a
   // deposit anywhere (customer screen, driver collection, reconciliation) flips
   // the order and (re)calculates commission.
-  if (so.status === "pending_deposit" && paid > 0) {
+  if (salesOrderAutoConfirm.autoConfirmsOnDeposit(so, paid)) {
     await supabase.from("sales_orders").update({ status: "confirmed" }).eq("id", so.id);
     for (const id of ids) await supabase.from("orders").update({ status: deliveryStatusFromSO("confirmed") }).eq("id", id);
     try { for (const id of ids) await calculateCommission(id, ord.company_id); }
@@ -16500,6 +16503,13 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
     // OR number. Zero-deposit orders stay NULL until a deposit is collected.
     const depositAtCreate = Number(deposit) || 0;
     const depositOrNumber = depositAtCreate > 0 ? await nextOrNumber(company_id) : null;
+    // A draft (or pending-deposit) order created WITH a deposit is a sale:
+    // save it confirmed — same rule as every later payment path
+    // (lib/sales-order-auto-confirm.js / migration 126). A draft that would
+    // break the e-invoice rule stays draft.
+    const createStatus = salesOrderAutoConfirm.autoConfirmsOnDeposit(
+      { status: status || "draft", subtotal, discount, gst_amount, gst_waived, einvoice_requested: einvoice_requested === true, customer_id_no, customer_email },
+      depositAtCreate) ? "confirmed" : (status || "draft");
 
     const { data: order, error: orderErr } = await supabase
       .from("sales_orders")
@@ -16509,7 +16519,7 @@ app.post("/sales-orders", requireAuth, async (req, res) => {
         customer_id_type: customer_id_type || null, customer_id_no: customer_id_no || null,
         customer_email: customer_email || null,
         delivery_address: delivery_address || null,
-        salesman_name: resolvedSalesman, status: status || "draft",
+        salesman_name: resolvedSalesman, status: createStatus,
         branch_id: branch_id || null,
         order_date: order_date || getMalaysiaDate(),
         delivery_date: delivery_date || null, delivery_time_slot: delivery_time_slot || null,

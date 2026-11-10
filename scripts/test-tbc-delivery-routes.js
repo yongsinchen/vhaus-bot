@@ -37,7 +37,9 @@ const prof = (i, company, role, extra = {}) => ({ id: i, role, company_id: compa
   const DOx = id => h.db.table("delivery_orders").find(d => d.id === id);
   let n = 0;
   const mkSO = async (status, date, user = "mgr") => {
-    const r = await h.call("POST", "/sales-orders", { user, body: { customer_name: `Cust ${++n}`, customer_contact: "012-345 6789", customer_address: `${n} Jalan Test`, salesman_names: "M", status, delivery_date: date, items: [{ product_code: `P${n}`, product_name: `Product ${n}`, quantity: 1, unit_price: 100 }], deposit: 50, payment_method: "Cash" } });
+    const r = await h.call("POST", "/sales-orders", { user, body: { customer_name: `Cust ${++n}`, customer_contact: "012-345 6789", customer_address: `${n} Jalan Test`, salesman_names: "M", status, delivery_date: date, items: [{ product_code: `P${n}`, product_name: `Product ${n}`, quantity: 1, unit_price: 100 }], deposit: status === "draft" ? 0 : 50, payment_method: "Cash" } });
+    // (A draft created WITH a deposit is saved confirmed since 2026-11-10 — migration 126 / lib/sales-order-auto-confirm.js —
+    // so a "draft" fixture carries no deposit.)
     if (r.status !== 201) throw new Error("create " + JSON.stringify(r.body));
     return r.body.order;
   };
