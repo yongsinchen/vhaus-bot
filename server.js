@@ -18654,16 +18654,33 @@ app.patch("/sales-orders/:id/signature", requireAuth, async (req, res) => {
 
 // ── Purchase Order Routes ─────────────────────────────────────────
 
-async function nextPONumber(company_id) {
-  const now = new Date();
-  const ymd = now.toISOString().slice(2, 10).replace(/-/g, "");
-  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-  const { count } = await supabase
-    .from("purchase_orders")
-    .select("id", { count: "exact", head: true })
-    .eq("company_id", company_id)
-    .gte("created_at", dayStart);
-  return `PO${ymd}-${String((count || 0) + 1).padStart(3, "0")}`;
+// PO number follows the sales order number (owner decision 2026-11-11): the
+// first PO raised from SO "30337" is "30337" (SO "U-70709" → "U-70709"). One
+// sales order can raise several POs — one per supplier, or a later submit of
+// the remaining items — so the next ones are "30337-2", "30337-3", …, keeping
+// every PO number unique within the company. Numbers already taken are read
+// back each time, so POs created in the same request number in sequence.
+function poNumberCandidates(soNumber, taken) {
+  const base = String(soNumber || "").trim();
+  const used = new Set((taken || []).map(t => String(t)));
+  if (!used.has(base)) return base;
+  for (let n = 2; ; n++) if (!used.has(`${base}-${n}`)) return `${base}-${n}`;
+}
+async function nextPONumber(company_id, soNumber) {
+  const base = String(soNumber || "").trim();
+  if (!base) {
+    // No sales-order number (should not happen) — keep the old date-based number.
+    const now = new Date();
+    const ymd = now.toISOString().slice(2, 10).replace(/-/g, "");
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const { count } = await supabase.from("purchase_orders").select("id", { count: "exact", head: true })
+      .eq("company_id", company_id).gte("created_at", dayStart);
+    return `PO${ymd}-${String((count || 0) + 1).padStart(3, "0")}`;
+  }
+  const { data, error } = await supabase.from("purchase_orders").select("po_number")
+    .eq("company_id", company_id).like("po_number", `${escapeLike(base)}%`);
+  if (error) throw new Error(`could not read existing PO numbers: ${error.message}`);
+  return poNumberCandidates(base, (data || []).map(r => r.po_number));
 }
 
 async function updatePOStatus(poId) {
@@ -18708,10 +18725,16 @@ app.post("/sales-orders/:id/submit-po", requireAuth, async (req, res) => {
 
     const createdPOs = [];
     for (const group of Object.values(grouped)) {
-      const po_number = await nextPONumber(company_id);
-      const { data: po, error: poErr } = await supabase.from("purchase_orders")
-        .insert({ company_id, po_number, supplier_id: group.supplier_id, sales_order_id: order.id, status: "draft", created_by: req.user.id })
-        .select().single();
+      // Retry on a unique-number clash (a PO from the same SO created at the
+      // same moment) — the next attempt reads the now-taken number back.
+      let po = null, poErr = null;
+      for (let attempt = 0; attempt < 5 && !po; attempt++) {
+        const po_number = await nextPONumber(company_id, order.order_number);
+        ({ data: po, error: poErr } = await supabase.from("purchase_orders")
+          .insert({ company_id, po_number, supplier_id: group.supplier_id, sales_order_id: order.id, status: "draft", created_by: req.user.id })
+          .select().single());
+        if (poErr && poErr.code !== "23505") break;
+      }
       if (poErr) throw poErr;
 
       const poItems = group.items.map(it => ({
