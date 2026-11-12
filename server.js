@@ -6293,8 +6293,12 @@ app.get("/customers/:id", requireAuth, async (req, res) => {
     // Totals. total_paid is derived from balances (the source of truth kept by
     // recomputeOrderPaid = deposit + payments) so it always reconciles, rather
     // than double-counting or missing the deposit lines above.
-    const totalSpent = allOrders.reduce((s, o) => s + (Number(o.order_amount) || 0), 0);
-    const totalBalance = allOrders.reduce((s, o) => s + Math.max(0, Number(o.balance) || 0), 0);
+    // A Cancelled order is still listed, but it is not owed: cancelling leaves
+    // its stored balance as it was, so it is left out of every total (same rule
+    // as the Outstanding Balance report).
+    const liveOrders = allOrders.filter(o => !commissionLifecycle.isCancelledStatus(o.status));
+    const totalSpent = liveOrders.reduce((s, o) => s + (Number(o.order_amount) || 0), 0);
+    const totalBalance = liveOrders.reduce((s, o) => s + Math.max(0, Number(o.balance) || 0), 0);
     const totalPaid = Math.max(0, totalSpent - totalBalance);
     res.json({ customer, orders: allOrders, payments: allPayments, summary: { total_spent: totalSpent, total_balance: totalBalance, total_paid: totalPaid, order_count: allOrders.length } });
   } catch (err) { res.status(500).json({ error: err.message }); }
