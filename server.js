@@ -5408,7 +5408,7 @@ const { computeDeliveryReadiness } = createDeliveryReadinessService({ supabase, 
 // TG-02 Phase 1: the private Telegram Delivery Dashboard (/start delivery, its buttons and searches),
 // read-only over the same readiness. Telegram errors keep their HTTP status + description, never the URL (token).
 const deliveryDashboard = createDeliveryDashboard({
-  supabase, computeDeliveryReadiness,
+  supabase, computeDeliveryReadiness, botUsername: process.env.TELEGRAM_BOT_USERNAME || null, // else asked with getMe
   telegram: async (method, payload) => {
     try { return (await axios.post(`${TELEGRAM_API}/${method}`, payload, { timeout: 15000 })).data?.result; }
     catch (err) {

@@ -18,6 +18,7 @@ const settle = () => new Promise(r => setTimeout(r, 150)); // the webhook answer
 
 (async () => {
   const h = await bootServer({
+    env: { TELEGRAM_BOT_USERNAME: "vhaus_delivery_bot" },
     seed: {
       companies: [{ id: A, name: "Vhaus A", code: "VA", is_active: true }],
       company_telegram_destinations: [{ id: "d1", company_id: A, notification_type: "daily_delivery_report", chat_id: "-100777", enabled: true }],
@@ -51,7 +52,9 @@ const settle = () => new Promise(r => setTimeout(r, 150)); // the webhook answer
     r = await post(msg(SALES, "2"));
     assert("registered salesman '2' → the existing reschedule flow", r.sent.some(m => /Reschedule/.test(m.text)));
     r = await post(msg(-100777, "/start delivery", "supergroup"));
-    assert("'/start delivery' typed in a group is not answered by the dashboard (no details in groups)", !r.sent.some(m => /Loading delivery data|DELIVERY ASSISTANT/.test(m.text)));
+    assert("'/start delivery' typed in a delivery group → only the button message, no order data", r.sent.length === 1 && /Delivery Dashboard/.test(r.sent[0].text) && !/Loading delivery data|DELIVERY ASSISTANT|Not Registered/.test(r.sent[0].text));
+    r = await post(msg(-100777, "/delivery", "supergroup"));
+    assert("'/delivery' in a delivery group → the button message (not 'Not Registered')", r.sent.length === 1 && /Delivery Dashboard/.test(r.sent[0].text));
   } catch (e) { h.quiet(false); out("❌ FATAL: " + (e.stack || e.message)); fail++; }
   finally { h.quiet(false); await h.close(); }
 

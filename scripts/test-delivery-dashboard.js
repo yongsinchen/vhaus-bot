@@ -85,6 +85,7 @@ function fakeTelegram(members) {
   const calls = []; let mid = 100;
   const fn = async (method, p) => {
     calls.push({ method, ...p });
+    if (method === "getMe") return { username: "vhaus_delivery_bot" };
     if (method === "getChatMember") return { status: members[p.chat_id]?.has(p.user_id) ? "member" : "left" };
     if (method === "sendMessage") { calls[calls.length - 1].result_id = ++mid; return { message_id: mid }; }
     if (method === "editMessageText" && fn.editError) { const e = new Error(fn.editError); e.description = fn.editError; e.status = 400; throw e; }
@@ -196,7 +197,14 @@ const click = (user, data, type = "private") => ({ callback_query: { id: "cq" + 
 
     assert("plain /start is NOT taken (the existing bot menu keeps it)", (await handle(msg(U1, "/start"))) === false);
     assert("ordinary text with no dashboard session is NOT taken", (await handle(msg(U1, "where is 31006"))) === false);
-    assert("group messages are never taken", (await handle(msg(-100111, "/start delivery", "supergroup"))) === false);
+    tg.reset();
+    assert("/delivery in a delivery group is answered…", (await handle(msg(-100111, "/delivery", "supergroup"))) === true);
+    let v = tg.last();
+    assert("…IN the group, with only the private-dashboard button (no order data)", v.chat_id === -100111 && button(v, /OPEN PRIVATE DELIVERY DASHBOARD/)?.url === "https://t.me/vhaus_delivery_bot?start=delivery" && !/SO |Overdue:|Tan|Sofa/.test(v.text));
+    assert("/start and /delivery@vhaus_delivery_bot in a delivery group get the button too", (await handle(msg(-100111, "/start", "supergroup"))) === true && (await handle(msg(-100111, "/delivery@vhaus_delivery_bot", "supergroup"))) === true);
+    assert("a command for ANOTHER bot is left alone", (await handle(msg(-100111, "/delivery@other_bot", "supergroup"))) === false);
+    assert("/delivery in a group that is not a delivery group is left to the rest of the bot", (await handle(msg(-100999, "/delivery", "supergroup"))) === false);
+    assert("ordinary group text is never taken", (await handle(msg(-100111, "how many overdue?", "supergroup"))) === false);
 
     tg.reset();
     assert("a stranger's /start delivery is handled", (await handle(msg(STRANGER, "/start delivery"))) === true);
@@ -204,7 +212,7 @@ const click = (user, data, type = "private") => ({ callback_query: { id: "cq" + 
 
     tg.reset();
     await handle(msg(U1, "/start delivery"));
-    let v = tg.last();
+    v = tg.last();
     assert("first message is a loading message, then edited into the dashboard (not a new message)", tg.calls.filter(c => c.method === "sendMessage").length === 1 && v.method === "editMessageText" && v.message_id === tg.calls.find(c => c.method === "sendMessage").result_id);
     assert("dashboard: title, company, counts, update time", /V HAUS DELIVERY ASSISTANT/.test(v.text) && /Vhaus A/.test(v.text) && /Overdue: 14 SOs · 15 items/.test(v.text) && /Upcoming \(next 5 days\): 2 SOs · 2 items/.test(v.text) && /Updated 11:00/.test(v.text), v.text);
     assert("dashboard buttons: Overdue, Upcoming, Search SO, Search Customer, Refresh", ["Overdue Deliveries", "Upcoming Deliveries", "Search SO Number", "Search Customer", "Refresh Dashboard"].every(t => buttons(v).some(b => b.text.includes(t))) && !button(v, /Switch Company/));
