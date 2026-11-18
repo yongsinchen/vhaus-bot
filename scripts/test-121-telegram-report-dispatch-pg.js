@@ -18,6 +18,7 @@ const { createDeliveryReadinessService } = require("../lib/delivery-readiness");
 const { createReportDispatchStore, deliverReport } = require("../lib/telegram-report-dispatch");
 const { classifyTelegramError, TelegramSendError } = require("../lib/telegram-send");
 const { run } = require("./run-daily-delivery-report");
+const { renderReportMessages } = require("../lib/daily-delivery-report");
 
 const out = s => process.stdout.write(s + "\n");
 let pass = 0, fail = 0;
@@ -88,7 +89,9 @@ const silently = async fn => { quietDepth++; console.log = () => {}; try { retur
   const row = async (company, date = TODAY) => (await q("SELECT * FROM telegram_report_dispatches WHERE company_id = $1 AND report_date = $2", [company, date]))[0];
   const store = createReportDispatchStore({ supabase: pgRpc(db) });
   const noSleep = async () => {};
-  const liveRun = (fake, tg, extra = {}) => silently(() => run({ ...fake, store, send: tg.send, live: true, now: AT_1030, sleep: noSleep, ...extra }));
+  // These cases test the dispatch ledger (claim / freeze / resume / retry), so they render the old detailed,
+  // multi-part text (the daily job itself now sends one summary — decision 8; covered by test-tg02).
+  const liveRun = (fake, tg, extra = {}) => silently(() => run({ ...fake, store, send: tg.send, live: true, now: AT_1030, sleep: noSleep, render: renderReportMessages, ...extra }));
 
   try {
     // ── Schema ───────────────────────────────────────────────────

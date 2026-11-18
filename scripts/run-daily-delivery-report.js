@@ -18,11 +18,14 @@
  *
  * Environment: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN,
  *   TG02_SEND_ENABLED, TG02_SEND_AFTER (HH:MM),
- *   TG02_OVERDUE_SINCE (YYYY-MM-DD floor for OVERDUE; default 2026-09-01 — DEFAULT_OVERDUE_SINCE; 'none' = no floor).
+ *   TG02_OVERDUE_SINCE (YYYY-MM-DD floor for OVERDUE; default 2026-09-01 — DEFAULT_OVERDUE_SINCE; 'none' = no floor),
+ *   TELEGRAM_BOT_USERNAME (optional — the dashboard button's bot; otherwise asked from Telegram with getMe).
+ *
+ * Each company gets ONE summary message (decision 8) with a button that opens the private dashboard.
  *
  * Usage:
  *   node scripts/run-daily-delivery-report.js                       dry run, EVERY company: counts (no message text)
- *   node scripts/run-daily-delivery-report.js --print               dry run + the full message text
+ *   node scripts/run-daily-delivery-report.js --print               dry run + the message text
  *   (a dry run reads only — no sends, no writes — and works before migration 121 / any destination exists)
  *   node scripts/run-daily-delivery-report.js --date 2026-10-20     dry run for another report date
  *   node scripts/run-daily-delivery-report.js --company <uuid>[,<uuid>…]   only those companies (dry run or live)
@@ -38,7 +41,11 @@
  */
 require("dotenv").config();
 const malaysiaDate = require("../lib/malaysia-date");
-const { REPORT_TYPE, DEFAULT_OVERDUE_SINCE, buildDailyDeliveryReport, renderReportMessages, isCalendarDate } = require("../lib/daily-delivery-report");
+const { REPORT_TYPE, DEFAULT_OVERDUE_SINCE, buildDailyDeliveryReport, renderSummaryMessage, renderReportMessages, dashboardButtonMarkup, isCalendarDate } = require("../lib/daily-delivery-report");
+
+// What the group gets: ONE summary message (decision 8). Tests of the multi-part dispatch inject the old
+// detailed renderer (renderReportMessages) through deps.render.
+const renderSummaryParts = (report, companyName) => [renderSummaryMessage(report, companyName)];
 const { createReportDispatchStore, deliverReport } = require("../lib/telegram-report-dispatch");
 
 const BAD_OUTCOMES = new Set(["failed", "uncertain", "gave_up", "error", "lost_claim"]);
@@ -69,10 +76,10 @@ async function fetchAll(supabase, table, select, filter) {
 /**
  * One run: live over every company with an enabled 'daily_delivery_report' destination; dry run over every company.
  * deps: { supabase, computeDeliveryReadiness, store, send, live, now, reportDate, companyIds, overdueSince,
- *         sendAfter, print, sleep } — tests inject fakes; nothing here reaches Telegram unless `send` does.
+ *         sendAfter, print, sleep, render } — tests inject fakes; nothing here reaches Telegram unless `send` does.
  */
 async function run(deps) {
-  const { supabase, computeDeliveryReadiness, live = false, print = false } = deps;
+  const { supabase, computeDeliveryReadiness, live = false, print = false, render = renderSummaryParts } = deps;
   const now = deps.now || new Date();
   const clock = malaysiaNow(now);
   const reportDate = deps.reportDate || clock.date;
@@ -111,13 +118,18 @@ async function run(deps) {
       let report = null;
       const build = async () => {
         report = await buildDailyDeliveryReport({ supabase, computeDeliveryReadiness, companyId: company.id, today: reportDate, overdueSince });
-        return renderReportMessages(report, company.name);
+        return render(report, company.name);
       };
 
       if (!live) {
         const parts = await build();
         Object.assign(row, { outcome: "dry_run", destination: dest ? "configured" : "none", overdue: report.overdue.length, upcoming: report.upcoming.length, parts: parts.length, excluded: report.excluded });
-        if (print) parts.forEach((p, i) => console.log(`\n--- ${company.name} · part ${i + 1}/${parts.length} (${p.length} chars) ---\n${p}`));
+        if (print) {
+          parts.forEach((p, i) => console.log(`\n--- ${company.name} · group message${parts.length > 1 ? ` ${i + 1}/${parts.length}` : ""} (${p.length} chars) ---\n${p}`));
+          // The per-SO detail is not sent to the group; printed for checking (it is what the dashboard lists).
+          const detail = renderReportMessages(report, company.name);
+          detail.forEach((p, i) => console.log(`\n--- ${company.name} · details, private dashboard only, NOT sent · ${i + 1}/${detail.length} ---\n${p}`));
+        }
         continue;
       }
 
@@ -178,8 +190,18 @@ async function main() {
   const doLib = require("../lib/delivery-orders");
   const { computeDeliveryReadiness } = require("../lib/delivery-readiness").createDeliveryReadinessService({ supabase, doLib });
   const { sendMessageConfirmed } = require("../lib/telegram-send").createTelegramSender({});
+  // The summary's "open private dashboard" button. Without a bot username the summary still goes out, button-less.
+  let replyMarkup = null;
+  if (wantsSend) {
+    let botUsername = process.env.TELEGRAM_BOT_USERNAME || null;
+    if (!botUsername) {
+      try { botUsername = (await require("axios").get(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/getMe`, { timeout: 15000 })).data?.result?.username || null; }
+      catch (e) { logEvent("bot_username_unavailable", { error: e?.response?.data?.description || e.code || "getMe failed" }); }
+    }
+    replyMarkup = dashboardButtonMarkup(botUsername);
+  }
   const summary = await run({
-    supabase, computeDeliveryReadiness, store, send: sendMessageConfirmed, live: wantsSend,
+    supabase, computeDeliveryReadiness, store, send: (chatId, text) => sendMessageConfirmed(chatId, text, { replyMarkup }), live: wantsSend,
     reportDate: date, companyIds, overdueSince, sendAfter, print: process.argv.includes("--print"),
   });
   return summary.ok === false ? 1 : 0;
