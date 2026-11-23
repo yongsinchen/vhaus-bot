@@ -49,6 +49,7 @@ const { createAssistantReadService } = require("./lib/assistant-read");
 const { renameSalesOrderNumber } = require("./lib/sales-order-rename");
 const { createDeliveryReadinessService } = require("./lib/delivery-readiness");
 const { createTelegramSender } = require("./lib/telegram-send");
+const { createDeliveryDashboard } = require("./lib/delivery-dashboard");
 const { createActiveDoAmendmentService, ACTIVE_DO_AMENDMENT_CONFLICT_MESSAGES } = require("./lib/active-do-amendment");
 const { threeWayMerge, applyResolutions, canonicalConflictPath, canonicalStateChanged } = require("./lib/amendment-three-way-merge");
 const { createItemArrivalEventService, SOURCES: ARRIVAL_EVENT_SOURCES } = require("./lib/item-arrival-events");
@@ -2133,6 +2134,8 @@ const showMenu = async (chatId, intro = "") => {
     "",
     "_Reply with a number, or just type naturally —_",
     "_e.g. \"move 31006 to next friday\", \"where is 31006\"_",
+    "",
+    "📦 Delivery dashboard (overdue / upcoming items): /delivery",
   ].filter(l => l !== null);
   await sendMessage(chatId, lines.join("\n"));
 };
@@ -5401,6 +5404,20 @@ const deliveryDateApprovalService = createDeliveryDateApprovalService({ supabase
 // /delivery-readiness and the Telegram 5-day reminder (scripts/run-delivery-
 // readiness-reminder.js) both call this same function. Never reimplemented.
 const { computeDeliveryReadiness } = createDeliveryReadinessService({ supabase, doLib });
+
+// TG-02 Phase 1: the private Telegram Delivery Dashboard (/start delivery, its buttons and searches),
+// read-only over the same readiness. Telegram errors keep their HTTP status + description, never the URL (token).
+const deliveryDashboard = createDeliveryDashboard({
+  supabase, computeDeliveryReadiness, botUsername: process.env.TELEGRAM_BOT_USERNAME || null, // else asked with getMe
+  telegram: async (method, payload) => {
+    try { return (await axios.post(`${TELEGRAM_API}/${method}`, payload, { timeout: 15000 })).data?.result; }
+    catch (err) {
+      const e = new Error(`Telegram ${method}: ${err.response?.data?.description || err.code || "request failed"}`);
+      e.status = err.response?.status ?? null; e.description = err.response?.data?.description || null;
+      throw e;
+    }
+  },
+});
 
 // Human-readable message for each applyApprovedDeliveryDate() conflict code
 // — mirrors the same pattern used for apply_active_do_amendment()'s conflicts.
@@ -10483,6 +10500,10 @@ app.post("/assistant/chat", requireAuth, async (req, res) => {
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
+    // Private Delivery Dashboard (lib/delivery-dashboard.js): "/start delivery", its own buttons and the
+    // replies it is waiting for. Anything else returns false and is handled below exactly as before.
+    if (await deliveryDashboard.handleUpdate(req.body)) return;
+
     const message = req.body.message;
     if (!message) return;
     const chatId = message.chat.id;
