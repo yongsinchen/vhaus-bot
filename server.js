@@ -5910,9 +5910,10 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
     const legacyOrderIds = [...new Set((data || []).filter(r => !r.sales_order_id && r.order_id).map(r => r.order_id))];
     const legacyDate = new Map();
     const legacyType = new Map();
+    const legacySoNumber = new Map();
     if (legacyOrderIds.length) {
-      const { data: ords } = await supabase.from("orders").select("id, delivery_date, type").in("id", legacyOrderIds);
-      for (const o of (ords || [])) { legacyDate.set(o.id, o.delivery_date || null); legacyType.set(o.id, o.type || null); }
+      const { data: ords } = await supabase.from("orders").select("id, delivery_date, type, so_number").in("id", legacyOrderIds);
+      for (const o of (ords || [])) { legacyDate.set(o.id, o.delivery_date || null); legacyType.set(o.id, o.type || null); legacySoNumber.set(o.id, o.so_number || null); }
     }
     // Service orders never go through the sales_order_id -> delivery_orders
     // lifecycle at all — a Service is scheduled straight onto
@@ -5927,6 +5928,15 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
     if (serviceLegacyIds.length) {
       const { data: svcs } = await supabase.from("services").select("legacy_order_id, status").in("legacy_order_id", serviceLegacyIds);
       for (const s of (svcs || [])) serviceStatus.set(s.legacy_order_id, s.status || null);
+    }
+    // A Service date change (requested_via "service_case") is stored with
+    // so_number NULL on purpose — approval must not touch orders by SO number.
+    // Give the card the case's own display number instead (same as the
+    // Services page: "SV-21814" when linked to SO 21814, else "SV-1000").
+    let serviceNums = new Map();
+    if (serviceLegacyIds.length && cid) {
+      serviceNums = await serviceNumber.serviceDisplayNumbersByLegacyOrder({ supabase, companyId: cid, legacyOrderIds: serviceLegacyIds })
+        .catch(e => { console.error("delivery-date-requests service numbers:", e.message); return new Map(); });
     }
     // Availability of each requested date so the approver can judge it without
     // leaving the page: how many deliveries are already booked that day (load),
@@ -5959,6 +5969,11 @@ app.get("/delivery-date-requests", requireAuth, async (req, res) => {
       requested_date_load: r.requested_date ? (loadByDate.get(r.requested_date) || null) : null,
       is_service: !r.sales_order_id && r.order_id ? legacyType.get(r.order_id) === "Service" : false,
       service_status: !r.sales_order_id && r.order_id ? (serviceStatus.get(r.order_id) || null) : null,
+      service_number: !r.sales_order_id && r.order_id ? (serviceNums.get(r.order_id)?.display_number || null) : null,
+      service_linked_so_label: !r.sales_order_id && r.order_id ? (serviceNums.get(r.order_id)?.linked_so_label || null) : null,
+      // A non-service legacy request saved without its SO number shows the
+      // order's own number (display only; the stored row is untouched).
+      so_number: r.so_number || (!r.sales_order_id && r.order_id && legacyType.get(r.order_id) !== "Service" ? (legacySoNumber.get(r.order_id) || null) : null),
     }));
     res.json({ requests, is_approver: isDateApprover(req) });
   } catch (err) { res.status(500).json({ error: err.message }); }
